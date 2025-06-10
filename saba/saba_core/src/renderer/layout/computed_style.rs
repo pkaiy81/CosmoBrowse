@@ -221,7 +221,6 @@ impl Color {
             code: "#ffffff".to_string(),
         }
     }
-
     pub fn black() -> Self {
         Self {
             name: Some("black".to_string()),
@@ -232,6 +231,12 @@ impl Color {
     pub fn code_u32(&self) -> u32 {
         u32::from_str_radix(self.code.trim_start_matches('#'), 16).unwrap()
     }
+
+    // Returns the CSS hex code (e.g. "#ff0000").
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
 }
 
 /// https://www.w3.org/TR/css-fonts-4/#absolute-size-mapping
