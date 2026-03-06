@@ -71,6 +71,22 @@ pub struct NavigationState {
     pub current_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TabSummary {
+    pub id: u32,
+    pub title: String,
+    pub url: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchResult {
+    pub id: u32,
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
 pub trait AppService {
     fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot>;
     fn reload(&mut self) -> AppResult<RenderSnapshot>;
@@ -78,36 +94,164 @@ pub trait AppService {
     fn forward(&mut self) -> AppResult<RenderSnapshot>;
     fn get_render_snapshot(&self) -> RenderSnapshot;
     fn get_navigation_state(&self) -> NavigationState;
+    fn new_tab(&mut self) -> TabSummary;
+    fn switch_tab(&mut self, id: u32) -> AppResult<RenderSnapshot>;
+    fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>>;
+    fn list_tabs(&self) -> Vec<TabSummary>;
+    fn search(&self, query: &str) -> AppResult<Vec<SearchResult>>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SabaApp {
-    session: BrowserSession,
+    tabs: Vec<Tab>,
+    active_tab_id: u32,
+    next_tab_id: u32,
+}
+
+impl Default for SabaApp {
+    fn default() -> Self {
+        let initial_tab = Tab::new(1);
+        Self {
+            tabs: vec![initial_tab],
+            active_tab_id: 1,
+            next_tab_id: 2,
+        }
+    }
 }
 
 impl AppService for SabaApp {
     fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
-        self.session.open_url(url)
+        self.active_session_mut()?.open_url(url)
     }
 
     fn reload(&mut self) -> AppResult<RenderSnapshot> {
-        self.session.reload()
+        self.active_session_mut()?.reload()
     }
 
     fn back(&mut self) -> AppResult<RenderSnapshot> {
-        self.session.back()
+        self.active_session_mut()?.back()
     }
 
     fn forward(&mut self) -> AppResult<RenderSnapshot> {
-        self.session.forward()
+        self.active_session_mut()?.forward()
     }
 
     fn get_render_snapshot(&self) -> RenderSnapshot {
-        self.session.get_render_snapshot()
+        self.active_session()
+            .map(BrowserSession::get_render_snapshot)
+            .unwrap_or_else(|_| BrowserSession::new().get_render_snapshot())
     }
 
     fn get_navigation_state(&self) -> NavigationState {
-        self.session.navigation_state()
+        self.active_session()
+            .map(BrowserSession::navigation_state)
+            .unwrap_or_else(|_| BrowserSession::new().navigation_state())
+    }
+
+    fn new_tab(&mut self) -> TabSummary {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab::new(id));
+        self.active_tab_id = id;
+        self.tab_summary(id)
+            .expect("newly created tab should be available")
+    }
+
+    fn switch_tab(&mut self, id: u32) -> AppResult<RenderSnapshot> {
+        if self.tabs.iter().any(|tab| tab.id == id) {
+            self.active_tab_id = id;
+            return self
+                .active_session()
+                .map(BrowserSession::get_render_snapshot);
+        }
+
+        Err(AppError::state(format!("Tab {id} does not exist")))
+    }
+
+    fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Err(AppError::state(format!("Tab {id} does not exist")));
+        };
+
+        self.tabs.remove(index);
+
+        if self.tabs.is_empty() {
+            let tab_id = self.next_tab_id;
+            self.next_tab_id += 1;
+            self.tabs.push(Tab::new(tab_id));
+        }
+
+        if self.active_tab_id == id {
+            self.active_tab_id = self
+                .tabs
+                .get(index.saturating_sub(1))
+                .or_else(|| self.tabs.first())
+                .map(|tab| tab.id)
+                .ok_or_else(|| AppError::state("Failed to resolve active tab"))?;
+        }
+
+        Ok(self.list_tabs())
+    }
+
+    fn list_tabs(&self) -> Vec<TabSummary> {
+        self.tabs
+            .iter()
+            .map(|tab| TabSummary {
+                id: tab.id,
+                title: tab.session.latest_snapshot.title.clone(),
+                url: tab.session.navigation_state().current_url,
+                is_active: tab.id == self.active_tab_id,
+            })
+            .collect()
+    }
+
+    fn search(&self, query: &str) -> AppResult<Vec<SearchResult>> {
+        build_search_results(query)
+    }
+}
+
+impl SabaApp {
+    fn active_session_mut(&mut self) -> AppResult<&mut BrowserSession> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == self.active_tab_id)
+            .map(|tab| &mut tab.session)
+            .ok_or_else(|| AppError::state("Active tab is unavailable"))
+    }
+
+    fn active_session(&self) -> AppResult<&BrowserSession> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == self.active_tab_id)
+            .map(|tab| &tab.session)
+            .ok_or_else(|| AppError::state("Active tab is unavailable"))
+    }
+
+    fn tab_summary(&self, id: u32) -> Option<TabSummary> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| TabSummary {
+                id: tab.id,
+                title: tab.session.latest_snapshot.title.clone(),
+                url: tab.session.navigation_state().current_url,
+                is_active: tab.id == self.active_tab_id,
+            })
+    }
+}
+
+#[derive(Debug)]
+struct Tab {
+    id: u32,
+    session: BrowserSession,
+}
+
+impl Tab {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            session: BrowserSession::new(),
+        }
     }
 }
 
@@ -244,6 +388,51 @@ fn normalize_url(url: &str) -> AppResult<String> {
         .map_err(|e| AppError::validation(format!("Invalid URL: {e}")))
 }
 
+fn build_search_results(query: &str) -> AppResult<Vec<SearchResult>> {
+    let normalized = query.trim();
+    if normalized.is_empty() {
+        return Err(AppError::validation("Search query is empty"));
+    }
+
+    let encoded = normalized.replace(' ', "+");
+    let mut results = vec![
+        SearchResult {
+            id: 1,
+            title: format!("Search \"{normalized}\" on DuckDuckGo"),
+            url: format!("https://duckduckgo.com/?q={encoded}"),
+            snippet: "Open web search results in DuckDuckGo".to_string(),
+        },
+        SearchResult {
+            id: 2,
+            title: format!("Search \"{normalized}\" on Wikipedia"),
+            url: format!("https://en.wikipedia.org/w/index.php?search={encoded}"),
+            snippet: "Open Wikipedia search results".to_string(),
+        },
+    ];
+
+    if !normalized.contains(' ') && normalized.contains('.') {
+        let candidate = if normalized.starts_with("http://") || normalized.starts_with("https://") {
+            normalized.to_string()
+        } else {
+            format!("http://{normalized}")
+        };
+
+        if normalize_url(&candidate).is_ok() {
+            results.insert(
+                0,
+                SearchResult {
+                    id: 0,
+                    title: format!("Open {normalized}"),
+                    url: candidate,
+                    snippet: "Detected URL-like input".to_string(),
+                },
+            );
+        }
+    }
+
+    Ok(results)
+}
+
 fn fetch_http_response(url: &str) -> AppResult<HttpResponse> {
     let client = Client::builder()
         .build()
@@ -274,7 +463,8 @@ fn fetch_http_response(url: &str) -> AppResult<HttpResponse> {
     raw_response.push_str("\n");
     raw_response.push_str(&body);
 
-    HttpResponse::new(raw_response).map_err(|e| AppError::parse(format!("Failed to parse response: {e:?}")))
+    HttpResponse::new(raw_response)
+        .map_err(|e| AppError::parse(format!("Failed to parse response: {e:?}")))
 }
 
 fn snapshot_from_page(page: &Page, current_url: String) -> RenderSnapshot {
@@ -302,13 +492,12 @@ fn snapshot_from_page(page: &Page, current_url: String) -> RenderSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_url, BrowserSession};
+    use super::{build_search_results, normalize_url, AppService, BrowserSession};
 
     #[test]
     fn normalize_http_url() {
         assert_eq!(
-            normalize_url("http://example.com")
-                .expect("must be valid"),
+            normalize_url("http://example.com").expect("must be valid"),
             "http://example.com"
         );
     }
@@ -399,5 +588,49 @@ mod tests {
         let _ = session.back();
 
         assert_eq!(session.history_index, 1);
+    }
+
+    #[test]
+    fn tab_lifecycle_switch_close_and_list() {
+        let mut app = super::SabaApp::default();
+        let first = app.list_tabs();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].is_active);
+
+        let new_tab = app.new_tab();
+        assert!(new_tab.is_active);
+        assert_eq!(app.list_tabs().len(), 2);
+
+        let first_id = first[0].id;
+        app.switch_tab(first_id).expect("switch must succeed");
+        let listed = app.list_tabs();
+        assert!(listed.iter().any(|t| t.id == first_id && t.is_active));
+
+        let listed = app.close_tab(first_id).expect("close must succeed");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_active);
+    }
+
+    #[test]
+    fn closing_last_tab_keeps_one_blank_tab() {
+        let mut app = super::SabaApp::default();
+        let id = app.list_tabs()[0].id;
+
+        let listed = app.close_tab(id).expect("close must succeed");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_active);
+    }
+
+    #[test]
+    fn search_returns_results_for_query() {
+        let results = build_search_results("rust browser").expect("search should succeed");
+        assert!(results.len() >= 2);
+        assert!(results.iter().any(|r| r.url.contains("duckduckgo.com")));
+    }
+
+    #[test]
+    fn search_empty_query_is_validation_error() {
+        let err = build_search_results("  ").expect_err("must fail");
+        assert_eq!(err.code, "validation_error");
     }
 }

@@ -14,15 +14,28 @@
         <h1>CosmoBrowse (Tauri v2)</h1>
       </header>
 
+      <section class="tabs-panel">
+        <h2>Tabs</h2>
+        <div class="tabs-actions">
+          <button id="new-tab-button" type="button">+ New Tab</button>
+        </div>
+        <ul id="tabs-list" class="tabs-list"></ul>
+      </section>
+
       <form id="url-form" class="toolbar">
         <button id="back-button" type="button">← Back</button>
         <button id="forward-button" type="button">Forward →</button>
         <button id="reload-button" type="button">Reload</button>
-        <input id="url-input" placeholder="http://example.com" />
-        <button type="submit">Open</button>
+        <input id="url-input" placeholder="URL または検索キーワード" />
+        <button type="submit">Open / Search</button>
       </form>
 
       <p id="status" class="status">Ready.</p>
+
+      <section>
+        <h2>Search Results</h2>
+        <ul id="search-results" class="search-results"></ul>
+      </section>
 
       <section>
         <h2>Snapshot</h2>

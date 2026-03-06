@@ -58,15 +58,21 @@ button:disabled {
   color: #59637b;
 }
 
-#text-list {
+#text-list,
+.search-results,
+.tabs-list {
   background: white;
   border: 1px solid #dce2f1;
   border-radius: 10px;
-  min-height: 220px;
   padding: 1rem 1.2rem;
 }
 
-#text-list li {
+#text-list {
+  min-height: 220px;
+}
+
+#text-list li,
+.search-results li {
   margin-bottom: 0.5rem;
   line-height: 1.4;
 }
@@ -74,4 +80,61 @@ button:disabled {
 .status[data-level="error"] {
   color: #a62132;
   font-weight: 600;
+}
+
+.tabs-panel {
+  margin-bottom: 1rem;
+}
+
+.tabs-actions {
+  margin-bottom: 0.5rem;
+}
+
+.tabs-list {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 0.8rem;
+  min-height: 2.8rem;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  border: 1px solid #cfd7ec;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.tab-item.active {
+  border-color: #3158d6;
+  box-shadow: 0 0 0 1px #3158d6;
+}
+
+.tab-switch,
+.tab-close,
+.linklike {
+  border: none;
+  background: transparent;
+  color: #1d2a4a;
+}
+
+.tab-switch {
+  max-width: 280px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.tab-close {
+  padding: 0.4rem 0.6rem;
+  font-weight: 700;
+  color: #7a0f28;
+}
+
+.linklike {
+  padding: 0;
+  color: #214ecf;
+  text-decoration: underline;
 }
