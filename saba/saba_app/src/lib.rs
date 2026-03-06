@@ -57,14 +57,8 @@ impl BrowserSession {
             return Err("No back history".to_string());
         }
 
-        self.history_index -= 1;
-        let url = self
-            .history
-            .get(self.history_index)
-            .cloned()
-            .ok_or_else(|| "Failed to read back history URL".to_string())?;
-
-        self.load_url(&url, false)
+        let target_index = self.history_index - 1;
+        self.navigate_to_index(target_index)
     }
 
     pub fn forward(&mut self) -> Result<RenderSnapshot, String> {
@@ -72,14 +66,8 @@ impl BrowserSession {
             return Err("No forward history".to_string());
         }
 
-        self.history_index += 1;
-        let url = self
-            .history
-            .get(self.history_index)
-            .cloned()
-            .ok_or_else(|| "Failed to read forward history URL".to_string())?;
-
-        self.load_url(&url, false)
+        let target_index = self.history_index + 1;
+        self.navigate_to_index(target_index)
     }
 
     pub fn reload(&mut self) -> Result<RenderSnapshot, String> {
@@ -102,6 +90,19 @@ impl BrowserSession {
             can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
             current_url: self.history.get(self.history_index).cloned(),
         }
+    }
+
+    fn navigate_to_index(&mut self, target_index: usize) -> Result<RenderSnapshot, String> {
+        let url = self
+            .history
+            .get(target_index)
+            .cloned()
+            .ok_or_else(|| "Failed to read history URL".to_string())?;
+
+        let snapshot = self.load_url(&url, false)?;
+        self.history_index = target_index;
+
+        Ok(snapshot)
     }
 
     fn load_url(&mut self, url: &str, record_history: bool) -> Result<RenderSnapshot, String> {
@@ -248,6 +249,30 @@ mod tests {
             vec!["http://a.com", "http://b.com", "http://d.com"]
         );
         assert_eq!(session.history_index, 2);
+    }
+
+    #[test]
+    fn back_does_not_mutate_index_on_load_failure() {
+        let mut session = BrowserSession::new();
+        session.history = vec!["http://%".to_string(), "http://example.com".to_string()];
+        session.history_index = 1;
+
+        let result = session.back();
+
+        assert!(result.is_err());
+        assert_eq!(session.history_index, 1);
+    }
+
+    #[test]
+    fn forward_does_not_mutate_index_on_load_failure() {
+        let mut session = BrowserSession::new();
+        session.history = vec!["http://example.com".to_string(), "http://%".to_string()];
+        session.history_index = 0;
+
+        let result = session.forward();
+
+        assert!(result.is_err());
+        assert_eq!(session.history_index, 0);
     }
 
     #[test]
