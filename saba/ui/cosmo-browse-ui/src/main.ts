@@ -95,7 +95,7 @@ async function openCurrentUrl() {
 
   const url = urlInputEl.value.trim();
   if (!url) {
-    setStatus("URL を入力してください。");
+    setStatus("Please enter a URL.");
     return;
   }
 
@@ -116,7 +116,7 @@ async function loadInitialSnapshot() {
     renderSnapshot(snapshot);
     await refreshNavigationState();
   } catch {
-    setStatus("初期スナップショットの取得に失敗しました。");
+    setStatus("Failed to load initial snapshot.");
   }
 }
 
