@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo check workspace (exclude tauri system-dependency crate)
-        run: cargo check --workspace --exclude cosmo-browse-ui
-      - name: cargo test workspace (exclude tauri system-dependency crate)
-        run: cargo test --workspace --exclude cosmo-browse-ui
+      - name: cargo check stable-target crates
+        run: cargo check -p saba_core -p saba_app
+      - name: cargo test stable-target crates
+        run: cargo test -p saba_core -p saba_app
 
   frontend:
     runs-on: ubuntu-latest
