@@ -63,9 +63,9 @@
 - 主要3サイト程度で遷移と戻る/進むが動作。
 
 ## Phase C: タブ・検索統合（Week 5-6）
-- [ ] タブ API（`new/switch/close/list`）。
-- [ ] Rust 検索機能を `saba_app::search(query)` として統合。
-- [ ] 検索結果から遷移までの一連フローを接続。
+- [x] タブ API（`new/switch/close/list`）。
+- [x] Rust 検索機能を `saba_app::search(query)` として統合。
+- [x] 検索結果から遷移までの一連フローを接続。
 
 **DoD**
 - 複数タブ + 検索遷移がクラッシュなく動作。
