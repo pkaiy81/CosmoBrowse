@@ -221,7 +221,7 @@ fn fetch_http_response(url: &str) -> AppResult<HttpResponse> {
     raw_response.push_str("\n");
     raw_response.push_str(&body);
 
-    HttpResponse::new(raw_response).map_err(|e| AppError::parse(format!("Failed to parse response: {e}")))
+    HttpResponse::new(raw_response).map_err(|e| AppError::parse(format!("Failed to parse response: {e:?}")))
 }
 
 fn snapshot_from_page(page: &Page, current_url: String) -> RenderSnapshot {
