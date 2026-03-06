@@ -4,40 +4,31 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <title>CosmoBrowse</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <main class="app-shell">
+      <header>
+        <h1>CosmoBrowse (Tauri v2)</h1>
+      </header>
 
-      <div class="row">
-        <a href="https://vitejs.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
-
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
+      <form id="url-form" class="toolbar">
+        <button id="back-btn" type="button">Back</button>
+        <button id="forward-btn" type="button">Forward</button>
+        <button id="reload-btn" type="button">Reload</button>
+        <input id="url-input" placeholder="http://example.com" />
+        <button type="submit">Open</button>
       </form>
-      <p id="greet-msg"></p>
+
+      <p id="status" class="status">Ready.</p>
+
+      <section>
+        <h2>Snapshot</h2>
+        <p id="current-url" class="muted"></p>
+        <ul id="text-list"></ul>
+      </section>
     </main>
   </body>
 </html>

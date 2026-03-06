@@ -32,3 +32,4 @@ For Android development, run:
   npm run tauri android dev
 
 - disk サイズの拡張
+- ロードマップ(v2): `ROADMAP.md` を参照（Tauri-first / UI切替可能構成 / バージョン運用方針）
