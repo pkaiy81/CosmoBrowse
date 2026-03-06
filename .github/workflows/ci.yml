@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo check workspace
-        run: cargo check --workspace
-      - name: cargo test workspace
-        run: cargo test --workspace
+      - name: cargo check workspace (exclude tauri system-dependency crate)
+        run: cargo check --workspace --exclude cosmo-browse-ui
+      - name: cargo test workspace (exclude tauri system-dependency crate)
+        run: cargo test --workspace --exclude cosmo-browse-ui
 
   frontend:
     runs-on: ubuntu-latest
