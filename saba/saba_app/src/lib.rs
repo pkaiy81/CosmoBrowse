@@ -5,6 +5,57 @@ use saba_core::renderer::page::Page;
 use saba_core::url::Url;
 use serde::Serialize;
 
+pub type AppResult<T> = Result<T, AppError>;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl AppError {
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self {
+            code: "validation_error".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn network(message: impl Into<String>) -> Self {
+        Self {
+            code: "network_error".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn parse(message: impl Into<String>) -> Self {
+        Self {
+            code: "parse_error".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn state(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_state".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+impl core::fmt::Display for AppError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AppError {}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RenderSnapshot {
     pub current_url: String,
@@ -20,8 +71,33 @@ pub struct NavigationState {
     pub current_url: Option<String>,
 }
 
+pub trait AppService {
+    fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot>;
+    fn get_render_snapshot(&self) -> RenderSnapshot;
+    fn get_navigation_state(&self) -> NavigationState;
+}
+
+#[derive(Debug, Default)]
+pub struct SabaApp {
+    session: BrowserSession,
+}
+
+impl AppService for SabaApp {
+    fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
+        self.session.open_url(url)
+    }
+
+    fn get_render_snapshot(&self) -> RenderSnapshot {
+        self.session.get_render_snapshot()
+    }
+
+    fn get_navigation_state(&self) -> NavigationState {
+        self.session.navigation_state()
+    }
+}
+
 #[derive(Debug)]
-pub struct BrowserSession {
+struct BrowserSession {
     history: Vec<String>,
     history_index: usize,
     latest_snapshot: RenderSnapshot,
@@ -34,7 +110,7 @@ impl Default for BrowserSession {
 }
 
 impl BrowserSession {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             history: Vec::new(),
             history_index: 0,
@@ -47,44 +123,18 @@ impl BrowserSession {
         }
     }
 
-    pub fn open_url(&mut self, url: &str) -> Result<RenderSnapshot, String> {
+    fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
         let normalized_url = normalize_url(url)?;
-        self.load_url(&normalized_url, true)
+        let snapshot = self.load_url(&normalized_url)?;
+        self.record_history(normalized_url);
+        Ok(snapshot)
     }
 
-    pub fn back(&mut self) -> Result<RenderSnapshot, String> {
-        if self.history.is_empty() || self.history_index == 0 {
-            return Err("No back history".to_string());
-        }
-
-        let target_index = self.history_index - 1;
-        self.navigate_to_index(target_index)
-    }
-
-    pub fn forward(&mut self) -> Result<RenderSnapshot, String> {
-        if self.history.is_empty() || self.history_index + 1 >= self.history.len() {
-            return Err("No forward history".to_string());
-        }
-
-        let target_index = self.history_index + 1;
-        self.navigate_to_index(target_index)
-    }
-
-    pub fn reload(&mut self) -> Result<RenderSnapshot, String> {
-        let url = self
-            .history
-            .get(self.history_index)
-            .cloned()
-            .ok_or_else(|| "No page to reload".to_string())?;
-
-        self.load_url(&url, false)
-    }
-
-    pub fn get_render_snapshot(&self) -> RenderSnapshot {
+    fn get_render_snapshot(&self) -> RenderSnapshot {
         self.latest_snapshot.clone()
     }
 
-    pub fn navigation_state(&self) -> NavigationState {
+    fn navigation_state(&self) -> NavigationState {
         NavigationState {
             can_back: !self.history.is_empty() && self.history_index > 0,
             can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
@@ -92,20 +142,7 @@ impl BrowserSession {
         }
     }
 
-    fn navigate_to_index(&mut self, target_index: usize) -> Result<RenderSnapshot, String> {
-        let url = self
-            .history
-            .get(target_index)
-            .cloned()
-            .ok_or_else(|| "Failed to read history URL".to_string())?;
-
-        let snapshot = self.load_url(&url, false)?;
-        self.history_index = target_index;
-
-        Ok(snapshot)
-    }
-
-    fn load_url(&mut self, url: &str, record_history: bool) -> Result<RenderSnapshot, String> {
+    fn load_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
         let response = fetch_http_response(url)?;
 
         let mut page = Page::new();
@@ -113,10 +150,6 @@ impl BrowserSession {
 
         let snapshot = snapshot_from_page(&page, url.to_string());
         self.latest_snapshot = snapshot.clone();
-
-        if record_history {
-            self.record_history(url.to_string());
-        }
 
         Ok(snapshot)
     }
@@ -140,10 +173,10 @@ impl BrowserSession {
     }
 }
 
-fn normalize_url(url: &str) -> Result<String, String> {
+fn normalize_url(url: &str) -> AppResult<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
-        return Err("URL is empty".to_string());
+        return Err(AppError::validation("URL is empty"));
     }
 
     let normalized = if trimmed.starts_with("http://") {
@@ -155,18 +188,18 @@ fn normalize_url(url: &str) -> Result<String, String> {
     Url::new(normalized.clone())
         .parse()
         .map(|_| normalized)
-        .map_err(|e| format!("Invalid URL: {e}"))
+        .map_err(|e| AppError::validation(format!("Invalid URL: {e}")))
 }
 
-fn fetch_http_response(url: &str) -> Result<HttpResponse, String> {
+fn fetch_http_response(url: &str) -> AppResult<HttpResponse> {
     let client = Client::builder()
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        .map_err(|e| AppError::network(format!("Failed to build HTTP client: {e}")))?;
 
     let response = client
         .get(url)
         .send()
-        .map_err(|e| format!("Failed to fetch URL: {e}"))?;
+        .map_err(|e| AppError::network(format!("Failed to fetch URL: {e}")))?;
 
     let version = format!("{:?}", response.version());
     let status = response.status();
@@ -184,11 +217,11 @@ fn fetch_http_response(url: &str) -> Result<HttpResponse, String> {
 
     let body = response
         .text()
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
+        .map_err(|e| AppError::network(format!("Failed to read response body: {e}")))?;
     raw_response.push_str("\n");
     raw_response.push_str(&body);
 
-    HttpResponse::new(raw_response).map_err(|e| format!("Failed to parse response: {e}"))
+    HttpResponse::new(raw_response).map_err(|e| AppError::parse(format!("Failed to parse response: {e:?}")))
 }
 
 fn snapshot_from_page(page: &Page, current_url: String) -> RenderSnapshot {
@@ -221,7 +254,8 @@ mod tests {
     #[test]
     fn normalize_http_url() {
         assert_eq!(
-            normalize_url("http://example.com").expect("must be valid"),
+            normalize_url("http://example.com")
+                .expect("must be valid"),
             "http://example.com"
         );
     }
@@ -232,6 +266,12 @@ mod tests {
             normalize_url("example.com").expect("must be valid"),
             "http://example.com"
         );
+    }
+
+    #[test]
+    fn normalize_empty_url_returns_validation_error() {
+        let error = normalize_url(" ").expect_err("must fail");
+        assert_eq!(error.code, "validation_error");
     }
 
     #[test]
@@ -252,30 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn back_does_not_mutate_index_on_load_failure() {
-        let mut session = BrowserSession::new();
-        session.history = vec!["http://%".to_string(), "http://example.com".to_string()];
-        session.history_index = 1;
-
-        let result = session.back();
-
-        assert!(result.is_err());
-        assert_eq!(session.history_index, 1);
-    }
-
-    #[test]
-    fn forward_does_not_mutate_index_on_load_failure() {
-        let mut session = BrowserSession::new();
-        session.history = vec!["http://example.com".to_string(), "http://%".to_string()];
-        session.history_index = 0;
-
-        let result = session.forward();
-
-        assert!(result.is_err());
-        assert_eq!(session.history_index, 0);
-    }
-
-    #[test]
     fn navigation_state_reflects_history_position() {
         let mut session = BrowserSession::new();
         session.record_history("http://a.com".to_string());
@@ -288,5 +304,11 @@ mod tests {
         assert!(nav.can_back);
         assert!(nav.can_forward);
         assert_eq!(nav.current_url, Some("http://b.com".to_string()));
+    }
+
+    #[test]
+    fn app_error_display_includes_code_and_message() {
+        let error = super::AppError::state("boom");
+        assert_eq!(error.to_string(), "invalid_state: boom");
     }
 }

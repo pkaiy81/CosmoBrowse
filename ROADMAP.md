@@ -115,13 +115,13 @@
 ---
 
 ## 5. 直近スプリント（次の2週間でやること）
-1. `saba_app` crate を追加。
-2. `AppService` trait + 実装を作成。
-3. `open_url` と `get_render_snapshot` を `saba_app` に実装。
-4. Tauri command は上記2つのみ先に接続。
-5. フロントに URL バー + 読み込みボタン + 表示領域を実装。
-6. エラーDTOを画面表示。
-7. CIに workspace check/test + frontend build を追加。
+1. [x] `saba_app` crate を追加。
+2. [x] `AppService` trait + 実装を作成。
+3. [x] `open_url` と `get_render_snapshot` を `saba_app` に実装。
+4. [x] Tauri command は上記2つのみ先に接続。
+5. [x] フロントに URL バー + 読み込みボタン + 表示領域を実装。
+6. [x] エラーDTOを画面表示。
+7. [x] CIに workspace check/test + frontend build を追加。
 
 **2週間の完了基準**
 - URL入力から本文表示まで一気通貫で動作。
