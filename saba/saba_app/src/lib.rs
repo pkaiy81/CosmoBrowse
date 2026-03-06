@@ -73,6 +73,9 @@ pub struct NavigationState {
 
 pub trait AppService {
     fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot>;
+    fn reload(&mut self) -> AppResult<RenderSnapshot>;
+    fn back(&mut self) -> AppResult<RenderSnapshot>;
+    fn forward(&mut self) -> AppResult<RenderSnapshot>;
     fn get_render_snapshot(&self) -> RenderSnapshot;
     fn get_navigation_state(&self) -> NavigationState;
 }
@@ -85,6 +88,18 @@ pub struct SabaApp {
 impl AppService for SabaApp {
     fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
         self.session.open_url(url)
+    }
+
+    fn reload(&mut self) -> AppResult<RenderSnapshot> {
+        self.session.reload()
+    }
+
+    fn back(&mut self) -> AppResult<RenderSnapshot> {
+        self.session.back()
+    }
+
+    fn forward(&mut self) -> AppResult<RenderSnapshot> {
+        self.session.forward()
     }
 
     fn get_render_snapshot(&self) -> RenderSnapshot {
@@ -134,12 +149,50 @@ impl BrowserSession {
         self.latest_snapshot.clone()
     }
 
+    fn reload(&mut self) -> AppResult<RenderSnapshot> {
+        let current = self
+            .history
+            .get(self.history_index)
+            .cloned()
+            .ok_or_else(|| AppError::state("No page to reload"))?;
+        self.load_url(&current)
+    }
+
+    fn back(&mut self) -> AppResult<RenderSnapshot> {
+        if self.history_index == 0 || self.history.is_empty() {
+            return Err(AppError::state("No back history"));
+        }
+
+        self.navigate_to_history_index(self.history_index - 1)
+    }
+
+    fn forward(&mut self) -> AppResult<RenderSnapshot> {
+        if self.history.is_empty() || self.history_index + 1 >= self.history.len() {
+            return Err(AppError::state("No forward history"));
+        }
+
+        self.navigate_to_history_index(self.history_index + 1)
+    }
+
     fn navigation_state(&self) -> NavigationState {
         NavigationState {
             can_back: !self.history.is_empty() && self.history_index > 0,
             can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
             current_url: self.history.get(self.history_index).cloned(),
         }
+    }
+
+    fn navigate_to_history_index(&mut self, index: usize) -> AppResult<RenderSnapshot> {
+        let target = self
+            .history
+            .get(index)
+            .cloned()
+            .ok_or_else(|| AppError::state("History target is unavailable"))?;
+
+        let snapshot = self.load_url(&target)?;
+        self.history_index = index;
+
+        Ok(snapshot)
     }
 
     fn load_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
@@ -310,5 +363,41 @@ mod tests {
     fn app_error_display_includes_code_and_message() {
         let error = super::AppError::state("boom");
         assert_eq!(error.to_string(), "invalid_state: boom");
+    }
+
+    #[test]
+    fn reload_without_history_returns_error() {
+        let mut session = BrowserSession::new();
+
+        let error = session.reload().expect_err("must fail");
+        assert_eq!(error.code, "invalid_state");
+    }
+
+    #[test]
+    fn back_without_history_returns_error() {
+        let mut session = BrowserSession::new();
+        let error = session.back().expect_err("must fail");
+
+        assert_eq!(error.code, "invalid_state");
+    }
+
+    #[test]
+    fn forward_without_history_returns_error() {
+        let mut session = BrowserSession::new();
+        let error = session.forward().expect_err("must fail");
+
+        assert_eq!(error.code, "invalid_state");
+    }
+
+    #[test]
+    fn navigation_failure_keeps_history_index_unchanged() {
+        let mut session = BrowserSession::new();
+        session.record_history("http://127.0.0.1:1".to_string());
+        session.record_history("http://127.0.0.1:2".to_string());
+        session.history_index = 1;
+
+        let _ = session.back();
+
+        assert_eq!(session.history_index, 1);
     }
 }

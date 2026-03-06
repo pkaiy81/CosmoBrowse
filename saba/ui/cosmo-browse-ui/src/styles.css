@@ -70,3 +70,8 @@ button:disabled {
   margin-bottom: 0.5rem;
   line-height: 1.4;
 }
+
+.status[data-level="error"] {
+  color: #a62132;
+  font-weight: 600;
+}
