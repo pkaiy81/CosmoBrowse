@@ -399,19 +399,21 @@ fn build_search_results(query: &str) -> AppResult<Vec<SearchResult>> {
         SearchResult {
             id: 1,
             title: format!("Search \"{normalized}\" on DuckDuckGo"),
-            url: format!("https://duckduckgo.com/?q={encoded}"),
+            url: format!("http://duckduckgo.com/?q={encoded}"),
             snippet: "Open web search results in DuckDuckGo".to_string(),
         },
         SearchResult {
             id: 2,
             title: format!("Search \"{normalized}\" on Wikipedia"),
-            url: format!("https://en.wikipedia.org/w/index.php?search={encoded}"),
+            url: format!("http://en.wikipedia.org/w/index.php?search={encoded}"),
             snippet: "Open Wikipedia search results".to_string(),
         },
     ];
 
     if !normalized.contains(' ') && normalized.contains('.') {
-        let candidate = if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        let candidate = if normalized.starts_with("https://") {
+            normalized.replacen("https://", "http://", 1)
+        } else if normalized.starts_with("http://") {
             normalized.to_string()
         } else {
             format!("http://{normalized}")
@@ -626,6 +628,7 @@ mod tests {
         let results = build_search_results("rust browser").expect("search should succeed");
         assert!(results.len() >= 2);
         assert!(results.iter().any(|r| r.url.contains("duckduckgo.com")));
+        assert!(results.iter().all(|r| r.url.starts_with("http://")));
     }
 
     #[test]
