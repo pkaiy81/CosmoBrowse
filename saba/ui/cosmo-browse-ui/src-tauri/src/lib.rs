@@ -16,6 +16,33 @@ fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<RenderSnap
 }
 
 #[tauri::command]
+fn back(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "Failed to lock browser session".to_string())?;
+    session.back()
+}
+
+#[tauri::command]
+fn forward(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "Failed to lock browser session".to_string())?;
+    session.forward()
+}
+
+#[tauri::command]
+fn reload(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "Failed to lock browser session".to_string())?;
+    session.reload()
+}
+
+#[tauri::command]
 fn get_render_snapshot(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, String> {
     let session = state
         .session
@@ -40,6 +67,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             open_url,
+            back,
+            forward,
+            reload,
             get_render_snapshot,
             get_navigation_state
         ])

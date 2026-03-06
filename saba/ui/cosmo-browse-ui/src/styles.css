@@ -10,7 +10,7 @@ body {
 
 .app-shell {
   margin: 0 auto;
-  max-width: 900px;
+  max-width: 980px;
   padding: 2rem 1rem;
 }
 
@@ -21,6 +21,8 @@ h1 {
 .toolbar {
   display: flex;
   gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
 input,
@@ -33,6 +35,7 @@ button {
 
 input {
   flex: 1;
+  min-width: 280px;
 }
 
 button {
@@ -40,6 +43,11 @@ button {
   color: white;
   border: none;
   cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  background-color: #8ea1de;
 }
 
 .status {

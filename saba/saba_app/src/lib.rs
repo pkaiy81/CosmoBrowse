@@ -49,28 +49,47 @@ impl BrowserSession {
 
     pub fn open_url(&mut self, url: &str) -> Result<RenderSnapshot, String> {
         let normalized_url = normalize_url(url)?;
-        let response = fetch_http_response(&normalized_url)?;
+        self.load_url(&normalized_url, true)
+    }
 
-        let mut page = Page::new();
-        page.receive_response(response);
-
-        let snapshot = snapshot_from_page(&page, normalized_url.clone());
-        self.latest_snapshot = snapshot.clone();
-
-        if self
-            .history
-            .get(self.history_index)
-            .map(|v| v != &normalized_url)
-            .unwrap_or(true)
-        {
-            if self.history_index + 1 < self.history.len() {
-                self.history.truncate(self.history_index + 1);
-            }
-            self.history.push(normalized_url);
-            self.history_index = self.history.len() - 1;
+    pub fn back(&mut self) -> Result<RenderSnapshot, String> {
+        if self.history.is_empty() || self.history_index == 0 {
+            return Err("No back history".to_string());
         }
 
-        Ok(snapshot)
+        self.history_index -= 1;
+        let url = self
+            .history
+            .get(self.history_index)
+            .cloned()
+            .ok_or_else(|| "Failed to read back history URL".to_string())?;
+
+        self.load_url(&url, false)
+    }
+
+    pub fn forward(&mut self) -> Result<RenderSnapshot, String> {
+        if self.history.is_empty() || self.history_index + 1 >= self.history.len() {
+            return Err("No forward history".to_string());
+        }
+
+        self.history_index += 1;
+        let url = self
+            .history
+            .get(self.history_index)
+            .cloned()
+            .ok_or_else(|| "Failed to read forward history URL".to_string())?;
+
+        self.load_url(&url, false)
+    }
+
+    pub fn reload(&mut self) -> Result<RenderSnapshot, String> {
+        let url = self
+            .history
+            .get(self.history_index)
+            .cloned()
+            .ok_or_else(|| "No page to reload".to_string())?;
+
+        self.load_url(&url, false)
     }
 
     pub fn get_render_snapshot(&self) -> RenderSnapshot {
@@ -83,6 +102,40 @@ impl BrowserSession {
             can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
             current_url: self.history.get(self.history_index).cloned(),
         }
+    }
+
+    fn load_url(&mut self, url: &str, record_history: bool) -> Result<RenderSnapshot, String> {
+        let response = fetch_http_response(url)?;
+
+        let mut page = Page::new();
+        page.receive_response(response);
+
+        let snapshot = snapshot_from_page(&page, url.to_string());
+        self.latest_snapshot = snapshot.clone();
+
+        if record_history {
+            self.record_history(url.to_string());
+        }
+
+        Ok(snapshot)
+    }
+
+    fn record_history(&mut self, url: String) {
+        if self
+            .history
+            .get(self.history_index)
+            .map(|v| v == &url)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        if self.history_index + 1 < self.history.len() {
+            self.history.truncate(self.history_index + 1);
+        }
+
+        self.history.push(url);
+        self.history_index = self.history.len() - 1;
     }
 }
 
@@ -162,7 +215,7 @@ fn snapshot_from_page(page: &Page, current_url: String) -> RenderSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_url;
+    use super::{normalize_url, BrowserSession};
 
     #[test]
     fn normalize_http_url() {
@@ -178,5 +231,37 @@ mod tests {
             normalize_url("example.com").expect("must be valid"),
             "http://example.com"
         );
+    }
+
+    #[test]
+    fn record_history_discards_forward_entries() {
+        let mut session = BrowserSession::new();
+        session.record_history("http://a.com".to_string());
+        session.record_history("http://b.com".to_string());
+        session.record_history("http://c.com".to_string());
+
+        session.history_index = 1;
+        session.record_history("http://d.com".to_string());
+
+        assert_eq!(
+            session.history,
+            vec!["http://a.com", "http://b.com", "http://d.com"]
+        );
+        assert_eq!(session.history_index, 2);
+    }
+
+    #[test]
+    fn navigation_state_reflects_history_position() {
+        let mut session = BrowserSession::new();
+        session.record_history("http://a.com".to_string());
+        session.record_history("http://b.com".to_string());
+        session.record_history("http://c.com".to_string());
+
+        session.history_index = 1;
+        let nav = session.navigation_state();
+
+        assert!(nav.can_back);
+        assert!(nav.can_forward);
+        assert_eq!(nav.current_url, Some("http://b.com".to_string()));
     }
 }
