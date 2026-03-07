@@ -1,10 +1,32 @@
 import { invoke } from "@tauri-apps/api/core";
 
+type SnapshotLink = {
+  text: string;
+  href: string;
+};
+
+type LayoutMetadata = {
+  text_item_count: number;
+  block_item_count: number;
+  content_width: number;
+  content_height: number;
+};
+
+type StyleMetadata = {
+  text_colors: string[];
+  background_colors: string[];
+  underlined_text_count: number;
+  heading_text_count: number;
+};
+
 type RenderSnapshot = {
   current_url: string;
   title: string;
   text_blocks: string[];
+  links: SnapshotLink[];
   diagnostics: string[];
+  layout: LayoutMetadata;
+  style: StyleMetadata;
 };
 
 type NavigationState = {
@@ -33,10 +55,39 @@ type AppError = {
   retryable: boolean;
 };
 
+type ErrorMetric = {
+  code: string;
+  count: number;
+};
+
+type NavigationEvent = {
+  command: string;
+  url: string | null;
+  duration_ms: number;
+  success: boolean;
+  error_code: string | null;
+  recorded_at_ms: number;
+};
+
+type AppMetricsSnapshot = {
+  total_navigations: number;
+  successful_navigations: number;
+  failed_navigations: number;
+  average_duration_ms: number;
+  last_duration_ms: number | null;
+  error_counts: ErrorMetric[];
+  recent_events: NavigationEvent[];
+};
+
 let urlInputEl: HTMLInputElement | null;
 let statusEl: HTMLElement | null;
 let currentUrlEl: HTMLElement | null;
 let textListEl: HTMLUListElement | null;
+let snapshotMetaEl: HTMLUListElement | null;
+let diagnosticsListEl: HTMLUListElement | null;
+let linksListEl: HTMLUListElement | null;
+let metricsSummaryEl: HTMLUListElement | null;
+let metricsEventsEl: HTMLUListElement | null;
 let backButtonEl: HTMLButtonElement | null;
 let forwardButtonEl: HTMLButtonElement | null;
 let reloadButtonEl: HTMLButtonElement | null;
@@ -69,14 +120,35 @@ function setNavButtons(nav: NavigationState) {
   }
 }
 
-async function refreshNavigationState() {
-  try {
-    const nav = await invoke<NavigationState>("get_navigation_state");
-    setNavButtons(nav);
-  } catch {
-    if (backButtonEl) backButtonEl.disabled = true;
-    if (forwardButtonEl) forwardButtonEl.disabled = true;
+function setTextItems(list: HTMLUListElement | null, lines: string[], emptyLabel: string) {
+  if (!list) return;
+
+  list.innerHTML = "";
+  const items = lines.length > 0 ? lines : [emptyLabel];
+
+  for (const line of items) {
+    const item = document.createElement("li");
+    item.textContent = line;
+    list.appendChild(item);
   }
+}
+
+function renderSnapshotMeta(snapshot: RenderSnapshot) {
+  const styleSummary = [
+    `Text colors: ${snapshot.style.text_colors.join(", ") || "(none)"}`,
+    `Background colors: ${snapshot.style.background_colors.join(", ") || "(none)"}`,
+    `Underlined text items: ${snapshot.style.underlined_text_count}`,
+    `Heading text items: ${snapshot.style.heading_text_count}`,
+  ];
+
+  const layoutSummary = [
+    `Text items: ${snapshot.layout.text_item_count}`,
+    `Block items: ${snapshot.layout.block_item_count}`,
+    `Content width: ${snapshot.layout.content_width}`,
+    `Content height: ${snapshot.layout.content_height}`,
+  ];
+
+  setTextItems(snapshotMetaEl, [...layoutSummary, ...styleSummary], "No snapshot metadata.");
 }
 
 function renderSnapshot(snapshot: RenderSnapshot) {
@@ -90,21 +162,42 @@ function renderSnapshot(snapshot: RenderSnapshot) {
     urlInputEl.value = snapshot.current_url;
   }
 
-  if (!textListEl) return;
+  renderSnapshotMeta(snapshot);
+  setTextItems(textListEl, snapshot.text_blocks, "No content.");
+  setTextItems(
+    diagnosticsListEl,
+    snapshot.diagnostics,
+    "No diagnostics."
+  );
+  renderLinks(snapshot.links);
+}
 
-  textListEl.innerHTML = "";
+function renderLinks(links: SnapshotLink[]) {
+  if (!linksListEl) return;
 
-  const lines =
-    snapshot.text_blocks.length > 0
-      ? snapshot.text_blocks
-      : snapshot.diagnostics.length > 0
-      ? snapshot.diagnostics
-      : ["No content"];
+  linksListEl.innerHTML = "";
 
-  for (const line of lines) {
+  if (links.length === 0) {
+    setTextItems(linksListEl, [], "No links found.");
+    return;
+  }
+
+  for (const link of links) {
     const item = document.createElement("li");
-    item.textContent = line;
-    textListEl.appendChild(item);
+    const button = document.createElement("button");
+    const detail = document.createElement("small");
+
+    button.type = "button";
+    button.className = "linklike";
+    button.textContent = link.text || link.href;
+    button.addEventListener("click", () => openUrl(link.href));
+
+    detail.textContent = link.href;
+
+    item.appendChild(button);
+    item.appendChild(document.createElement("br"));
+    item.appendChild(detail);
+    linksListEl.appendChild(item);
   }
 }
 
@@ -112,6 +205,11 @@ function renderSearchResults(results: SearchResult[]) {
   if (!searchResultsEl) return;
 
   searchResultsEl.innerHTML = "";
+
+  if (results.length === 0) {
+    setTextItems(searchResultsEl, [], "No search results.");
+    return;
+  }
 
   for (const result of results) {
     const item = document.createElement("li");
@@ -123,7 +221,7 @@ function renderSearchResults(results: SearchResult[]) {
     button.textContent = result.title;
     button.addEventListener("click", () => openUrl(result.url));
 
-    detail.textContent = `${result.url} — ${result.snippet}`;
+    detail.textContent = `${result.url} | ${result.snippet}`;
 
     item.appendChild(button);
     item.appendChild(document.createElement("br"));
@@ -136,6 +234,11 @@ function renderTabs(tabs: TabSummary[]) {
   if (!tabsListEl) return;
 
   tabsListEl.innerHTML = "";
+
+  if (tabs.length === 0) {
+    setTextItems(tabsListEl, [], "No tabs.");
+    return;
+  }
 
   for (const tab of tabs) {
     const item = document.createElement("li");
@@ -150,7 +253,7 @@ function renderTabs(tabs: TabSummary[]) {
     const closeButton = document.createElement("button");
     closeButton.type = "button";
     closeButton.className = "tab-close";
-    closeButton.textContent = "×";
+    closeButton.textContent = "x";
     closeButton.addEventListener("click", (event) => {
       event.stopPropagation();
       closeTab(tab.id);
@@ -162,9 +265,62 @@ function renderTabs(tabs: TabSummary[]) {
   }
 }
 
+function renderMetrics(metrics: AppMetricsSnapshot) {
+  const summaryLines = [
+    `Total navigations: ${metrics.total_navigations}`,
+    `Successful navigations: ${metrics.successful_navigations}`,
+    `Failed navigations: ${metrics.failed_navigations}`,
+    `Average duration: ${metrics.average_duration_ms} ms`,
+    `Last duration: ${metrics.last_duration_ms ?? 0} ms`,
+    `Error counts: ${formatErrorCounts(metrics.error_counts)}`,
+  ];
+
+  setTextItems(metricsSummaryEl, summaryLines, "No metrics.");
+
+  const eventLines = metrics.recent_events
+    .slice()
+    .reverse()
+    .map((event) => {
+      const time = new Date(event.recorded_at_ms).toLocaleTimeString();
+      const status = event.success ? "ok" : `failed (${event.error_code ?? "unknown"})`;
+      const target = event.url ?? "(no url)";
+      return `${time} | ${event.command} | ${status} | ${event.duration_ms} ms | ${target}`;
+    });
+
+  setTextItems(metricsEventsEl, eventLines, "No recent events.");
+}
+
+function formatErrorCounts(errorCounts: ErrorMetric[]) {
+  if (errorCounts.length === 0) {
+    return "none";
+  }
+
+  return errorCounts.map((metric) => `${metric.code}: ${metric.count}`).join(", ");
+}
+
+async function refreshNavigationState() {
+  try {
+    const nav = await invoke<NavigationState>("get_navigation_state");
+    setNavButtons(nav);
+  } catch {
+    if (backButtonEl) backButtonEl.disabled = true;
+    if (forwardButtonEl) forwardButtonEl.disabled = true;
+  }
+}
+
 async function refreshTabs() {
   const tabs = await invoke<TabSummary[]>("list_tabs");
   renderTabs(tabs);
+}
+
+async function refreshMetrics() {
+  try {
+    const metrics = await invoke<AppMetricsSnapshot>("get_metrics");
+    renderMetrics(metrics);
+  } catch {
+    setTextItems(metricsSummaryEl, [], "Failed to load metrics.");
+    setTextItems(metricsEventsEl, [], "Failed to load recent events.");
+  }
 }
 
 function errorLabelByCode(code: string): string {
@@ -182,8 +338,8 @@ function errorLabelByCode(code: string): string {
   }
 }
 
-function formatError(e: unknown): string {
-  const error = e as Partial<AppError>;
+function formatError(errorValue: unknown): string {
+  const error = errorValue as Partial<AppError>;
   const code = error.code ?? "unknown_error";
   const message = error.message ?? "Unknown error";
   const retry = error.retryable ? " (retryable)" : "";
@@ -197,11 +353,12 @@ async function executeNavigationCommand(command: string, loadingMessage: string)
     setStatus(loadingMessage);
     const snapshot = await invoke<RenderSnapshot>(command);
     renderSnapshot(snapshot);
-    await refreshNavigationState();
-    await refreshTabs();
+    renderSearchResults([]);
+    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
     setStatus("Done.");
-  } catch (e) {
-    setStatus(formatError(e), "error");
+  } catch (errorValue) {
+    await refreshMetrics();
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -211,11 +368,11 @@ async function openUrl(url: string) {
     const snapshot = await invoke<RenderSnapshot>("open_url", { url });
     renderSnapshot(snapshot);
     renderSearchResults([]);
-    await refreshNavigationState();
-    await refreshTabs();
+    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
     setStatus("Done.");
-  } catch (e) {
-    setStatus(formatError(e), "error");
+  } catch (errorValue) {
+    await refreshMetrics();
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -237,9 +394,10 @@ async function openCurrentInput() {
     setStatus("Searching...");
     const results = await invoke<SearchResult[]>("search", { query: value });
     renderSearchResults(results);
+    await refreshMetrics();
     setStatus(`Found ${results.length} search results.`);
-  } catch (e) {
-    setStatus(formatError(e), "error");
+  } catch (errorValue) {
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -247,34 +405,31 @@ async function switchTab(id: number) {
   try {
     const snapshot = await invoke<RenderSnapshot>("switch_tab", { id });
     renderSnapshot(snapshot);
-    await refreshNavigationState();
-    await refreshTabs();
-  } catch (e) {
-    setStatus(formatError(e), "error");
+    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
+  } catch (errorValue) {
+    setStatus(formatError(errorValue), "error");
   }
 }
 
 async function closeTab(id: number) {
   try {
     await invoke<TabSummary[]>("close_tab", { id });
-    await refreshTabs();
     const snapshot = await invoke<RenderSnapshot>("get_render_snapshot");
     renderSnapshot(snapshot);
-    await refreshNavigationState();
-  } catch (e) {
-    setStatus(formatError(e), "error");
+    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
+  } catch (errorValue) {
+    setStatus(formatError(errorValue), "error");
   }
 }
 
 async function createTab() {
   try {
     await invoke<TabSummary>("new_tab");
-    await refreshTabs();
     const snapshot = await invoke<RenderSnapshot>("get_render_snapshot");
     renderSnapshot(snapshot);
-    await refreshNavigationState();
-  } catch (e) {
-    setStatus(formatError(e), "error");
+    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
+  } catch (errorValue) {
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -282,12 +437,12 @@ async function loadInitialSnapshot() {
   try {
     const snapshot = await invoke<RenderSnapshot>("get_render_snapshot");
     renderSnapshot(snapshot);
-    await refreshTabs();
   } catch {
     setStatus("Failed to load initial snapshot.", "error");
   }
 
-  await refreshNavigationState();
+  renderSearchResults([]);
+  await Promise.all([refreshTabs(), refreshNavigationState(), refreshMetrics()]);
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -295,6 +450,11 @@ window.addEventListener("DOMContentLoaded", () => {
   statusEl = document.querySelector("#status");
   currentUrlEl = document.querySelector("#current-url");
   textListEl = document.querySelector("#text-list");
+  snapshotMetaEl = document.querySelector("#snapshot-meta");
+  diagnosticsListEl = document.querySelector("#diagnostics-list");
+  linksListEl = document.querySelector("#links-list");
+  metricsSummaryEl = document.querySelector("#metrics-summary");
+  metricsEventsEl = document.querySelector("#metrics-events");
   backButtonEl = document.querySelector("#back-button");
   forwardButtonEl = document.querySelector("#forward-button");
   reloadButtonEl = document.querySelector("#reload-button");
@@ -304,24 +464,24 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.querySelector("#url-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
-    openCurrentInput();
+    void openCurrentInput();
   });
 
   backButtonEl?.addEventListener("click", () => {
-    executeNavigationCommand("back", "Going back...");
+    void executeNavigationCommand("back", "Going back...");
   });
 
   forwardButtonEl?.addEventListener("click", () => {
-    executeNavigationCommand("forward", "Going forward...");
+    void executeNavigationCommand("forward", "Going forward...");
   });
 
   reloadButtonEl?.addEventListener("click", () => {
-    executeNavigationCommand("reload", "Reloading...");
+    void executeNavigationCommand("reload", "Reloading...");
   });
 
   newTabButtonEl?.addEventListener("click", () => {
-    createTab();
+    void createTab();
   });
 
-  loadInitialSnapshot();
+  void loadInitialSnapshot();
 });

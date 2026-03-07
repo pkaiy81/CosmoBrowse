@@ -1,9 +1,16 @@
 use reqwest::blocking::Client;
 use saba_core::display_item::DisplayItem;
 use saba_core::http::HttpResponse;
+use saba_core::renderer::layout::computed_style::FontSize;
+use saba_core::renderer::layout::computed_style::TextDecoration;
 use saba_core::renderer::page::Page;
 use saba_core::url::Url;
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -56,12 +63,37 @@ impl core::fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotLink {
+    pub text: String,
+    pub href: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LayoutMetadata {
+    pub text_item_count: usize,
+    pub block_item_count: usize,
+    pub content_width: i64,
+    pub content_height: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StyleMetadata {
+    pub text_colors: Vec<String>,
+    pub background_colors: Vec<String>,
+    pub underlined_text_count: usize,
+    pub heading_text_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RenderSnapshot {
     pub current_url: String,
     pub title: String,
     pub text_blocks: Vec<String>,
+    pub links: Vec<SnapshotLink>,
     pub diagnostics: Vec<String>,
+    pub layout: LayoutMetadata,
+    pub style: StyleMetadata,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +119,33 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ErrorMetric {
+    pub code: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NavigationEvent {
+    pub command: String,
+    pub url: Option<String>,
+    pub duration_ms: u64,
+    pub success: bool,
+    pub error_code: Option<String>,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppMetricsSnapshot {
+    pub total_navigations: u64,
+    pub successful_navigations: u64,
+    pub failed_navigations: u64,
+    pub average_duration_ms: u64,
+    pub last_duration_ms: Option<u64>,
+    pub error_counts: Vec<ErrorMetric>,
+    pub recent_events: Vec<NavigationEvent>,
+}
+
 pub trait AppService {
     fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot>;
     fn reload(&mut self) -> AppResult<RenderSnapshot>;
@@ -94,6 +153,7 @@ pub trait AppService {
     fn forward(&mut self) -> AppResult<RenderSnapshot>;
     fn get_render_snapshot(&self) -> RenderSnapshot;
     fn get_navigation_state(&self) -> NavigationState;
+    fn get_metrics(&self) -> AppMetricsSnapshot;
     fn new_tab(&mut self) -> TabSummary;
     fn switch_tab(&mut self, id: u32) -> AppResult<RenderSnapshot>;
     fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>>;
@@ -106,6 +166,7 @@ pub struct SabaApp {
     tabs: Vec<Tab>,
     active_tab_id: u32,
     next_tab_id: u32,
+    metrics: AppMetrics,
 }
 
 impl Default for SabaApp {
@@ -115,25 +176,40 @@ impl Default for SabaApp {
             tabs: vec![initial_tab],
             active_tab_id: 1,
             next_tab_id: 2,
+            metrics: AppMetrics::default(),
         }
     }
 }
 
 impl AppService for SabaApp {
     fn open_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
-        self.active_session_mut()?.open_url(url)
+        self.execute_navigation("open_url", Some(url.to_string()), |session| {
+            session.open_url(url)
+        })
     }
 
     fn reload(&mut self) -> AppResult<RenderSnapshot> {
-        self.active_session_mut()?.reload()
+        let url = self
+            .active_session()
+            .ok()
+            .and_then(|session| session.current_url());
+        self.execute_navigation("reload", url, BrowserSession::reload)
     }
 
     fn back(&mut self) -> AppResult<RenderSnapshot> {
-        self.active_session_mut()?.back()
+        let url = self
+            .active_session()
+            .ok()
+            .and_then(|session| session.previous_url());
+        self.execute_navigation("back", url, BrowserSession::back)
     }
 
     fn forward(&mut self) -> AppResult<RenderSnapshot> {
-        self.active_session_mut()?.forward()
+        let url = self
+            .active_session()
+            .ok()
+            .and_then(|session| session.next_url());
+        self.execute_navigation("forward", url, BrowserSession::forward)
     }
 
     fn get_render_snapshot(&self) -> RenderSnapshot {
@@ -146,6 +222,10 @@ impl AppService for SabaApp {
         self.active_session()
             .map(BrowserSession::navigation_state)
             .unwrap_or_else(|_| BrowserSession::new().navigation_state())
+    }
+
+    fn get_metrics(&self) -> AppMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     fn new_tab(&mut self) -> TabSummary {
@@ -238,6 +318,25 @@ impl SabaApp {
                 is_active: tab.id == self.active_tab_id,
             })
     }
+
+    fn execute_navigation<F>(
+        &mut self,
+        command: &str,
+        url: Option<String>,
+        action: F,
+    ) -> AppResult<RenderSnapshot>
+    where
+        F: FnOnce(&mut BrowserSession) -> AppResult<RenderSnapshot>,
+    {
+        let start = Instant::now();
+        let result = match self.active_session_mut() {
+            Ok(session) => action(session),
+            Err(error) => Err(error),
+        };
+        self.metrics
+            .record_navigation(command, url.as_deref(), start.elapsed(), &result);
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -277,7 +376,20 @@ impl BrowserSession {
                 current_url: String::new(),
                 title: "CosmoBrowse".to_string(),
                 text_blocks: Vec::new(),
+                links: Vec::new(),
                 diagnostics: vec!["No page loaded".to_string()],
+                layout: LayoutMetadata {
+                    text_item_count: 0,
+                    block_item_count: 0,
+                    content_width: 0,
+                    content_height: 0,
+                },
+                style: StyleMetadata {
+                    text_colors: Vec::new(),
+                    background_colors: Vec::new(),
+                    underlined_text_count: 0,
+                    heading_text_count: 0,
+                },
             },
         }
     }
@@ -322,8 +434,24 @@ impl BrowserSession {
         NavigationState {
             can_back: !self.history.is_empty() && self.history_index > 0,
             can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
-            current_url: self.history.get(self.history_index).cloned(),
+            current_url: self.current_url(),
         }
+    }
+
+    fn current_url(&self) -> Option<String> {
+        self.history.get(self.history_index).cloned()
+    }
+
+    fn previous_url(&self) -> Option<String> {
+        if self.history_index == 0 || self.history.is_empty() {
+            None
+        } else {
+            self.history.get(self.history_index - 1).cloned()
+        }
+    }
+
+    fn next_url(&self) -> Option<String> {
+        self.history.get(self.history_index + 1).cloned()
     }
 
     fn navigate_to_history_index(&mut self, index: usize) -> AppResult<RenderSnapshot> {
@@ -341,7 +469,14 @@ impl BrowserSession {
 
     fn load_url(&mut self, url: &str) -> AppResult<RenderSnapshot> {
         let response = fetch_http_response(url)?;
+        self.load_http_response(url, response)
+    }
 
+    fn load_http_response(
+        &mut self,
+        url: &str,
+        response: HttpResponse,
+    ) -> AppResult<RenderSnapshot> {
         let mut page = Page::new();
         page.receive_response(response);
 
@@ -368,6 +503,89 @@ impl BrowserSession {
         self.history.push(url);
         self.history_index = self.history.len() - 1;
     }
+}
+
+#[derive(Debug, Default)]
+struct AppMetrics {
+    total_navigations: u64,
+    successful_navigations: u64,
+    failed_navigations: u64,
+    total_duration_ms: u128,
+    last_duration_ms: Option<u64>,
+    error_counts: BTreeMap<String, u64>,
+    recent_events: Vec<NavigationEvent>,
+}
+
+impl AppMetrics {
+    fn record_navigation(
+        &mut self,
+        command: &str,
+        url: Option<&str>,
+        duration: Duration,
+        result: &AppResult<RenderSnapshot>,
+    ) {
+        let duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        self.total_navigations += 1;
+        self.total_duration_ms += duration.as_millis();
+        self.last_duration_ms = Some(duration_ms);
+
+        let (success, error_code) = match result {
+            Ok(_) => {
+                self.successful_navigations += 1;
+                (true, None)
+            }
+            Err(error) => {
+                self.failed_navigations += 1;
+                *self.error_counts.entry(error.code.clone()).or_insert(0) += 1;
+                (false, Some(error.code.clone()))
+            }
+        };
+
+        self.recent_events.push(NavigationEvent {
+            command: command.to_string(),
+            url: url.map(str::to_string),
+            duration_ms,
+            success,
+            error_code,
+            recorded_at_ms: unix_timestamp_ms(),
+        });
+
+        if self.recent_events.len() > 20 {
+            self.recent_events.remove(0);
+        }
+    }
+
+    fn snapshot(&self) -> AppMetricsSnapshot {
+        let average_duration_ms = if self.total_navigations == 0 {
+            0
+        } else {
+            (self.total_duration_ms / u128::from(self.total_navigations)) as u64
+        };
+
+        AppMetricsSnapshot {
+            total_navigations: self.total_navigations,
+            successful_navigations: self.successful_navigations,
+            failed_navigations: self.failed_navigations,
+            average_duration_ms,
+            last_duration_ms: self.last_duration_ms,
+            error_counts: self
+                .error_counts
+                .iter()
+                .map(|(code, count)| ErrorMetric {
+                    code: code.clone(),
+                    count: *count,
+                })
+                .collect(),
+            recent_events: self.recent_events.clone(),
+        }
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 fn normalize_url(url: &str) -> AppResult<String> {
@@ -470,31 +688,119 @@ fn fetch_http_response(url: &str) -> AppResult<HttpResponse> {
 }
 
 fn snapshot_from_page(page: &Page, current_url: String) -> RenderSnapshot {
-    let text_blocks = page
-        .display_items()
-        .into_iter()
+    let display_items = page.display_items();
+    let text_blocks = display_items
+        .iter()
         .filter_map(|item| match item {
-            DisplayItem::Text { text, .. } => Some(text),
+            DisplayItem::Text { text, .. } => Some(text.clone()),
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>();
 
+    let links = page
+        .links()
+        .into_iter()
+        .map(|(text, href)| SnapshotLink { text, href })
+        .collect::<Vec<_>>();
+
+    let mut diagnostics = Vec::new();
+    if text_blocks.is_empty() {
+        diagnostics.push("No renderable text extracted from page".to_string());
+    }
+
     RenderSnapshot {
         current_url,
         title: "CosmoBrowse".to_string(),
-        diagnostics: if text_blocks.is_empty() {
-            vec!["No renderable text extracted from page".to_string()]
-        } else {
-            Vec::new()
-        },
+        diagnostics,
         text_blocks,
+        links,
+        layout: summarize_layout(&display_items),
+        style: summarize_style(&display_items),
+    }
+}
+
+fn summarize_layout(display_items: &[DisplayItem]) -> LayoutMetadata {
+    let mut text_item_count = 0;
+    let mut block_item_count = 0;
+    let mut content_width = 0;
+    let mut content_height = 0;
+
+    for item in display_items {
+        match item {
+            DisplayItem::Rect {
+                layout_point,
+                layout_size,
+                ..
+            } => {
+                block_item_count += 1;
+                content_width = content_width.max(layout_point.x() + layout_size.width());
+                content_height = content_height.max(layout_point.y() + layout_size.height());
+            }
+            DisplayItem::Text { layout_point, .. } => {
+                text_item_count += 1;
+                content_width = content_width.max(layout_point.x());
+                content_height = content_height.max(layout_point.y());
+            }
+        }
+    }
+
+    LayoutMetadata {
+        text_item_count,
+        block_item_count,
+        content_width,
+        content_height,
+    }
+}
+
+fn summarize_style(display_items: &[DisplayItem]) -> StyleMetadata {
+    let mut text_colors = Vec::new();
+    let mut background_colors = Vec::new();
+    let mut underlined_text_count = 0;
+    let mut heading_text_count = 0;
+
+    for item in display_items {
+        match item {
+            DisplayItem::Rect { style, .. } => {
+                push_unique(
+                    &mut background_colors,
+                    style.background_color().code().to_string(),
+                );
+            }
+            DisplayItem::Text { style, .. } => {
+                push_unique(&mut text_colors, style.color().code().to_string());
+                if style.text_decoration() == TextDecoration::Underline {
+                    underlined_text_count += 1;
+                }
+                if matches!(style.font_size(), FontSize::XLarge | FontSize::XXLarge) {
+                    heading_text_count += 1;
+                }
+            }
+        }
+    }
+
+    StyleMetadata {
+        text_colors,
+        background_colors,
+        underlined_text_count,
+        heading_text_count,
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, candidate: String) {
+    if !values.iter().any(|value| value == &candidate) {
+        values.push(candidate);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_search_results, normalize_url, AppService, BrowserSession};
+    use super::{
+        build_search_results, normalize_url, AppError, AppMetrics, AppResult, AppService,
+        BrowserSession, SnapshotLink,
+    };
+    use saba_core::http::HttpResponse;
+    use std::time::Duration;
 
     #[test]
     fn normalize_http_url() {
@@ -552,7 +858,7 @@ mod tests {
 
     #[test]
     fn app_error_display_includes_code_and_message() {
-        let error = super::AppError::state("boom");
+        let error = AppError::state("boom");
         assert_eq!(error.to_string(), "invalid_state: boom");
     }
 
@@ -635,5 +941,89 @@ mod tests {
     fn search_empty_query_is_validation_error() {
         let err = build_search_results("  ").expect_err("must fail");
         assert_eq!(err.code, "validation_error");
+    }
+
+    #[test]
+    fn render_snapshot_collects_links_and_metadata() {
+        let mut session = BrowserSession::new();
+        let snapshot = session
+            .load_http_response(
+                "http://example.com",
+                html_response(
+                    r#"<html><body><h1>Docs</h1><p>Read the <a href="http://example.com/guide">guide</a></p></body></html>"#,
+                ),
+            )
+            .expect("snapshot should load");
+
+        assert!(snapshot
+            .text_blocks
+            .iter()
+            .any(|line| line.contains("Docs")));
+        assert_eq!(
+            snapshot.links,
+            vec![SnapshotLink {
+                text: "guide".to_string(),
+                href: "http://example.com/guide".to_string(),
+            }]
+        );
+        assert!(snapshot.layout.text_item_count > 0);
+        assert!(snapshot.style.underlined_text_count > 0);
+    }
+
+    #[test]
+    fn render_snapshot_reports_missing_text() {
+        let mut session = BrowserSession::new();
+        let snapshot = session
+            .load_http_response(
+                "http://example.com/hidden",
+                html_response(
+                    r#"<html><head><style>p { display: none; }</style></head><body><p>Hidden</p></body></html>"#,
+                ),
+            )
+            .expect("snapshot should load");
+
+        assert!(snapshot.text_blocks.is_empty());
+        assert_eq!(
+            snapshot.diagnostics,
+            vec!["No renderable text extracted from page".to_string()]
+        );
+    }
+
+    #[test]
+    fn metrics_track_success_and_failure() {
+        let mut metrics = AppMetrics::default();
+        let ok: AppResult<super::RenderSnapshot> = Ok(BrowserSession::new().get_render_snapshot());
+        let err: AppResult<super::RenderSnapshot> = Err(AppError::network("boom"));
+
+        metrics.record_navigation(
+            "open_url",
+            Some("http://example.com"),
+            Duration::from_millis(12),
+            &ok,
+        );
+        metrics.record_navigation(
+            "reload",
+            Some("http://example.com"),
+            Duration::from_millis(4),
+            &err,
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.total_navigations, 2);
+        assert_eq!(snapshot.successful_navigations, 1);
+        assert_eq!(snapshot.failed_navigations, 1);
+        assert_eq!(snapshot.average_duration_ms, 8);
+        assert!(snapshot
+            .error_counts
+            .iter()
+            .any(|metric| metric.code == "network_error" && metric.count == 1));
+        assert_eq!(snapshot.recent_events.len(), 2);
+    }
+
+    fn html_response(body: &str) -> HttpResponse {
+        HttpResponse::new(format!(
+            "HTTP/1.1 200 OK\nContent-Type: text/html\n\n{body}"
+        ))
+        .expect("response should parse")
     }
 }

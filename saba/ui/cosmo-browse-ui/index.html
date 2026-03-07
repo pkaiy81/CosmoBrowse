@@ -10,37 +10,68 @@
 
   <body>
     <main class="app-shell">
-      <header>
-        <h1>CosmoBrowse (Tauri v2)</h1>
+      <header class="hero">
+        <p class="eyebrow">CosmoBrowse</p>
+        <h1>Tauri adapter with Phase D observability</h1>
+        <p class="hero-copy">Browse pages, inspect snapshot metadata, and watch navigation health from the same surface.</p>
       </header>
 
-      <section class="tabs-panel">
-        <h2>Tabs</h2>
-        <div class="tabs-actions">
-          <button id="new-tab-button" type="button">+ New Tab</button>
+      <section class="panel tabs-panel">
+        <div class="section-heading">
+          <h2>Tabs</h2>
+          <button id="new-tab-button" type="button">New Tab</button>
         </div>
         <ul id="tabs-list" class="tabs-list"></ul>
       </section>
 
-      <form id="url-form" class="toolbar">
-        <button id="back-button" type="button">← Back</button>
-        <button id="forward-button" type="button">Forward →</button>
+      <form id="url-form" class="panel toolbar">
+        <button id="back-button" type="button">Back</button>
+        <button id="forward-button" type="button">Forward</button>
         <button id="reload-button" type="button">Reload</button>
-        <input id="url-input" placeholder="URL または検索キーワード" />
+        <input id="url-input" placeholder="Enter a URL or search query" />
         <button type="submit">Open / Search</button>
       </form>
 
-      <p id="status" class="status">Ready.</p>
+      <p id="status" class="status panel">Ready.</p>
 
-      <section>
-        <h2>Search Results</h2>
-        <ul id="search-results" class="search-results"></ul>
-      </section>
+      <section class="dashboard-grid">
+        <section class="panel stack-section">
+          <div class="section-heading">
+            <h2>Search Results</h2>
+          </div>
+          <ul id="search-results" class="stack-list"></ul>
+        </section>
 
-      <section>
-        <h2>Snapshot</h2>
-        <p id="current-url" class="muted"></p>
-        <ul id="text-list"></ul>
+        <section class="panel stack-section">
+          <div class="section-heading">
+            <h2>Snapshot</h2>
+          </div>
+          <p id="current-url" class="muted"></p>
+          <ul id="snapshot-meta" class="stack-list compact-list"></ul>
+          <ul id="text-list" class="stack-list"></ul>
+        </section>
+
+        <section class="panel stack-section">
+          <div class="section-heading">
+            <h2>Links</h2>
+          </div>
+          <ul id="links-list" class="stack-list"></ul>
+        </section>
+
+        <section class="panel stack-section">
+          <div class="section-heading">
+            <h2>Diagnostics</h2>
+          </div>
+          <ul id="diagnostics-list" class="stack-list compact-list"></ul>
+        </section>
+
+        <section class="panel stack-section metrics-panel">
+          <div class="section-heading">
+            <h2>Metrics</h2>
+          </div>
+          <ul id="metrics-summary" class="stack-list compact-list"></ul>
+          <ul id="metrics-events" class="stack-list compact-list"></ul>
+        </section>
       </section>
     </main>
   </body>
