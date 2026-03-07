@@ -7,6 +7,7 @@ use crate::renderer::css::token::CssTokenizer;
 use crate::renderer::dom::api::get_js_content;
 use crate::renderer::dom::api::get_style_content;
 use crate::renderer::dom::node::ElementKind;
+use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
 use crate::renderer::dom::node::Window;
 use crate::renderer::html::parser::HtmlParser;
@@ -132,4 +133,57 @@ impl Page {
 
         None
     }
+
+    pub fn links(&self) -> Vec<(String, String)> {
+        let Some(frame) = &self.frame else {
+            return Vec::new();
+        };
+
+        let document = frame.borrow().document();
+        let mut links = Vec::new();
+        collect_links(&document, &mut links);
+        links
+    }
+}
+
+fn collect_links(node: &Rc<RefCell<Node>>, links: &mut Vec<(String, String)>) {
+    let (node_kind, first_child) = {
+        let borrowed = node.borrow();
+        (borrowed.kind(), borrowed.first_child())
+    };
+
+    if let NodeKind::Element(element) = node_kind {
+        if element.kind() == ElementKind::A {
+            if let Some(href) = element.get_attribute("href") {
+                let text = String::from(collect_text(node).trim());
+                links.push((text, href));
+            }
+        }
+    }
+
+    let mut child = first_child;
+    while let Some(current) = child {
+        collect_links(&current, links);
+        child = current.borrow().next_sibling();
+    }
+}
+
+fn collect_text(node: &Rc<RefCell<Node>>) -> String {
+    let (node_kind, first_child) = {
+        let borrowed = node.borrow();
+        (borrowed.kind(), borrowed.first_child())
+    };
+
+    let mut text = match node_kind {
+        NodeKind::Text(value) => value,
+        _ => String::new(),
+    };
+
+    let mut child = first_child;
+    while let Some(current) = child {
+        text.push_str(&collect_text(&current));
+        child = current.borrow().next_sibling();
+    }
+
+    text
 }
