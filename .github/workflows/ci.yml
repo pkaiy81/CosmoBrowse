@@ -15,9 +15,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo check stable-target crates
-        run: cargo check -p saba_core -p saba_app
+        run: cargo check -p saba_core -p saba_app -p adapter_cli
       - name: cargo test stable-target crates
-        run: cargo test -p saba_core -p saba_app
+        run: cargo test -p saba_core -p saba_app -p adapter_cli
 
   frontend:
     runs-on: ubuntu-latest
