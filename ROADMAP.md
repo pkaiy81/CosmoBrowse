@@ -7,12 +7,14 @@
 
 ---
 
-## 1. 現状確認（2026-03 時点）
+## 1. 現状確認（2026-03-08 時点）
 - Rust toolchain: `stable`（`saba/rust-toolchain.toml`）。
 - Tauri (Rust): `tauri = "2"`, `tauri-build = "2"`, `tauri-plugin-opener = "2"`。
 - Tauri (JS): `@tauri-apps/api = "^2"`, `@tauri-apps/cli = "^2"`。
 - Frontend: `vite = "^6.0.3"`, `typescript = "~5.6.2"`。
-- 現在の Tauri 側はテンプレート段階（`greet` command のみ）。
+- Tauri 側は `saba_app` 経由で `open_url` / `reload` / `back` / `forward` / `tabs` / `search` / `metrics` を接続済み。
+- `RenderSnapshot` は本文・リンク・diagnostics に加えて layout/style メタ情報を返却。
+- `adapter_cli` PoC を追加済みで、`open-url` / `get-snapshot` / `metrics` が同一 `saba_app` API で動作。
 
 ---
 
@@ -37,18 +39,19 @@
 ## 2.3 DTO の最小セット（v2）
 - `NavigationState { can_back, can_forward, current_url }`
 - `TabSummary { id, title, url, is_active }`
-- `RenderSnapshot { title, text_blocks, links, diagnostics }`
+- `RenderSnapshot { title, text_blocks, links, diagnostics, layout, style }`
 - `AppError { code, message, retryable }`
+- `AppMetricsSnapshot { total_navigations, successful_navigations, failed_navigations, average_duration_ms, error_counts }`
 
 ---
 
 ## 3. 実装ロードマップ v2（10週間）
 
 ## Phase A: 土台再編（Week 1-2）
-- [ ] `saba_app` crate 新設。
-- [ ] workspace に UI/Tauri crate を正式参加。
-- [ ] `AppService`（同期/非同期 API）定義。
-- [ ] DTO / Error 体系定義。
+- [x] `saba_app` crate 新設。
+- [x] workspace に UI/Tauri crate を正式参加。
+- [x] `AppService`（同期/非同期 API）定義。
+- [x] DTO / Error 体系定義。
 
 **DoD**
 - `cargo check --workspace` 成功。
@@ -71,16 +74,16 @@
 - 複数タブ + 検索遷移がクラッシュなく動作。
 
 ## Phase D: 描画品質・観測性（Week 7-8）
-- [ ] `RenderSnapshot` を段階拡張（style/layoutメタ情報）。
-- [ ] ログ/メトリクス（遷移時間、失敗率、主要エラーコード）。
-- [ ] 代表ページのスモークテスト追加。
+- [x] `RenderSnapshot` を段階拡張（style/layoutメタ情報）。
+- [x] ログ/メトリクス（遷移時間、失敗率、主要エラーコード）。
+- [x] 代表ページのスモークテスト追加。
 
 **DoD**
 - 代表ページ群で表示成功率と失敗理由が取得可能。
 
 ## Phase E: UI 交換検証（Week 9-10）
-- [ ] `adapter_cli` or `adapter_egui` の最小 PoC を追加。
-- [ ] 同一 `saba_app` API で動作確認。
+- [x] `adapter_cli` or `adapter_egui` の最小 PoC を追加。
+- [x] 同一 `saba_app` API で動作確認。
 
 **DoD**
 - Tauri 以外の adapter で `open_url/get_snapshot` が動く。
