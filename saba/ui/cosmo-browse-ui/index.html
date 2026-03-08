@@ -2,45 +2,46 @@
 <html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
     <title>CosmoBrowse</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
-
   <body>
-    <main class="app-shell">
-      <header>
-        <h1>CosmoBrowse (Tauri v2)</h1>
-      </header>
-
+    <main class="browser-shell">
       <section class="tabs-panel">
-        <h2>Tabs</h2>
-        <div class="tabs-actions">
-          <button id="new-tab-button" type="button">+ New Tab</button>
+        <div class="tabs-header">
+          <h1>CosmoBrowse</h1>
+          <button id="new-tab-button" class="ghost-button" type="button">+ Tab</button>
         </div>
         <ul id="tabs-list" class="tabs-list"></ul>
       </section>
 
-      <form id="url-form" class="toolbar">
-        <button id="back-button" type="button">← Back</button>
-        <button id="forward-button" type="button">Forward →</button>
-        <button id="reload-button" type="button">Reload</button>
-        <input id="url-input" placeholder="URL または検索キーワード" />
-        <button type="submit">Open / Search</button>
-      </form>
-
-      <p id="status" class="status">Ready.</p>
-
-      <section>
-        <h2>Search Results</h2>
-        <ul id="search-results" class="search-results"></ul>
+      <section class="browser-chrome">
+        <form id="url-form" class="toolbar">
+          <div class="nav-group">
+            <button id="back-button" type="button">Back</button>
+            <button id="forward-button" type="button">Forward</button>
+            <button id="reload-button" type="button">Reload</button>
+          </div>
+          <input id="url-input" class="address-input" placeholder="URL or search query" />
+          <button class="primary-button" type="submit">Open</button>
+        </form>
+        <ul id="search-results" class="search-results hidden"></ul>
       </section>
 
-      <section>
-        <h2>Snapshot</h2>
-        <p id="current-url" class="muted"></p>
-        <ul id="text-list"></ul>
+      <section class="viewport-shell">
+        <header class="page-meta">
+          <div>
+            <p id="page-title" class="page-title">New Tab</p>
+            <p id="current-url" class="current-url">URL: (none)</p>
+          </div>
+          <p id="status" class="status">Ready.</p>
+        </header>
+
+        <div id="viewport" class="viewport">
+          <div id="scene-root" class="scene-root"></div>
+        </div>
       </section>
     </main>
   </body>

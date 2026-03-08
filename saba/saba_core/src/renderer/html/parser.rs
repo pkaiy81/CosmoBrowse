@@ -327,22 +327,33 @@ impl HtmlParser {
                             self_closing: _,
                             ref attributes,
                         }) => {
-                            if tag == "style" || tag == "script" {
+                            if tag == "style" || tag == "script" || tag == "title" {
                                 self.insert_element(tag, attributes.to_vec());
                                 self.original_insertion_mode = self.mode;
                                 self.mode = InsertionMode::Text;
                                 token = self.t.next();
                                 continue;
                             }
-                            // The following code is not in the specification.
-                            // But, it is necessary to handle the ommited <head> tag in HTML.
-                            // If this code is not included, infinite loop occurs.
+                            if tag == "link" {
+                                self.insert_element(tag, attributes.to_vec());
+                                self.pop_current_node(ElementKind::Link);
+                                token = self.t.next();
+                                continue;
+                            }
                             if tag == "body" {
                                 self.pop_until(ElementKind::Head);
                                 self.mode = InsertionMode::AfterHead;
                                 continue;
                             }
-                            if let Ok(_element_kind) = ElementKind::from_str(tag) {
+                            if let Ok(element_kind) = ElementKind::from_str(tag) {
+                                if element_kind == ElementKind::Link
+                                    || element_kind == ElementKind::Style
+                                    || element_kind == ElementKind::Script
+                                    || element_kind == ElementKind::Title
+                                {
+                                    token = self.t.next();
+                                    continue;
+                                }
                                 self.pop_until(ElementKind::Head);
                                 self.mode = InsertionMode::AfterHead;
                                 continue;
@@ -360,7 +371,6 @@ impl HtmlParser {
                             return self.window.clone();
                         }
                     }
-                    // Ignore the unsupported tag. For example, <meta>, <title>, etc.
                     token = self.t.next();
                     continue;
                 } // AfterHead handles mainly start tag of <body> tag.
@@ -409,18 +419,17 @@ impl HtmlParser {
                             self_closing: _,
                             ref attributes,
                         }) => match tag.as_str() {
-                            "p" => {
+                            "a" | "button" | "div" | "form" | "h1" | "h2" | "header" | "li"
+                            | "main" | "p" | "section" | "span" | "ul" => {
                                 self.insert_element(tag, attributes.to_vec());
                                 token = self.t.next();
                                 continue;
                             }
-                            "h1" | "h2" => {
+                            "img" | "input" => {
                                 self.insert_element(tag, attributes.to_vec());
-                                token = self.t.next();
-                                continue;
-                            }
-                            "a" => {
-                                self.insert_element(tag, attributes.to_vec());
+                                let element_kind = ElementKind::from_str(tag)
+                                    .expect("failed to convert string to ElementKind");
+                                self.pop_current_node(element_kind);
                                 token = self.t.next();
                                 continue;
                             }
@@ -434,7 +443,6 @@ impl HtmlParser {
                                     self.mode = InsertionMode::AfterBody;
                                     token = self.t.next();
                                     if !self.contain_in_stack(ElementKind::Body) {
-                                        // Faile to parse the HTML. So, ignore the token.
                                         continue;
                                     }
                                     self.pop_until(ElementKind::Body);
@@ -449,21 +457,8 @@ impl HtmlParser {
                                     }
                                     continue;
                                 }
-                                "p" => {
-                                    let element_kind = ElementKind::from_str(tag)
-                                        .expect("failed to convert string to ElementKind");
-                                    token = self.t.next();
-                                    self.pop_until(element_kind);
-                                    continue;
-                                }
-                                "h1" | "h2" => {
-                                    let element_kind = ElementKind::from_str(tag)
-                                        .expect("failed to convert string to ElementKind");
-                                    token = self.t.next();
-                                    self.pop_until(element_kind);
-                                    continue;
-                                }
-                                "a" => {
+                                "a" | "button" | "div" | "form" | "h1" | "h2" | "header" | "li"
+                                | "main" | "p" | "section" | "span" | "ul" => {
                                     let element_kind = ElementKind::from_str(tag)
                                         .expect("failed to convert string to ElementKind");
                                     token = self.t.next();
@@ -477,9 +472,8 @@ impl HtmlParser {
                         }
                         Some(HtmlToken::Eof) | None => {
                             return self.window.clone();
-                        } // _ => {}
+                        }
                         Some(HtmlToken::Char(c)) => {
-                            // support text content.
                             self.insert_char(c);
                             token = self.t.next();
                             continue;
@@ -488,7 +482,6 @@ impl HtmlParser {
                 }
 
                 // Text handles mainly text content.
-                // 1. If the token is end of <style> or <script> tag, then change the insertion mode to "original insertion mode".
                 // 2. Add the text content to the DOM tree until the token is end of <style> or <script> tag.
                 InsertionMode::Text => {
                     match token {
@@ -504,6 +497,12 @@ impl HtmlParser {
                             }
                             if tag == "script" {
                                 self.pop_until(ElementKind::Script);
+                                self.mode = self.original_insertion_mode;
+                                token = self.t.next();
+                                continue;
+                            }
+                            if tag == "title" {
+                                self.pop_until(ElementKind::Title);
                                 self.mode = self.original_insertion_mode;
                                 token = self.t.next();
                                 continue;
@@ -749,4 +748,44 @@ mod tests {
             text
         );
     }
+    #[test]
+    fn test_form_controls() {
+        let html = "<html><head></head><body><form><input value=foo /><button>Go</button><img src=hero.png /></form></body></html>".to_string();
+        let t = HtmlTokenizer::new(html);
+        let window = HtmlParser::new(t).construct_tree();
+        let document = window.borrow().document();
+
+        let body = document
+            .borrow()
+            .first_child()
+            .expect("html should exist")
+            .borrow()
+            .first_child()
+            .expect("head should exist")
+            .borrow()
+            .next_sibling()
+            .expect("body should exist");
+        let form = body.borrow().first_child().expect("form should exist");
+        assert_eq!(form.borrow().element_kind(), Some(ElementKind::Form));
+
+        let input = form.borrow().first_child().expect("input should exist");
+        assert_eq!(input.borrow().element_kind(), Some(ElementKind::Input));
+
+        let button = input
+            .borrow()
+            .next_sibling()
+            .expect("button should exist");
+        assert_eq!(button.borrow().element_kind(), Some(ElementKind::Button));
+
+        let image = button
+            .borrow()
+            .next_sibling()
+            .expect("image should exist");
+        assert_eq!(image.borrow().element_kind(), Some(ElementKind::Img));
+    }
 }
+
+
+
+
+

@@ -1,4 +1,4 @@
-use saba_app::{AppError, AppService, RenderSnapshot, SabaApp, SearchResult, TabSummary};
+use saba_app::{AppError, AppService, PageViewModel, SabaApp, SearchResult, TabSummary};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -7,7 +7,7 @@ struct AppState {
 }
 
 #[tauri::command]
-fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<RenderSnapshot, AppError> {
+fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<PageViewModel, AppError> {
     let mut app = state
         .app
         .lock()
@@ -16,16 +16,29 @@ fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<RenderSnap
 }
 
 #[tauri::command]
-fn get_render_snapshot(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, AppError> {
+fn get_page_view(state: tauri::State<'_, AppState>) -> Result<PageViewModel, AppError> {
     let app = state
         .app
         .lock()
         .map_err(|_| AppError::state("Failed to lock app state"))?;
-    Ok(app.get_render_snapshot())
+    Ok(app.get_page_view())
 }
 
 #[tauri::command]
-fn reload(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, AppError> {
+fn set_viewport(
+    state: tauri::State<'_, AppState>,
+    width: i64,
+    height: i64,
+) -> Result<PageViewModel, AppError> {
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    app.set_viewport(width, height)
+}
+
+#[tauri::command]
+fn reload(state: tauri::State<'_, AppState>) -> Result<PageViewModel, AppError> {
     let mut app = state
         .app
         .lock()
@@ -34,7 +47,7 @@ fn reload(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, AppError>
 }
 
 #[tauri::command]
-fn back(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, AppError> {
+fn back(state: tauri::State<'_, AppState>) -> Result<PageViewModel, AppError> {
     let mut app = state
         .app
         .lock()
@@ -43,7 +56,7 @@ fn back(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, AppError> {
 }
 
 #[tauri::command]
-fn forward(state: tauri::State<'_, AppState>) -> Result<RenderSnapshot, AppError> {
+fn forward(state: tauri::State<'_, AppState>) -> Result<PageViewModel, AppError> {
     let mut app = state
         .app
         .lock()
@@ -72,7 +85,7 @@ fn new_tab(state: tauri::State<'_, AppState>) -> Result<TabSummary, AppError> {
 }
 
 #[tauri::command]
-fn switch_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<RenderSnapshot, AppError> {
+fn switch_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<PageViewModel, AppError> {
     let mut app = state
         .app
         .lock()
@@ -114,7 +127,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             open_url,
-            get_render_snapshot,
+            get_page_view,
+            set_viewport,
             reload,
             back,
             forward,

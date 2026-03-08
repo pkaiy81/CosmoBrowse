@@ -14,5 +14,6 @@ pub enum DisplayItem {
         text: String,
         style: ComputedStyle,
         layout_point: LayoutPoint,
+        href: Option<String>,
     },
 }

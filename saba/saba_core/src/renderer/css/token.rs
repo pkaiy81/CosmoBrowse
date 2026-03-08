@@ -9,6 +9,8 @@ pub enum CssToken {
     Delim(char),
     /// https://www.w3.org/TR/css-syntax-3/#typedef-number-token
     Number(f64),
+    /// https://www.w3.org/TR/css-syntax-3/#typedef-dimension-token
+    Dimension(f64, String),
     /// https://www.w3.org/TR/css-syntax-3/#typedef-colon-token
     Colon,
     /// https://www.w3.org/TR/css-syntax-3/#typedef-semicolon-token
@@ -65,14 +67,14 @@ impl CssTokenizer {
 
     /// https://www.w3.org/TR/css-syntax-3/#consume-number
     /// https://www.w3.org/TR/css-syntax-3/#consume-a-numeric-token
-    fn consume_numeric_token(&mut self) -> f64 {
+    fn consume_numeric_token(&mut self) -> CssToken {
         let mut num = 0f64;
         let mut floating = false;
         let mut floating_digit = 1f64;
 
         loop {
             if self.pos >= self.input.len() {
-                return num;
+                return CssToken::Number(num);
             }
 
             let c = self.input[self.pos];
@@ -95,7 +97,15 @@ impl CssTokenizer {
             }
         }
 
-        num
+        if self.pos < self.input.len() {
+            let c = self.input[self.pos];
+            if c.is_ascii_alphabetic() {
+                let unit = self.consume_ident_token();
+                return CssToken::Dimension(num, unit);
+            }
+        }
+
+        CssToken::Number(num)
     }
 
     // https://www.w3.org/TR/css-syntax-3/#consume-ident-like-token
@@ -106,6 +116,9 @@ impl CssTokenizer {
 
         loop {
             self.pos += 1;
+            if self.pos >= self.input.len() {
+                break;
+            }
             let c = self.input[self.pos];
             match c {
                 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => {
@@ -150,7 +163,7 @@ impl Iterator for CssTokenizer {
                     CssToken::StringToken(value)
                 }
                 '0'..='9' => {
-                    let t = CssToken::Number(self.consume_numeric_token());
+                    let t = self.consume_numeric_token();
                     self.pos -= 1;
                     t
                 }
@@ -290,6 +303,29 @@ mod tests {
             CssToken::Ident("color".to_string()),
             CssToken::Colon,
             CssToken::Ident("blue".to_string()),
+            CssToken::SemiColon,
+            CssToken::CloseCurly,
+        ];
+        for e in expected {
+            assert_eq!(Some(e.clone()), t.next());
+        }
+        assert!(t.next().is_none());
+    }
+
+    #[test]
+    fn test_dimension_tokens() {
+        let style = "body { width: 60vw; font-size: 1.5em; }".to_string();
+        let mut t = CssTokenizer::new(style);
+        let expected = [
+            CssToken::Ident("body".to_string()),
+            CssToken::OpenCurly,
+            CssToken::Ident("width".to_string()),
+            CssToken::Colon,
+            CssToken::Dimension(60.0, "vw".to_string()),
+            CssToken::SemiColon,
+            CssToken::Ident("font-size".to_string()),
+            CssToken::Colon,
+            CssToken::Dimension(1.5, "em".to_string()),
             CssToken::SemiColon,
             CssToken::CloseCurly,
         ];
