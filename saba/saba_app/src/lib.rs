@@ -74,7 +74,7 @@ pub struct ContentSize {
     pub height: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SceneItem {
     Rect {
@@ -83,6 +83,7 @@ pub enum SceneItem {
         width: i64,
         height: i64,
         background_color: String,
+        opacity: f64,
     },
     Text {
         x: i64,
@@ -90,7 +91,9 @@ pub enum SceneItem {
         text: String,
         color: String,
         font_px: i64,
+        font_family: String,
         underline: bool,
+        opacity: f64,
         href: Option<String>,
     },
 }
@@ -827,6 +830,7 @@ fn build_page_view(
                     width: layout_size.width(),
                     height: layout_size.height(),
                     background_color: background,
+                    opacity: style.opacity(),
                 });
             }
             DisplayItem::Text {
@@ -844,8 +848,10 @@ fn build_page_view(
                     text,
                     color: style.color().code().to_string(),
                     font_px: style.font_size().px(),
+                    font_family: style.font_family(),
                     underline: style.text_decoration()
                         == saba_core::renderer::layout::computed_style::TextDecoration::Underline,
+                    opacity: style.opacity(),
                     href: href.and_then(|value| resolve_url(&current_url, &value).ok()),
                 });
             }
@@ -1024,6 +1030,28 @@ mod tests {
         assert!(view.scene_items.iter().any(|item| matches!(
             item,
             SceneItem::Text { href: Some(href), .. } if href == "http://example.com/docs"
+        )));
+    }
+
+    #[test]
+    fn page_view_includes_font_family_and_opacity() {
+        let page = page_from_html(
+            r#"<html><head><style>body{font-family:system-ui,sans-serif}div{opacity:0.8;color:#334488}</style></head><body><div>Example Domain</div></body></html>"#,
+        );
+        let view = build_page_view(&page, "http://example.com".to_string(), Vec::new());
+
+        assert!(view.scene_items.iter().any(|item| matches!(
+            item,
+            SceneItem::Text {
+                text,
+                color,
+                font_family,
+                opacity,
+                ..
+            } if text == "Example Domain"
+                && color == "#334488"
+                && font_family == "system-ui"
+                && (*opacity - 0.8).abs() < f64::EPSILON
         )));
     }
 

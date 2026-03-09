@@ -48,6 +48,13 @@ fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64>
     }
 }
 
+fn first_font_family(value: &[ComponentValue]) -> Option<String> {
+    value.iter().find_map(|component| match component {
+        ComponentValue::Ident(name) | ComponentValue::StringToken(name) => Some(name.clone()),
+        _ => None,
+    })
+}
+
 fn parse_dimension_attr(value: Option<String>) -> Option<i64> {
     let value = value?;
     let digits = value
@@ -79,10 +86,8 @@ fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
     let mut result: Vec<String> = vec![];
     let safe_width = max_width.max(char_width).max(1);
     if line.len() as i64 * char_width > safe_width {
-        let split_index = find_index_for_line_break(
-            line.clone(),
-            (safe_width / char_width).max(1) as usize,
-        );
+        let split_index =
+            find_index_for_line_break(line.clone(), (safe_width / char_width).max(1) as usize);
         let s = line.split_at(split_index.min(line.len()));
         result.push(s.0.to_string());
         result.extend(split_text(s.1.trim().to_string(), char_width, safe_width));
@@ -233,7 +238,8 @@ impl LayoutObject {
                     })
                     .unwrap_or_else(|| "Button".to_string());
                 Some(LayoutSize::new(
-                    explicit_width.max(measure_text_width(&child_text, self.style.font_size()) + 28),
+                    explicit_width
+                        .max(measure_text_width(&child_text, self.style.font_size()) + 28),
                     explicit_height.max(36),
                 ))
             }
@@ -287,7 +293,10 @@ impl LayoutObject {
                         items.push(DisplayItem::Text {
                             text,
                             style: self.style(),
-                            layout_point: LayoutPoint::new(self.point().x() + 10, self.point().y() + 10),
+                            layout_point: LayoutPoint::new(
+                                self.point().x() + 10,
+                                self.point().y() + 10,
+                            ),
                             href: self.link_href(),
                         });
                     }
@@ -402,7 +411,8 @@ impl LayoutObject {
                         .filter(|s| !s.is_empty())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let max_width = (parent_size.width() - margin_h - padding_h).max(CHAR_WIDTH * ratio);
+                    let max_width =
+                        (parent_size.width() - margin_h - padding_h).max(CHAR_WIDTH * ratio);
                     let lines = split_text(plain_text.clone(), CHAR_WIDTH * ratio, max_width);
                     let width = lines
                         .iter()
@@ -514,7 +524,8 @@ impl LayoutObject {
                 },
                 "display" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
-                        let display_type = DisplayType::from_str(value).unwrap_or(DisplayType::DisplayNone);
+                        let display_type =
+                            DisplayType::from_str(value).unwrap_or(DisplayType::DisplayNone);
                         self.style.set_display(display_type)
                     }
                 }
@@ -578,6 +589,16 @@ impl LayoutObject {
                     }
                     _ => {}
                 },
+                "opacity" => {
+                    if let Some(ComponentValue::Number(value)) = first_value {
+                        self.style.set_opacity(*value);
+                    }
+                }
+                "font-family" => {
+                    if let Some(font_family) = first_font_family(&declaration.value) {
+                        self.style.set_font_family(font_family);
+                    }
+                }
                 "font-size" => match first_value {
                     Some(ComponentValue::Ident(value)) => {
                         if let Ok(font_size) = FontSize::from_str(value) {
@@ -740,19 +761,3 @@ impl LayoutSize {
         self.height = height;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

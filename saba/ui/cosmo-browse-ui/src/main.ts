@@ -7,6 +7,7 @@ type SceneRect = {
   width: number;
   height: number;
   background_color: string;
+  opacity: number;
 };
 
 type SceneText = {
@@ -16,7 +17,9 @@ type SceneText = {
   text: string;
   color: string;
   font_px: number;
+  font_family: string;
   underline: boolean;
+  opacity: number;
   href: string | null;
 };
 
@@ -211,6 +214,7 @@ function renderScene(sceneItems: SceneItem[], contentSize: ContentSize) {
       rect.style.width = `${item.width}px`;
       rect.style.height = `${item.height}px`;
       rect.style.backgroundColor = item.background_color;
+      rect.style.opacity = `${item.opacity}`;
       sceneRootEl.appendChild(rect);
       continue;
     }
@@ -222,7 +226,9 @@ function renderScene(sceneItems: SceneItem[], contentSize: ContentSize) {
     textNode.style.top = `${item.y}px`;
     textNode.style.color = item.color;
     textNode.style.fontSize = `${item.font_px}px`;
+    textNode.style.fontFamily = item.font_family;
     textNode.style.textDecoration = item.underline ? "underline" : "none";
+    textNode.style.opacity = `${item.opacity}`;
 
     if (item.href) {
       (textNode as HTMLButtonElement).type = "button";

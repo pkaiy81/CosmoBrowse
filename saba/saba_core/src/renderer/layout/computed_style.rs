@@ -61,8 +61,10 @@ pub struct ComputedStyle {
     background_color: Option<Color>,
     color: Option<Color>,
     display: Option<DisplayType>,
+    font_family: Option<String>,
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
+    opacity: Option<f64>,
     height: Option<f64>,
     height_ratio: Option<f64>,
     width: Option<f64>,
@@ -78,8 +80,10 @@ impl ComputedStyle {
             background_color: None,
             color: None,
             display: None,
+            font_family: None,
             font_size: None,
             text_decoration: None,
+            opacity: None,
             height: None,
             height_ratio: None,
             width: None,
@@ -89,7 +93,6 @@ impl ComputedStyle {
             padding: None,
         }
     }
-
     pub fn defaulting(&mut self, node: &Rc<RefCell<Node>>, parent_style: Option<ComputedStyle>) {
         if let Some(parent_style) = parent_style {
             if self.background_color.is_none() && parent_style.background_color() != Color::white()
@@ -99,6 +102,9 @@ impl ComputedStyle {
             if self.color.is_none() && parent_style.color() != Color::black() {
                 self.color = Some(parent_style.color());
             }
+            if self.font_family.is_none() {
+                self.font_family = Some(parent_style.font_family());
+            }
             if self.font_size.is_none() && parent_style.font_size() != FontSize::Medium {
                 self.font_size = Some(parent_style.font_size());
             }
@@ -106,6 +112,12 @@ impl ComputedStyle {
                 && parent_style.text_decoration() != TextDecoration::None
             {
                 self.text_decoration = Some(parent_style.text_decoration());
+            }
+            let parent_opacity = parent_style.opacity();
+            if let Some(opacity) = self.opacity {
+                self.opacity = Some((opacity * parent_opacity).clamp(0.0, 1.0));
+            } else if parent_opacity < 1.0 {
+                self.opacity = Some(parent_opacity);
             }
         }
 
@@ -123,11 +135,17 @@ impl ComputedStyle {
         if self.display.is_none() {
             self.display = Some(DisplayType::default(node));
         }
+        if self.font_family.is_none() {
+            self.font_family = Some("serif".to_string());
+        }
         if self.font_size.is_none() {
             self.font_size = Some(FontSize::default(node));
         }
         if self.text_decoration.is_none() {
             self.text_decoration = Some(TextDecoration::default(node));
+        }
+        if self.opacity.is_none() {
+            self.opacity = Some(1.0);
         }
         if self.height.is_none() {
             self.height = Some(0.0);
@@ -168,7 +186,18 @@ impl ComputedStyle {
     }
 
     pub fn display(&self) -> DisplayType {
-        self.display.expect("failed to access CSS property: display")
+        self.display
+            .expect("failed to access CSS property: display")
+    }
+
+    pub fn set_font_family(&mut self, font_family: String) {
+        self.font_family = Some(font_family);
+    }
+
+    pub fn font_family(&self) -> String {
+        self.font_family
+            .clone()
+            .expect("failed to access CSS property: font-family")
     }
 
     pub fn set_font_size(&mut self, font_size: FontSize) {
@@ -187,6 +216,15 @@ impl ComputedStyle {
     pub fn text_decoration(&self) -> TextDecoration {
         self.text_decoration
             .expect("failed to access CSS property: text-decoration")
+    }
+
+    pub fn set_opacity(&mut self, opacity: f64) {
+        self.opacity = Some(opacity.clamp(0.0, 1.0));
+    }
+
+    pub fn opacity(&self) -> f64 {
+        self.opacity
+            .expect("failed to access CSS property: opacity")
     }
 
     pub fn set_height(&mut self, height: f64) {
@@ -246,7 +284,8 @@ impl ComputedStyle {
     }
 
     pub fn padding(&self) -> EdgeSize {
-        self.padding.expect("failed to access CSS property: padding")
+        self.padding
+            .expect("failed to access CSS property: padding")
     }
 }
 
@@ -495,10 +534,3 @@ impl TextDecoration {
         }
     }
 }
-
-
-
-
-
-
-
