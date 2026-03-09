@@ -1,6 +1,9 @@
 use reqwest::blocking::Client;
 use saba_core::display_item::DisplayItem;
 use saba_core::http::HttpResponse;
+use saba_core::renderer::dom::api::get_stylesheet_links;
+use saba_core::renderer::html::parser::HtmlParser;
+use saba_core::renderer::html::token::HtmlTokenizer;
 use saba_core::renderer::layout::layout_object::LayoutSize;
 use saba_core::renderer::page::Page;
 use saba_core::url::Url;
@@ -391,11 +394,9 @@ impl BrowserSession {
     fn load_url(&mut self, url: &str) -> AppResult<PageViewModel> {
         let response = fetch_http_response(url)?;
         let html = response.body();
-        let mut probe_page = Page::new();
-        probe_page.receive_response(response.clone(), String::new(), self.viewport_width);
 
         let mut diagnostics = Vec::new();
-        let extra_style = fetch_stylesheet_bundle(url, &probe_page, &mut diagnostics);
+        let extra_style = fetch_stylesheet_bundle(url, &html, &mut diagnostics);
 
         let mut page = Page::new();
         page.receive_response(response, extra_style.clone(), self.viewport_width);
@@ -406,7 +407,6 @@ impl BrowserSession {
         self.latest_view = view.clone();
         Ok(view)
     }
-
 
     fn rerender_cached_page(&mut self) -> AppResult<PageViewModel> {
         let html = self
@@ -420,7 +420,11 @@ impl BrowserSession {
             .unwrap_or_default();
         let response = http_response_from_html(&html)?;
         let mut page = Page::new();
-        page.receive_response(response, self.latest_extra_style.clone(), self.viewport_width);
+        page.receive_response(
+            response,
+            self.latest_extra_style.clone(),
+            self.viewport_width,
+        );
         let view = build_page_view(&page, current_url, Vec::new());
         self.latest_view = view.clone();
         Ok(view)
@@ -596,18 +600,33 @@ fn fetch_url_text(url: &str) -> AppResult<String> {
         .map_err(|e| AppError::network(format!("Failed to read resource body: {e}")))
 }
 
-fn fetch_stylesheet_bundle(url: &str, page: &Page, diagnostics: &mut Vec<String>) -> String {
+fn extract_stylesheet_links(html: &str) -> Vec<String> {
+    let tokenizer = HtmlTokenizer::new(html.to_string());
+    let mut parser = HtmlParser::new(tokenizer);
+    let window = parser.construct_tree();
+    let document = window.borrow().document();
+    get_stylesheet_links(document)
+}
+
+fn fetch_stylesheet_bundle(url: &str, html: &str, diagnostics: &mut Vec<String>) -> String {
     let mut styles = Vec::new();
-    for href in page.stylesheet_links() {
+    for href in extract_stylesheet_links(html) {
         match resolve_url(url, &href).and_then(|resolved| fetch_url_text(&resolved)) {
             Ok(sheet) => styles.push(sheet),
-            Err(error) => diagnostics.push(format!("Stylesheet load failed for {href}: {}", error.message)),
+            Err(error) => diagnostics.push(format!(
+                "Stylesheet load failed for {href}: {}",
+                error.message
+            )),
         }
     }
     styles.join("\n")
 }
 
-fn build_page_view(page: &Page, current_url: String, mut diagnostics: Vec<String>) -> PageViewModel {
+fn build_page_view(
+    page: &Page,
+    current_url: String,
+    mut diagnostics: Vec<String>,
+) -> PageViewModel {
     let mut scene_items = Vec::new();
     for item in page.display_items() {
         match item {
@@ -738,14 +757,15 @@ fn split_url(url: &str) -> AppResult<(String, String, String)> {
 mod tests {
     use super::{
         blank_page_view, build_page_view, build_search_results, normalize_url, resolve_url,
-        AppService, BrowserSession, SceneItem, SabaApp,
+        AppService, BrowserSession, SabaApp, SceneItem,
     };
     use saba_core::http::HttpResponse;
     use saba_core::renderer::page::Page;
 
     fn page_from_html(html: &str) -> Page {
         let mut page = Page::new();
-        let response = HttpResponse::new(format!("HTTP/1.1 200 OK\n\n{html}")).expect("valid response");
+        let response =
+            HttpResponse::new(format!("HTTP/1.1 200 OK\n\n{html}")).expect("valid response");
         page.receive_response(response, String::new(), 800);
         page
     }
@@ -826,7 +846,6 @@ mod tests {
         )));
     }
 
-
     #[test]
     fn cached_html_rerender_preserves_scene_items() {
         let mut session = BrowserSession::new();
@@ -837,7 +856,9 @@ mod tests {
         session.history.push("http://example.com".to_string());
         session.history_index = 0;
 
-        let view = session.rerender_cached_page().expect("rerender should succeed");
+        let view = session
+            .rerender_cached_page()
+            .expect("rerender should succeed");
 
         assert_eq!(view.current_url, "http://example.com");
         assert_eq!(view.title, "Example");
@@ -926,13 +947,3 @@ mod tests {
         assert_eq!(err.code, "validation_error");
     }
 }
-
-
-
-
-
-
-
-
-
-
