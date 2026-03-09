@@ -2,76 +2,46 @@
 <html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
     <title>CosmoBrowse</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
-
   <body>
-    <main class="app-shell">
-      <header class="hero">
-        <p class="eyebrow">CosmoBrowse</p>
-        <h1>Tauri adapter with Phase D observability</h1>
-        <p class="hero-copy">Browse pages, inspect snapshot metadata, and watch navigation health from the same surface.</p>
-      </header>
-
-      <section class="panel tabs-panel">
-        <div class="section-heading">
-          <h2>Tabs</h2>
-          <button id="new-tab-button" type="button">New Tab</button>
+    <main class="browser-shell">
+      <section class="tabs-panel">
+        <div class="tabs-header">
+          <h1>CosmoBrowse</h1>
+          <button id="new-tab-button" class="ghost-button" type="button">+ Tab</button>
         </div>
         <ul id="tabs-list" class="tabs-list"></ul>
       </section>
 
-      <form id="url-form" class="panel toolbar">
-        <button id="back-button" type="button">Back</button>
-        <button id="forward-button" type="button">Forward</button>
-        <button id="reload-button" type="button">Reload</button>
-        <input id="url-input" placeholder="Enter a URL or search query" />
-        <button type="submit">Open / Search</button>
-      </form>
-
-      <p id="status" class="status panel">Ready.</p>
-
-      <section class="dashboard-grid">
-        <section class="panel stack-section">
-          <div class="section-heading">
-            <h2>Search Results</h2>
+      <section class="browser-chrome">
+        <form id="url-form" class="toolbar">
+          <div class="nav-group">
+            <button id="back-button" type="button">Back</button>
+            <button id="forward-button" type="button">Forward</button>
+            <button id="reload-button" type="button">Reload</button>
           </div>
-          <ul id="search-results" class="stack-list"></ul>
-        </section>
+          <input id="url-input" class="address-input" placeholder="URL or search query" />
+          <button class="primary-button" type="submit">Open</button>
+        </form>
+        <ul id="search-results" class="search-results hidden"></ul>
+      </section>
 
-        <section class="panel stack-section">
-          <div class="section-heading">
-            <h2>Snapshot</h2>
+      <section class="viewport-shell">
+        <header class="page-meta">
+          <div>
+            <p id="page-title" class="page-title">New Tab</p>
+            <p id="current-url" class="current-url">URL: (none)</p>
           </div>
-          <p id="current-url" class="muted"></p>
-          <ul id="snapshot-meta" class="stack-list compact-list"></ul>
-          <ul id="text-list" class="stack-list"></ul>
-        </section>
+          <p id="status" class="status">Ready.</p>
+        </header>
 
-        <section class="panel stack-section">
-          <div class="section-heading">
-            <h2>Links</h2>
-          </div>
-          <ul id="links-list" class="stack-list"></ul>
-        </section>
-
-        <section class="panel stack-section">
-          <div class="section-heading">
-            <h2>Diagnostics</h2>
-          </div>
-          <ul id="diagnostics-list" class="stack-list compact-list"></ul>
-        </section>
-
-        <section class="panel stack-section metrics-panel">
-          <div class="section-heading">
-            <h2>Metrics</h2>
-          </div>
-          <ul id="metrics-summary" class="stack-list compact-list"></ul>
-          <ul id="metrics-events" class="stack-list compact-list"></ul>
-        </section>
+        <div id="viewport" class="viewport">
+          <div id="scene-root" class="scene-root"></div>
+        </div>
       </section>
     </main>
   </body>

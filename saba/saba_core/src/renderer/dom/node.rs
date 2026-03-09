@@ -9,7 +9,6 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use core::str::FromStr;
 
-// https:://dom.spec.whatwg.org/multipage/nav-history-apis.html#window
 #[derive(Debug, Clone)]
 pub struct Window {
     document: Rc<RefCell<Node>>,
@@ -36,13 +35,13 @@ impl Window {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub kind: NodeKind,                      // kind of node
-    window: Weak<RefCell<Window>>,           // There is one window instance for each page.
-    parent: Weak<RefCell<Node>>,             // parent node
-    first_child: Option<Rc<RefCell<Node>>>,  // first child node
-    last_child: Weak<RefCell<Node>>,         // last child node
-    previous_sibling: Weak<RefCell<Node>>,   // previous sibling node
-    next_sibling: Option<Rc<RefCell<Node>>>, // next sibling node
+    pub kind: NodeKind,
+    window: Weak<RefCell<Window>>,
+    parent: Weak<RefCell<Node>>,
+    first_child: Option<Rc<RefCell<Node>>>,
+    last_child: Weak<RefCell<Node>>,
+    previous_sibling: Weak<RefCell<Node>>,
+    next_sibling: Option<Rc<RefCell<Node>>>,
 }
 
 impl PartialEq for Node {
@@ -129,11 +128,8 @@ impl Node {
 
 #[derive(Debug, Clone)]
 pub enum NodeKind {
-    /// https://dom.spec.whatwg.org/#interface-document
     Document,
-    /// https://dom.spec.whatwg.org/#interface-element
     Element(Element),
-    /// https://dom.spec.whatwg.org/#interface-text
     Text(String),
 }
 
@@ -150,7 +146,6 @@ impl PartialEq for NodeKind {
     }
 }
 
-/// https://dom.spec.whatwg.org/#interface-element
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Element {
     kind: ElementKind,
@@ -171,10 +166,20 @@ impl Element {
     }
 
     pub fn is_block_element(&self) -> bool {
-        match self.kind {
-            ElementKind::Body | ElementKind::H1 | ElementKind::H2 | ElementKind::P => true,
-            _ => false,
-        }
+        matches!(
+            self.kind,
+            ElementKind::Body
+                | ElementKind::Div
+                | ElementKind::Form
+                | ElementKind::H1
+                | ElementKind::H2
+                | ElementKind::Header
+                | ElementKind::Li
+                | ElementKind::Main
+                | ElementKind::P
+                | ElementKind::Section
+                | ElementKind::Ul
+        )
     }
 
     pub fn attributes(&self) -> Vec<Attribute> {
@@ -192,25 +197,29 @@ impl Element {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-/// https://dom.spec.whatwg.org/#interface-element
 pub enum ElementKind {
-    /// https://html.spec.whatwg.org/multipage/semantics.html#the-html-element
     Html,
-    /// https://html.spec.whatwg.org/multipage/semantics.html#the-head-element
     Head,
-    /// https://html.spec.whatwg.org/multipage/semantics.html#the-style-element
+    Link,
     Style,
-    /// https://html.spec.whatwg.org/multipage/scripting.html#the-script-element
     Script,
-    /// https://html.spec.whatwg.org/multipage/sections.html#the-body-element
+    Title,
     Body,
-    /// https://html.spec.whatwg.org/multipage/grouping-content.html#the-p-element
+    Div,
+    Form,
+    Span,
+    Img,
+    Input,
+    Button,
     P,
-    /// https://html.spec.whatwg.org/multipage/sections.html#the-h1,-h2,-h3,-h4,-h5,-and-h6-elements
     H1,
     H2,
-    /// https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-a-element
     A,
+    Ul,
+    Li,
+    Header,
+    Main,
+    Section,
 }
 
 impl Display for ElementKind {
@@ -218,13 +227,26 @@ impl Display for ElementKind {
         let s = match self {
             ElementKind::Html => "html",
             ElementKind::Head => "head",
+            ElementKind::Link => "link",
             ElementKind::Style => "style",
             ElementKind::Script => "script",
+            ElementKind::Title => "title",
             ElementKind::Body => "body",
+            ElementKind::Div => "div",
+            ElementKind::Form => "form",
+            ElementKind::Span => "span",
+            ElementKind::Img => "img",
+            ElementKind::Input => "input",
+            ElementKind::Button => "button",
+            ElementKind::P => "p",
             ElementKind::H1 => "h1",
             ElementKind::H2 => "h2",
-            ElementKind::P => "p",
             ElementKind::A => "a",
+            ElementKind::Ul => "ul",
+            ElementKind::Li => "li",
+            ElementKind::Header => "header",
+            ElementKind::Main => "main",
+            ElementKind::Section => "section",
         };
         write!(f, "{}", s)
     }
@@ -237,14 +259,28 @@ impl FromStr for ElementKind {
         match s {
             "html" => Ok(ElementKind::Html),
             "head" => Ok(ElementKind::Head),
+            "link" => Ok(ElementKind::Link),
             "style" => Ok(ElementKind::Style),
             "script" => Ok(ElementKind::Script),
+            "title" => Ok(ElementKind::Title),
             "body" => Ok(ElementKind::Body),
+            "div" => Ok(ElementKind::Div),
+            "form" => Ok(ElementKind::Form),
+            "span" => Ok(ElementKind::Span),
+            "img" => Ok(ElementKind::Img),
+            "input" => Ok(ElementKind::Input),
+            "button" => Ok(ElementKind::Button),
             "p" => Ok(ElementKind::P),
             "h1" => Ok(ElementKind::H1),
             "h2" => Ok(ElementKind::H2),
             "a" => Ok(ElementKind::A),
+            "ul" => Ok(ElementKind::Ul),
+            "li" => Ok(ElementKind::Li),
+            "header" => Ok(ElementKind::Header),
+            "main" => Ok(ElementKind::Main),
+            "section" => Ok(ElementKind::Section),
             _ => Err(format!("unimplemented element name {:?}", s)),
         }
     }
 }
+

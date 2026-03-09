@@ -1,20 +1,20 @@
 // renderer-wasm/src/lib.rs
 
 // 1. wasm-bindgen と serde をインポート
-use wasm_bindgen::prelude::*;
 use serde::Serialize;
-use wasm_bindgen::JsValue;
 use serde_json;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsValue;
 
 // 2. 既存のエンジン（saba_core）を取り込む
-use saba_core::renderer::html::parser::HtmlParser;
-use saba_core::renderer::html::token::HtmlTokenizer;
-use saba_core::renderer::dom::api::get_style_content;
+use saba_core::display_item::DisplayItem;
 use saba_core::renderer::css::cssom::CssParser;
 use saba_core::renderer::css::token::CssTokenizer;
-use saba_core::renderer::layout::layout_view::LayoutView;
-use saba_core::display_item::DisplayItem;
+use saba_core::renderer::dom::api::get_style_content;
+use saba_core::renderer::html::parser::HtmlParser;
+use saba_core::renderer::html::token::HtmlTokenizer;
 use saba_core::renderer::layout::computed_style::FontSize;
+use saba_core::renderer::layout::layout_view::LayoutView;
 
 // 3. JS 側にシリアライズして渡すための構造体／enum 定義
 #[derive(Serialize)]
@@ -40,7 +40,7 @@ pub enum DrawCommand {
 
 // 4. wasm-bindgen でエクスポートする関数
 #[wasm_bindgen]
-pub fn parse_and_render(html: &str, _canvas_width: f64, _canvas_height: f64) -> JsValue {
+pub fn parse_and_render(html: &str, canvas_width: f64, _canvas_height: f64) -> JsValue {
     // --- HTML → DOM ---
     let tokenizer = HtmlTokenizer::new(html.to_string());
     let mut parser = HtmlParser::new(tokenizer);
@@ -53,7 +53,8 @@ pub fn parse_and_render(html: &str, _canvas_width: f64, _canvas_height: f64) -> 
     let stylesheet = css_parser.parse_stylesheet();
 
     // --- レイアウト & ペイント ---
-    let layout_view = LayoutView::new(dom.clone(), &stylesheet);
+    let viewport_width = canvas_width.max(0.0) as i64;
+    let layout_view = LayoutView::new(dom.clone(), &stylesheet, viewport_width);
     let items: Vec<DisplayItem> = layout_view.paint();
 
     // --- DisplayItem → DrawCommand に変換 ---
@@ -78,6 +79,7 @@ pub fn parse_and_render(html: &str, _canvas_width: f64, _canvas_height: f64) -> 
                 text,
                 style,
                 layout_point,
+                ..
             } => {
                 // フォントサイズをピクセルにマッピング
                 let size_px = match style.font_size() {
@@ -98,7 +100,6 @@ pub fn parse_and_render(html: &str, _canvas_width: f64, _canvas_height: f64) -> 
         .collect();
 
     // 5. JS に渡すため JSON シリアライズ
-    let json = serde_json::to_string(&commands)
-        .expect("failed to serialize draw commands");
+    let json = serde_json::to_string(&commands).expect("failed to serialize draw commands");
     JsValue::from_str(&json)
 }

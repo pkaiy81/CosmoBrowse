@@ -8,6 +8,54 @@ use alloc::string::String;
 use alloc::string::ToString;
 use core::cell::RefCell;
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct EdgeSize {
+    top: f64,
+    right: f64,
+    bottom: f64,
+    left: f64,
+}
+
+impl EdgeSize {
+    pub fn zero() -> Self {
+        Self {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        }
+    }
+
+    pub fn all(value: f64) -> Self {
+        Self {
+            top: value,
+            right: value,
+            bottom: value,
+            left: value,
+        }
+    }
+
+    pub fn horizontal(&self) -> f64 {
+        self.left + self.right
+    }
+
+    pub fn vertical(&self) -> f64 {
+        self.top + self.bottom
+    }
+
+    pub fn top(&self) -> f64 {
+        self.top
+    }
+
+    pub fn left(&self) -> f64 {
+        self.left
+    }
+
+    pub fn bottom(&self) -> f64 {
+        self.bottom
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     background_color: Option<Color>,
@@ -16,7 +64,12 @@ pub struct ComputedStyle {
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
     height: Option<f64>,
+    height_ratio: Option<f64>,
     width: Option<f64>,
+    width_ratio: Option<f64>,
+    margin_horizontal_auto: bool,
+    margin: Option<EdgeSize>,
+    padding: Option<EdgeSize>,
 }
 
 impl ComputedStyle {
@@ -28,20 +81,23 @@ impl ComputedStyle {
             font_size: None,
             text_decoration: None,
             height: None,
+            height_ratio: None,
             width: None,
+            width_ratio: None,
+            margin_horizontal_auto: false,
+            margin: None,
+            padding: None,
         }
     }
 
     pub fn defaulting(&mut self, node: &Rc<RefCell<Node>>, parent_style: Option<ComputedStyle>) {
-        // If the parent node exists and the parent css value is not different from the default value, inherit the parent css value.
         if let Some(parent_style) = parent_style {
             if self.background_color.is_none() && parent_style.background_color() != Color::white()
             {
                 self.background_color = Some(parent_style.background_color());
             }
             if self.color.is_none() && parent_style.color() != Color::black() {
-                // 1
-                self.color = Some(parent_style.color()); // 2
+                self.color = Some(parent_style.color());
             }
             if self.font_size.is_none() && parent_style.font_size() != FontSize::Medium {
                 self.font_size = Some(parent_style.font_size());
@@ -53,12 +109,16 @@ impl ComputedStyle {
             }
         }
 
-        // Set the default value each css property.
         if self.background_color.is_none() {
-            self.background_color = Some(Color::white());
+            self.background_color = Some(match node.borrow().element_kind() {
+                Some(ElementKind::Button) | Some(ElementKind::Img) | Some(ElementKind::Input) => {
+                    Color::lightgray()
+                }
+                _ => Color::white(),
+            });
         }
         if self.color.is_none() {
-            self.color = Some(Color::black()); // 3
+            self.color = Some(Color::black());
         }
         if self.display.is_none() {
             self.display = Some(DisplayType::default(node));
@@ -74,6 +134,12 @@ impl ComputedStyle {
         }
         if self.width.is_none() {
             self.width = Some(0.0);
+        }
+        if self.margin.is_none() {
+            self.margin = Some(EdgeSize::zero());
+        }
+        if self.padding.is_none() {
+            self.padding = Some(EdgeSize::zero());
         }
     }
 
@@ -102,13 +168,20 @@ impl ComputedStyle {
     }
 
     pub fn display(&self) -> DisplayType {
-        self.display
-            .expect("failed to access CSS property: display")
+        self.display.expect("failed to access CSS property: display")
+    }
+
+    pub fn set_font_size(&mut self, font_size: FontSize) {
+        self.font_size = Some(font_size);
     }
 
     pub fn font_size(&self) -> FontSize {
         self.font_size
             .expect("failed to access CSS property: font-size")
+    }
+
+    pub fn set_text_decoration(&mut self, text_decoration: TextDecoration) {
+        self.text_decoration = Some(text_decoration);
     }
 
     pub fn text_decoration(&self) -> TextDecoration {
@@ -118,18 +191,62 @@ impl ComputedStyle {
 
     pub fn set_height(&mut self, height: f64) {
         self.height = Some(height);
+        self.height_ratio = None;
+    }
+
+    pub fn set_height_ratio(&mut self, ratio: f64) {
+        self.height_ratio = Some(ratio);
+        self.height = Some(0.0);
     }
 
     pub fn height(&self) -> f64 {
         self.height.expect("failed to access CSS property: height")
     }
 
+    pub fn height_ratio(&self) -> Option<f64> {
+        self.height_ratio
+    }
+
     pub fn set_width(&mut self, width: f64) {
         self.width = Some(width);
+        self.width_ratio = None;
+    }
+
+    pub fn set_width_ratio(&mut self, ratio: f64) {
+        self.width_ratio = Some(ratio);
+        self.width = Some(0.0);
     }
 
     pub fn width(&self) -> f64 {
         self.width.expect("failed to access CSS property: width")
+    }
+
+    pub fn width_ratio(&self) -> Option<f64> {
+        self.width_ratio
+    }
+
+    pub fn set_margin_all(&mut self, value: f64) {
+        self.margin = Some(EdgeSize::all(value));
+    }
+
+    pub fn set_margin_horizontal_auto(&mut self, enabled: bool) {
+        self.margin_horizontal_auto = enabled;
+    }
+
+    pub fn margin_horizontal_auto(&self) -> bool {
+        self.margin_horizontal_auto
+    }
+
+    pub fn margin(&self) -> EdgeSize {
+        self.margin.expect("failed to access CSS property: margin")
+    }
+
+    pub fn set_padding_all(&mut self, value: f64) {
+        self.padding = Some(EdgeSize::all(value));
+    }
+
+    pub fn padding(&self) -> EdgeSize {
+        self.padding.expect("failed to access CSS property: padding")
     }
 }
 
@@ -175,43 +292,63 @@ impl Color {
     }
 
     pub fn from_code(code: &str) -> Result<Self, Error> {
-        if code.chars().nth(0) != Some('#') || code.len() != 7 {
+        if code.chars().nth(0) != Some('#') {
             return Err(Error::UnexpectedInput(format!(
                 "invalid color code: {}",
                 code
             )));
         }
 
-        let name = match code {
-            "#000000" => "black".to_string(),
-            "#c0c0c0" => "silver".to_string(),
-            "#808080" => "gray".to_string(),
-            "#ffffff" => "white".to_string(),
-            "#800000" => "maroon".to_string(),
-            "#ff0000" => "red".to_string(),
-            "#800080" => "purple".to_string(),
-            "#ff00ff" => "fuchsia".to_string(),
-            "#008000" => "green".to_string(),
-            "#00ff00" => "lime".to_string(),
-            "#808000" => "olive".to_string(),
-            "#ffff00" => "yellow".to_string(),
-            "#000080" => "navy".to_string(),
-            "#0000ff" => "blue".to_string(),
-            "#008080" => "teal".to_string(),
-            "#00ffff" => "aqua".to_string(),
-            "#ffa500" => "orange".to_string(),
-            "#d3d3d3" => "lightgray".to_string(),
-            _ => {
-                return Err(Error::UnexpectedInput(format!(
-                    "color code {:?} is not supported yet",
-                    code
-                )));
+        let normalized = if code.len() == 4 {
+            let mut expanded = String::from("#");
+            for ch in code.chars().skip(1) {
+                expanded.push(ch);
+                expanded.push(ch);
             }
+            expanded
+        } else {
+            code.to_string()
+        };
+
+        if normalized.len() != 7 {
+            return Err(Error::UnexpectedInput(format!(
+                "invalid color code: {}",
+                code
+            )));
+        }
+
+        if normalized.chars().skip(1).any(|ch| !ch.is_ascii_hexdigit()) {
+            return Err(Error::UnexpectedInput(format!(
+                "invalid color code: {}",
+                code
+            )));
+        }
+
+        let name = match normalized.as_str() {
+            "#000000" => Some("black".to_string()),
+            "#c0c0c0" => Some("silver".to_string()),
+            "#808080" => Some("gray".to_string()),
+            "#ffffff" => Some("white".to_string()),
+            "#800000" => Some("maroon".to_string()),
+            "#ff0000" => Some("red".to_string()),
+            "#800080" => Some("purple".to_string()),
+            "#ff00ff" => Some("fuchsia".to_string()),
+            "#008000" => Some("green".to_string()),
+            "#00ff00" => Some("lime".to_string()),
+            "#808000" => Some("olive".to_string()),
+            "#ffff00" => Some("yellow".to_string()),
+            "#000080" => Some("navy".to_string()),
+            "#0000ff" => Some("blue".to_string()),
+            "#008080" => Some("teal".to_string()),
+            "#00ffff" => Some("aqua".to_string()),
+            "#ffa500" => Some("orange".to_string()),
+            "#d3d3d3" => Some("lightgray".to_string()),
+            _ => None,
         };
 
         Ok(Self {
-            name: Some(name),
-            code: code.to_string(),
+            name,
+            code: normalized,
         })
     }
 
@@ -221,6 +358,7 @@ impl Color {
             code: "#ffffff".to_string(),
         }
     }
+
     pub fn black() -> Self {
         Self {
             name: Some("black".to_string()),
@@ -228,18 +366,22 @@ impl Color {
         }
     }
 
+    pub fn lightgray() -> Self {
+        Self {
+            name: Some("lightgray".to_string()),
+            code: "#d3d3d3".to_string(),
+        }
+    }
+
     pub fn code_u32(&self) -> u32 {
         u32::from_str_radix(self.code.trim_start_matches('#'), 16).unwrap()
     }
 
-    // Returns the CSS hex code (e.g. "#ff0000").
     pub fn code(&self) -> &str {
         &self.code
     }
-
 }
 
-/// https://www.w3.org/TR/css-fonts-4/#absolute-size-mapping
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum FontSize {
     Medium,
@@ -258,15 +400,42 @@ impl FontSize {
             _ => FontSize::Medium,
         }
     }
+
+    pub fn from_str(value: &str) -> Result<Self, Error> {
+        match value {
+            "medium" => Ok(Self::Medium),
+            "large" | "x-large" => Ok(Self::XLarge),
+            "xx-large" => Ok(Self::XXLarge),
+            _ => Err(Error::UnexpectedInput(format!(
+                "font-size {:?} is not supported yet",
+                value
+            ))),
+        }
+    }
+
+    pub fn from_px(value: f64) -> Self {
+        if value >= 32.0 {
+            Self::XXLarge
+        } else if value >= 24.0 {
+            Self::XLarge
+        } else {
+            Self::Medium
+        }
+    }
+
+    pub fn px(&self) -> i64 {
+        match self {
+            FontSize::Medium => 16,
+            FontSize::XLarge => 24,
+            FontSize::XXLarge => 32,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum DisplayType {
-    /// https://www.w3.org/TR/css-display-3/#valdef-display-block
     Block,
-    /// https://www.w3.org/TR/css-display-3/#valdef-display-inline
     Inline,
-    /// https://www.w3.org/TR/css-display-3/#valdef-display-none
     DisplayNone,
 }
 
@@ -298,7 +467,6 @@ impl DisplayType {
     }
 }
 
-/// https://w3c.github.io/csswg-drafts/css-text-decor/#text-decoration-property
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum TextDecoration {
     None,
@@ -315,4 +483,22 @@ impl TextDecoration {
             _ => TextDecoration::None,
         }
     }
+
+    pub fn from_str(value: &str) -> Result<Self, Error> {
+        match value {
+            "none" => Ok(Self::None),
+            "underline" => Ok(Self::Underline),
+            _ => Err(Error::UnexpectedInput(format!(
+                "text-decoration {:?} is not supported yet",
+                value
+            ))),
+        }
+    }
 }
+
+
+
+
+
+
+

@@ -1,32 +1,38 @@
 import { invoke } from "@tauri-apps/api/core";
 
-type SnapshotLink = {
+type SceneRect = {
+  kind: "rect";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  background_color: string;
+};
+
+type SceneText = {
+  kind: "text";
+  x: number;
+  y: number;
   text: string;
-  href: string;
+  color: string;
+  font_px: number;
+  underline: boolean;
+  href: string | null;
 };
 
-type LayoutMetadata = {
-  text_item_count: number;
-  block_item_count: number;
-  content_width: number;
-  content_height: number;
+type SceneItem = SceneRect | SceneText;
+
+type ContentSize = {
+  width: number;
+  height: number;
 };
 
-type StyleMetadata = {
-  text_colors: string[];
-  background_colors: string[];
-  underlined_text_count: number;
-  heading_text_count: number;
-};
-
-type RenderSnapshot = {
+type PageViewModel = {
   current_url: string;
   title: string;
-  text_blocks: string[];
-  links: SnapshotLink[];
   diagnostics: string[];
-  layout: LayoutMetadata;
-  style: StyleMetadata;
+  content_size: ContentSize;
+  scene_items: SceneItem[];
 };
 
 type NavigationState = {
@@ -55,51 +61,39 @@ type AppError = {
   retryable: boolean;
 };
 
-type ErrorMetric = {
-  code: string;
-  count: number;
-};
-
-type NavigationEvent = {
-  command: string;
-  url: string | null;
-  duration_ms: number;
-  success: boolean;
-  error_code: string | null;
-  recorded_at_ms: number;
-};
-
-type AppMetricsSnapshot = {
-  total_navigations: number;
-  successful_navigations: number;
-  failed_navigations: number;
-  average_duration_ms: number;
-  last_duration_ms: number | null;
-  error_counts: ErrorMetric[];
-  recent_events: NavigationEvent[];
-};
-
 let urlInputEl: HTMLInputElement | null;
 let statusEl: HTMLElement | null;
 let currentUrlEl: HTMLElement | null;
-let textListEl: HTMLUListElement | null;
-let snapshotMetaEl: HTMLUListElement | null;
-let diagnosticsListEl: HTMLUListElement | null;
-let linksListEl: HTMLUListElement | null;
-let metricsSummaryEl: HTMLUListElement | null;
-let metricsEventsEl: HTMLUListElement | null;
+let pageTitleEl: HTMLElement | null;
 let backButtonEl: HTMLButtonElement | null;
 let forwardButtonEl: HTMLButtonElement | null;
 let reloadButtonEl: HTMLButtonElement | null;
 let tabsListEl: HTMLUListElement | null;
 let newTabButtonEl: HTMLButtonElement | null;
 let searchResultsEl: HTMLUListElement | null;
+let viewportEl: HTMLElement | null;
+let sceneRootEl: HTMLElement | null;
+let resizeObserver: ResizeObserver | null = null;
+let resizeTimer: number | null = null;
+let pageEpoch = 0;
+
+function beginPageEpoch() {
+  pageEpoch += 1;
+  return pageEpoch;
+}
+
+function currentPageEpoch() {
+  return pageEpoch;
+}
+
+function isCurrentPageEpoch(epoch: number) {
+  return epoch === pageEpoch;
+}
 
 function setStatus(message: string, level: "info" | "error" = "info") {
-  if (statusEl) {
-    statusEl.textContent = message;
-    statusEl.dataset.level = level;
-  }
+  if (!statusEl) return;
+  statusEl.textContent = message;
+  statusEl.dataset.level = level;
 }
 
 function isUrlLikeInput(input: string) {
@@ -111,216 +105,8 @@ function isUrlLikeInput(input: string) {
 }
 
 function setNavButtons(nav: NavigationState) {
-  if (backButtonEl) {
-    backButtonEl.disabled = !nav.can_back;
-  }
-
-  if (forwardButtonEl) {
-    forwardButtonEl.disabled = !nav.can_forward;
-  }
-}
-
-function setTextItems(list: HTMLUListElement | null, lines: string[], emptyLabel: string) {
-  if (!list) return;
-
-  list.innerHTML = "";
-  const items = lines.length > 0 ? lines : [emptyLabel];
-
-  for (const line of items) {
-    const item = document.createElement("li");
-    item.textContent = line;
-    list.appendChild(item);
-  }
-}
-
-function renderSnapshotMeta(snapshot: RenderSnapshot) {
-  const styleSummary = [
-    `Text colors: ${snapshot.style.text_colors.join(", ") || "(none)"}`,
-    `Background colors: ${snapshot.style.background_colors.join(", ") || "(none)"}`,
-    `Underlined text items: ${snapshot.style.underlined_text_count}`,
-    `Heading text items: ${snapshot.style.heading_text_count}`,
-  ];
-
-  const layoutSummary = [
-    `Text items: ${snapshot.layout.text_item_count}`,
-    `Block items: ${snapshot.layout.block_item_count}`,
-    `Content width: ${snapshot.layout.content_width}`,
-    `Content height: ${snapshot.layout.content_height}`,
-  ];
-
-  setTextItems(snapshotMetaEl, [...layoutSummary, ...styleSummary], "No snapshot metadata.");
-}
-
-function renderSnapshot(snapshot: RenderSnapshot) {
-  if (currentUrlEl) {
-    currentUrlEl.textContent = snapshot.current_url
-      ? `URL: ${snapshot.current_url}`
-      : "URL: (none)";
-  }
-
-  if (urlInputEl && snapshot.current_url) {
-    urlInputEl.value = snapshot.current_url;
-  }
-
-  renderSnapshotMeta(snapshot);
-  setTextItems(textListEl, snapshot.text_blocks, "No content.");
-  setTextItems(
-    diagnosticsListEl,
-    snapshot.diagnostics,
-    "No diagnostics."
-  );
-  renderLinks(snapshot.links);
-}
-
-function renderLinks(links: SnapshotLink[]) {
-  if (!linksListEl) return;
-
-  linksListEl.innerHTML = "";
-
-  if (links.length === 0) {
-    setTextItems(linksListEl, [], "No links found.");
-    return;
-  }
-
-  for (const link of links) {
-    const item = document.createElement("li");
-    const button = document.createElement("button");
-    const detail = document.createElement("small");
-
-    button.type = "button";
-    button.className = "linklike";
-    button.textContent = link.text || link.href;
-    button.addEventListener("click", () => openUrl(link.href));
-
-    detail.textContent = link.href;
-
-    item.appendChild(button);
-    item.appendChild(document.createElement("br"));
-    item.appendChild(detail);
-    linksListEl.appendChild(item);
-  }
-}
-
-function renderSearchResults(results: SearchResult[]) {
-  if (!searchResultsEl) return;
-
-  searchResultsEl.innerHTML = "";
-
-  if (results.length === 0) {
-    setTextItems(searchResultsEl, [], "No search results.");
-    return;
-  }
-
-  for (const result of results) {
-    const item = document.createElement("li");
-    const button = document.createElement("button");
-    const detail = document.createElement("small");
-
-    button.type = "button";
-    button.className = "linklike";
-    button.textContent = result.title;
-    button.addEventListener("click", () => openUrl(result.url));
-
-    detail.textContent = `${result.url} | ${result.snippet}`;
-
-    item.appendChild(button);
-    item.appendChild(document.createElement("br"));
-    item.appendChild(detail);
-    searchResultsEl.appendChild(item);
-  }
-}
-
-function renderTabs(tabs: TabSummary[]) {
-  if (!tabsListEl) return;
-
-  tabsListEl.innerHTML = "";
-
-  if (tabs.length === 0) {
-    setTextItems(tabsListEl, [], "No tabs.");
-    return;
-  }
-
-  for (const tab of tabs) {
-    const item = document.createElement("li");
-    item.className = tab.is_active ? "tab-item active" : "tab-item";
-
-    const switchButton = document.createElement("button");
-    switchButton.type = "button";
-    switchButton.className = "tab-switch";
-    switchButton.textContent = tab.url ?? tab.title;
-    switchButton.addEventListener("click", () => switchTab(tab.id));
-
-    const closeButton = document.createElement("button");
-    closeButton.type = "button";
-    closeButton.className = "tab-close";
-    closeButton.textContent = "x";
-    closeButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      closeTab(tab.id);
-    });
-
-    item.appendChild(switchButton);
-    item.appendChild(closeButton);
-    tabsListEl.appendChild(item);
-  }
-}
-
-function renderMetrics(metrics: AppMetricsSnapshot) {
-  const summaryLines = [
-    `Total navigations: ${metrics.total_navigations}`,
-    `Successful navigations: ${metrics.successful_navigations}`,
-    `Failed navigations: ${metrics.failed_navigations}`,
-    `Average duration: ${metrics.average_duration_ms} ms`,
-    `Last duration: ${metrics.last_duration_ms ?? 0} ms`,
-    `Error counts: ${formatErrorCounts(metrics.error_counts)}`,
-  ];
-
-  setTextItems(metricsSummaryEl, summaryLines, "No metrics.");
-
-  const eventLines = metrics.recent_events
-    .slice()
-    .reverse()
-    .map((event) => {
-      const time = new Date(event.recorded_at_ms).toLocaleTimeString();
-      const status = event.success ? "ok" : `failed (${event.error_code ?? "unknown"})`;
-      const target = event.url ?? "(no url)";
-      return `${time} | ${event.command} | ${status} | ${event.duration_ms} ms | ${target}`;
-    });
-
-  setTextItems(metricsEventsEl, eventLines, "No recent events.");
-}
-
-function formatErrorCounts(errorCounts: ErrorMetric[]) {
-  if (errorCounts.length === 0) {
-    return "none";
-  }
-
-  return errorCounts.map((metric) => `${metric.code}: ${metric.count}`).join(", ");
-}
-
-async function refreshNavigationState() {
-  try {
-    const nav = await invoke<NavigationState>("get_navigation_state");
-    setNavButtons(nav);
-  } catch {
-    if (backButtonEl) backButtonEl.disabled = true;
-    if (forwardButtonEl) forwardButtonEl.disabled = true;
-  }
-}
-
-async function refreshTabs() {
-  const tabs = await invoke<TabSummary[]>("list_tabs");
-  renderTabs(tabs);
-}
-
-async function refreshMetrics() {
-  try {
-    const metrics = await invoke<AppMetricsSnapshot>("get_metrics");
-    renderMetrics(metrics);
-  } catch {
-    setTextItems(metricsSummaryEl, [], "Failed to load metrics.");
-    setTextItems(metricsEventsEl, [], "Failed to load recent events.");
-  }
+  if (backButtonEl) backButtonEl.disabled = !nav.can_back;
+  if (forwardButtonEl) forwardButtonEl.disabled = !nav.can_forward;
 }
 
 function errorLabelByCode(code: string): string {
@@ -338,41 +124,216 @@ function errorLabelByCode(code: string): string {
   }
 }
 
-function formatError(errorValue: unknown): string {
-  const error = errorValue as Partial<AppError>;
+function formatError(e: unknown): string {
+  const error = e as Partial<AppError>;
   const code = error.code ?? "unknown_error";
   const message = error.message ?? "Unknown error";
   const retry = error.retryable ? " (retryable)" : "";
   const label = errorLabelByCode(code);
-
   return `${label} [${code}]: ${message}${retry}`;
 }
 
-async function executeNavigationCommand(command: string, loadingMessage: string) {
+function clearSearchResults() {
+  if (!searchResultsEl) return;
+  searchResultsEl.innerHTML = "";
+  searchResultsEl.classList.add("hidden");
+}
+
+function renderSearchResults(results: SearchResult[]) {
+  if (!searchResultsEl) return;
+
+  searchResultsEl.innerHTML = "";
+  searchResultsEl.classList.toggle("hidden", results.length === 0);
+
+  if (results.length === 0) {
+    return;
+  }
+
+  for (const result of results) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    const detail = document.createElement("small");
+
+    button.type = "button";
+    button.className = "linklike";
+    button.textContent = result.title;
+    button.addEventListener("click", () => {
+      clearSearchResults();
+      openUrl(result.url);
+    });
+
+    detail.textContent = `${result.url} - ${result.snippet}`;
+    item.append(button, document.createElement("br"), detail);
+    searchResultsEl.appendChild(item);
+  }
+}
+
+function renderTabs(tabs: TabSummary[]) {
+  if (!tabsListEl) return;
+
+  tabsListEl.innerHTML = "";
+  for (const tab of tabs) {
+    const item = document.createElement("li");
+    item.className = tab.is_active ? "tab-item active" : "tab-item";
+
+    const switchButton = document.createElement("button");
+    switchButton.type = "button";
+    switchButton.className = "tab-switch";
+    switchButton.textContent = tab.title || tab.url || "New Tab";
+    switchButton.addEventListener("click", () => switchTab(tab.id));
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "tab-close";
+    closeButton.textContent = "x";
+    closeButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeTab(tab.id);
+    });
+
+    item.append(switchButton, closeButton);
+    tabsListEl.appendChild(item);
+  }
+}
+
+function renderScene(sceneItems: SceneItem[], contentSize: ContentSize) {
+  if (!sceneRootEl) return;
+  sceneRootEl.innerHTML = "";
+  sceneRootEl.style.width = `${Math.max(contentSize.width, 320)}px`;
+  sceneRootEl.style.height = `${Math.max(contentSize.height, 240)}px`;
+
+  for (const item of sceneItems) {
+    if (item.kind === "rect") {
+      const rect = document.createElement("div");
+      rect.className = "scene-rect";
+      rect.style.left = `${item.x}px`;
+      rect.style.top = `${item.y}px`;
+      rect.style.width = `${item.width}px`;
+      rect.style.height = `${item.height}px`;
+      rect.style.backgroundColor = item.background_color;
+      sceneRootEl.appendChild(rect);
+      continue;
+    }
+
+    const textNode = document.createElement(item.href ? "button" : "div");
+    textNode.className = item.href ? "scene-link" : "scene-text";
+    textNode.textContent = item.text;
+    textNode.style.left = `${item.x}px`;
+    textNode.style.top = `${item.y}px`;
+    textNode.style.color = item.color;
+    textNode.style.fontSize = `${item.font_px}px`;
+    textNode.style.textDecoration = item.underline ? "underline" : "none";
+
+    if (item.href) {
+      (textNode as HTMLButtonElement).type = "button";
+      textNode.addEventListener("click", () => openUrl(item.href ?? ""));
+    }
+
+    sceneRootEl.appendChild(textNode);
+  }
+}
+
+function renderPageView(view: PageViewModel) {
+  if (currentUrlEl) {
+    currentUrlEl.textContent = view.current_url ? `URL: ${view.current_url}` : "URL: (none)";
+  }
+
+  if (pageTitleEl) {
+    pageTitleEl.textContent = view.title || "New Tab";
+  }
+
+  document.title = view.title ? `${view.title} - CosmoBrowse` : "CosmoBrowse";
+
+  if (urlInputEl && view.current_url) {
+    urlInputEl.value = view.current_url;
+  }
+
+  renderScene(view.scene_items, view.content_size);
+
+  const diagnostics = view.diagnostics.filter((entry) => entry.trim().length > 0);
+  if (diagnostics.length > 0) {
+    setStatus(diagnostics.join(" | "));
+  }
+}
+
+async function refreshTabs() {
+  const tabs = await invoke<TabSummary[]>("list_tabs");
+  renderTabs(tabs);
+}
+
+async function refreshNavigationState() {
   try {
+    const nav = await invoke<NavigationState>("get_navigation_state");
+    setNavButtons(nav);
+  } catch {
+    if (backButtonEl) backButtonEl.disabled = true;
+    if (forwardButtonEl) forwardButtonEl.disabled = true;
+  }
+}
+
+async function syncViewport(force = false, epoch = currentPageEpoch()) {
+  if (!viewportEl) return;
+
+  const width = Math.floor(viewportEl.clientWidth - 32);
+  const height = Math.floor(viewportEl.clientHeight - 32);
+  if (width <= 0 || height <= 0) return;
+
+  if (!force && resizeTimer) {
+    window.clearTimeout(resizeTimer);
+  }
+
+  const run = async () => {
+    try {
+      const view = await invoke<PageViewModel>("set_viewport", { width, height });
+      if (!isCurrentPageEpoch(epoch)) return;
+      renderPageView(view);
+      await refreshNavigationState();
+      await refreshTabs();
+    } catch {
+      // Ignore transient resize errors while the app initializes.
+    }
+  };
+
+  if (force) {
+    await run();
+  } else {
+    resizeTimer = window.setTimeout(run, 120);
+  }
+}
+
+async function executeNavigationCommand(command: string, loadingMessage: string) {
+  const epoch = beginPageEpoch();
+  try {
+    clearSearchResults();
     setStatus(loadingMessage);
-    const snapshot = await invoke<RenderSnapshot>(command);
-    renderSnapshot(snapshot);
-    renderSearchResults([]);
-    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
+    const view = await invoke<PageViewModel>(command);
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+    if (!isCurrentPageEpoch(epoch)) return;
     setStatus("Done.");
-  } catch (errorValue) {
-    await refreshMetrics();
-    setStatus(formatError(errorValue), "error");
+  } catch (e) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus(formatError(e), "error");
   }
 }
 
 async function openUrl(url: string) {
+  const epoch = beginPageEpoch();
   try {
+    clearSearchResults();
     setStatus("Loading...");
-    const snapshot = await invoke<RenderSnapshot>("open_url", { url });
-    renderSnapshot(snapshot);
-    renderSearchResults([]);
-    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
+    const view = await invoke<PageViewModel>("open_url", { url });
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+    if (!isCurrentPageEpoch(epoch)) return;
     setStatus("Done.");
-  } catch (errorValue) {
-    await refreshMetrics();
-    setStatus(formatError(errorValue), "error");
+  } catch (e) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus(formatError(e), "error");
   }
 }
 
@@ -394,7 +355,6 @@ async function openCurrentInput() {
     setStatus("Searching...");
     const results = await invoke<SearchResult[]>("search", { query: value });
     renderSearchResults(results);
-    await refreshMetrics();
     setStatus(`Found ${results.length} search results.`);
   } catch (errorValue) {
     setStatus(formatError(errorValue), "error");
@@ -402,65 +362,83 @@ async function openCurrentInput() {
 }
 
 async function switchTab(id: number) {
+  const epoch = beginPageEpoch();
   try {
-    const snapshot = await invoke<RenderSnapshot>("switch_tab", { id });
-    renderSnapshot(snapshot);
-    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
-  } catch (errorValue) {
-    setStatus(formatError(errorValue), "error");
+    clearSearchResults();
+    const view = await invoke<PageViewModel>("switch_tab", { id });
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+  } catch (e) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus(formatError(e), "error");
   }
 }
 
 async function closeTab(id: number) {
+  const epoch = beginPageEpoch();
   try {
+    clearSearchResults();
     await invoke<TabSummary[]>("close_tab", { id });
-    const snapshot = await invoke<RenderSnapshot>("get_render_snapshot");
-    renderSnapshot(snapshot);
-    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
-  } catch (errorValue) {
-    setStatus(formatError(errorValue), "error");
+    if (!isCurrentPageEpoch(epoch)) return;
+    const view = await invoke<PageViewModel>("get_page_view");
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+  } catch (e) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus(formatError(e), "error");
   }
 }
 
 async function createTab() {
+  const epoch = beginPageEpoch();
   try {
+    clearSearchResults();
     await invoke<TabSummary>("new_tab");
-    const snapshot = await invoke<RenderSnapshot>("get_render_snapshot");
-    renderSnapshot(snapshot);
-    await Promise.all([refreshNavigationState(), refreshTabs(), refreshMetrics()]);
-  } catch (errorValue) {
-    setStatus(formatError(errorValue), "error");
+    if (!isCurrentPageEpoch(epoch)) return;
+    const view = await invoke<PageViewModel>("get_page_view");
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+  } catch (e) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus(formatError(e), "error");
   }
 }
 
-async function loadInitialSnapshot() {
+async function loadInitialPageView() {
+  const epoch = beginPageEpoch();
   try {
-    const snapshot = await invoke<RenderSnapshot>("get_render_snapshot");
-    renderSnapshot(snapshot);
+    await syncViewport(true, epoch);
+    if (!isCurrentPageEpoch(epoch)) return;
+    const view = await invoke<PageViewModel>("get_page_view");
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
   } catch {
-    setStatus("Failed to load initial snapshot.", "error");
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus("Failed to load initial page.", "error");
   }
-
-  renderSearchResults([]);
-  await Promise.all([refreshTabs(), refreshNavigationState(), refreshMetrics()]);
 }
 
 window.addEventListener("DOMContentLoaded", () => {
   urlInputEl = document.querySelector("#url-input");
   statusEl = document.querySelector("#status");
   currentUrlEl = document.querySelector("#current-url");
-  textListEl = document.querySelector("#text-list");
-  snapshotMetaEl = document.querySelector("#snapshot-meta");
-  diagnosticsListEl = document.querySelector("#diagnostics-list");
-  linksListEl = document.querySelector("#links-list");
-  metricsSummaryEl = document.querySelector("#metrics-summary");
-  metricsEventsEl = document.querySelector("#metrics-events");
+  pageTitleEl = document.querySelector("#page-title");
   backButtonEl = document.querySelector("#back-button");
   forwardButtonEl = document.querySelector("#forward-button");
   reloadButtonEl = document.querySelector("#reload-button");
   tabsListEl = document.querySelector("#tabs-list");
   newTabButtonEl = document.querySelector("#new-tab-button");
   searchResultsEl = document.querySelector("#search-results");
+  viewportEl = document.querySelector("#viewport");
+  sceneRootEl = document.querySelector("#scene-root");
 
   document.querySelector("#url-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -483,5 +461,12 @@ window.addEventListener("DOMContentLoaded", () => {
     void createTab();
   });
 
-  void loadInitialSnapshot();
+  if (viewportEl) {
+    resizeObserver = new ResizeObserver(() => {
+      void syncViewport();
+    });
+    resizeObserver.observe(viewportEl);
+  }
+
+  void loadInitialPageView();
 });

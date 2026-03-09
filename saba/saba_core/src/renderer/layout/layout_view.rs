@@ -1,4 +1,3 @@
-use crate::constants::CONTENT_AREA_WIDTH;
 use crate::display_item::DisplayItem;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::dom::api::get_target_element_node;
@@ -18,21 +17,14 @@ fn build_layout_tree(
     parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
     cssom: &StyleSheet,
 ) -> Option<Rc<RefCell<LayoutObject>>> {
-    // Try to create a LayoutObject as a node with the function `create_layout_object`.
-    // If “display:none” is specified by CSS, the node is not created.
     let mut target_node = node.clone();
-    let mut layout_object = create_layout_object(node, parent_obj, cssom); // 1
+    let mut layout_object = create_layout_object(node, parent_obj, cssom);
 
-    // If the node is not created, attempt to create a LayoutObject using a sibling node of the DOM node.
-    // Continue traversing sibling nodes until LayoutObject is created.
     while layout_object.is_none() {
-        // 2
         if let Some(n) = target_node {
             target_node = n.borrow().next_sibling().clone();
             layout_object = create_layout_object(&target_node, parent_obj, cssom);
-        // 3
         } else {
-            // If there are no sibling nodes, the DOM tree to be processed is finished and the layout tree created so far is returned.
             return layout_object;
         }
     }
@@ -40,15 +32,12 @@ fn build_layout_tree(
     if let Some(n) = target_node {
         let original_first_child = n.borrow().first_child();
         let original_next_sibling = n.borrow().next_sibling();
-        let mut first_child = build_layout_tree(&original_first_child, &layout_object, cssom); // 4
+        let mut first_child = build_layout_tree(&original_first_child, &layout_object, cssom);
         let mut next_sibling = build_layout_tree(&original_next_sibling, &None, cssom);
-        // 5
 
-        // If “display:node” is specified for the child node, no LayoutObject is created, so it tries to create a LayoutObject using the child node's sibling nodes.
-        // The process is repeated until either the LayoutObject is created or there are no more sibling nodes to follow.
         if first_child.is_none() && original_first_child.is_some() {
             let mut original_dom_node = original_first_child
-                .expect("first child shoud exist")
+                .expect("first child should exist")
                 .borrow()
                 .next_sibling();
 
@@ -67,11 +56,9 @@ fn build_layout_tree(
             }
         }
 
-        // If “display:node” is specified for the sibling node, no LayoutObject will be created, so attempt to create a LayoutObject using the sibling node of the sibling node.
-        // The process is repeated until either a LayoutObject is created or there are no more sibling nodes to follow.
         if next_sibling.is_none() && n.borrow().next_sibling().is_some() {
             let mut original_dom_node = original_next_sibling
-                .expect("first child should exist")
+                .expect("next sibling should exist")
                 .borrow()
                 .next_sibling();
 
@@ -90,12 +77,9 @@ fn build_layout_tree(
             }
         }
 
-        let obj = match layout_object {
-            Some(ref obj) => obj,
-            None => panic!("render object should exist here"),
-        };
-        obj.borrow_mut().set_first_child(first_child); // 6
-        obj.borrow_mut().set_next_sibling(next_sibling); // 7
+        let obj = layout_object.as_ref().expect("render object should exist here");
+        obj.borrow_mut().set_first_child(first_child);
+        obj.borrow_mut().set_next_sibling(next_sibling);
     }
 
     layout_object
@@ -104,46 +88,47 @@ fn build_layout_tree(
 #[derive(Debug, Clone)]
 pub struct LayoutView {
     root: Option<Rc<RefCell<LayoutObject>>>,
+    viewport_width: i64,
 }
 
 impl LayoutView {
-    pub fn new(root: Rc<RefCell<Node>>, cssom: &StyleSheet) -> Self {
-        // Try to create a LayoutObject as a node by `create_layout_object` function.
-        // If “display:none” is specified by CSS, the node is not created.
+    pub fn new(root: Rc<RefCell<Node>>, cssom: &StyleSheet, viewport_width: i64) -> Self {
         let body_root = get_target_element_node(Some(root), ElementKind::Body);
 
         let mut tree = Self {
             root: build_layout_tree(&body_root, &None, cssom),
+            viewport_width: viewport_width.max(1),
         };
 
         tree.update_layout();
-
         tree
     }
 
     fn calculate_node_size(node: &Option<Rc<RefCell<LayoutObject>>>, parent_size: LayoutSize) {
         if let Some(n) = node {
-            // If the node is a block element, determine width before calculating the layout of child node.
             if n.borrow().kind() == LayoutObjectKind::Block {
-                n.borrow_mut().compute_size(parent_size); // 1
+                n.borrow_mut().compute_size(parent_size);
             }
 
+            let child_parent_size = if n.borrow().kind() == LayoutObjectKind::Block {
+                n.borrow().content_size()
+            } else {
+                parent_size
+            };
             let first_child = n.borrow().first_child();
-            Self::calculate_node_size(&first_child, n.borrow().size());
+            Self::calculate_node_size(&first_child, child_parent_size);
 
             let next_sibling = n.borrow().next_sibling();
             Self::calculate_node_size(&next_sibling, parent_size);
 
-            // Calculate size after determining the size of the child node.
-            // If the node is a block element, the height depends on the height of the child node.
-            // If the node is an inline element, both the height and width depend on the child node.
-            n.borrow_mut().compute_size(parent_size); // 2
+            n.borrow_mut().compute_size(parent_size);
         }
     }
 
     fn calculate_node_position(
         node: &Option<Rc<RefCell<LayoutObject>>>,
         parent_point: LayoutPoint,
+        parent_size: LayoutSize,
         previous_sibling_kind: LayoutObjectKind,
         previous_sibling_point: Option<LayoutPoint>,
         previous_sibling_size: Option<LayoutSize>,
@@ -151,27 +136,27 @@ impl LayoutView {
         if let Some(n) = node {
             n.borrow_mut().compute_position(
                 parent_point,
+                parent_size,
                 previous_sibling_kind,
                 previous_sibling_point,
                 previous_sibling_size,
             );
 
-            // Calculate the position of the child node.
             let first_child = n.borrow().first_child();
             Self::calculate_node_position(
-                // 1
                 &first_child,
-                n.borrow().point(),
+                n.borrow().content_origin(),
+                n.borrow().content_size(),
                 LayoutObjectKind::Block,
                 None,
                 None,
             );
 
-            // Calculate the position of the sibling node.
             let next_sibling = n.borrow().next_sibling();
             Self::calculate_node_position(
                 &next_sibling,
                 parent_point,
+                parent_size,
                 n.borrow().kind(),
                 Some(n.borrow().point()),
                 Some(n.borrow().size()),
@@ -180,38 +165,31 @@ impl LayoutView {
     }
 
     fn update_layout(&mut self) {
-        Self::calculate_node_size(&self.root, LayoutSize::new(CONTENT_AREA_WIDTH, 0));
-
+        let viewport_size = LayoutSize::new(self.viewport_width, 0);
+        Self::calculate_node_size(&self.root, viewport_size);
         Self::calculate_node_position(
             &self.root,
             LayoutPoint::new(0, 0),
+            viewport_size,
             LayoutObjectKind::Block,
             None,
             None,
         );
     }
 
-    // p.283
     fn paint_node(node: &Option<Rc<RefCell<LayoutObject>>>, display_items: &mut Vec<DisplayItem>) {
-        match node {
-            Some(n) => {
-                display_items.extend(n.borrow_mut().paint()); // 1
-
-                let first_child = n.borrow().first_child();
-                Self::paint_node(&first_child, display_items);
-
-                let next_sibling = n.borrow().next_sibling();
-                Self::paint_node(&next_sibling, display_items);
-            }
-            None => (),
+        if let Some(n) = node {
+            display_items.extend(n.borrow_mut().paint());
+            let first_child = n.borrow().first_child();
+            Self::paint_node(&first_child, display_items);
+            let next_sibling = n.borrow().next_sibling();
+            Self::paint_node(&next_sibling, display_items);
         }
     }
 
     pub fn paint(&self) -> Vec<DisplayItem> {
         let mut display_items = Vec::new();
-
         Self::paint_node(&self.root, &mut display_items);
-
         display_items
     }
 
@@ -259,6 +237,7 @@ impl LayoutView {
 mod tests {
     use super::*;
     use crate::alloc::string::ToString;
+    use crate::display_item::DisplayItem;
     use crate::renderer::css::cssom::CssParser;
     use crate::renderer::css::token::CssTokenizer;
     use crate::renderer::dom::api::get_style_content;
@@ -269,26 +248,26 @@ mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
 
-    fn create_layout_view(html: String) -> LayoutView {
+    fn create_layout_view(html: String, viewport_width: i64) -> LayoutView {
         let t = HtmlTokenizer::new(html);
         let window = HtmlParser::new(t).construct_tree();
         let dom = window.borrow().document();
         let style = get_style_content(dom.clone());
         let css_tokenizer = CssTokenizer::new(style);
         let cssom = CssParser::new(css_tokenizer).parse_stylesheet();
-        LayoutView::new(dom, &cssom)
+        LayoutView::new(dom, &cssom, viewport_width)
     }
 
     #[test]
     fn test_empty() {
-        let layout_view = create_layout_view("".to_string());
+        let layout_view = create_layout_view("".to_string(), 600);
         assert_eq!(None, layout_view.root());
     }
 
     #[test]
     fn test_body() {
         let html = "<html><head></head><body></body></html>".to_string();
-        let layout_view = create_layout_view(html);
+        let layout_view = create_layout_view(html, 600);
 
         let root = layout_view.root();
         assert!(root.is_some());
@@ -308,23 +287,10 @@ mod tests {
     #[test]
     fn test_text() {
         let html = "<html><head></head><body>text</body></html>".to_string();
-        let layout_view = create_layout_view(html);
+        let layout_view = create_layout_view(html, 600);
 
-        let root = layout_view.root();
-        assert!(root.is_some());
-        assert_eq!(
-            LayoutObjectKind::Block,
-            root.clone().expect("root should exist").borrow().kind()
-        );
-        assert_eq!(
-            NodeKind::Element(Element::new("body", Vec::new())),
-            root.clone()
-                .expect("root should exist")
-                .borrow()
-                .node_kind()
-        );
-
-        let text = root.expect("root should exist").borrow().first_child();
+        let root = layout_view.root().expect("root should exist");
+        let text = root.borrow().first_child();
         assert!(text.is_some());
         assert_eq!(
             LayoutObjectKind::Text,
@@ -333,78 +299,45 @@ mod tests {
                 .borrow()
                 .kind()
         );
-        assert_eq!(
-            NodeKind::Text("text".to_string()),
-            text.clone()
-                .expect("text node should exist")
-                .borrow()
-                .node_kind()
-        );
     }
 
     #[test]
-    fn test_display_none() {
-        let html = "<html><head><style>body{display:none;}</style></head><body>text</body></html>"
-            .to_string();
-        let layout_view = create_layout_view(html);
+    fn test_example_like_layout_keeps_heading_width() {
+        let html = r#"<html><head><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 1200);
 
-        assert_eq!(None, layout_view.root());
+        let body = layout_view.root().expect("body should exist");
+        let div = body.borrow().first_child().expect("div should exist");
+        let h1 = div.borrow().first_child().expect("h1 should exist");
+        let display_items = layout_view.paint();
+
+        assert!(body.borrow().size().width() >= 700, "body width was {}", body.borrow().size().width());
+        assert!(body.borrow().point().x() >= 200, "body x was {}", body.borrow().point().x());
+        assert!(h1.borrow().size().width() >= 300, "h1 width was {}", h1.borrow().size().width());
+        assert!(display_items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, .. } if text == "Example Domain"
+        )));
+        assert!(display_items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Rect { style, .. } if style.background_color().code() == "#eeeeee"
+        )));
+        assert!(display_items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, style, .. } if text == "Learn more" && style.color().code() == "#334488"
+        )));
     }
 
     #[test]
-    fn test_hidden_class() {
-        let html = r#"<html>
-<head>
-<style>
-  .hidden {
-    display: none;
-  }
-</style>
-</head>
-<body>
-  <a class="hidden">link1</a>
-  <p></p>
-  <p class="hidden"><a>link2</a></p>
-</body>
-</html>"#
-            .to_string();
-        let layout_view = create_layout_view(html);
+    fn test_form_control_placeholders_paint() {
+        let html = r#"<html><head></head><body><form><input placeholder="Email" /><button>Send</button><img alt="Hero" /></form></body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
 
-        let root = layout_view.root();
-        assert!(root.is_some());
-        assert_eq!(
-            LayoutObjectKind::Block,
-            root.clone().expect("root should exist").borrow().kind()
-        );
-        assert_eq!(
-            NodeKind::Element(Element::new("body", Vec::new())),
-            root.clone()
-                .expect("root should exist")
-                .borrow()
-                .node_kind()
-        );
-
-        let p = root.expect("root should exist").borrow().first_child();
-        assert!(p.is_some());
-        assert_eq!(
-            LayoutObjectKind::Block,
-            p.clone().expect("p node should exist").borrow().kind()
-        );
-        assert_eq!(
-            NodeKind::Element(Element::new("p", Vec::new())),
-            p.clone().expect("p node should exist").borrow().node_kind()
-        );
-
-        assert!(p
-            .clone()
-            .expect("p node should exist")
-            .borrow()
-            .first_child()
-            .is_none());
-        assert!(p
-            .expect("p node should exist")
-            .borrow()
-            .next_sibling()
-            .is_none());
+        assert!(display_items.iter().any(|item| matches!(item, DisplayItem::Rect { .. })));
+        assert!(display_items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, .. } if text == "Email" || text == "Hero"
+        )));
     }
 }

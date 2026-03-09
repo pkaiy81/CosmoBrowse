@@ -1,4 +1,4 @@
-use saba_app::{AppService, RenderSnapshot, SabaApp};
+use saba_app::{AppService, PageViewModel, SabaApp};
 use std::env;
 use std::process::ExitCode;
 
@@ -56,8 +56,8 @@ fn required_arg(args: &[String], index: usize, label: &str) -> Result<String, St
 fn open_url(url: &str) -> Result<(), ()> {
     let mut app = SabaApp::default();
     match app.open_url(url) {
-        Ok(snapshot) => {
-            print_snapshot_summary(&snapshot);
+        Ok(view) => {
+            print_page_summary(&view);
             Ok(())
         }
         Err(error) => {
@@ -74,8 +74,8 @@ fn get_snapshot(url: &str) -> Result<(), ()> {
         return Err(());
     }
 
-    let snapshot = app.get_render_snapshot();
-    let json = serde_json::to_string_pretty(&snapshot).expect("snapshot should serialize");
+    let view = app.get_page_view();
+    let json = serde_json::to_string_pretty(&view).expect("page view should serialize");
     println!("{json}");
     Ok(())
 }
@@ -92,21 +92,17 @@ fn show_metrics(url: &str) -> Result<(), ()> {
     Ok(())
 }
 
-fn print_snapshot_summary(snapshot: &RenderSnapshot) {
-    println!("Title: {}", snapshot.title);
-    println!("URL: {}", snapshot.current_url);
-    println!("Text blocks: {}", snapshot.text_blocks.len());
-    println!("Links: {}", snapshot.links.len());
+fn print_page_summary(view: &PageViewModel) {
+    println!("Title: {}", view.title);
+    println!("URL: {}", view.current_url);
+    println!("Scene items: {}", view.scene_items.len());
     println!(
-        "Layout: text_items={}, block_items={}, width={}, height={}",
-        snapshot.layout.text_item_count,
-        snapshot.layout.block_item_count,
-        snapshot.layout.content_width,
-        snapshot.layout.content_height
+        "Content size: width={}, height={}",
+        view.content_size.width, view.content_size.height
     );
 
-    if !snapshot.diagnostics.is_empty() {
-        println!("Diagnostics: {}", snapshot.diagnostics.join(" | "));
+    if !view.diagnostics.is_empty() {
+        println!("Diagnostics: {}", view.diagnostics.join(" | "));
     }
 }
 
