@@ -77,7 +77,9 @@ fn build_layout_tree(
             }
         }
 
-        let obj = layout_object.as_ref().expect("render object should exist here");
+        let obj = layout_object
+            .as_ref()
+            .expect("render object should exist here");
         obj.borrow_mut().set_first_child(first_child);
         obj.borrow_mut().set_next_sibling(next_sibling);
     }
@@ -311,9 +313,21 @@ mod tests {
         let h1 = div.borrow().first_child().expect("h1 should exist");
         let display_items = layout_view.paint();
 
-        assert!(body.borrow().size().width() >= 700, "body width was {}", body.borrow().size().width());
-        assert!(body.borrow().point().x() >= 200, "body x was {}", body.borrow().point().x());
-        assert!(h1.borrow().size().width() >= 300, "h1 width was {}", h1.borrow().size().width());
+        assert!(
+            body.borrow().size().width() >= 700,
+            "body width was {}",
+            body.borrow().size().width()
+        );
+        assert!(
+            body.borrow().point().x() >= 200,
+            "body x was {}",
+            body.borrow().point().x()
+        );
+        assert!(
+            h1.borrow().size().width() >= 300,
+            "h1 width was {}",
+            h1.borrow().size().width()
+        );
         assert!(display_items.iter().any(|item| matches!(
             item,
             DisplayItem::Text { text, .. } if text == "Example Domain"
@@ -321,6 +335,13 @@ mod tests {
         assert!(display_items.iter().any(|item| matches!(
             item,
             DisplayItem::Rect { style, .. } if style.background_color().code() == "#eeeeee"
+        )));
+        assert!(display_items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, style, .. }
+                if text == "Example Domain"
+                    && style.font_family() == "system-ui"
+                    && (style.opacity() - 0.8).abs() < f64::EPSILON
         )));
         assert!(display_items.iter().any(|item| matches!(
             item,
@@ -334,7 +355,9 @@ mod tests {
         let layout_view = create_layout_view(html, 800);
         let display_items = layout_view.paint();
 
-        assert!(display_items.iter().any(|item| matches!(item, DisplayItem::Rect { .. })));
+        assert!(display_items
+            .iter()
+            .any(|item| matches!(item, DisplayItem::Rect { .. })));
         assert!(display_items.iter().any(|item| matches!(
             item,
             DisplayItem::Text { text, .. } if text == "Email" || text == "Hero"
