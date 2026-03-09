@@ -350,6 +350,32 @@ mod tests {
     }
 
     #[test]
+    fn test_spacing_shorthand_and_auto_center_block() {
+        let html = r#"<html><head><style>body{width:400px;margin:10px auto 30px auto;padding:8px 20px}p{margin:0}</style></head><body><p>Spacing</p></body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 1000);
+
+        let body = layout_view.root().expect("body should exist");
+        let paragraph = body.borrow().first_child().expect("paragraph should exist");
+        let text = paragraph.borrow().first_child().expect("text should exist");
+
+        assert_eq!(body.borrow().point().x(), 300);
+        assert_eq!(body.borrow().point().y(), 10);
+        assert_eq!(text.borrow().point().x(), 320);
+        assert_eq!(text.borrow().point().y(), 18);
+    }
+
+    #[test]
+    fn test_spacing_shorthand_supports_left_auto_alignment() {
+        let html = r#"<html><head><style>body{width:400px;margin:10px 25px 30px auto}</style></head><body><p>Spacing</p></body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 1000);
+
+        let body = layout_view.root().expect("body should exist");
+
+        assert_eq!(body.borrow().point().x(), 575);
+        assert_eq!(body.borrow().point().y(), 10);
+    }
+
+    #[test]
     fn test_form_control_placeholders_paint() {
         let html = r#"<html><head></head><body><form><input placeholder="Email" /><button>Send</button><img alt="Hero" /></form></body></html>"#.to_string();
         let layout_view = create_layout_view(html, 800);

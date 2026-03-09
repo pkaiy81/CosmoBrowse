@@ -27,11 +27,15 @@ impl EdgeSize {
     }
 
     pub fn all(value: f64) -> Self {
+        Self::from_values(value, value, value, value)
+    }
+
+    pub fn from_values(top: f64, right: f64, bottom: f64, left: f64) -> Self {
         Self {
-            top: value,
-            right: value,
-            bottom: value,
-            left: value,
+            top,
+            right,
+            bottom,
+            left,
         }
     }
 
@@ -49,6 +53,10 @@ impl EdgeSize {
 
     pub fn left(&self) -> f64 {
         self.left
+    }
+
+    pub fn right(&self) -> f64 {
+        self.right
     }
 
     pub fn bottom(&self) -> f64 {
@@ -69,7 +77,8 @@ pub struct ComputedStyle {
     height_ratio: Option<f64>,
     width: Option<f64>,
     width_ratio: Option<f64>,
-    margin_horizontal_auto: bool,
+    margin_left_auto: bool,
+    margin_right_auto: bool,
     margin: Option<EdgeSize>,
     padding: Option<EdgeSize>,
 }
@@ -88,11 +97,13 @@ impl ComputedStyle {
             height_ratio: None,
             width: None,
             width_ratio: None,
-            margin_horizontal_auto: false,
+            margin_left_auto: false,
+            margin_right_auto: false,
             margin: None,
             padding: None,
         }
     }
+
     pub fn defaulting(&mut self, node: &Rc<RefCell<Node>>, parent_style: Option<ComputedStyle>) {
         if let Some(parent_style) = parent_style {
             if self.background_color.is_none() && parent_style.background_color() != Color::white()
@@ -209,6 +220,9 @@ impl ComputedStyle {
             .expect("failed to access CSS property: font-size")
     }
 
+    pub fn font_size_or_default(&self) -> FontSize {
+        self.font_size.unwrap_or(FontSize::Medium)
+    }
     pub fn set_text_decoration(&mut self, text_decoration: TextDecoration) {
         self.text_decoration = Some(text_decoration);
     }
@@ -267,12 +281,28 @@ impl ComputedStyle {
         self.margin = Some(EdgeSize::all(value));
     }
 
-    pub fn set_margin_horizontal_auto(&mut self, enabled: bool) {
-        self.margin_horizontal_auto = enabled;
+    pub fn set_margin(&mut self, margin: EdgeSize) {
+        self.margin = Some(margin);
+    }
+
+    pub fn set_margin_left_auto(&mut self, enabled: bool) {
+        self.margin_left_auto = enabled;
+    }
+
+    pub fn set_margin_right_auto(&mut self, enabled: bool) {
+        self.margin_right_auto = enabled;
+    }
+
+    pub fn margin_left_auto(&self) -> bool {
+        self.margin_left_auto
+    }
+
+    pub fn margin_right_auto(&self) -> bool {
+        self.margin_right_auto
     }
 
     pub fn margin_horizontal_auto(&self) -> bool {
-        self.margin_horizontal_auto
+        self.margin_left_auto && self.margin_right_auto
     }
 
     pub fn margin(&self) -> EdgeSize {
@@ -281,6 +311,10 @@ impl ComputedStyle {
 
     pub fn set_padding_all(&mut self, value: f64) {
         self.padding = Some(EdgeSize::all(value));
+    }
+
+    pub fn set_padding(&mut self, padding: EdgeSize) {
+        self.padding = Some(padding);
     }
 
     pub fn padding(&self) -> EdgeSize {

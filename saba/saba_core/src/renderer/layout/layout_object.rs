@@ -54,6 +54,46 @@ fn first_font_family(value: &[ComponentValue]) -> Option<String> {
         _ => None,
     })
 }
+fn spacing_component_to_px(component: &ComponentValue, base_font_size: FontSize) -> Option<f64> {
+    match component {
+        ComponentValue::Number(value) => Some(*value),
+        ComponentValue::Dimension(value, unit) => length_to_px(*value, unit, base_font_size),
+        _ => None,
+    }
+}
+
+fn parse_spacing_shorthand(
+    value: &[ComponentValue],
+    base_font_size: FontSize,
+) -> Option<(f64, f64, f64, f64)> {
+    let components = value
+        .iter()
+        .filter_map(|component| spacing_component_to_px(component, base_font_size))
+        .collect::<Vec<_>>();
+
+    match components.as_slice() {
+        [all] => Some((*all, *all, *all, *all)),
+        [vertical, horizontal] => Some((*vertical, *horizontal, *vertical, *horizontal)),
+        [top, horizontal, bottom] => Some((*top, *horizontal, *bottom, *horizontal)),
+        [top, right, bottom, left] => Some((*top, *right, *bottom, *left)),
+        _ => None,
+    }
+}
+
+fn parse_margin_auto_flags(value: &[ComponentValue]) -> (bool, bool) {
+    let flags = value
+        .iter()
+        .map(|component| matches!(component, ComponentValue::Ident(name) if name == "auto"))
+        .collect::<Vec<_>>();
+
+    match flags.as_slice() {
+        [all] => (*all, *all),
+        [_, horizontal] => (*horizontal, *horizontal),
+        [_, horizontal, _] => (*horizontal, *horizontal),
+        [_, right, _, left] => (*left, *right),
+        _ => (false, false),
+    }
+}
 
 fn parse_dimension_attr(value: Option<String>) -> Option<i64> {
     let value = value?;
@@ -444,6 +484,7 @@ impl LayoutObject {
         let mut point = LayoutPoint::new(0, 0);
         let margin = self.style.margin();
         let margin_left = edge_to_i64(margin.left());
+        let margin_right = edge_to_i64(margin.right());
         let margin_top = edge_to_i64(margin.top());
         let margin_bottom = edge_to_i64(margin.bottom());
 
@@ -454,8 +495,12 @@ impl LayoutObject {
                 } else {
                     point.set_y(parent_point.y() + margin_top);
                 }
-                if self.style.margin_horizontal_auto() && parent_size.width() > self.size.width() {
-                    point.set_x(parent_point.x() + (parent_size.width() - self.size.width()) / 2);
+
+                let available_width = parent_size.width() - self.size.width();
+                if self.style.margin_horizontal_auto() && available_width > 0 {
+                    point.set_x(parent_point.x() + available_width / 2);
+                } else if self.style.margin_left_auto() && available_width > margin_right {
+                    point.set_x(parent_point.x() + available_width - margin_right);
                 } else {
                     point.set_x(parent_point.x() + margin_left);
                 }
@@ -560,35 +605,32 @@ impl LayoutObject {
                     _ => {}
                 },
                 "margin" => {
-                    self.style.set_margin_horizontal_auto(false);
-                    match first_value {
-                        Some(ComponentValue::Number(value)) => {
-                            self.style.set_margin_all(*value);
-                        }
-                        Some(ComponentValue::Dimension(value, unit)) => {
-                            if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
-                                self.style.set_margin_all(px);
-                            }
-                        }
-                        _ => {}
-                    }
-                    if declaration.value.len() >= 2
-                        && matches!(declaration.value.get(1), Some(ComponentValue::Ident(value)) if value == "auto")
+                    let base_font_size = self.style.font_size_or_default();
+                    if let Some((top, right, bottom, left)) =
+                        parse_spacing_shorthand(&declaration.value, base_font_size)
                     {
-                        self.style.set_margin_horizontal_auto(true);
+                        self.style.set_margin(
+                            crate::renderer::layout::computed_style::EdgeSize::from_values(
+                                top, right, bottom, left,
+                            ),
+                        );
+                    }
+                    let (left_auto, right_auto) = parse_margin_auto_flags(&declaration.value);
+                    self.style.set_margin_left_auto(left_auto);
+                    self.style.set_margin_right_auto(right_auto);
+                }
+                "padding" => {
+                    let base_font_size = self.style.font_size_or_default();
+                    if let Some((top, right, bottom, left)) =
+                        parse_spacing_shorthand(&declaration.value, base_font_size)
+                    {
+                        self.style.set_padding(
+                            crate::renderer::layout::computed_style::EdgeSize::from_values(
+                                top, right, bottom, left,
+                            ),
+                        );
                     }
                 }
-                "padding" => match first_value {
-                    Some(ComponentValue::Number(value)) => {
-                        self.style.set_padding_all(*value);
-                    }
-                    Some(ComponentValue::Dimension(value, unit)) => {
-                        if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
-                            self.style.set_padding_all(px);
-                        }
-                    }
-                    _ => {}
-                },
                 "opacity" => {
                     if let Some(ComponentValue::Number(value)) = first_value {
                         self.style.set_opacity(*value);
