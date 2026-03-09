@@ -61,30 +61,6 @@ type AppError = {
   retryable: boolean;
 };
 
-type ErrorMetric = {
-  code: string;
-  count: number;
-};
-
-type NavigationEvent = {
-  command: string;
-  url: string | null;
-  duration_ms: number;
-  success: boolean;
-  error_code: string | null;
-  recorded_at_ms: number;
-};
-
-type AppMetricsSnapshot = {
-  total_navigations: number;
-  successful_navigations: number;
-  failed_navigations: number;
-  average_duration_ms: number;
-  last_duration_ms: number | null;
-  error_counts: ErrorMetric[];
-  recent_events: NavigationEvent[];
-};
-
 let urlInputEl: HTMLInputElement | null;
 let statusEl: HTMLElement | null;
 let currentUrlEl: HTMLElement | null;
@@ -170,7 +146,6 @@ function renderSearchResults(results: SearchResult[]) {
   searchResultsEl.classList.toggle("hidden", results.length === 0);
 
   if (results.length === 0) {
-    setTextItems(searchResultsEl, [], "No search results.");
     return;
   }
 
@@ -380,7 +355,6 @@ async function openCurrentInput() {
     setStatus("Searching...");
     const results = await invoke<SearchResult[]>("search", { query: value });
     renderSearchResults(results);
-    await refreshMetrics();
     setStatus(`Found ${results.length} search results.`);
   } catch (errorValue) {
     setStatus(formatError(errorValue), "error");

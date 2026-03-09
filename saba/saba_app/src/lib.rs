@@ -192,19 +192,33 @@ impl Default for SabaApp {
 
 impl AppService for SabaApp {
     fn open_url(&mut self, url: &str) -> AppResult<PageViewModel> {
-        self.active_session_mut()?.open_url(url)
+        self.execute_navigation("open_url", Some(url.to_string()), |session| {
+            session.open_url(url)
+        })
     }
 
     fn reload(&mut self) -> AppResult<PageViewModel> {
-        self.active_session_mut()?.reload()
+        let url = self
+            .active_session()
+            .ok()
+            .and_then(|session| session.current_url());
+        self.execute_navigation("reload", url, BrowserSession::reload)
     }
 
     fn back(&mut self) -> AppResult<PageViewModel> {
-        self.active_session_mut()?.back()
+        let url = self
+            .active_session()
+            .ok()
+            .and_then(|session| session.previous_url());
+        self.execute_navigation("back", url, BrowserSession::back)
     }
 
     fn forward(&mut self) -> AppResult<PageViewModel> {
-        self.active_session_mut()?.forward()
+        let url = self
+            .active_session()
+            .ok()
+            .and_then(|session| session.next_url());
+        self.execute_navigation("forward", url, BrowserSession::forward)
     }
 
     fn get_page_view(&self) -> PageViewModel {
@@ -321,9 +335,9 @@ impl SabaApp {
         command: &str,
         url: Option<String>,
         action: F,
-    ) -> AppResult<RenderSnapshot>
+    ) -> AppResult<PageViewModel>
     where
-        F: FnOnce(&mut BrowserSession) -> AppResult<RenderSnapshot>,
+        F: FnOnce(&mut BrowserSession) -> AppResult<PageViewModel>,
     {
         let start = Instant::now();
         let result = match self.active_session_mut() {
@@ -436,6 +450,22 @@ impl BrowserSession {
         }
     }
 
+    fn current_url(&self) -> Option<String> {
+        self.history.get(self.history_index).cloned()
+    }
+
+    fn previous_url(&self) -> Option<String> {
+        if self.history_index == 0 || self.history.is_empty() {
+            None
+        } else {
+            self.history.get(self.history_index - 1).cloned()
+        }
+    }
+
+    fn next_url(&self) -> Option<String> {
+        self.history.get(self.history_index + 1).cloned()
+    }
+
     fn navigate_to_history_index(&mut self, index: usize) -> AppResult<PageViewModel> {
         let target = self
             .history
@@ -451,6 +481,14 @@ impl BrowserSession {
 
     fn load_url(&mut self, url: &str) -> AppResult<PageViewModel> {
         let response = fetch_http_response(url)?;
+        self.load_http_response(url, response)
+    }
+
+    fn load_http_response(
+        &mut self,
+        url: &str,
+        response: HttpResponse,
+    ) -> AppResult<PageViewModel> {
         let html = response.body();
 
         let mut diagnostics = Vec::new();
@@ -504,6 +542,89 @@ impl BrowserSession {
         self.history.push(url);
         self.history_index = self.history.len() - 1;
     }
+}
+
+#[derive(Debug, Default)]
+struct AppMetrics {
+    total_navigations: u64,
+    successful_navigations: u64,
+    failed_navigations: u64,
+    total_duration_ms: u128,
+    last_duration_ms: Option<u64>,
+    error_counts: BTreeMap<String, u64>,
+    recent_events: Vec<NavigationEvent>,
+}
+
+impl AppMetrics {
+    fn record_navigation(
+        &mut self,
+        command: &str,
+        url: Option<&str>,
+        duration: Duration,
+        result: &AppResult<PageViewModel>,
+    ) {
+        let duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        self.total_navigations += 1;
+        self.total_duration_ms += duration.as_millis();
+        self.last_duration_ms = Some(duration_ms);
+
+        let (success, error_code) = match result {
+            Ok(_) => {
+                self.successful_navigations += 1;
+                (true, None)
+            }
+            Err(error) => {
+                self.failed_navigations += 1;
+                *self.error_counts.entry(error.code.clone()).or_insert(0) += 1;
+                (false, Some(error.code.clone()))
+            }
+        };
+
+        self.recent_events.push(NavigationEvent {
+            command: command.to_string(),
+            url: url.map(str::to_string),
+            duration_ms,
+            success,
+            error_code,
+            recorded_at_ms: unix_timestamp_ms(),
+        });
+
+        if self.recent_events.len() > 20 {
+            self.recent_events.remove(0);
+        }
+    }
+
+    fn snapshot(&self) -> AppMetricsSnapshot {
+        let average_duration_ms = if self.total_navigations == 0 {
+            0
+        } else {
+            (self.total_duration_ms / u128::from(self.total_navigations)) as u64
+        };
+
+        AppMetricsSnapshot {
+            total_navigations: self.total_navigations,
+            successful_navigations: self.successful_navigations,
+            failed_navigations: self.failed_navigations,
+            average_duration_ms,
+            last_duration_ms: self.last_duration_ms,
+            error_counts: self
+                .error_counts
+                .iter()
+                .map(|(code, count)| ErrorMetric {
+                    code: code.clone(),
+                    count: *count,
+                })
+                .collect(),
+            recent_events: self.recent_events.clone(),
+        }
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 fn blank_page_view() -> PageViewModel {
@@ -815,10 +936,12 @@ fn split_url(url: &str) -> AppResult<(String, String, String)> {
 mod tests {
     use super::{
         blank_page_view, build_page_view, build_search_results, normalize_url, resolve_url,
-        AppService, BrowserSession, SabaApp, SceneItem,
+        AppError, AppMetrics, AppResult, AppService, BrowserSession, PageViewModel, SabaApp,
+        SceneItem,
     };
     use saba_core::http::HttpResponse;
     use saba_core::renderer::page::Page;
+    use std::time::Duration;
 
     fn page_from_html(html: &str) -> Page {
         let mut page = Page::new();
@@ -1006,56 +1129,52 @@ mod tests {
     }
 
     #[test]
-    fn render_snapshot_collects_links_and_metadata() {
+    fn load_http_response_builds_page_view() {
         let mut session = BrowserSession::new();
-        let snapshot = session
+        let view = session
             .load_http_response(
                 "http://example.com",
                 html_response(
                     r#"<html><body><h1>Docs</h1><p>Read the <a href="http://example.com/guide">guide</a></p></body></html>"#,
                 ),
             )
-            .expect("snapshot should load");
+            .expect("page view should load");
 
-        assert!(snapshot
-            .text_blocks
+        assert_eq!(view.current_url, "http://example.com");
+        assert!(view
+            .scene_items
             .iter()
-            .any(|line| line.contains("Docs")));
-        assert_eq!(
-            snapshot.links,
-            vec![SnapshotLink {
-                text: "guide".to_string(),
-                href: "http://example.com/guide".to_string(),
-            }]
-        );
-        assert!(snapshot.layout.text_item_count > 0);
-        assert!(snapshot.style.underlined_text_count > 0);
+            .any(|item| matches!(item, SceneItem::Text { text, .. } if text.contains("Docs"))));
+        assert!(view.scene_items.iter().any(|item| matches!(
+            item,
+            SceneItem::Text { href: Some(href), .. } if href == "http://example.com/guide"
+        )));
     }
 
     #[test]
-    fn render_snapshot_reports_missing_text() {
+    fn load_http_response_reports_missing_scene_items() {
         let mut session = BrowserSession::new();
-        let snapshot = session
+        let view = session
             .load_http_response(
                 "http://example.com/hidden",
                 html_response(
                     r#"<html><head><style>p { display: none; }</style></head><body><p>Hidden</p></body></html>"#,
                 ),
             )
-            .expect("snapshot should load");
+            .expect("page view should load");
 
-        assert!(snapshot.text_blocks.is_empty());
+        assert!(view.scene_items.is_empty());
         assert_eq!(
-            snapshot.diagnostics,
-            vec!["No renderable text extracted from page".to_string()]
+            view.diagnostics,
+            vec!["No renderable scene items produced".to_string()]
         );
     }
 
     #[test]
     fn metrics_track_success_and_failure() {
         let mut metrics = AppMetrics::default();
-        let ok: AppResult<super::RenderSnapshot> = Ok(BrowserSession::new().get_render_snapshot());
-        let err: AppResult<super::RenderSnapshot> = Err(AppError::network("boom"));
+        let ok: AppResult<PageViewModel> = Ok(BrowserSession::new().get_page_view());
+        let err: AppResult<PageViewModel> = Err(AppError::network("boom"));
 
         metrics.record_navigation(
             "open_url",

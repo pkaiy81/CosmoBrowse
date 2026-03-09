@@ -1,4 +1,7 @@
-use saba_app::{AppError, AppService, PageViewModel, SabaApp, SearchResult, TabSummary};
+use saba_app::{
+    AppError, AppMetricsSnapshot, AppService, NavigationState, PageViewModel, SabaApp,
+    SearchResult, TabSummary,
+};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -12,9 +15,7 @@ fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<PageViewMo
         .app
         .lock()
         .map_err(|_| AppError::state("Failed to lock app state"))?;
-    let result = action(&app);
-    log_command(command, &result);
-    result
+    app.open_url(&url)
 }
 
 #[tauri::command]
@@ -68,19 +69,29 @@ fn forward(state: tauri::State<'_, AppState>) -> Result<PageViewModel, AppError>
 
 #[tauri::command]
 fn get_navigation_state(state: tauri::State<'_, AppState>) -> Result<NavigationState, AppError> {
-    with_app(state, "get_navigation_state", |app| {
-        Ok(app.get_navigation_state())
-    })
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    Ok(app.get_navigation_state())
 }
 
 #[tauri::command]
 fn get_metrics(state: tauri::State<'_, AppState>) -> Result<AppMetricsSnapshot, AppError> {
-    with_app(state, "get_metrics", |app| Ok(app.get_metrics()))
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    Ok(app.get_metrics())
 }
 
 #[tauri::command]
 fn new_tab(state: tauri::State<'_, AppState>) -> Result<TabSummary, AppError> {
-    with_app_mut(state, "new_tab", |app| Ok(app.new_tab()))
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    Ok(app.new_tab())
 }
 
 #[tauri::command]
@@ -94,17 +105,29 @@ fn switch_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<PageViewMode
 
 #[tauri::command]
 fn close_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<Vec<TabSummary>, AppError> {
-    with_app_mut(state, "close_tab", |app| app.close_tab(id))
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    app.close_tab(id)
 }
 
 #[tauri::command]
 fn list_tabs(state: tauri::State<'_, AppState>) -> Result<Vec<TabSummary>, AppError> {
-    with_app(state, "list_tabs", |app| Ok(app.list_tabs()))
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    Ok(app.list_tabs())
 }
 
 #[tauri::command]
 fn search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, AppError> {
-    with_app(state, "search", |app| app.search(&query))
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
+    app.search(&query)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
