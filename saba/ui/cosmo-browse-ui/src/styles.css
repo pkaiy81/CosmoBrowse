@@ -77,7 +77,33 @@ input {
   margin: 0;
 }
 
-.tabs-list {
+.toolbar input {
+  flex: 1;
+}
+
+.status {
+  padding: 1rem 1.1rem;
+}
+
+.status[data-level="error"] {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.section-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.tabs-panel,
+.stack-section {
+  padding: 1rem 1.1rem;
+}
+
+.tabs-list,
+.stack-list {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -87,11 +113,11 @@ input {
 }
 
 .tab-item {
-  display: flex;
   align-items: center;
   background: #edf3ff;
   border: 1px solid transparent;
   border-radius: 999px;
+  display: flex;
   overflow: hidden;
 }
 
@@ -113,6 +139,7 @@ input {
   max-width: 260px;
   text-overflow: ellipsis;
   overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0.55rem 0.9rem;
 }
@@ -170,6 +197,7 @@ input {
 }
 
 .linklike {
+  border-radius: 0;
   padding: 0;
   color: #2151c4;
   text-decoration: underline;

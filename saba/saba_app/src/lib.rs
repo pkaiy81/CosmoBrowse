@@ -8,6 +8,11 @@ use saba_core::renderer::layout::layout_object::LayoutSize;
 use saba_core::renderer::page::Page;
 use saba_core::url::Url;
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -122,6 +127,33 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ErrorMetric {
+    pub code: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NavigationEvent {
+    pub command: String,
+    pub url: Option<String>,
+    pub duration_ms: u64,
+    pub success: bool,
+    pub error_code: Option<String>,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppMetricsSnapshot {
+    pub total_navigations: u64,
+    pub successful_navigations: u64,
+    pub failed_navigations: u64,
+    pub average_duration_ms: u64,
+    pub last_duration_ms: Option<u64>,
+    pub error_counts: Vec<ErrorMetric>,
+    pub recent_events: Vec<NavigationEvent>,
+}
+
 pub trait AppService {
     fn open_url(&mut self, url: &str) -> AppResult<PageViewModel>;
     fn reload(&mut self) -> AppResult<PageViewModel>;
@@ -130,6 +162,7 @@ pub trait AppService {
     fn get_page_view(&self) -> PageViewModel;
     fn set_viewport(&mut self, width: i64, height: i64) -> AppResult<PageViewModel>;
     fn get_navigation_state(&self) -> NavigationState;
+    fn get_metrics(&self) -> AppMetricsSnapshot;
     fn new_tab(&mut self) -> TabSummary;
     fn switch_tab(&mut self, id: u32) -> AppResult<PageViewModel>;
     fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>>;
@@ -142,6 +175,7 @@ pub struct SabaApp {
     tabs: Vec<Tab>,
     active_tab_id: u32,
     next_tab_id: u32,
+    metrics: AppMetrics,
 }
 
 impl Default for SabaApp {
@@ -151,6 +185,7 @@ impl Default for SabaApp {
             tabs: vec![initial_tab],
             active_tab_id: 1,
             next_tab_id: 2,
+            metrics: AppMetrics::default(),
         }
     }
 }
@@ -186,6 +221,10 @@ impl AppService for SabaApp {
         self.active_session()
             .map(BrowserSession::navigation_state)
             .unwrap_or_else(|_| BrowserSession::new().navigation_state())
+    }
+
+    fn get_metrics(&self) -> AppMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     fn new_tab(&mut self) -> TabSummary {
@@ -275,6 +314,25 @@ impl SabaApp {
                 url: tab.session.navigation_state().current_url,
                 is_active: tab.id == self.active_tab_id,
             })
+    }
+
+    fn execute_navigation<F>(
+        &mut self,
+        command: &str,
+        url: Option<String>,
+        action: F,
+    ) -> AppResult<RenderSnapshot>
+    where
+        F: FnOnce(&mut BrowserSession) -> AppResult<RenderSnapshot>,
+    {
+        let start = Instant::now();
+        let result = match self.active_session_mut() {
+            Ok(session) => action(session),
+            Err(error) => Err(error),
+        };
+        self.metrics
+            .record_navigation(command, url.as_deref(), start.elapsed(), &result);
+        result
     }
 }
 
@@ -374,7 +432,7 @@ impl BrowserSession {
         NavigationState {
             can_back: !self.history.is_empty() && self.history_index > 0,
             can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
-            current_url: self.history.get(self.history_index).cloned(),
+            current_url: self.current_url(),
         }
     }
 
@@ -869,7 +927,7 @@ mod tests {
     }
     #[test]
     fn app_error_display_includes_code_and_message() {
-        let error = super::AppError::state("boom");
+        let error = AppError::state("boom");
         assert_eq!(error.to_string(), "invalid_state: boom");
     }
 
@@ -945,5 +1003,89 @@ mod tests {
     fn search_empty_query_is_validation_error() {
         let err = build_search_results("  ").expect_err("must fail");
         assert_eq!(err.code, "validation_error");
+    }
+
+    #[test]
+    fn render_snapshot_collects_links_and_metadata() {
+        let mut session = BrowserSession::new();
+        let snapshot = session
+            .load_http_response(
+                "http://example.com",
+                html_response(
+                    r#"<html><body><h1>Docs</h1><p>Read the <a href="http://example.com/guide">guide</a></p></body></html>"#,
+                ),
+            )
+            .expect("snapshot should load");
+
+        assert!(snapshot
+            .text_blocks
+            .iter()
+            .any(|line| line.contains("Docs")));
+        assert_eq!(
+            snapshot.links,
+            vec![SnapshotLink {
+                text: "guide".to_string(),
+                href: "http://example.com/guide".to_string(),
+            }]
+        );
+        assert!(snapshot.layout.text_item_count > 0);
+        assert!(snapshot.style.underlined_text_count > 0);
+    }
+
+    #[test]
+    fn render_snapshot_reports_missing_text() {
+        let mut session = BrowserSession::new();
+        let snapshot = session
+            .load_http_response(
+                "http://example.com/hidden",
+                html_response(
+                    r#"<html><head><style>p { display: none; }</style></head><body><p>Hidden</p></body></html>"#,
+                ),
+            )
+            .expect("snapshot should load");
+
+        assert!(snapshot.text_blocks.is_empty());
+        assert_eq!(
+            snapshot.diagnostics,
+            vec!["No renderable text extracted from page".to_string()]
+        );
+    }
+
+    #[test]
+    fn metrics_track_success_and_failure() {
+        let mut metrics = AppMetrics::default();
+        let ok: AppResult<super::RenderSnapshot> = Ok(BrowserSession::new().get_render_snapshot());
+        let err: AppResult<super::RenderSnapshot> = Err(AppError::network("boom"));
+
+        metrics.record_navigation(
+            "open_url",
+            Some("http://example.com"),
+            Duration::from_millis(12),
+            &ok,
+        );
+        metrics.record_navigation(
+            "reload",
+            Some("http://example.com"),
+            Duration::from_millis(4),
+            &err,
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.total_navigations, 2);
+        assert_eq!(snapshot.successful_navigations, 1);
+        assert_eq!(snapshot.failed_navigations, 1);
+        assert_eq!(snapshot.average_duration_ms, 8);
+        assert!(snapshot
+            .error_counts
+            .iter()
+            .any(|metric| metric.code == "network_error" && metric.count == 1));
+        assert_eq!(snapshot.recent_events.len(), 2);
+    }
+
+    fn html_response(body: &str) -> HttpResponse {
+        HttpResponse::new(format!(
+            "HTTP/1.1 200 OK\nContent-Type: text/html\n\n{body}"
+        ))
+        .expect("response should parse")
     }
 }
