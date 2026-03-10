@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl as openExternalUrl } from "@tauri-apps/plugin-opener";
 
 type FrameRect = { x: number; y: number; width: number; height: number };
 type ContentSize = { width: number; height: number };
@@ -257,11 +258,22 @@ function normalizeTargetKeyword(target?: string | null): string | null {
   return normalizedTarget;
 }
 
+// Ref: HTML Living Standard browsing context names and keywords.
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
+async function openExternalNavigation(href: string) {
+  await openExternalUrl(href);
+}
+
 async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
   if (!message.href) return;
   const normalizedTarget = normalizeTargetKeyword(message.target);
   if (message.href.startsWith("mailto:") || normalizedTarget === "_blank") {
-    window.open(message.href, "_blank");
+    try {
+      await openExternalNavigation(message.href);
+      setStatus(`Opened externally: ${message.href}`);
+    } catch (errorValue) {
+      setStatus(formatError(errorValue), "error");
+    }
     return;
   }
 
@@ -405,4 +417,5 @@ window.addEventListener("DOMContentLoaded", () => {
 
   void loadInitialPageView();
 });
+
 

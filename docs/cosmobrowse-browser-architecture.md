@@ -6,13 +6,14 @@
 
 ## Scope
 - URL input, command dispatch, and Tauri bridge.
+- HTTPS deep dive: `docs/https-display-implementation.md`.
 - Rust-side navigation state, history, fetching, decoding, and frame tree construction.
 - Frontend-side frame rendering through `iframe srcdoc`.
 - Frame-targeted navigation and verification tooling.
 
 ## High-Level Architecture
 - Frontend UI: `saba/ui/cosmo-browse-ui/src/main.ts`
-  - Collects user input, calls Tauri commands, renders the returned `PageViewModel`, and listens for embedded navigation messages from `iframe srcdoc` documents.
+  - Collects user input, calls Tauri commands, renders the returned `PageViewModel`, listens for embedded navigation messages from `iframe srcdoc` documents, and delegates `_blank` / `mailto:` links to the host OS through the Tauri opener plugin.
 - Tauri command bridge: `saba/ui/cosmo-browse-ui/src-tauri/src/lib.rs`
   - Exposes `open_url`, `activate_link`, `reload`, `back`, `forward`, `set_viewport`, `get_page_view`, `list_tabs`, `new_tab`, `close_tab`, `search`, and `get_metrics`.
 - Application service and navigation state: `saba/saba_app/src/session.rs`
@@ -141,7 +142,7 @@
   - `find_frame_id_by_name(...)`
 - Behavior:
   - The frontend receives the `postMessage(...)` payload from the leaf iframe.
-  - `_blank` is opened in a new window by the frontend after ASCII case-insensitive target keyword normalization.
+  - `_blank` and `mailto:` navigations are delegated to the Tauri opener plugin after ASCII case-insensitive target keyword normalization.
   - Other targets go back to Rust through `activate_link`.
   - `_self`, `_parent`, `_top`, and named frame targets are resolved in the session after ASCII case-insensitive target keyword normalization for keyword targets.
   - The session rebuilds the page using stored frame URL overrides so only the destination frame changes.
@@ -180,6 +181,8 @@
   - `cargo run -p adapter_cli --offline -- get-snapshot <url>`
   - `cargo run -p adapter_cli --offline -- activate-link <url> <frame-id> <href> [target]`
   - `cargo run -p adapter_cli --offline -- metrics <url>`
+- Portable distribution script:
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\build-cosmobrowse-portable.ps1`
 - Current regression tests:
   - `saba/saba_app/src/loader.rs`
   - `saba/saba_app/src/session.rs`
