@@ -141,9 +141,9 @@
   - `find_frame_id_by_name(...)`
 - Behavior:
   - The frontend receives the `postMessage(...)` payload from the leaf iframe.
-  - `_blank` is opened in a new window by the frontend.
+  - `_blank` is opened in a new window by the frontend after ASCII case-insensitive target keyword normalization.
   - Other targets go back to Rust through `activate_link`.
-  - `_self`, `_parent`, `_top`, and named frame targets are resolved in the session.
+  - `_self`, `_parent`, `_top`, and named frame targets are resolved in the session after ASCII case-insensitive target keyword normalization for keyword targets.
   - The session rebuilds the page using stored frame URL overrides so only the destination frame changes.
 
 ### 10. History and viewport changes re-render the current page
@@ -188,6 +188,7 @@
 - Leaf document layout is delegated to the WebView engine instead of the legacy Rust layout engine.
 - History stores complete page snapshots instead of diff-based updates.
 - Link interception currently handles click-based anchor navigation, not arbitrary JavaScript-driven navigation.
+- Target keyword handling is normalized for legacy uppercase / padded `_blank`, `_self`, `_parent`, and `_top` values, but arbitrary named targets remain case-sensitive.
 - Page-level diagnostics are aggregated from all frames and deduplicated in first-seen order.
 
 ## Files That Commonly Need Joint Updates

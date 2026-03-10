@@ -247,14 +247,21 @@ impl BrowserSession {
         let current = self
             .current_page()
             .ok_or_else(|| AppError::state("No page loaded"))?;
-        if target == Some("_top") || current.root_frame.child_frames.is_empty() {
+        let normalized_target = normalize_target_keyword(target);
+        if normalized_target.as_deref() == Some("_top")
+            || current.root_frame.child_frames.is_empty()
+        {
             let view = self.load_page(&normalized_href, None)?;
             self.push_history(view.clone());
             return Ok(view);
         }
         let mut overrides = snapshot_frame_urls(&current.root_frame);
-        let destination = resolve_destination_frame_id(&current.root_frame, frame_id, target)
-            .ok_or_else(|| AppError::state("Target frame is unavailable"))?;
+        let destination = resolve_destination_frame_id(
+            &current.root_frame,
+            frame_id,
+            normalized_target.as_deref(),
+        )
+        .ok_or_else(|| AppError::state("Target frame is unavailable"))?;
         overrides.insert(destination, normalized_href);
         let view = self.load_page(&current.current_url, Some(&overrides))?;
         self.push_history(view.clone());
@@ -717,6 +724,22 @@ fn resolve_destination_frame_id(
     }
 }
 
+// Ref: HTML Living Standard browsing context keywords are matched using ASCII case-insensitive
+// comparisons after attribute value processing.
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
+fn normalize_target_keyword(target: Option<&str>) -> Option<String> {
+    let target = target?.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    if target.starts_with('_') {
+        return Some(target.to_ascii_lowercase());
+    }
+
+    Some(target.to_string())
+}
+
 fn parent_frame_id(frame_id: &str) -> Option<String> {
     let (parent, _) = frame_id.rsplit_once('/')?;
     Some(parent.to_string())
@@ -942,6 +965,32 @@ mod tests {
             resolve_destination_frame_id(&root, "root/right/inner", Some("_parent")),
             Some("root/right".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_parent_target_uses_ascii_case_insensitive_keyword() {
+        let root = sample_nested_root_frame();
+        let normalized_target = normalize_target_keyword(Some("  _PARENT  "));
+        assert_eq!(
+            resolve_destination_frame_id(&root, "root/right/inner", normalized_target.as_deref()),
+            Some("root/right".to_string())
+        );
+    }
+
+    #[test]
+    fn activate_link_treats_top_keyword_as_ascii_case_insensitive() {
+        let mut session = BrowserSession::new();
+        let _ = session
+            .open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+
+        let next = session
+            .activate_link("root/left", "fixture://abehiroshi/prof", Some("  _TOP "))
+            .expect("top navigation should reload the root document");
+
+        assert_eq!(next.current_url, "fixture://abehiroshi/prof");
+        assert!(next.root_frame.child_frames.is_empty());
+        assert!(next.root_frame.current_url.ends_with("/prof"));
     }
 
     fn sample_nested_root_frame() -> FrameViewModel {
