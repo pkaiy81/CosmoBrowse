@@ -1,0 +1,14 @@
+C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\deps\serde-79bbd6f462e9c057.d: C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\build\serde-a69cc8b9e40e8f0c\out/private.rs
+
+C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\deps\libserde-79bbd6f462e9c057.rlib: C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\build\serde-a69cc8b9e40e8f0c\out/private.rs
+
+C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\deps\libserde-79bbd6f462e9c057.rmeta: C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\build\serde-a69cc8b9e40e8f0c\out/private.rs
+
+C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\kohei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+C:\Users\kohei\OneDrive\my_learn\rust\CosmoBrowse\saba\target-local\debug\build\serde-a69cc8b9e40e8f0c\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\kohei\\OneDrive\\my_learn\\rust\\CosmoBrowse\\saba\\target-local\\debug\\build\\serde-a69cc8b9e40e8f0c\\out

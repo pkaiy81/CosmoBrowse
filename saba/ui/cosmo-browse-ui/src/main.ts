@@ -1,67 +1,34 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 
-type SceneRect = {
-  kind: "rect";
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  background_color: string;
-  opacity: number;
+type FrameRect = { x: number; y: number; width: number; height: number };
+type ContentSize = { width: number; height: number };
+type FrameViewModel = {
+  id: string;
+  name: string | null;
+  current_url: string;
+  title: string;
+  diagnostics: string[];
+  rect: FrameRect;
+  content_size: ContentSize;
+  html_content: string | null;
+  child_frames: FrameViewModel[];
 };
-
-type SceneText = {
-  kind: "text";
-  x: number;
-  y: number;
-  text: string;
-  color: string;
-  font_px: number;
-  font_family: string;
-  underline: boolean;
-  opacity: number;
-  href: string | null;
-};
-
-type SceneItem = SceneRect | SceneText;
-
-type ContentSize = {
-  width: number;
-  height: number;
-};
-
 type PageViewModel = {
   current_url: string;
   title: string;
   diagnostics: string[];
   content_size: ContentSize;
-  scene_items: SceneItem[];
+  root_frame: FrameViewModel;
 };
-
-type NavigationState = {
-  can_back: boolean;
-  can_forward: boolean;
-  current_url: string | null;
-};
-
-type TabSummary = {
-  id: number;
-  title: string;
-  url: string | null;
-  is_active: boolean;
-};
-
-type SearchResult = {
-  id: number;
-  title: string;
-  url: string;
-  snippet: string;
-};
-
-type AppError = {
-  code: string;
-  message: string;
-  retryable: boolean;
+type NavigationState = { can_back: boolean; can_forward: boolean; current_url: string | null };
+type TabSummary = { id: number; title: string; url: string | null; is_active: boolean };
+type SearchResult = { id: number; title: string; url: string; snippet: string };
+type AppError = { code: string; message: string; retryable: boolean };
+type EmbeddedNavigationMessage = {
+  type: "cosmobrowse:navigate";
+  frameId: string;
+  href: string;
+  target: string;
 };
 
 let urlInputEl: HTMLInputElement | null;
@@ -85,10 +52,6 @@ function beginPageEpoch() {
   return pageEpoch;
 }
 
-function currentPageEpoch() {
-  return pageEpoch;
-}
-
 function isCurrentPageEpoch(epoch: number) {
   return epoch === pageEpoch;
 }
@@ -100,11 +63,7 @@ function setStatus(message: string, level: "info" | "error" = "info") {
 }
 
 function isUrlLikeInput(input: string) {
-  return (
-    input.startsWith("http://") ||
-    input.startsWith("https://") ||
-    (!input.includes(" ") && input.includes("."))
-  );
+  return input.startsWith("http://") || input.startsWith("https://") || input.startsWith("fixture://") || (!input.includes(" ") && input.includes("."));
 }
 
 function setNavButtons(nav: NavigationState) {
@@ -112,28 +71,11 @@ function setNavButtons(nav: NavigationState) {
   if (forwardButtonEl) forwardButtonEl.disabled = !nav.can_forward;
 }
 
-function errorLabelByCode(code: string): string {
-  switch (code) {
-    case "network_error":
-      return "Network error";
-    case "parse_error":
-      return "Parse error";
-    case "validation_error":
-      return "Validation error";
-    case "invalid_state":
-      return "State error";
-    default:
-      return "Error";
-  }
-}
-
-function formatError(e: unknown): string {
-  const error = e as Partial<AppError>;
+function formatError(errorValue: unknown): string {
+  const error = errorValue as Partial<AppError>;
   const code = error.code ?? "unknown_error";
   const message = error.message ?? "Unknown error";
-  const retry = error.retryable ? " (retryable)" : "";
-  const label = errorLabelByCode(code);
-  return `${label} [${code}]: ${message}${retry}`;
+  return `${code}: ${message}`;
 }
 
 function clearSearchResults() {
@@ -144,27 +86,16 @@ function clearSearchResults() {
 
 function renderSearchResults(results: SearchResult[]) {
   if (!searchResultsEl) return;
-
   searchResultsEl.innerHTML = "";
   searchResultsEl.classList.toggle("hidden", results.length === 0);
-
-  if (results.length === 0) {
-    return;
-  }
-
   for (const result of results) {
     const item = document.createElement("li");
     const button = document.createElement("button");
     const detail = document.createElement("small");
-
     button.type = "button";
     button.className = "linklike";
     button.textContent = result.title;
-    button.addEventListener("click", () => {
-      clearSearchResults();
-      openUrl(result.url);
-    });
-
+    button.addEventListener("click", () => void openUrl(result.url));
     detail.textContent = `${result.url} - ${result.snippet}`;
     item.append(button, document.createElement("br"), detail);
     searchResultsEl.appendChild(item);
@@ -173,7 +104,6 @@ function renderSearchResults(results: SearchResult[]) {
 
 function renderTabs(tabs: TabSummary[]) {
   if (!tabsListEl) return;
-
   tabsListEl.innerHTML = "";
   for (const tab of tabs) {
     const item = document.createElement("li");
@@ -183,7 +113,7 @@ function renderTabs(tabs: TabSummary[]) {
     switchButton.type = "button";
     switchButton.className = "tab-switch";
     switchButton.textContent = tab.title || tab.url || "New Tab";
-    switchButton.addEventListener("click", () => switchTab(tab.id));
+    switchButton.addEventListener("click", () => void switchTab(tab.id));
 
     const closeButton = document.createElement("button");
     closeButton.type = "button";
@@ -191,7 +121,7 @@ function renderTabs(tabs: TabSummary[]) {
     closeButton.textContent = "x";
     closeButton.addEventListener("click", (event) => {
       event.stopPropagation();
-      closeTab(tab.id);
+      void closeTab(tab.id);
     });
 
     item.append(switchButton, closeButton);
@@ -199,67 +129,49 @@ function renderTabs(tabs: TabSummary[]) {
   }
 }
 
-function renderScene(sceneItems: SceneItem[], contentSize: ContentSize) {
+function renderFrame(frame: FrameViewModel, host: HTMLElement) {
+  const shell = document.createElement("section");
+  shell.className = frame.child_frames.length > 0 ? "frame-shell frameset-shell" : "frame-shell leaf-shell";
+  shell.style.left = `${frame.rect.x}px`;
+  shell.style.top = `${frame.rect.y}px`;
+  shell.style.width = `${Math.max(frame.rect.width, 1)}px`;
+  shell.style.height = `${Math.max(frame.rect.height, 1)}px`;
+  shell.dataset.frameId = frame.id;
+
+  if (frame.child_frames.length > 0) {
+    const childrenRoot = document.createElement("div");
+    childrenRoot.className = "frame-children";
+    for (const child of frame.child_frames) {
+      renderFrame(child, childrenRoot);
+    }
+    shell.appendChild(childrenRoot);
+  } else {
+    const iframe = document.createElement("iframe");
+    iframe.className = "frame-document";
+    iframe.title = frame.title || frame.current_url;
+    iframe.srcdoc = frame.html_content ?? "<html><body></body></html>";
+    shell.appendChild(iframe);
+  }
+
+  host.appendChild(shell);
+}
+
+function renderFrameTree(view: PageViewModel) {
   if (!sceneRootEl) return;
   sceneRootEl.innerHTML = "";
-  sceneRootEl.style.width = `${Math.max(contentSize.width, 320)}px`;
-  sceneRootEl.style.height = `${Math.max(contentSize.height, 240)}px`;
-
-  for (const item of sceneItems) {
-    if (item.kind === "rect") {
-      const rect = document.createElement("div");
-      rect.className = "scene-rect";
-      rect.style.left = `${item.x}px`;
-      rect.style.top = `${item.y}px`;
-      rect.style.width = `${item.width}px`;
-      rect.style.height = `${item.height}px`;
-      rect.style.backgroundColor = item.background_color;
-      rect.style.opacity = `${item.opacity}`;
-      sceneRootEl.appendChild(rect);
-      continue;
-    }
-
-    const textNode = document.createElement(item.href ? "button" : "div");
-    textNode.className = item.href ? "scene-link" : "scene-text";
-    textNode.textContent = item.text;
-    textNode.style.left = `${item.x}px`;
-    textNode.style.top = `${item.y}px`;
-    textNode.style.color = item.color;
-    textNode.style.fontSize = `${item.font_px}px`;
-    textNode.style.fontFamily = item.font_family;
-    textNode.style.textDecoration = item.underline ? "underline" : "none";
-    textNode.style.opacity = `${item.opacity}`;
-
-    if (item.href) {
-      (textNode as HTMLButtonElement).type = "button";
-      textNode.addEventListener("click", () => openUrl(item.href ?? ""));
-    }
-
-    sceneRootEl.appendChild(textNode);
-  }
+  sceneRootEl.style.width = `${Math.max(view.content_size.width, 320)}px`;
+  sceneRootEl.style.height = `${Math.max(view.content_size.height, 240)}px`;
+  renderFrame(view.root_frame, sceneRootEl);
 }
 
 function renderPageView(view: PageViewModel) {
-  if (currentUrlEl) {
-    currentUrlEl.textContent = view.current_url ? `URL: ${view.current_url}` : "URL: (none)";
-  }
-
-  if (pageTitleEl) {
-    pageTitleEl.textContent = view.title || "New Tab";
-  }
-
+  if (currentUrlEl) currentUrlEl.textContent = view.current_url ? `URL: ${view.current_url}` : "URL: (none)";
+  if (pageTitleEl) pageTitleEl.textContent = view.title || "New Tab";
+  if (urlInputEl && view.current_url) urlInputEl.value = view.current_url;
   document.title = view.title ? `${view.title} - CosmoBrowse` : "CosmoBrowse";
-
-  if (urlInputEl && view.current_url) {
-    urlInputEl.value = view.current_url;
-  }
-
-  renderScene(view.scene_items, view.content_size);
-
+  renderFrameTree(view);
   const diagnostics = view.diagnostics.filter((entry) => entry.trim().length > 0);
-  if (diagnostics.length > 0) {
-    setStatus(diagnostics.join(" | "));
-  }
+  setStatus(diagnostics.length > 0 ? diagnostics.join(" | ") : "Done.");
 }
 
 async function refreshTabs() {
@@ -277,17 +189,13 @@ async function refreshNavigationState() {
   }
 }
 
-async function syncViewport(force = false, epoch = currentPageEpoch()) {
+async function syncViewport(force = false, epoch = pageEpoch) {
   if (!viewportEl) return;
-
   const width = Math.floor(viewportEl.clientWidth - 32);
   const height = Math.floor(viewportEl.clientHeight - 32);
   if (width <= 0 || height <= 0) return;
 
-  if (!force && resizeTimer) {
-    window.clearTimeout(resizeTimer);
-  }
-
+  if (!force && resizeTimer) window.clearTimeout(resizeTimer);
   const run = async () => {
     try {
       const view = await invoke<PageViewModel>("set_viewport", { width, height });
@@ -296,7 +204,7 @@ async function syncViewport(force = false, epoch = currentPageEpoch()) {
       await refreshNavigationState();
       await refreshTabs();
     } catch {
-      // Ignore transient resize errors while the app initializes.
+      // Ignore transient resize failures during startup.
     }
   };
 
@@ -317,11 +225,9 @@ async function executeNavigationCommand(command: string, loadingMessage: string)
     renderPageView(view);
     await refreshNavigationState();
     await refreshTabs();
+  } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus("Done.");
-  } catch (e) {
-    if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(e), "error");
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -335,17 +241,39 @@ async function openUrl(url: string) {
     renderPageView(view);
     await refreshNavigationState();
     await refreshTabs();
+  } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus("Done.");
-  } catch (e) {
+    setStatus(formatError(errorValue), "error");
+  }
+}
+
+async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
+  if (!message.href) return;
+  if (message.href.startsWith("mailto:") || message.target === "_blank") {
+    window.open(message.href, "_blank");
+    return;
+  }
+
+  const epoch = beginPageEpoch();
+  try {
+    setStatus("Navigating...");
+    const view = await invoke<PageViewModel>("activate_link", {
+      frameId: message.frameId,
+      href: message.href,
+      target: message.target || null,
+    });
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(e), "error");
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+  } catch (errorValue) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    setStatus(formatError(errorValue), "error");
   }
 }
 
 async function openCurrentInput() {
   if (!urlInputEl) return;
-
   const value = urlInputEl.value.trim();
   if (!value) {
     setStatus("Please enter a URL or search query.", "error");
@@ -358,7 +286,6 @@ async function openCurrentInput() {
   }
 
   try {
-    setStatus("Searching...");
     const results = await invoke<SearchResult[]>("search", { query: value });
     renderSearchResults(results);
     setStatus(`Found ${results.length} search results.`);
@@ -376,9 +303,9 @@ async function switchTab(id: number) {
     renderPageView(view);
     await refreshNavigationState();
     await refreshTabs();
-  } catch (e) {
+  } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(e), "error");
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -393,9 +320,9 @@ async function closeTab(id: number) {
     renderPageView(view);
     await refreshNavigationState();
     await refreshTabs();
-  } catch (e) {
+  } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(e), "error");
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -410,9 +337,9 @@ async function createTab() {
     renderPageView(view);
     await refreshNavigationState();
     await refreshTabs();
-  } catch (e) {
+  } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(e), "error");
+    setStatus(formatError(errorValue), "error");
   }
 }
 
@@ -432,6 +359,12 @@ async function loadInitialPageView() {
   }
 }
 
+window.addEventListener("message", (event) => {
+  const data = event.data as EmbeddedNavigationMessage | undefined;
+  if (!data || data.type !== "cosmobrowse:navigate") return;
+  void handleEmbeddedNavigation(data);
+});
+
 window.addEventListener("DOMContentLoaded", () => {
   urlInputEl = document.querySelector("#url-input");
   statusEl = document.querySelector("#status");
@@ -450,29 +383,16 @@ window.addEventListener("DOMContentLoaded", () => {
     event.preventDefault();
     void openCurrentInput();
   });
-
-  backButtonEl?.addEventListener("click", () => {
-    void executeNavigationCommand("back", "Going back...");
-  });
-
-  forwardButtonEl?.addEventListener("click", () => {
-    void executeNavigationCommand("forward", "Going forward...");
-  });
-
-  reloadButtonEl?.addEventListener("click", () => {
-    void executeNavigationCommand("reload", "Reloading...");
-  });
-
-  newTabButtonEl?.addEventListener("click", () => {
-    void createTab();
-  });
+  backButtonEl?.addEventListener("click", () => void executeNavigationCommand("back", "Going back..."));
+  forwardButtonEl?.addEventListener("click", () => void executeNavigationCommand("forward", "Going forward..."));
+  reloadButtonEl?.addEventListener("click", () => void executeNavigationCommand("reload", "Reloading..."));
+  newTabButtonEl?.addEventListener("click", () => void createTab());
 
   if (viewportEl) {
-    resizeObserver = new ResizeObserver(() => {
-      void syncViewport();
-    });
+    resizeObserver = new ResizeObserver(() => void syncViewport());
     resizeObserver.observe(viewportEl);
   }
 
   void loadInitialPageView();
 });
+
