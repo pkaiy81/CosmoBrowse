@@ -12,6 +12,12 @@ fn main() -> ExitCode {
     let result = match parse_command(&args) {
         Ok(Command::OpenUrl(url)) => open_url(&url),
         Ok(Command::GetSnapshot(url)) => get_snapshot(&url),
+        Ok(Command::ActivateLink {
+            url,
+            frame_id,
+            href,
+            target,
+        }) => activate_link(&url, &frame_id, &href, target.as_deref()),
         Ok(Command::Metrics(url)) => show_metrics(&url),
         Ok(Command::Help) => {
             print_usage(&program);
@@ -33,6 +39,12 @@ fn main() -> ExitCode {
 enum Command {
     OpenUrl(String),
     GetSnapshot(String),
+    ActivateLink {
+        url: String,
+        frame_id: String,
+        href: String,
+        target: Option<String>,
+    },
     Metrics(String),
     Help,
 }
@@ -41,6 +53,12 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
     match args.get(1).map(String::as_str) {
         Some("open-url") => Ok(Command::OpenUrl(required_arg(args, 2, "url")?)),
         Some("get-snapshot") => Ok(Command::GetSnapshot(required_arg(args, 2, "url")?)),
+        Some("activate-link") => Ok(Command::ActivateLink {
+            url: required_arg(args, 2, "url")?,
+            frame_id: required_arg(args, 3, "frame-id")?,
+            href: required_arg(args, 4, "href")?,
+            target: optional_arg(args, 5),
+        }),
         Some("metrics") => Ok(Command::Metrics(required_arg(args, 2, "url")?)),
         Some("help") | Some("--help") | Some("-h") | None => Ok(Command::Help),
         Some(command) => Err(format!("Unknown command: {command}")),
@@ -51,6 +69,13 @@ fn required_arg(args: &[String], index: usize, label: &str) -> Result<String, St
     args.get(index)
         .cloned()
         .ok_or_else(|| format!("Missing required argument: {label}"))
+}
+
+fn optional_arg(args: &[String], index: usize) -> Option<String> {
+    args.get(index)
+        .cloned()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn open_url(url: &str) -> Result<(), ()> {
@@ -75,9 +100,27 @@ fn get_snapshot(url: &str) -> Result<(), ()> {
     }
 
     let view = app.get_page_view();
-    let json = serde_json::to_string_pretty(&view).expect("page view should serialize");
-    println!("{json}");
+    print_page_snapshot(&view);
     Ok(())
+}
+
+fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) -> Result<(), ()> {
+    let mut app = SabaApp::default();
+    if let Err(error) = app.open_url(url) {
+        eprintln!("open_url failed [{}]: {}", error.code, error.message);
+        return Err(());
+    }
+
+    match app.activate_link(frame_id, href, target) {
+        Ok(view) => {
+            print_page_snapshot(&view);
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("activate_link failed [{}]: {}", error.code, error.message);
+            Err(())
+        }
+    }
 }
 
 fn show_metrics(url: &str) -> Result<(), ()> {
@@ -106,9 +149,15 @@ fn print_page_summary(view: &PageViewModel) {
     }
 }
 
+fn print_page_snapshot(view: &PageViewModel) {
+    let json = serde_json::to_string_pretty(view).expect("page view should serialize");
+    println!("{json}");
+}
+
 fn print_usage(program: &str) {
     println!("Usage:");
     println!("  {program} open-url <url>");
     println!("  {program} get-snapshot <url>");
+    println!("  {program} activate-link <url> <frame-id> <href> [target]");
     println!("  {program} metrics <url>");
 }
