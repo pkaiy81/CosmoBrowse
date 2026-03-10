@@ -1,4 +1,4 @@
-﻿import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 
 type FrameRect = { x: number; y: number; width: number; height: number };
 type ContentSize = { width: number; height: number };
@@ -247,9 +247,20 @@ async function openUrl(url: string) {
   }
 }
 
+// Ref: HTML Living Standard browsing context keywords are matched using ASCII
+// case-insensitive comparisons after attribute value processing.
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
+function normalizeTargetKeyword(target?: string | null): string | null {
+  const normalizedTarget = target?.trim();
+  if (!normalizedTarget) return null;
+  if (normalizedTarget.startsWith("_")) return normalizedTarget.toLowerCase();
+  return normalizedTarget;
+}
+
 async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
   if (!message.href) return;
-  if (message.href.startsWith("mailto:") || message.target === "_blank") {
+  const normalizedTarget = normalizeTargetKeyword(message.target);
+  if (message.href.startsWith("mailto:") || normalizedTarget === "_blank") {
     window.open(message.href, "_blank");
     return;
   }
@@ -260,7 +271,7 @@ async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
     const view = await invoke<PageViewModel>("activate_link", {
       frameId: message.frameId,
       href: message.href,
-      target: message.target || null,
+      target: normalizedTarget,
     });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
@@ -271,7 +282,6 @@ async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
     setStatus(formatError(errorValue), "error");
   }
 }
-
 async function openCurrentInput() {
   if (!urlInputEl) return;
   const value = urlInputEl.value.trim();
