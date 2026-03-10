@@ -62,6 +62,9 @@ fn spacing_component_to_px(component: &ComponentValue, base_font_size: FontSize)
     }
 }
 
+// Ref: CSS Box Model Level 4, margin and padding shorthands.
+// https://drafts.csswg.org/css-box-4/#margin-shorthand
+// https://drafts.csswg.org/css-box-4/#padding-shorthand
 fn parse_spacing_shorthand(
     value: &[ComponentValue],
     base_font_size: FontSize,
@@ -496,6 +499,8 @@ impl LayoutObject {
                     point.set_y(parent_point.y() + margin_top);
                 }
 
+                // Ref: CSS 2.1 §10.3.3, auto horizontal margins center a block when width is known.
+                // https://www.w3.org/TR/CSS21/visudet.html#blockwidth
                 let available_width = parent_size.width() - self.size.width();
                 if self.style.margin_horizontal_auto() && available_width > 0 {
                     point.set_x(parent_point.x() + available_width / 2);

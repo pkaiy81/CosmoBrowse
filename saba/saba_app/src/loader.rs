@@ -1,4 +1,4 @@
-﻿use crate::model::{AppError, AppResult, FrameRect};
+use crate::model::{AppError, AppResult, FrameRect};
 use encoding_rs::{Encoding, SHIFT_JIS, UTF_8};
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -19,13 +19,20 @@ pub struct LoadedDocument {
 pub struct FramesetSpec {
     pub cols: Option<Vec<TrackSpec>>,
     pub rows: Option<Vec<TrackSpec>>,
-    pub frames: Vec<FrameSpec>,
+    pub children: Vec<FramesetChild>,
+    pub noframes_html: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct FrameSpec {
     pub name: Option<String>,
     pub src: String,
+}
+
+#[derive(Debug)]
+pub enum FramesetChild {
+    Frame(FrameSpec),
+    Frameset(FramesetSpec),
 }
 
 #[derive(Debug, Clone)]
@@ -64,34 +71,13 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     })
 }
 
+// Ref: HTML Standard obsolete frames features and the `in frameset` parsing mode.
+// https://html.spec.whatwg.org/multipage/obsolete.html
+// https://html.spec.whatwg.org/multipage/parsing.html
 pub fn parse_frameset_document(html: &str) -> Option<FramesetSpec> {
-    let captures = frameset_regex().captures(html)?;
-    let attrs = captures.name("attrs")?.as_str();
-    let body = captures.name("body")?.as_str();
-    let attr_map = parse_attrs(attrs);
-    let cols = attr_map.get("cols").map(|value| parse_track_list(value));
-    let rows = attr_map.get("rows").map(|value| parse_track_list(value));
-    let mut frames = Vec::new();
-
-    for captures in frame_regex().captures_iter(body) {
-        let Some(attrs) = captures.name("attrs") else {
-            continue;
-        };
-        let attr_map = parse_attrs(attrs.as_str());
-        let Some(src) = attr_map.get("src").cloned() else {
-            continue;
-        };
-        frames.push(FrameSpec {
-            name: attr_map.get("name").cloned(),
-            src,
-        });
-    }
-
-    if frames.is_empty() {
-        return None;
-    }
-
-    Some(FramesetSpec { cols, rows, frames })
+    let opening = frameset_open_regex().find(html)?;
+    let (frameset, _) = parse_frameset_at(html, opening.start())?;
+    Some(frameset)
 }
 
 impl FramesetSpec {
@@ -190,6 +176,9 @@ pub fn extract_title(html: &str) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
+// Ref: HTML Living Standard, the document base URL and the `iframe srcdoc` document model.
+// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
+// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc
 pub fn prepare_html_for_display(html: &str, base_url: &str, frame_id: &str) -> String {
     let base_tag = format!("<base href=\"{}\">", escape_html_attr(base_url));
     let navigation_script = format!(
@@ -198,10 +187,20 @@ pub fn prepare_html_for_display(html: &str, base_url: &str, frame_id: &str) -> S
     );
     let payload = format!("{base_tag}{navigation_script}");
 
-    if let Some(index) = html.to_lowercase().find("</head>") {
+    if let Some(index) = find_head_close_index(html) {
         let mut output = String::with_capacity(html.len() + payload.len());
         output.push_str(&html[..index]);
         output.push_str(&payload);
+        output.push_str(&html[index..]);
+        return output;
+    }
+
+    if let Some(index) = find_html_open_end_index(html) {
+        let mut output = String::with_capacity(html.len() + payload.len() + "<head></head>".len());
+        output.push_str(&html[..index]);
+        output.push_str("<head>");
+        output.push_str(&payload);
+        output.push_str("</head>");
         output.push_str(&html[index..]);
         return output;
     }
@@ -234,6 +233,26 @@ pub fn load_fixture_document(url: &str) -> Option<LoadedDocument> {
             "fixture://abehiroshi/prof".to_string(),
             include_str!("../../testdata/abehiroshi/prof/prof.htm").to_string(),
         ),
+        "fixture://legacy_frames/nested" => (
+            "fixture://legacy_frames/nested".to_string(),
+            include_str!("../../testdata/legacy_frames/nested.htm").to_string(),
+        ),
+        "fixture://legacy_frames/menu" | "fixture://legacy_frames/menu.htm" => (
+            "fixture://legacy_frames/menu".to_string(),
+            include_str!("../../testdata/legacy_frames/menu.htm").to_string(),
+        ),
+        "fixture://legacy_frames/top" | "fixture://legacy_frames/top.htm" => (
+            "fixture://legacy_frames/top".to_string(),
+            include_str!("../../testdata/legacy_frames/top.htm").to_string(),
+        ),
+        "fixture://legacy_frames/prof" | "fixture://legacy_frames/prof.htm" => (
+            "fixture://legacy_frames/prof".to_string(),
+            include_str!("../../testdata/legacy_frames/prof.htm").to_string(),
+        ),
+        "fixture://legacy_frames/noframes" => (
+            "fixture://legacy_frames/noframes".to_string(),
+            include_str!("../../testdata/legacy_frames/noframes.htm").to_string(),
+        ),
         _ => return None,
     };
 
@@ -254,13 +273,10 @@ fn classify_request_error(error: reqwest::Error) -> AppError {
 }
 
 fn extract_charset_from_content_type(content_type: &str) -> Option<String> {
-    content_type
-        .split(';')
-        .map(str::trim)
-        .find_map(|part| {
-            part.strip_prefix("charset=")
-                .map(|value| value.trim_matches('"').trim().to_string())
-        })
+    content_type.split(';').map(str::trim).find_map(|part| {
+        part.strip_prefix("charset=")
+            .map(|value| value.trim_matches('"').trim().to_string())
+    })
 }
 
 fn sniff_charset_from_html(bytes: &[u8]) -> Option<String> {
@@ -304,6 +320,80 @@ fn parse_track_list(value: &str) -> Vec<TrackSpec> {
             trimmed.parse::<f64>().ok().map(TrackSpec::Raw)
         })
         .collect()
+}
+
+fn parse_frameset_at(html: &str, start_index: usize) -> Option<(FramesetSpec, usize)> {
+    let remaining = &html[start_index..];
+    let opening = frameset_open_regex().find(remaining)?;
+    if opening.start() != 0 {
+        return None;
+    }
+
+    let opening_html = &remaining[..opening.end()];
+    let attrs = frameset_open_regex()
+        .captures(opening_html)?
+        .name("attrs")?
+        .as_str();
+    let attr_map = parse_attrs(attrs);
+    let cols = attr_map.get("cols").map(|value| parse_track_list(value));
+    let rows = attr_map.get("rows").map(|value| parse_track_list(value));
+    let mut children = Vec::new();
+    let mut noframes_html = None;
+    let mut cursor = start_index + opening.end();
+
+    while cursor < html.len() {
+        let segment = &html[cursor..];
+        let captures = frameset_token_regex().captures(segment)?;
+        let matched = captures.get(0)?;
+        cursor += matched.start();
+        let is_closing = captures.name("closing").is_some();
+        let tag = captures.name("tag")?.as_str().to_ascii_lowercase();
+
+        match (is_closing, tag.as_str()) {
+            (true, "frameset") => {
+                cursor += matched.as_str().len();
+                return Some((
+                    FramesetSpec {
+                        cols,
+                        rows,
+                        children,
+                        noframes_html,
+                    },
+                    cursor,
+                ));
+            }
+            (false, "frame") => {
+                let attr_map = parse_attrs(captures.name("attrs")?.as_str());
+                if let Some(src) = attr_map.get("src").cloned() {
+                    children.push(FramesetChild::Frame(FrameSpec {
+                        name: attr_map.get("name").cloned(),
+                        src,
+                    }));
+                }
+                cursor += matched.as_str().len();
+            }
+            (false, "frameset") => {
+                let (nested, next_cursor) = parse_frameset_at(html, cursor)?;
+                children.push(FramesetChild::Frameset(nested));
+                cursor = next_cursor;
+            }
+            (false, "noframes") => {
+                let start = cursor + matched.as_str().len();
+                let closing = noframes_close_regex().find(&html[start..])?;
+                let end = start + closing.start();
+                let fallback = html[start..end].trim();
+                if !fallback.is_empty() {
+                    noframes_html = Some(fallback.to_string());
+                }
+                cursor = start + closing.end();
+            }
+            _ => {
+                cursor += matched.as_str().len();
+            }
+        }
+    }
+
+    None
 }
 
 fn resolve_tracks(specs: &[TrackSpec], total: i64) -> Vec<i64> {
@@ -396,30 +486,34 @@ fn escape_js_string(input: &str) -> String {
 fn title_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?is)<title[^>]*>(?P<title>.*?)</title>")
-            .expect("valid title regex")
+        Regex::new(r"(?is)<title[^>]*>(?P<title>.*?)</title>").expect("valid title regex")
     })
 }
 
-fn frameset_regex() -> &'static Regex {
+fn frameset_open_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?is)<frameset\b(?P<attrs>[^>]*)>(?P<body>.*?)</frameset>")
-            .expect("valid frameset regex")
+        Regex::new(r"(?is)<frameset\b(?P<attrs>[^>]*)>").expect("valid frameset opening regex")
     })
 }
 
-fn frame_regex() -> &'static Regex {
+fn frameset_token_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?is)<frame\b(?P<attrs>[^>]*)>").expect("valid frame regex")
+        Regex::new(r"(?is)<(?P<closing>/)?(?P<tag>frameset|frame|noframes)\b(?P<attrs>[^>]*)>")
+            .expect("valid frameset token regex")
     })
+}
+
+fn noframes_close_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)</noframes\s*>").expect("valid noframes closing regex"))
 }
 
 fn attr_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?is)(?P<name>[a-z_:][-a-z0-9_:.]*)\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))"#)
+        Regex::new(r#"(?is)(?P<name>[a-z_:][-a-z0-9_:.]*)\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))"#)
             .expect("valid attr regex")
     })
 }
@@ -429,4 +523,83 @@ fn tag_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid tag regex"))
 }
 
+fn head_close_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)</head\s*>").expect("valid head closing regex"))
+}
 
+fn html_open_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<html\b[^>]*>").expect("valid html opening regex"))
+}
+
+fn find_head_close_index(html: &str) -> Option<usize> {
+    head_close_regex().find(html).map(|matched| matched.start())
+}
+
+fn find_html_open_end_index(html: &str) -> Option<usize> {
+    html_open_regex().find(html).map(|matched| matched.end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_frameset_document, prepare_html_for_display, FrameSpec, FramesetChild};
+
+    #[test]
+    fn prepare_html_for_display_injects_before_case_insensitive_head_close() {
+        let html = "<html><HEAD><title>Example</title></HEAD><body><a href=\"next.html\">Next</a></body></html>";
+        let prepared =
+            prepare_html_for_display(html, "https://example.com/root/index.html", "root/right");
+
+        assert!(prepared.contains("<base href=\"https://example.com/root/index.html\">"));
+        assert!(prepared.contains("frameId:'root/right'"));
+        assert!(prepared.contains("</HEAD>"));
+        assert!(
+            prepared.find("<base href=").expect("base tag should exist")
+                < prepared.find("</HEAD>").expect("closing HEAD should exist")
+        );
+    }
+
+    #[test]
+    fn prepare_html_for_display_creates_head_inside_html_when_missing() {
+        let html = "<html><body>Example</body></html>";
+        let prepared =
+            prepare_html_for_display(html, "https://example.com/root/index.html", "root");
+
+        assert!(
+            prepared.starts_with("<html><head><base href=\"https://example.com/root/index.html\">")
+        );
+        assert!(prepared.contains("</head><body>Example</body></html>"));
+    }
+
+    #[test]
+    fn parse_frameset_document_preserves_noframes_fallback() {
+        let html = "<html><frameset cols=\"50,50\"><noframes><body><p>Fallback</p></body></noframes></frameset></html>";
+        let frameset = parse_frameset_document(html).expect("frameset should parse");
+
+        assert_eq!(frameset.children.len(), 0);
+        assert_eq!(
+            frameset.noframes_html.as_deref(),
+            Some("<body><p>Fallback</p></body>")
+        );
+    }
+
+    #[test]
+    fn parse_frameset_document_supports_nested_framesets() {
+        let html = "<html><frameset cols=\"20,80\"><frame src=\"menu.htm\" name=\"left\"><frameset rows=\"40,60\"><frame src=\"top.htm\" name=\"upper\"><frame src=\"prof.htm\" name=\"lower\"></frameset></frameset></html>";
+        let frameset = parse_frameset_document(html).expect("frameset should parse");
+
+        assert_eq!(frameset.children.len(), 2);
+        assert!(matches!(
+            &frameset.children[0],
+            FramesetChild::Frame(FrameSpec {
+                name: Some(name),
+                src
+            }) if name == "left" && src == "menu.htm"
+        ));
+        match &frameset.children[1] {
+            FramesetChild::Frameset(nested) => assert_eq!(nested.children.len(), 2),
+            FramesetChild::Frame(_) => panic!("expected nested frameset child"),
+        }
+    }
+}
