@@ -16,11 +16,15 @@ type FrameViewModel = {
   html_content: string | null;
   child_frames: FrameViewModel[];
 };
+type DomSnapshotEntry = { frame_id: string; document_url: string; html: string };
 type PageViewModel = {
   current_url: string;
   title: string;
   diagnostics: string[];
   content_size: ContentSize;
+  network_log: string[];
+  console_log: string[];
+  dom_snapshot: DomSnapshotEntry[];
   root_frame: FrameViewModel;
 };
 type NavigationState = { can_back: boolean; can_forward: boolean; current_url: string | null };
@@ -46,6 +50,10 @@ let newTabButtonEl: HTMLButtonElement | null;
 let searchResultsEl: HTMLUListElement | null;
 let viewportEl: HTMLElement | null;
 let sceneRootEl: HTMLElement | null;
+let networkLogEl: HTMLElement | null;
+let consoleLogEl: HTMLElement | null;
+let domSnapshotEl: HTMLElement | null;
+let crashReportEl: HTMLElement | null;
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
 let pageEpoch = 0;
@@ -197,12 +205,38 @@ function renderFrameTree(view: PageViewModel) {
   renderFrame(view.root_frame, sceneRootEl);
 }
 
+
+function renderDiagnostics(view: PageViewModel) {
+  if (networkLogEl) networkLogEl.textContent = view.network_log.length > 0 ? view.network_log.join("\n") : "(no network diagnostics)";
+  if (consoleLogEl) consoleLogEl.textContent = view.console_log.length > 0 ? view.console_log.join("\n") : "(no console diagnostics)";
+  if (domSnapshotEl) {
+    domSnapshotEl.textContent = view.dom_snapshot.length > 0
+      ? view.dom_snapshot
+          .map((entry) => `# ${entry.frame_id} (${entry.document_url})\n${entry.html}`)
+          .join("\n\n")
+      : "(no DOM snapshots)";
+  }
+}
+
+async function refreshCrashReport() {
+  try {
+    const report = await invoke<{ path: string; reason: string; crashed_at_ms: number; reproduction: string[] } | null>("get_latest_crash_report");
+    if (!crashReportEl) return;
+    crashReportEl.textContent = report
+      ? `Crash report: ${report.reason} @ ${new Date(report.crashed_at_ms).toISOString()} (${report.path})`
+      : "Crash report: none";
+  } catch {
+    if (crashReportEl) crashReportEl.textContent = "Crash report: unavailable";
+  }
+}
+
 function renderPageView(view: PageViewModel) {
   if (currentUrlEl) currentUrlEl.textContent = view.current_url ? `URL: ${view.current_url}` : "URL: (none)";
   if (pageTitleEl) pageTitleEl.textContent = view.title || "New Tab";
   if (urlInputEl && view.current_url) urlInputEl.value = view.current_url;
   document.title = view.title ? `${view.title} - CosmoBrowse` : "CosmoBrowse";
   renderFrameTree(view);
+  renderDiagnostics(view);
   const diagnostics = view.diagnostics.filter((entry) => entry.trim().length > 0);
   setStatus(diagnostics.length > 0 ? diagnostics.join(" | ") : "Done.");
 }
@@ -432,6 +466,10 @@ window.addEventListener("DOMContentLoaded", () => {
   searchResultsEl = document.querySelector("#search-results");
   viewportEl = document.querySelector("#viewport");
   sceneRootEl = document.querySelector("#scene-root");
+  networkLogEl = document.querySelector("#network-log");
+  consoleLogEl = document.querySelector("#console-log");
+  domSnapshotEl = document.querySelector("#dom-snapshot");
+  crashReportEl = document.querySelector("#crash-report");
 
   document.querySelector("#url-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -447,5 +485,6 @@ window.addEventListener("DOMContentLoaded", () => {
     resizeObserver.observe(viewportEl);
   }
 
+  void refreshCrashReport();
   void loadInitialPageView();
 });
