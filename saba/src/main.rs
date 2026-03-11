@@ -10,10 +10,10 @@ use alloc::string::String;
 use core::cell::RefCell;
 use net_wasabi::http::HttpClient;
 use noli::*;
-use saba_core::browser::Browser;
-use saba_core::error::Error;
-use saba_core::http::HttpResponse;
-use saba_core::url::Url;
+use cosmo_core::browser::Browser;
+use cosmo_core::error::Error;
+use cosmo_core::http::HttpResponse;
+use cosmo_core::url::Url;
 use ui_wasabi::app::WasabiUI;
 
 fn handle_url(url: String) -> Result<HttpResponse, Error> {

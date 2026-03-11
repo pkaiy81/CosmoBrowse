@@ -1,4 +1,4 @@
-use saba_app::{AppService, PageViewModel, SabaApp};
+use cosmo_runtime::{AppService, PageViewModel, StarshipApp};
 use std::env;
 use std::process::ExitCode;
 
@@ -79,7 +79,7 @@ fn optional_arg(args: &[String], index: usize) -> Option<String> {
 }
 
 fn open_url(url: &str) -> Result<(), ()> {
-    let mut app = SabaApp::default();
+    let mut app = StarshipApp::default();
     match app.open_url(url) {
         Ok(view) => {
             print_page_summary(&view);
@@ -93,7 +93,7 @@ fn open_url(url: &str) -> Result<(), ()> {
 }
 
 fn get_snapshot(url: &str) -> Result<(), ()> {
-    let mut app = SabaApp::default();
+    let mut app = StarshipApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -105,7 +105,7 @@ fn get_snapshot(url: &str) -> Result<(), ()> {
 }
 
 fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) -> Result<(), ()> {
-    let mut app = SabaApp::default();
+    let mut app = StarshipApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -124,7 +124,7 @@ fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) ->
 }
 
 fn show_metrics(url: &str) -> Result<(), ()> {
-    let mut app = SabaApp::default();
+    let mut app = StarshipApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());

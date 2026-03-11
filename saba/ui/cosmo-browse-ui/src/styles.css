@@ -43,6 +43,21 @@ input { border: 1px solid #c7d2e9; border-radius: 14px; padding: 0.8rem 1rem; ba
 .frameset-shell { border-right: 1px solid #d8deef; border-bottom: 1px solid #d8deef; }
 .frame-children { position: relative; width: 100%; height: 100%; }
 .frame-document { width: 100%; height: 100%; border: none; background: #fff; }
+.frame-scene { width: 100%; height: 100%; background: #fff; }
+.scene-rect { pointer-events: none; }
+.scene-text { white-space: pre; line-height: 1.2; }
+.scene-link,
+.scene-link-image {
+  cursor: pointer;
+}
+.scene-link {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+}
+.scene-image { display: block; width: 100%; height: 100%; object-fit: contain; }
 
 @media (max-width: 840px) {
   .toolbar { grid-template-columns: 1fr; }

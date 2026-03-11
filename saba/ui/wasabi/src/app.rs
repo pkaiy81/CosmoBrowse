@@ -12,18 +12,18 @@ use noli::sys::api::MouseEvent;
 use noli::sys::wasabi::Api;
 use noli::window::StringSize;
 use noli::window::Window;
-use saba_core::browser::Browser;
-use saba_core::constants::WHITE;
-use saba_core::constants::WINDOW_HEIGHT;
-use saba_core::constants::WINDOW_INIT_X_POS;
-use saba_core::constants::WINDOW_INIT_Y_POS;
-use saba_core::constants::WINDOW_WIDTH;
-use saba_core::constants::*;
-use saba_core::display_item::DisplayItem;
-use saba_core::error::Error;
-use saba_core::http::HttpResponse;
-use saba_core::renderer::layout::computed_style::FontSize;
-use saba_core::renderer::layout::computed_style::TextDecoration;
+use cosmo_core::browser::Browser;
+use cosmo_core::constants::WHITE;
+use cosmo_core::constants::WINDOW_HEIGHT;
+use cosmo_core::constants::WINDOW_INIT_X_POS;
+use cosmo_core::constants::WINDOW_INIT_Y_POS;
+use cosmo_core::constants::WINDOW_WIDTH;
+use cosmo_core::constants::*;
+use cosmo_core::display_item::DisplayItem;
+use cosmo_core::error::Error;
+use cosmo_core::http::HttpResponse;
+use cosmo_core::renderer::layout::computed_style::FontSize;
+use cosmo_core::renderer::layout::computed_style::TextDecoration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputMode {

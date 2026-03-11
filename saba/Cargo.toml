@@ -1,4 +1,4 @@
-workspace = { members = [ "adapter_cli", "net/wasabi", "saba_core", "saba_app", "ui/wasabi", "renderer-wasm", "ui/cosmo-browse-ui/src-tauri"] }
+workspace = { members = [ "adapter_cli", "net/wasabi", "saba_core", "saba_app", "cosmo_core", "cosmo_runtime", "ui/wasabi", "renderer-wasm", "ui/cosmo-browse-ui/src-tauri"] }
 
 [package]
 authors = ["pkaiy81"]
@@ -17,7 +17,7 @@ path = "src/main.rs"
 required-features = ["wasabi"]
 
 [dependencies]
-saba_core = { path = "./saba_core" }
+cosmo_core = { path = "./cosmo_core" }
 net_wasabi = { path = "./net/wasabi", optional = true }
 ui_wasabi = { path = "./ui/wasabi", optional = true }
 noli = { git = "https://github.com/hikalium/wasabi.git", branch = "for_saba", optional = true }
