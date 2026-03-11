@@ -1,6 +1,6 @@
 use cosmo_runtime::{
-    AppError, AppMetricsSnapshot, AppService, NavigationState, OrbitSnapshot, SceneItem,
-    SearchResult, StarshipApp, TabSummary,
+    AppError, AppMetricsSnapshot, AppService, GalaxyFrame, NavigationState, OrbitSnapshot,
+    RenderBackendKind, SceneItem, SearchResult, StarshipApp, TabSummary,
 };
 use serde::Serialize;
 use std::backtrace::Backtrace;
@@ -110,8 +110,8 @@ impl From<OrbitSnapshot> for BrowserPageDto {
     }
 }
 
-impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
-    fn from(frame: cosmo_runtime::FrameViewModel) -> Self {
+impl From<GalaxyFrame> for BrowserFrameDto {
+    fn from(frame: GalaxyFrame) -> Self {
         Self {
             id: frame.id,
             name: frame.name,
@@ -125,8 +125,8 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
                 height: frame.rect.height,
             },
             render_backend: match frame.render_backend {
-                cosmo_runtime::RenderBackendKind::WebView => "web_view".to_string(),
-                cosmo_runtime::RenderBackendKind::NativeScene => "native_scene".to_string(),
+                RenderBackendKind::WebView => "web_view".to_string(),
+                RenderBackendKind::NativeScene => "native_scene".to_string(),
             },
             document_url: frame.document_url,
             scene_items: frame.scene_items,
@@ -136,7 +136,7 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
     }
 }
 
-fn collect_dom_snapshots(frame: &cosmo_runtime::FrameViewModel, out: &mut Vec<DomSnapshotEntryDto>) {
+fn collect_dom_snapshots(frame: &GalaxyFrame, out: &mut Vec<DomSnapshotEntryDto>) {
     if let Some(html) = frame.html_content.as_ref() {
         out.push(DomSnapshotEntryDto {
             frame_id: frame.id.clone(),
