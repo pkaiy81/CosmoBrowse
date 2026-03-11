@@ -8,6 +8,7 @@ use crate::model::{
     FrameViewModel, NavigationEvent, NavigationState, PageViewModel, RenderBackendKind,
     ScriptEngine, SearchResult, TabSummary,
 };
+use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -275,6 +276,15 @@ impl BrowserSession {
             return Ok(view);
         }
         let mut overrides = snapshot_frame_urls(&current.root_frame);
+        let source_url = frame_current_url(&current.root_frame, frame_id)
+            .unwrap_or_else(|| current.current_url.clone());
+        enforce_mixed_content_policy(&source_url, &normalized_href)?;
+        if !is_same_origin(&source_url, &normalized_href) {
+            return Err(AppError::validation(format!(
+                "Navigation blocked by same-origin policy: {} -> {}",
+                source_url, normalized_href
+            )));
+        }
         let destination = resolve_destination_frame_id(
             &current.root_frame,
             frame_id,
@@ -616,6 +626,7 @@ fn load_external_frame(
     let child_url = overrides
         .and_then(|map| map.get(frame_id).cloned())
         .unwrap_or(default_url);
+    enforce_mixed_content_policy(base_url, &child_url)?;
     load_frame_recursive(frame_id, spec.name.clone(), &child_url, rect, overrides)
 }
 
@@ -635,8 +646,10 @@ fn build_leaf_frame_view(
     rect: FrameRect,
     html: &str,
 ) -> FrameViewModel {
-    let prepared_html = prepare_html_for_display(html, current_url, frame_id);
+    let (csp_html, csp_diagnostics) = apply_minimum_csp(html);
+    let prepared_html = prepare_html_for_display(&csp_html, current_url, frame_id);
     let mut diagnostics = diagnostics;
+    diagnostics.extend(csp_diagnostics);
     let script_layout = build_layout_scene_with_script_runtime(html, &rect);
     diagnostics.extend(script_layout.diagnostics.clone());
     if script_layout.dom_updated {
@@ -713,6 +726,18 @@ fn page_title_from_root(root: &FrameViewModel) -> String {
             }
         })
         .unwrap_or_else(|| "CosmoBrowse".to_string())
+}
+
+fn frame_current_url(frame: &FrameViewModel, target_id: &str) -> Option<String> {
+    if frame.id == target_id {
+        return Some(frame.current_url.clone());
+    }
+    for child in &frame.child_frames {
+        if let Some(url) = frame_current_url(child, target_id) {
+            return Some(url);
+        }
+    }
+    None
 }
 
 fn collect_diagnostics(frame: &FrameViewModel) -> Vec<String> {

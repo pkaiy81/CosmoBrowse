@@ -1,4 +1,5 @@
 use crate::model::{AppError, AppResult, FrameRect};
+use crate::security::{classify_tls_policy_error, collect_cookie_diagnostics, passes_cors};
 use encoding_rs::{Encoding, SHIFT_JIS, UTF_8};
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -53,6 +54,14 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
 
     let response = client.get(url).send().map_err(classify_request_error)?;
     let final_url = response.url().to_string();
+    let mut diagnostics = Vec::new();
+    if !passes_cors(url, &final_url, response.headers()) {
+        diagnostics.push(format!(
+            "CORS policy blocked cross-origin read: {} -> {}",
+            url, final_url
+        ));
+    }
+    diagnostics.extend(collect_cookie_diagnostics(response.headers(), &final_url));
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
@@ -63,11 +72,12 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
         .map_err(|error| AppError::network(format!("Failed to read response body: {error}")))?;
 
     let decoded = decode_html_bytes(&bytes, content_type.as_deref());
+    diagnostics.extend(decoded.diagnostics.clone());
     Ok(LoadedDocument {
         final_url,
         title: extract_title(&decoded.html),
         html: decoded.html,
-        diagnostics: decoded.diagnostics,
+        diagnostics,
     })
 }
 
@@ -266,10 +276,7 @@ pub fn load_fixture_document(url: &str) -> Option<LoadedDocument> {
 
 fn classify_request_error(error: reqwest::Error) -> AppError {
     let message = format!("Failed to fetch URL: {error}");
-    if message.to_lowercase().contains("certificate") || message.to_lowercase().contains("tls") {
-        return AppError::tls(message);
-    }
-    AppError::network(message)
+    classify_tls_policy_error(&message)
 }
 
 fn extract_charset_from_content_type(content_type: &str) -> Option<String> {
