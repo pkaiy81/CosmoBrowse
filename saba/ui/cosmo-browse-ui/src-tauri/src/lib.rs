@@ -1,6 +1,6 @@
-use saba_app::{
-    AppError, AppMetricsSnapshot, AppService, NavigationState, PageViewModel, SabaApp, SceneItem,
-    SearchResult, TabSummary,
+use cosmo_runtime::{
+    AppError, AppMetricsSnapshot, AppService, NavigationState, OrbitSnapshot, SceneItem,
+    SearchResult, StarshipApp, TabSummary,
 };
 use serde::Serialize;
 use std::backtrace::Backtrace;
@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 struct AppState {
-    app: Mutex<SabaApp>,
+    app: Mutex<StarshipApp>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,8 +77,8 @@ struct CrashReportDto {
     reproduction: Vec<String>,
 }
 
-impl From<PageViewModel> for BrowserPageDto {
-    fn from(page: PageViewModel) -> Self {
+impl From<OrbitSnapshot> for BrowserPageDto {
+    fn from(page: OrbitSnapshot) -> Self {
         let mut dom_snapshot = Vec::new();
         collect_dom_snapshots(&page.root_frame, &mut dom_snapshot);
         let network_log = page
@@ -110,8 +110,8 @@ impl From<PageViewModel> for BrowserPageDto {
     }
 }
 
-impl From<saba_app::FrameViewModel> for BrowserFrameDto {
-    fn from(frame: saba_app::FrameViewModel) -> Self {
+impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
+    fn from(frame: cosmo_runtime::FrameViewModel) -> Self {
         Self {
             id: frame.id,
             name: frame.name,
@@ -125,8 +125,8 @@ impl From<saba_app::FrameViewModel> for BrowserFrameDto {
                 height: frame.rect.height,
             },
             render_backend: match frame.render_backend {
-                saba_app::RenderBackendKind::WebView => "web_view".to_string(),
-                saba_app::RenderBackendKind::NativeScene => "native_scene".to_string(),
+                cosmo_runtime::RenderBackendKind::WebView => "web_view".to_string(),
+                cosmo_runtime::RenderBackendKind::NativeScene => "native_scene".to_string(),
             },
             document_url: frame.document_url,
             scene_items: frame.scene_items,
@@ -136,7 +136,7 @@ impl From<saba_app::FrameViewModel> for BrowserFrameDto {
     }
 }
 
-fn collect_dom_snapshots(frame: &saba_app::FrameViewModel, out: &mut Vec<DomSnapshotEntryDto>) {
+fn collect_dom_snapshots(frame: &cosmo_runtime::FrameViewModel, out: &mut Vec<DomSnapshotEntryDto>) {
     if let Some(html) = frame.html_content.as_ref() {
         out.push(DomSnapshotEntryDto {
             frame_id: frame.id.clone(),
