@@ -1,7 +1,7 @@
-# Foundation API Contracts (`saba_app`)
+# Foundation API Contracts (`cosmo_runtime` compatibility layer)
 
 ## Purpose
-- Freeze minimal extension points in `saba_app` so callers can depend on stable contracts while backend internals evolve.
+- Freeze minimal extension points in `cosmo_runtime`/`saba_app` so callers can depend on stable contracts while backend internals evolve.
 - Keep existing integrations backward-compatible by providing default implementations via `AppService`.
 
 ## New contracts

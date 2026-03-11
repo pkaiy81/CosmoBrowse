@@ -4,6 +4,7 @@
 - 開発は **Tauri を継続採用**。
 - ただし構成は **UI 交換可能**を前提にし、`adapter` を差し替えるだけで `egui/iced/winit` へ移行できる設計にする。
 - Rust 資産（検索・ネットワーク・レンダリング）は `saba_core` を中心に再利用する。
+- 命名は段階的に CosmoBrowse へ移行する（`docs/cosmic-naming-migration.md`）。
 
 ---
 
