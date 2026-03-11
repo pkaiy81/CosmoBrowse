@@ -11,6 +11,8 @@ type FrameViewModel = {
   diagnostics: string[];
   rect: FrameRect;
   content_size: ContentSize;
+  render_backend: "web_view" | "native_scene";
+  document_url: string;
   html_content: string | null;
   child_frames: FrameViewModel[];
 };
@@ -47,6 +49,36 @@ let sceneRootEl: HTMLElement | null;
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
 let pageEpoch = 0;
+
+type RenderBackend = {
+  kind: "web_view" | "native_scene";
+  renderLeafFrame: (frame: FrameViewModel, shell: HTMLElement) => void;
+};
+
+const webViewBackend: RenderBackend = {
+  kind: "web_view",
+  renderLeafFrame(frame, shell) {
+    const iframe = document.createElement("iframe");
+    iframe.className = "frame-document";
+    iframe.title = frame.title || frame.current_url;
+    // Ref: HTML Living Standard `iframe srcdoc` definition.
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc
+    iframe.srcdoc = frame.html_content ?? "<html><body></body></html>";
+    shell.appendChild(iframe);
+  },
+};
+
+function resolveRenderBackend(frame: FrameViewModel): RenderBackend {
+  // Backend replacement point: keep WebViewBackend as default and route future
+  // native renderer selection from this switch only.
+  switch (frame.render_backend) {
+    case "web_view":
+      return webViewBackend;
+    // For future native scene rendering: return a NativeSceneBackend here.
+    case "native_scene":
+      return webViewBackend;
+  }
+}
 
 function beginPageEpoch() {
   pageEpoch += 1;
@@ -133,6 +165,8 @@ function renderTabs(tabs: TabSummary[]) {
 function renderFrame(frame: FrameViewModel, host: HTMLElement) {
   const shell = document.createElement("section");
   shell.className = frame.child_frames.length > 0 ? "frame-shell frameset-shell" : "frame-shell leaf-shell";
+  // Ref: CSS 2.2 visual formatting model; absolutely positioned boxes use inset offsets.
+  // https://www.w3.org/TR/CSS22/visuren.html#absolute-positioning
   shell.style.left = `${frame.rect.x}px`;
   shell.style.top = `${frame.rect.y}px`;
   shell.style.width = `${Math.max(frame.rect.width, 1)}px`;
@@ -147,11 +181,9 @@ function renderFrame(frame: FrameViewModel, host: HTMLElement) {
     }
     shell.appendChild(childrenRoot);
   } else {
-    const iframe = document.createElement("iframe");
-    iframe.className = "frame-document";
-    iframe.title = frame.title || frame.current_url;
-    iframe.srcdoc = frame.html_content ?? "<html><body></body></html>";
-    shell.appendChild(iframe);
+    const backend = resolveRenderBackend(frame);
+    backend.renderLeafFrame(frame, shell);
+    shell.dataset.renderBackend = backend.kind;
   }
 
   host.appendChild(shell);
@@ -417,5 +449,3 @@ window.addEventListener("DOMContentLoaded", () => {
 
   void loadInitialPageView();
 });
-
-

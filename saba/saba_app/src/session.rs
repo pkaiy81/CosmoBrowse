@@ -4,7 +4,8 @@ use crate::loader::{
 };
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
-    FrameViewModel, NavigationEvent, NavigationState, PageViewModel, SearchResult, TabSummary,
+    FrameViewModel, NavigationEvent, NavigationState, PageViewModel, RenderBackendKind,
+    SearchResult, TabSummary,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -561,6 +562,8 @@ fn build_inline_frameset_view(
             width: rect.width,
             height: rect.height,
         },
+        render_backend: RenderBackendKind::WebView,
+        document_url: current_url.to_string(),
         scene_items: Vec::new(),
         html_content: None,
         child_frames,
@@ -609,6 +612,8 @@ fn build_leaf_frame_view(
             width: rect.width,
             height: rect.height,
         },
+        render_backend: RenderBackendKind::WebView,
+        document_url: current_url.to_string(),
         scene_items: Vec::new(),
         html_content: Some(prepared_html),
         child_frames: Vec::new(),
@@ -635,6 +640,8 @@ fn blank_page_view(width: i64, height: i64) -> PageViewModel {
                 height,
             },
             content_size: ContentSize { width, height },
+            render_backend: RenderBackendKind::WebView,
+            document_url: String::new(),
             scene_items: Vec::new(),
             html_content: Some(
                 "<html><head><meta charset=\"utf-8\"></head><body></body></html>".to_string(),
@@ -1010,6 +1017,8 @@ mod tests {
                 width: 960,
                 height: 720,
             },
+            render_backend: RenderBackendKind::WebView,
+            document_url: "fixture://abehiroshi/index".to_string(),
             scene_items: Vec::new(),
             html_content: None,
             child_frames: vec![
@@ -1030,6 +1039,8 @@ mod tests {
                         width: 720,
                         height: 720,
                     },
+                    render_backend: RenderBackendKind::WebView,
+                    document_url: "fixture://abehiroshi/top".to_string(),
                     scene_items: Vec::new(),
                     html_content: None,
                     child_frames: vec![sample_leaf_frame(
@@ -1059,6 +1070,8 @@ mod tests {
                 width: 320,
                 height: 240,
             },
+            render_backend: RenderBackendKind::WebView,
+            document_url: current_url.to_string(),
             scene_items: Vec::new(),
             html_content: Some("<html></html>".to_string()),
             child_frames: Vec::new(),

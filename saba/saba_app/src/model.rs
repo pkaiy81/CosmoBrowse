@@ -1,4 +1,4 @@
-﻿use serde::Serialize;
+use serde::Serialize;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -11,23 +11,43 @@ pub struct AppError {
 
 impl AppError {
     pub fn validation(message: impl Into<String>) -> Self {
-        Self { code: "validation_error".to_string(), message: message.into(), retryable: false }
+        Self {
+            code: "validation_error".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
     }
 
     pub fn network(message: impl Into<String>) -> Self {
-        Self { code: "network_error".to_string(), message: message.into(), retryable: true }
+        Self {
+            code: "network_error".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
     }
 
     pub fn tls(message: impl Into<String>) -> Self {
-        Self { code: "tls_error".to_string(), message: message.into(), retryable: true }
+        Self {
+            code: "tls_error".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
     }
 
     pub fn parse(message: impl Into<String>) -> Self {
-        Self { code: "parse_error".to_string(), message: message.into(), retryable: false }
+        Self {
+            code: "parse_error".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
     }
 
     pub fn state(message: impl Into<String>) -> Self {
-        Self { code: "invalid_state".to_string(), message: message.into(), retryable: false }
+        Self {
+            code: "invalid_state".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
     }
 }
 
@@ -56,7 +76,14 @@ pub struct FrameRect {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SceneItem {
-    Rect { x: i64, y: i64, width: i64, height: i64, background_color: String, opacity: f64 },
+    Rect {
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        background_color: String,
+        opacity: f64,
+    },
     Text {
         x: i64,
         y: i64,
@@ -83,6 +110,13 @@ pub enum SceneItem {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderBackendKind {
+    WebView,
+    NativeScene,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FrameViewModel {
     pub id: String,
     pub name: Option<String>,
@@ -91,6 +125,10 @@ pub struct FrameViewModel {
     pub diagnostics: Vec<String>,
     pub rect: FrameRect,
     pub content_size: ContentSize,
+    // Rendering strategy hint for the UI layer.
+    pub render_backend: RenderBackendKind,
+    // Canonical document URL used as a base for resource/link resolution.
+    pub document_url: String,
     pub scene_items: Vec<SceneItem>,
     pub html_content: Option<String>,
     pub child_frames: Vec<FrameViewModel>,
@@ -158,7 +196,12 @@ pub struct AppMetricsSnapshot {
 
 pub trait AppService {
     fn open_url(&mut self, url: &str) -> AppResult<PageViewModel>;
-    fn activate_link(&mut self, frame_id: &str, href: &str, target: Option<&str>) -> AppResult<PageViewModel>;
+    fn activate_link(
+        &mut self,
+        frame_id: &str,
+        href: &str,
+        target: Option<&str>,
+    ) -> AppResult<PageViewModel>;
     fn reload(&mut self) -> AppResult<PageViewModel>;
     fn back(&mut self) -> AppResult<PageViewModel>;
     fn forward(&mut self) -> AppResult<PageViewModel>;
@@ -172,4 +215,3 @@ pub trait AppService {
     fn list_tabs(&self) -> Vec<TabSummary>;
     fn search(&self, query: &str) -> AppResult<Vec<SearchResult>>;
 }
-
