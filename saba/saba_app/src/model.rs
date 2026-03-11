@@ -116,6 +116,102 @@ pub enum RenderBackendKind {
     NativeScene,
 }
 
+/// Rendering adapter contract used by `saba_app` to keep backend-specific code replaceable.
+///
+/// ```rust
+/// use saba_app::{FrameViewModel, RenderBackend, RenderBackendKind};
+///
+/// struct CompatBackend;
+///
+/// impl RenderBackend for CompatBackend {
+///     fn name(&self) -> &'static str {
+///         "compat-webview"
+///     }
+///
+///     fn kind_for_frame(&self, frame: &FrameViewModel) -> RenderBackendKind {
+///         frame.render_backend.clone()
+///     }
+/// }
+/// ```
+pub trait RenderBackend {
+    fn name(&self) -> &'static str;
+
+    fn kind_for_frame(&self, frame: &FrameViewModel) -> RenderBackendKind;
+}
+
+/// Script execution contract exposed by `saba_app`.
+///
+/// ```rust
+/// use saba_app::{FrameViewModel, ScriptEngine};
+///
+/// struct NoopScriptEngine;
+///
+/// impl ScriptEngine for NoopScriptEngine {
+///     fn name(&self) -> &'static str {
+///         "noop"
+///     }
+/// }
+/// ```
+pub trait ScriptEngine {
+    fn name(&self) -> &'static str;
+
+    fn can_execute(&self, _frame: &FrameViewModel) -> bool {
+        false
+    }
+}
+
+/// Security policy contract for navigation and content handling decisions.
+///
+/// ```rust
+/// use saba_app::SecurityPolicy;
+///
+/// struct AllowAllPolicy;
+///
+/// impl SecurityPolicy for AllowAllPolicy {
+///     fn name(&self) -> &'static str {
+///         "allow-all"
+///     }
+/// }
+/// ```
+pub trait SecurityPolicy {
+    fn name(&self) -> &'static str;
+
+    fn allows_navigation(&self, _current_url: Option<&str>, _target_url: &str) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultRenderBackend;
+
+impl RenderBackend for DefaultRenderBackend {
+    fn name(&self) -> &'static str {
+        "webview"
+    }
+
+    fn kind_for_frame(&self, frame: &FrameViewModel) -> RenderBackendKind {
+        frame.render_backend.clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultScriptEngine;
+
+impl ScriptEngine for DefaultScriptEngine {
+    fn name(&self) -> &'static str {
+        "disabled"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultSecurityPolicy;
+
+impl SecurityPolicy for DefaultSecurityPolicy {
+    fn name(&self) -> &'static str {
+        "allow-navigation"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FrameViewModel {
     pub id: String,
@@ -214,4 +310,16 @@ pub trait AppService {
     fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>>;
     fn list_tabs(&self) -> Vec<TabSummary>;
     fn search(&self, query: &str) -> AppResult<Vec<SearchResult>>;
+
+    fn render_backend(&self) -> Box<dyn RenderBackend> {
+        Box::new(DefaultRenderBackend)
+    }
+
+    fn script_engine(&self) -> Box<dyn ScriptEngine> {
+        Box::new(DefaultScriptEngine)
+    }
+
+    fn security_policy(&self) -> Box<dyn SecurityPolicy> {
+        Box::new(DefaultSecurityPolicy)
+    }
 }

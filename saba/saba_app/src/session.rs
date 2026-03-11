@@ -496,7 +496,7 @@ fn build_frameset_view(
     )
 }
 
-// Ref: HTML Standard obsolete frames features, where `noframes` provides fallback content.
+// Spec: HTML Standard obsolete frames features, where `noframes` provides fallback content.
 // https://html.spec.whatwg.org/multipage/obsolete.html
 fn build_inline_frameset_view(
     frame_id: &str,
@@ -714,7 +714,7 @@ fn collect_frame_urls(frame: &FrameViewModel, urls: &mut BTreeMap<String, String
     }
 }
 
-// Ref: HTML Living Standard, rules for choosing a navigable target from `target`.
+// Spec: HTML Living Standard, rules for choosing a navigable target from `target`.
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
 fn resolve_destination_frame_id(
     root: &FrameViewModel,
@@ -731,7 +731,7 @@ fn resolve_destination_frame_id(
     }
 }
 
-// Ref: HTML Living Standard browsing context keywords are matched using ASCII case-insensitive
+// Spec: HTML Living Standard browsing context keywords are matched using ASCII case-insensitive
 // comparisons after attribute value processing.
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
 fn normalize_target_keyword(target: Option<&str>) -> Option<String> {
@@ -764,7 +764,7 @@ fn find_frame_id_by_name(frame: &FrameViewModel, target: &str) -> Option<String>
     None
 }
 
-// Ref: RFC 3986 scheme handling for absolute URIs.
+// Spec: RFC 3986 scheme handling for absolute URIs.
 // https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
 fn normalize_url(input: &str) -> AppResult<String> {
     let trimmed = input.trim();
