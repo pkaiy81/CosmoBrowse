@@ -92,6 +92,11 @@ pub struct JsRuntime {
     dom_root: Rc<RefCell<DomNode>>,
     env: Rc<RefCell<Environment>>,
     functions: Vec<Function>,
+    pending_tasks: Vec<String>,
+    pending_microtasks: Vec<String>,
+    click_handlers: Vec<(Rc<RefCell<DomNode>>, String)>,
+    unsupported_apis: Vec<String>,
+    dom_updated: bool,
 }
 
 impl JsRuntime {
@@ -100,13 +105,78 @@ impl JsRuntime {
             dom_root,
             functions: Vec::new(),
             env: Rc::new(RefCell::new(Environment::new(None))),
+            pending_tasks: Vec::new(),
+            pending_microtasks: Vec::new(),
+            click_handlers: Vec::new(),
+            unsupported_apis: Vec::new(),
+            dom_updated: false,
         }
     }
 
     pub fn execute(&mut self, program: &Program) {
+        // Spec: HTML event loop processes one task, then drains the microtask queue.
+        // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
         for node in program.body() {
             self.eval(&Some(node.clone()), self.env.clone());
         }
+        self.process_event_loop();
+    }
+
+    // Spec: DOM events are dispatched to an event target and invoke registered listeners.
+    // https://dom.spec.whatwg.org/#concept-event-dispatch
+    pub fn dispatch_click(&mut self, target_id: &str) {
+        if let Some(target) = get_element_by_id(Some(self.dom_root.clone()), &target_id.to_string())
+        {
+            let mut callbacks = Vec::new();
+            for (registered_target, callback) in &self.click_handlers {
+                if Rc::ptr_eq(registered_target, &target) {
+                    callbacks.push(callback.clone());
+                }
+            }
+            for callback in callbacks {
+                self.pending_tasks.push(callback);
+            }
+            self.process_event_loop();
+        }
+    }
+
+    pub fn unsupported_apis(&self) -> Vec<String> {
+        self.unsupported_apis.clone()
+    }
+
+    pub fn dom_updated(&self) -> bool {
+        self.dom_updated
+    }
+
+    fn process_event_loop(&mut self) {
+        while !self.pending_tasks.is_empty() {
+            let callback = self.pending_tasks.remove(0);
+            self.invoke_named_function(&callback, self.env.clone());
+
+            while !self.pending_microtasks.is_empty() {
+                let microtask = self.pending_microtasks.remove(0);
+                self.invoke_named_function(&microtask, self.env.clone());
+            }
+        }
+    }
+
+    fn invoke_named_function(&mut self, callback: &str, env: Rc<RefCell<Environment>>) {
+        let function_body = self
+            .functions
+            .iter()
+            .find(|func| func.id == callback)
+            .and_then(|func| func.body.clone());
+        if let Some(body) = function_body {
+            let new_env = Rc::new(RefCell::new(Environment::new(Some(env))));
+            self.eval(&Some(body), new_env);
+            return;
+        }
+        self.report_unsupported_api(format!("callback '{}'", callback));
+    }
+
+    fn report_unsupported_api(&mut self, api: String) {
+        self.unsupported_apis
+            .push(format!("Unsupported browser API: {}", api));
     }
 
     /// Return a tuple of (bool, Option<RuntimeValue>)
@@ -141,12 +211,66 @@ impl JsRuntime {
             );
         }
 
+        if func == &RuntimeValue::StringLiteral("setTimeout".to_string()) {
+            if arguments.is_empty() {
+                self.report_unsupported_api("setTimeout(callback, delay)".to_string());
+                return (true, None);
+            }
+            if let Some(callback) = self.eval(&arguments[0], env.clone()).map(|v| v.to_string()) {
+                self.pending_tasks.push(callback);
+                return (
+                    true,
+                    Some(RuntimeValue::Number(self.pending_tasks.len() as u64)),
+                );
+            }
+            self.report_unsupported_api("setTimeout(callback, delay)".to_string());
+            return (true, None);
+        }
+
+        if func == &RuntimeValue::StringLiteral("queueMicrotask".to_string()) {
+            if arguments.is_empty() {
+                self.report_unsupported_api("queueMicrotask(callback)".to_string());
+                return (true, None);
+            }
+            if let Some(callback) = self.eval(&arguments[0], env.clone()).map(|v| v.to_string()) {
+                self.pending_microtasks.push(callback);
+                return (true, None);
+            }
+            self.report_unsupported_api("queueMicrotask(callback)".to_string());
+            return (true, None);
+        }
+
+        if let RuntimeValue::HtmlElement {
+            object,
+            property: Some(property),
+        } = func
+        {
+            if property == "addEventListener" {
+                if arguments.len() < 2 {
+                    self.report_unsupported_api("Element.addEventListener".to_string());
+                    return (true, None);
+                }
+                let event_type = self.eval(&arguments[0], env.clone());
+                let callback = self.eval(&arguments[1], env.clone());
+                if event_type == Some(RuntimeValue::StringLiteral("click".to_string())) {
+                    if let Some(callback) = callback.map(|v| v.to_string()) {
+                        self.click_handlers.push((object.clone(), callback));
+                        return (true, None);
+                    }
+                }
+                self.report_unsupported_api("Element.addEventListener".to_string());
+                return (true, None);
+            }
+        }
+
         (false, None)
     }
 
     // p.372
     // p.395 X
     // p.419 Y
+    // Spec: function calls and environment chaining follow ECMAScript execution contexts.
+    // https://262.ecma-international.org/#sec-execution-contexts
     fn eval(
         &mut self,
         node: &Option<Rc<Node>>,
@@ -219,6 +343,10 @@ impl JsRuntime {
                                 .set_first_child(Some(Rc::new(RefCell::new(DomNode::new(
                                     DomNodeKind::Text(right_value.to_string()),
                                 )))));
+                            self.dom_updated = true;
+                        } else if p == "onclick" {
+                            self.click_handlers
+                                .push((object.clone(), right_value.to_string()));
                         }
                     }
                 }
@@ -321,6 +449,13 @@ impl JsRuntime {
                     return api_result.1;
                 }
 
+                if let RuntimeValue::StringLiteral(callee) = &callee_value {
+                    if callee.contains('.') {
+                        self.report_unsupported_api(callee.clone());
+                        return None;
+                    }
+                }
+
                 // Find the defined function.
                 let function = {
                     // Y8
@@ -334,7 +469,10 @@ impl JsRuntime {
 
                     match f {
                         Some(f) => f,
-                        None => panic!("function {:?} doesn't exist", callee), // Y9
+                        None => {
+                            self.report_unsupported_api(callee_value.to_string());
+                            return None;
+                        } // Y9
                     }
                 };
 
