@@ -13,9 +13,45 @@ type FrameViewModel = {
   content_size: ContentSize;
   render_backend: "web_view" | "native_scene";
   document_url: string;
+  scene_items: SceneItem[];
   html_content: string | null;
   child_frames: FrameViewModel[];
 };
+type SceneItemRect = {
+  kind: "rect";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  background_color: string;
+  opacity: number;
+};
+type SceneItemText = {
+  kind: "text";
+  x: number;
+  y: number;
+  text: string;
+  color: string;
+  font_px: number;
+  font_family: string;
+  underline: boolean;
+  opacity: number;
+  href: string | null;
+  target: string | null;
+};
+type SceneItemImage = {
+  kind: "image";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  src: string;
+  alt: string;
+  opacity: number;
+  href: string | null;
+  target: string | null;
+};
+type SceneItem = SceneItemRect | SceneItemText | SceneItemImage;
 type DomSnapshotEntry = { frame_id: string; document_url: string; html: string };
 type PageViewModel = {
   current_url: string;
@@ -76,15 +112,111 @@ const webViewBackend: RenderBackend = {
   },
 };
 
+const nativeSceneBackend: RenderBackend = {
+  kind: "native_scene",
+  renderLeafFrame(frame, shell) {
+    const scene = document.createElement("div");
+    scene.className = "frame-scene";
+    // Ref: CSS 2.2 visual formatting model; absolutely positioned descendants are
+    // laid out using inset offsets in their containing block.
+    // https://www.w3.org/TR/CSS22/visuren.html#absolute-positioning
+    scene.style.position = "relative";
+    scene.style.width = "100%";
+    scene.style.height = "100%";
+    scene.style.overflow = "hidden";
+
+    for (const item of frame.scene_items) {
+      scene.appendChild(renderSceneItem(frame, item));
+    }
+
+    shell.appendChild(scene);
+  },
+};
+
+function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
+  if (item.kind === "rect") {
+    const rect = document.createElement("div");
+    rect.className = "scene-rect";
+    rect.style.position = "absolute";
+    rect.style.left = `${item.x}px`;
+    rect.style.top = `${item.y}px`;
+    rect.style.width = `${Math.max(item.width, 1)}px`;
+    rect.style.height = `${Math.max(item.height, 1)}px`;
+    rect.style.backgroundColor = item.background_color;
+    rect.style.opacity = `${Math.min(Math.max(item.opacity, 0), 1)}`;
+    return rect;
+  }
+
+  if (item.kind === "text") {
+    const textEl = document.createElement(item.href ? "button" : "span");
+    textEl.className = item.href ? "scene-text scene-link" : "scene-text";
+    textEl.textContent = item.text;
+    textEl.style.position = "absolute";
+    textEl.style.left = `${item.x}px`;
+    textEl.style.top = `${item.y}px`;
+    textEl.style.color = item.color;
+    textEl.style.fontSize = `${Math.max(item.font_px, 1)}px`;
+    textEl.style.fontFamily = item.font_family;
+    textEl.style.opacity = `${Math.min(Math.max(item.opacity, 0), 1)}`;
+    textEl.style.textDecoration = item.underline ? "underline" : "none";
+    if (item.href) {
+      // Ref: HTML Standard browsing context target keyword handling (`_blank`,
+      // `_self`, `_parent`, `_top`) must use ASCII case-insensitive comparison.
+      // https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
+      textEl.addEventListener("click", () => {
+        void handleEmbeddedNavigation({
+          type: "cosmobrowse:navigate",
+          frameId: frame.id,
+          href: item.href ?? "",
+          target: item.target ?? "",
+        });
+      });
+    }
+    return textEl;
+  }
+
+  const imgEl = document.createElement("img");
+  imgEl.className = "scene-image";
+  imgEl.alt = item.alt;
+  imgEl.src = item.src;
+  imgEl.style.position = "absolute";
+  imgEl.style.left = `${item.x}px`;
+  imgEl.style.top = `${item.y}px`;
+  imgEl.style.width = `${Math.max(item.width, 1)}px`;
+  imgEl.style.height = `${Math.max(item.height, 1)}px`;
+  imgEl.style.opacity = `${Math.min(Math.max(item.opacity, 0), 1)}`;
+  if (item.href) {
+    const wrapper = document.createElement("button");
+    wrapper.className = "scene-link-image";
+    wrapper.style.position = "absolute";
+    wrapper.style.left = `${item.x}px`;
+    wrapper.style.top = `${item.y}px`;
+    wrapper.style.width = `${Math.max(item.width, 1)}px`;
+    wrapper.style.height = `${Math.max(item.height, 1)}px`;
+    wrapper.style.padding = "0";
+    wrapper.style.border = "none";
+    wrapper.style.background = "transparent";
+    wrapper.appendChild(imgEl);
+    wrapper.addEventListener("click", () => {
+      void handleEmbeddedNavigation({
+        type: "cosmobrowse:navigate",
+        frameId: frame.id,
+        href: item.href ?? "",
+        target: item.target ?? "",
+      });
+    });
+    return wrapper;
+  }
+  return imgEl;
+}
+
 function resolveRenderBackend(frame: FrameViewModel): RenderBackend {
-  // Backend replacement point: keep WebViewBackend as default and route future
-  // native renderer selection from this switch only.
+  // Backend replacement point: renderer selection is centralized here.
   switch (frame.render_backend) {
     case "web_view":
       return webViewBackend;
-    // For future native scene rendering: return a NativeSceneBackend here.
     case "native_scene":
-      return webViewBackend;
+      return nativeSceneBackend;
   }
 }
 
