@@ -52,9 +52,15 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
         .build()
         .map_err(|error| AppError::network(format!("Failed to build HTTP client: {error}")))?;
 
+    // Spec: RFC 9110 request target and response status semantics are captured in diagnostics.
+    // https://www.rfc-editor.org/rfc/rfc9110
+    // Spec: RFC 9112 HTTP/1.1 framing and message completeness requirements.
+    // https://www.rfc-editor.org/rfc/rfc9112
     let response = client.get(url).send().map_err(classify_request_error)?;
     let final_url = response.url().to_string();
+    let status = response.status();
     let mut diagnostics = Vec::new();
+    diagnostics.push(format!("HTTP GET {} -> {}", url, status));
     if !passes_cors(url, &final_url, response.headers()) {
         diagnostics.push(format!(
             "CORS policy blocked cross-origin read: {} -> {}",

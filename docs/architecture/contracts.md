@@ -57,3 +57,13 @@
 - When a script mutates DOM, diagnostics include a render-loop propagation marker and a relayout trigger.
 - Unsupported browser APIs are reported with a unified message: `Unsupported browser API: <name>`.
 - See `docs/architecture/js-event-loop.md` for the task/microtask processing diagram.
+
+
+## Browser/Renderer IPC DTO (`cosmo-browse-ui`)
+- Tauri IPC uses a fixed DTO: `BrowserPageDto`.
+- The DTO includes:
+  - `root_frame`: frame tree
+  - `network_log`: HTTP/CORS/TLS diagnostic logs
+  - `console_log`: script/DOM diagnostic logs
+  - `dom_snapshot`: per-frame HTML snapshots
+- Goal: prevent Browser internal model changes from cascading into the Renderer.

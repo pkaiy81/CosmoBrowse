@@ -42,6 +42,25 @@
         <div id="viewport" class="viewport">
           <div id="scene-root" class="scene-root"></div>
         </div>
+
+        <section class="diagnostics-shell">
+          <h2>Developer Diagnostics</h2>
+          <p id="crash-report" class="diagnostic-summary">Crash report: none</p>
+          <div class="diagnostics-grid">
+            <article>
+              <h3>Network log</h3>
+              <pre id="network-log" class="diagnostic-log"></pre>
+            </article>
+            <article>
+              <h3>Console</h3>
+              <pre id="console-log" class="diagnostic-log"></pre>
+            </article>
+            <article>
+              <h3>DOM snapshot</h3>
+              <pre id="dom-snapshot" class="diagnostic-log"></pre>
+            </article>
+          </div>
+        </section>
       </section>
     </main>
   </body>
