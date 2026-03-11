@@ -1,3 +1,4 @@
+use crate::layout::{build_layout_scene, RelayoutTrigger};
 use crate::loader::{
     build_frame_id, fetch_document, parse_frameset_document, prepare_html_for_display, resolve_url,
     FramesetChild, FramesetSpec, LoadedDocument,
@@ -233,7 +234,7 @@ impl BrowserSession {
 
     fn open_url(&mut self, url: &str) -> AppResult<PageViewModel> {
         let normalized_url = normalize_url(url)?;
-        let view = self.load_page(&normalized_url, None)?;
+        let view = self.load_page(&normalized_url, None, Some(RelayoutTrigger::DomChanged))?;
         self.push_history(view.clone());
         Ok(view)
     }
@@ -252,7 +253,7 @@ impl BrowserSession {
         if normalized_target.as_deref() == Some("_top")
             || current.root_frame.child_frames.is_empty()
         {
-            let view = self.load_page(&normalized_href, None)?;
+            let view = self.load_page(&normalized_href, None, Some(RelayoutTrigger::DomChanged))?;
             self.push_history(view.clone());
             return Ok(view);
         }
@@ -264,7 +265,11 @@ impl BrowserSession {
         )
         .ok_or_else(|| AppError::state("Target frame is unavailable"))?;
         overrides.insert(destination, normalized_href);
-        let view = self.load_page(&current.current_url, Some(&overrides))?;
+        let view = self.load_page(
+            &current.current_url,
+            Some(&overrides),
+            Some(RelayoutTrigger::DomChanged),
+        )?;
         self.push_history(view.clone());
         Ok(view)
     }
@@ -281,7 +286,11 @@ impl BrowserSession {
             return Ok(blank_page_view(self.viewport_width, self.viewport_height));
         };
         let overrides = snapshot_frame_urls(&current.root_frame);
-        let rerendered = self.load_page(&current.current_url, Some(&overrides))?;
+        let rerendered = self.load_page(
+            &current.current_url,
+            Some(&overrides),
+            Some(RelayoutTrigger::ViewportChanged),
+        )?;
         self.history[self.history_index] = rerendered.clone();
         Ok(rerendered)
     }
@@ -291,7 +300,11 @@ impl BrowserSession {
             .current_page()
             .ok_or_else(|| AppError::state("No page to reload"))?;
         let overrides = snapshot_frame_urls(&current.root_frame);
-        let rerendered = self.load_page(&current.current_url, Some(&overrides))?;
+        let rerendered = self.load_page(
+            &current.current_url,
+            Some(&overrides),
+            Some(RelayoutTrigger::DomChanged),
+        )?;
         self.history[self.history_index] = rerendered.clone();
         Ok(rerendered)
     }
@@ -344,6 +357,7 @@ impl BrowserSession {
         &self,
         url: &str,
         overrides: Option<&BTreeMap<String, String>>,
+        relayout_trigger: Option<RelayoutTrigger>,
     ) -> AppResult<PageViewModel> {
         let root_rect = FrameRect {
             x: 0,
@@ -352,10 +366,14 @@ impl BrowserSession {
             height: self.viewport_height.max(200),
         };
         let root_frame = load_frame_recursive("root", None, url, root_rect.clone(), overrides)?;
+        let mut diagnostics = collect_diagnostics(&root_frame);
+        if let Some(trigger) = relayout_trigger {
+            diagnostics.push(trigger.as_diagnostic().to_string());
+        }
         Ok(PageViewModel {
             current_url: root_frame.current_url.clone(),
             title: page_title_from_root(&root_frame),
-            diagnostics: collect_diagnostics(&root_frame),
+            diagnostics,
             content_size: ContentSize {
                 width: root_rect.width,
                 height: root_rect.height,
@@ -601,6 +619,7 @@ fn build_leaf_frame_view(
     html: &str,
 ) -> FrameViewModel {
     let prepared_html = prepare_html_for_display(html, current_url, frame_id);
+    let layout_scene = build_layout_scene(html, &rect);
     FrameViewModel {
         id: frame_id.to_string(),
         name: frame_name,
@@ -608,13 +627,10 @@ fn build_leaf_frame_view(
         title,
         diagnostics,
         rect: rect.clone(),
-        content_size: ContentSize {
-            width: rect.width,
-            height: rect.height,
-        },
-        render_backend: RenderBackendKind::WebView,
+        content_size: layout_scene.content_size,
+        render_backend: RenderBackendKind::NativeScene,
         document_url: current_url.to_string(),
-        scene_items: Vec::new(),
+        scene_items: layout_scene.scene_items,
         html_content: Some(prepared_html),
         child_frames: Vec::new(),
     }
