@@ -554,7 +554,7 @@ fn build_inline_frameset_view(
     Ok(FrameViewModel {
         id: frame_id.to_string(),
         name: frame_name,
-        current_url,
+        current_url: current_url.clone(),
         title,
         diagnostics,
         rect: rect.clone(),
@@ -563,7 +563,7 @@ fn build_inline_frameset_view(
             height: rect.height,
         },
         render_backend: RenderBackendKind::WebView,
-        document_url: current_url.to_string(),
+        document_url: current_url,
         scene_items: Vec::new(),
         html_content: None,
         child_frames,
