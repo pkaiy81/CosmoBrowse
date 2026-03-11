@@ -2,9 +2,12 @@ use crate::model::{ContentSize, FrameRect, SceneItem};
 use saba_core::display_item::DisplayItem;
 use saba_core::renderer::css::cssom::CssParser;
 use saba_core::renderer::css::token::CssTokenizer;
-use saba_core::renderer::dom::api::get_style_content;
+use saba_core::renderer::dom::api::{get_js_content, get_style_content};
 use saba_core::renderer::html::parser::HtmlParser;
 use saba_core::renderer::html::token::HtmlTokenizer;
+use saba_core::renderer::js::ast::JsParser;
+use saba_core::renderer::js::runtime::JsRuntime;
+use saba_core::renderer::js::token::JsLexer;
 use saba_core::renderer::layout::computed_style::TextDecoration;
 use saba_core::renderer::layout::layout_view::LayoutView;
 
@@ -35,16 +38,49 @@ pub struct LayoutScene {
     pub content_size: ContentSize,
 }
 
-pub fn build_layout_scene(html: &str, rect: &FrameRect) -> LayoutScene {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptLayoutResult {
+    pub layout_scene: LayoutScene,
+    pub diagnostics: Vec<String>,
+    pub dom_updated: bool,
+}
+
+pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> ScriptLayoutResult {
     let tokenizer = HtmlTokenizer::new(html.to_string());
     let window = HtmlParser::new(tokenizer).construct_tree();
     let dom = window.borrow().document();
+
+    let script = get_js_content(dom.clone());
+    let mut runtime = JsRuntime::new(dom.clone());
+    if !script.trim().is_empty() {
+        let lexer = JsLexer::new(script);
+        let mut parser = JsParser::new(lexer);
+        let program = parser.parse_ast();
+        runtime.execute(&program);
+    }
 
     let style = get_style_content(dom.clone());
     let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
     let layout_view = LayoutView::new(dom, &cssom, rect.width.max(1));
 
-    let display_items = layout_view.paint();
+    let layout_scene = display_items_to_scene(layout_view.paint(), rect);
+    let mut diagnostics = runtime.unsupported_apis();
+    if runtime.dom_updated() {
+        diagnostics.push("Render loop: DOM mutation -> relayout -> repaint".to_string());
+    }
+
+    ScriptLayoutResult {
+        layout_scene,
+        diagnostics,
+        dom_updated: runtime.dom_updated(),
+    }
+}
+
+pub fn build_layout_scene(html: &str, rect: &FrameRect) -> LayoutScene {
+    build_layout_scene_with_script_runtime(html, rect).layout_scene
+}
+
+fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> LayoutScene {
     let mut scene_items = Vec::with_capacity(display_items.len());
     let mut max_width = 0;
     let mut max_height = 0;

@@ -46,3 +46,14 @@
 ## Migration guidance
 - Current consumers can continue using `SabaApp` without code changes.
 - Future backends/policies can incrementally override the new `AppService` methods and provide custom trait objects.
+
+### `ScriptEngine` lifecycle integration (minimum runtime)
+- `saba_app` now executes inline script during frame build and reflects DOM mutations in the same render cycle.
+- Current minimum runtime scope:
+  - click handlers (`onclick`, `addEventListener("click", ...)`)
+  - timer task enqueue (`setTimeout`)
+  - microtask enqueue (`queueMicrotask`)
+  - DOM read/write (`document.getElementById`, `textContent`)
+- When a script mutates DOM, diagnostics include a render-loop propagation marker and a relayout trigger.
+- Unsupported browser APIs are reported with a unified message: `Unsupported browser API: <name>`.
+- See `docs/architecture/js-event-loop.md` for the task/microtask processing diagram.

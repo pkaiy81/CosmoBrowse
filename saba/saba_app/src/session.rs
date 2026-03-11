@@ -1,4 +1,4 @@
-use crate::layout::{build_layout_scene, RelayoutTrigger};
+use crate::layout::{build_layout_scene_with_script_runtime, RelayoutTrigger};
 use crate::loader::{
     build_frame_id, fetch_document, parse_frameset_document, prepare_html_for_display, resolve_url,
     FramesetChild, FramesetSpec, LoadedDocument,
@@ -6,7 +6,7 @@ use crate::loader::{
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
     FrameViewModel, NavigationEvent, NavigationState, PageViewModel, RenderBackendKind,
-    SearchResult, TabSummary,
+    ScriptEngine, SearchResult, TabSummary,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +14,19 @@ use url::Url;
 
 pub const DEFAULT_VIEWPORT_WIDTH: i64 = 960;
 pub const DEFAULT_VIEWPORT_HEIGHT: i64 = 720;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MinimumScriptEngine;
+
+impl ScriptEngine for MinimumScriptEngine {
+    fn name(&self) -> &'static str {
+        "saba-js-runtime-minimum"
+    }
+
+    fn can_execute(&self, frame: &FrameViewModel) -> bool {
+        frame.html_content.is_some()
+    }
+}
 
 #[derive(Debug)]
 pub struct SabaApp {
@@ -147,6 +160,10 @@ impl AppService for SabaApp {
 
     fn search(&self, query: &str) -> AppResult<Vec<SearchResult>> {
         build_search_results(query)
+    }
+
+    fn script_engine(&self) -> Box<dyn ScriptEngine> {
+        Box::new(MinimumScriptEngine)
     }
 }
 
@@ -619,7 +636,12 @@ fn build_leaf_frame_view(
     html: &str,
 ) -> FrameViewModel {
     let prepared_html = prepare_html_for_display(html, current_url, frame_id);
-    let layout_scene = build_layout_scene(html, &rect);
+    let mut diagnostics = diagnostics;
+    let script_layout = build_layout_scene_with_script_runtime(html, &rect);
+    diagnostics.extend(script_layout.diagnostics.clone());
+    if script_layout.dom_updated {
+        diagnostics.push(RelayoutTrigger::DomChanged.as_diagnostic().to_string());
+    }
     FrameViewModel {
         id: frame_id.to_string(),
         name: frame_name,
@@ -627,10 +649,10 @@ fn build_leaf_frame_view(
         title,
         diagnostics,
         rect: rect.clone(),
-        content_size: layout_scene.content_size,
+        content_size: script_layout.layout_scene.content_size,
         render_backend: RenderBackendKind::NativeScene,
         document_url: current_url.to_string(),
-        scene_items: layout_scene.scene_items,
+        scene_items: script_layout.layout_scene.scene_items,
         html_content: Some(prepared_html),
         child_frames: Vec::new(),
     }
