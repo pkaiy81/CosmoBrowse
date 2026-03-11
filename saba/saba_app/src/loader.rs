@@ -71,7 +71,7 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     })
 }
 
-// Ref: HTML Standard obsolete frames features and the `in frameset` parsing mode.
+// Spec: HTML Standard obsolete frames features and the `in frameset` parsing mode.
 // https://html.spec.whatwg.org/multipage/obsolete.html
 // https://html.spec.whatwg.org/multipage/parsing.html
 pub fn parse_frameset_document(html: &str) -> Option<FramesetSpec> {
@@ -122,7 +122,7 @@ impl FramesetSpec {
     }
 }
 
-// Ref: RFC 3986 relative reference resolution.
+// Spec: RFC 3986 relative reference resolution.
 // https://datatracker.ietf.org/doc/html/rfc3986#section-5
 pub fn resolve_url(base_url: &str, target: &str) -> AppResult<String> {
     let base = Url::parse(base_url)
@@ -133,9 +133,9 @@ pub fn resolve_url(base_url: &str, target: &str) -> AppResult<String> {
     Ok(resolved.to_string())
 }
 
-// Ref: HTML Living Standard, determining the character encoding.
+// Spec: HTML Living Standard, determining the character encoding.
 // https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
-// Ref: HTML Living Standard, meta charset.
+// Spec: HTML Living Standard, meta charset.
 // https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-charset
 pub fn decode_html_bytes(bytes: &[u8], content_type: Option<&str>) -> DecodedDocument {
     let mut diagnostics = Vec::new();
@@ -176,7 +176,7 @@ pub fn extract_title(html: &str) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
-// Ref: HTML Living Standard, the document base URL and the `iframe srcdoc` document model.
+// Spec: HTML Living Standard, the document base URL and the `iframe srcdoc` document model.
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc
 pub fn prepare_html_for_display(html: &str, base_url: &str, frame_id: &str) -> String {
