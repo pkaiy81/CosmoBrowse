@@ -81,6 +81,9 @@ pub struct ComputedStyle {
     margin_right_auto: bool,
     margin: Option<EdgeSize>,
     padding: Option<EdgeSize>,
+    position: Option<PositionType>,
+    offset_top: Option<f64>,
+    offset_left: Option<f64>,
 }
 
 impl ComputedStyle {
@@ -101,6 +104,9 @@ impl ComputedStyle {
             margin_right_auto: false,
             margin: None,
             padding: None,
+            position: None,
+            offset_top: None,
+            offset_left: None,
         }
     }
 
@@ -169,6 +175,15 @@ impl ComputedStyle {
         }
         if self.padding.is_none() {
             self.padding = Some(EdgeSize::zero());
+        }
+        if self.position.is_none() {
+            self.position = Some(PositionType::Static);
+        }
+        if self.offset_top.is_none() {
+            self.offset_top = Some(0.0);
+        }
+        if self.offset_left.is_none() {
+            self.offset_left = Some(0.0);
         }
     }
 
@@ -320,6 +335,32 @@ impl ComputedStyle {
     pub fn padding(&self) -> EdgeSize {
         self.padding
             .expect("failed to access CSS property: padding")
+    }
+
+    pub fn set_position(&mut self, position: PositionType) {
+        self.position = Some(position);
+    }
+
+    pub fn position(&self) -> PositionType {
+        self.position
+            .expect("failed to access CSS property: position")
+    }
+
+    pub fn set_offset_top(&mut self, top: f64) {
+        self.offset_top = Some(top);
+    }
+
+    pub fn offset_top(&self) -> f64 {
+        self.offset_top.expect("failed to access CSS property: top")
+    }
+
+    pub fn set_offset_left(&mut self, left: f64) {
+        self.offset_left = Some(left);
+    }
+
+    pub fn offset_left(&self) -> f64 {
+        self.offset_left
+            .expect("failed to access CSS property: left")
     }
 }
 
@@ -501,6 +542,27 @@ impl FontSize {
             FontSize::Medium => 16,
             FontSize::XLarge => 24,
             FontSize::XXLarge => 32,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum PositionType {
+    Static,
+    Relative,
+    Absolute,
+}
+
+impl PositionType {
+    pub fn from_str(value: &str) -> Result<Self, Error> {
+        match value {
+            "static" => Ok(Self::Static),
+            "relative" => Ok(Self::Relative),
+            "absolute" => Ok(Self::Absolute),
+            _ => Err(Error::UnexpectedInput(format!(
+                "position {:?} is not supported yet",
+                value
+            ))),
         }
     }
 }

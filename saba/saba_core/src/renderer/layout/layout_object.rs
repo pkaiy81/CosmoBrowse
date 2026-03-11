@@ -12,6 +12,7 @@ use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::FontSize;
+use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextDecoration;
 use alloc::format;
 use alloc::rc::Rc;
@@ -525,6 +526,18 @@ impl LayoutObject {
             }
         }
 
+        match self.style.position() {
+            PositionType::Static => {}
+            PositionType::Relative => {
+                point.set_x(point.x() + edge_to_i64(self.style.offset_left()));
+                point.set_y(point.y() + edge_to_i64(self.style.offset_top()));
+            }
+            PositionType::Absolute => {
+                point.set_x(parent_point.x() + edge_to_i64(self.style.offset_left()));
+                point.set_y(parent_point.y() + edge_to_i64(self.style.offset_top()));
+            }
+        }
+
         self.point = point;
     }
 
@@ -607,6 +620,27 @@ impl LayoutObject {
                         }
                         _ => {}
                     },
+                    _ => {}
+                },
+                "position" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        let position =
+                            PositionType::from_str(value).unwrap_or(PositionType::Static);
+                        self.style.set_position(position);
+                    }
+                }
+                "top" => match first_value {
+                    Some(ComponentValue::Number(value)) => self.style.set_offset_top(*value),
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
+                        self.style.set_offset_top(*value)
+                    }
+                    _ => {}
+                },
+                "left" => match first_value {
+                    Some(ComponentValue::Number(value)) => self.style.set_offset_left(*value),
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
+                        self.style.set_offset_left(*value)
+                    }
                     _ => {}
                 },
                 "margin" => {

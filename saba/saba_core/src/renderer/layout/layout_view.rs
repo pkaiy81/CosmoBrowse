@@ -12,6 +12,10 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+// Spec: DOM tree order drives layout-tree construction.
+// The traversal keeps preorder semantics so siblings are laid out in document order.
+// Ref: DOM Standard, tree order.
+// https://dom.spec.whatwg.org/#concept-tree-order
 fn build_layout_tree(
     node: &Option<Rc<RefCell<Node>>>,
     parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
@@ -106,6 +110,9 @@ impl LayoutView {
         tree
     }
 
+    // Spec: CSS2.2 visual formatting model computes used sizes before positions
+    // for normal-flow block/inline boxes in a containing block.
+    // https://www.w3.org/TR/CSS22/visuren.html
     fn calculate_node_size(node: &Option<Rc<RefCell<LayoutObject>>>, parent_size: LayoutSize) {
         if let Some(n) = node {
             if n.borrow().kind() == LayoutObjectKind::Block {
@@ -127,6 +134,9 @@ impl LayoutView {
         }
     }
 
+    // Spec: CSS positioning phase places normal-flow and positioned boxes
+    // relative to their containing blocks after size resolution.
+    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
     fn calculate_node_position(
         node: &Option<Rc<RefCell<LayoutObject>>>,
         parent_point: LayoutPoint,
