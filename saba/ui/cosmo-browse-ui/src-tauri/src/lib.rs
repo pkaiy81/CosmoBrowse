@@ -124,19 +124,31 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
                 width: frame.rect.width,
                 height: frame.rect.height,
             },
-            render_backend: match frame.render_backend {
-                cosmo_runtime::RenderBackendKind::WebView => "web_view".to_string(),
-                cosmo_runtime::RenderBackendKind::NativeScene => "native_scene".to_string(),
+            // Rendering contract: UI consumes scene items only. Legacy WebView hints
+            // are normalized to native_scene during DTO serialization.
+            render_backend: {
+                #[allow(deprecated)]
+                match frame.render_backend {
+                    cosmo_runtime::RenderBackendKind::WebView
+                    | cosmo_runtime::RenderBackendKind::NativeScene => "native_scene".to_string(),
+                }
             },
             document_url: frame.document_url,
             scene_items: frame.scene_items,
             html_content: frame.html_content,
-            child_frames: frame.child_frames.into_iter().map(BrowserFrameDto::from).collect(),
+            child_frames: frame
+                .child_frames
+                .into_iter()
+                .map(BrowserFrameDto::from)
+                .collect(),
         }
     }
 }
 
-fn collect_dom_snapshots(frame: &cosmo_runtime::FrameViewModel, out: &mut Vec<DomSnapshotEntryDto>) {
+fn collect_dom_snapshots(
+    frame: &cosmo_runtime::FrameViewModel,
+    out: &mut Vec<DomSnapshotEntryDto>,
+) {
     if let Some(html) = frame.html_content.as_ref() {
         out.push(DomSnapshotEntryDto {
             frame_id: frame.id.clone(),
@@ -165,7 +177,10 @@ fn is_console_log_entry(entry: &str) -> bool {
 
 #[tauri::command]
 fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.open_url(&url).map(BrowserPageDto::from)
 }
 
@@ -176,14 +191,20 @@ fn activate_link(
     href: String,
     target: Option<String>,
 ) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.activate_link(&frame_id, &href, target.as_deref())
         .map(BrowserPageDto::from)
 }
 
 #[tauri::command]
 fn get_page_view(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    let app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     Ok(BrowserPageDto::from(app.get_page_view()))
 }
 
@@ -193,37 +214,55 @@ fn set_viewport(
     width: i64,
     height: i64,
 ) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.set_viewport(width, height).map(BrowserPageDto::from)
 }
 
 #[tauri::command]
 fn reload(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.reload().map(BrowserPageDto::from)
 }
 
 #[tauri::command]
 fn back(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.back().map(BrowserPageDto::from)
 }
 
 #[tauri::command]
 fn forward(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.forward().map(BrowserPageDto::from)
 }
 
 #[tauri::command]
 fn get_navigation_state(state: tauri::State<'_, AppState>) -> Result<NavigationState, AppError> {
-    let app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     Ok(app.get_navigation_state())
 }
 
 #[tauri::command]
 fn get_metrics(state: tauri::State<'_, AppState>) -> Result<AppMetricsSnapshot, AppError> {
-    let app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     Ok(app.get_metrics())
 }
 
@@ -236,31 +275,46 @@ fn get_latest_crash_report() -> Option<CrashReportDto> {
 
 #[tauri::command]
 fn new_tab(state: tauri::State<'_, AppState>) -> Result<TabSummary, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     Ok(app.new_tab())
 }
 
 #[tauri::command]
 fn switch_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<BrowserPageDto, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.switch_tab(id).map(BrowserPageDto::from)
 }
 
 #[tauri::command]
 fn close_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<Vec<TabSummary>, AppError> {
-    let mut app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let mut app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.close_tab(id)
 }
 
 #[tauri::command]
 fn list_tabs(state: tauri::State<'_, AppState>) -> Result<Vec<TabSummary>, AppError> {
-    let app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     Ok(app.list_tabs())
 }
 
 #[tauri::command]
 fn search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, AppError> {
-    let app = state.app.lock().map_err(|_| AppError::state("Failed to lock app state"))?;
+    let app = state
+        .app
+        .lock()
+        .map_err(|_| AppError::state("Failed to lock app state"))?;
     app.search(&query)
 }
 
