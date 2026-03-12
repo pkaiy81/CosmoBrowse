@@ -1,4 +1,4 @@
-workspace = { members = [ "adapter_cli", "net/wasabi", "saba_core", "saba_app", "cosmo_core", "cosmo_runtime", "ui/wasabi", "renderer-wasm", "ui/cosmo-browse-ui/src-tauri"] }
+workspace = { members = [ "adapter_cli", "adapter_native", "net/wasabi", "saba_core", "saba_app", "cosmo_core", "cosmo_runtime", "ui/wasabi", "renderer-wasm", "ui/cosmo-browse-ui/src-tauri"] }
 
 [package]
 authors = ["pkaiy81"]

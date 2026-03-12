@@ -59,11 +59,17 @@
 - See `docs/architecture/js-event-loop.md` for the task/microtask processing diagram.
 
 
-## Browser/Renderer IPC DTO (`cosmo-browse-ui`)
-- Tauri IPC uses a fixed DTO: `BrowserPageDto`.
-- The DTO includes:
+## Browser/Renderer IPC contract (`saba_app` public API boundary)
+- `saba_app` public API (`AppService` + exported DTO群) is treated as the Browser Process API boundary.
+- IPC contract is defined with framework-neutral message schema in `adapter_native`:
+  - request: `IpcRequest`
+  - response: `IpcResponse`
+- `IpcResponse::Page(BrowserPageDto)` is the canonical page payload and does **not** include Tauri-specific types (`tauri::State`, `Invoke`, command macro types, etc.).
+- `BrowserPageDto` fields:
   - `root_frame`: frame tree
   - `network_log`: HTTP/CORS/TLS diagnostic logs
   - `console_log`: script/DOM diagnostic logs
   - `dom_snapshot`: per-frame HTML snapshots
-- Goal: prevent Browser internal model changes from cascading into the Renderer.
+- Compatibility policy:
+  - Existing Tauri command names remain available via `adapter_tauri` compatibility commands.
+  - Default integration path is schema-based IPC (`dispatch_ipc(IpcRequest) -> IpcResponse`) so Renderer can migrate away from `invoke`-specific coupling.
