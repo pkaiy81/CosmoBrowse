@@ -149,3 +149,18 @@
 - コマンド失敗率（`open_url`, `search` など）
 - クラッシュ率
 - 別adapterで再利用できた API 比率
+
+
+---
+
+## 8. IPC adapter migration plan（invoke互換維持）
+1. `adapter_native` を Browser Process の標準 adapter として導入し、`IpcRequest` / `IpcResponse` を IPC 契約として固定する。
+2. `ui/cosmo-browse-ui/src-tauri` の command 群は `adapter_tauri` 互換レイヤとして維持し、内部では `adapter_native` を呼び出す。
+3. デフォルト実行経路は `dispatch_ipc`（schema-based）へ切替える。
+4. 既存フロントは段階移行:
+   - Step 1: 既存 `invoke("open_url")` 等を維持（互換モード）。
+   - Step 2: 新規実装は `invoke("dispatch_ipc", { request })` を使用。
+   - Step 3: 移行完了後に互換 command の利用状況を監視し、削除可否を判断する。
+5. 移行期間のレビュー観点:
+   - `adapter_* -> saba_app -> saba_core` 依存方向を維持。
+   - DTO/IPC 契約に `tauri` 固有型を混入させない。

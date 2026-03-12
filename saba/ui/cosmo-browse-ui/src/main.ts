@@ -74,6 +74,21 @@ type EmbeddedNavigationMessage = {
   target: string;
 };
 
+type IpcRequest = {
+  type: string;
+  payload?: Record<string, unknown>;
+};
+
+type IpcEnvelope<T> = {
+  type: string;
+  payload: T;
+};
+
+async function invokeIpc<T>(request: IpcRequest): Promise<T> {
+  const response = await invoke<IpcEnvelope<T>>("dispatch_ipc", { request });
+  return response.payload;
+}
+
 let urlInputEl: HTMLInputElement | null;
 let statusEl: HTMLElement | null;
 let currentUrlEl: HTMLElement | null;
@@ -343,7 +358,7 @@ function renderDiagnostics(view: PageViewModel) {
 
 async function refreshCrashReport() {
   try {
-    const report = await invoke<{ path: string; reason: string; crashed_at_ms: number; reproduction: string[] } | null>("get_latest_crash_report");
+    const report = await invokeIpc<{ path: string; reason: string; crashed_at_ms: number; reproduction: string[] } | null>({ type: "get_latest_crash_report" });
     if (!crashReportEl) return;
     crashReportEl.textContent = report
       ? `Crash report: ${report.reason} @ ${new Date(report.crashed_at_ms).toISOString()} (${report.path})`
@@ -365,13 +380,13 @@ function renderPageView(view: PageViewModel) {
 }
 
 async function refreshTabs() {
-  const tabs = await invoke<TabSummary[]>("list_tabs");
+  const tabs = await invokeIpc<TabSummary[]>({ type: "list_tabs" });
   renderTabs(tabs);
 }
 
 async function refreshNavigationState() {
   try {
-    const nav = await invoke<NavigationState>("get_navigation_state");
+    const nav = await invokeIpc<NavigationState>({ type: "get_navigation_state" });
     setNavButtons(nav);
   } catch {
     if (backButtonEl) backButtonEl.disabled = true;
@@ -388,7 +403,7 @@ async function syncViewport(force = false, epoch = pageEpoch) {
   if (!force && resizeTimer) window.clearTimeout(resizeTimer);
   const run = async () => {
     try {
-      const view = await invoke<PageViewModel>("set_viewport", { width, height });
+      const view = await invokeIpc<PageViewModel>({ type: "set_viewport", payload: { width, height } });
       if (!isCurrentPageEpoch(epoch)) return;
       renderPageView(view);
       await refreshNavigationState();
@@ -410,7 +425,7 @@ async function executeNavigationCommand(command: string, loadingMessage: string)
   try {
     clearSearchResults();
     setStatus(loadingMessage);
-    const view = await invoke<PageViewModel>(command);
+    const view = await invokeIpc<PageViewModel>({ type: command });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -426,7 +441,7 @@ async function openUrl(url: string) {
   try {
     clearSearchResults();
     setStatus("Loading...");
-    const view = await invoke<PageViewModel>("open_url", { url });
+    const view = await invokeIpc<PageViewModel>({ type: "open_url", payload: { url } });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -469,10 +484,13 @@ async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
   const epoch = beginPageEpoch();
   try {
     setStatus("Navigating...");
-    const view = await invoke<PageViewModel>("activate_link", {
-      frameId: message.frameId,
-      href: message.href,
-      target: normalizedTarget,
+    const view = await invokeIpc<PageViewModel>({
+      type: "activate_link",
+      payload: {
+        frame_id: message.frameId,
+        href: message.href,
+        target: normalizedTarget,
+      },
     });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
@@ -497,7 +515,7 @@ async function openCurrentInput() {
   }
 
   try {
-    const results = await invoke<SearchResult[]>("search", { query: value });
+    const results = await invokeIpc<SearchResult[]>({ type: "search", payload: { query: value } });
     renderSearchResults(results);
     setStatus(`Found ${results.length} search results.`);
   } catch (errorValue) {
@@ -509,7 +527,7 @@ async function switchTab(id: number) {
   const epoch = beginPageEpoch();
   try {
     clearSearchResults();
-    const view = await invoke<PageViewModel>("switch_tab", { id });
+    const view = await invokeIpc<PageViewModel>({ type: "switch_tab", payload: { id } });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -524,9 +542,9 @@ async function closeTab(id: number) {
   const epoch = beginPageEpoch();
   try {
     clearSearchResults();
-    await invoke<TabSummary[]>("close_tab", { id });
+    await invokeIpc<TabSummary[]>({ type: "close_tab", payload: { id } });
     if (!isCurrentPageEpoch(epoch)) return;
-    const view = await invoke<PageViewModel>("get_page_view");
+    const view = await invokeIpc<PageViewModel>({ type: "get_page_view" });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -541,9 +559,9 @@ async function createTab() {
   const epoch = beginPageEpoch();
   try {
     clearSearchResults();
-    await invoke<TabSummary>("new_tab");
+    await invokeIpc<TabSummary>({ type: "new_tab" });
     if (!isCurrentPageEpoch(epoch)) return;
-    const view = await invoke<PageViewModel>("get_page_view");
+    const view = await invokeIpc<PageViewModel>({ type: "get_page_view" });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -559,7 +577,7 @@ async function loadInitialPageView() {
   try {
     await syncViewport(true, epoch);
     if (!isCurrentPageEpoch(epoch)) return;
-    const view = await invoke<PageViewModel>("get_page_view");
+    const view = await invokeIpc<PageViewModel>({ type: "get_page_view" });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
