@@ -112,6 +112,7 @@ pub enum SceneItem {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderBackendKind {
+    #[deprecated(note = "WebView backend is legacy-only; use NativeScene")]
     WebView,
     NativeScene,
 }
@@ -136,7 +137,18 @@ pub enum RenderBackendKind {
 pub trait RenderBackend {
     fn name(&self) -> &'static str;
 
+    /// Resolves the backend kind for a frame.
+    ///
+    /// Render paths should follow the engine pipeline order defined by standards:
+    /// HTML LS parsing -> DOM Standard tree mutations -> CSS Display/CSS2 visual
+    /// formatting model layout -> paint in scene item order.
     fn kind_for_frame(&self, frame: &FrameViewModel) -> RenderBackendKind;
+
+    /// Returns true when this backend kind represents deprecated WebView usage.
+    #[allow(deprecated)]
+    fn is_legacy_webview(&self, kind: &RenderBackendKind) -> bool {
+        matches!(kind, RenderBackendKind::WebView)
+    }
 }
 
 /// Script execution contract exposed by `saba_app`.
@@ -186,7 +198,7 @@ pub struct DefaultRenderBackend;
 
 impl RenderBackend for DefaultRenderBackend {
     fn name(&self) -> &'static str {
-        "webview"
+        "native-scene"
     }
 
     fn kind_for_frame(&self, frame: &FrameViewModel) -> RenderBackendKind {

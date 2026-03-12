@@ -607,7 +607,7 @@ fn build_inline_frameset_view(
             width: rect.width,
             height: rect.height,
         },
-        render_backend: RenderBackendKind::WebView,
+        render_backend: RenderBackendKind::NativeScene,
         document_url: current_url,
         scene_items: Vec::new(),
         html_content: None,
@@ -650,6 +650,9 @@ fn build_leaf_frame_view(
     let prepared_html = prepare_html_for_display(&csp_html, current_url, frame_id);
     let mut diagnostics = diagnostics;
     diagnostics.extend(csp_diagnostics);
+    // Spec mapping: HTML LS parsing + DOM Standard tree updates happen in the
+    // layout/JS runtime stage, and resulting computed boxes are painted in
+    // CSS Display + CSS2 visual formatting model order as `scene_items`.
     let script_layout = build_layout_scene_with_script_runtime(html, &rect);
     diagnostics.extend(script_layout.diagnostics.clone());
     if script_layout.dom_updated {
@@ -691,7 +694,7 @@ fn blank_page_view(width: i64, height: i64) -> PageViewModel {
                 height,
             },
             content_size: ContentSize { width, height },
-            render_backend: RenderBackendKind::WebView,
+            render_backend: RenderBackendKind::NativeScene,
             document_url: String::new(),
             scene_items: Vec::new(),
             html_content: Some(
@@ -1080,7 +1083,7 @@ mod tests {
                 width: 960,
                 height: 720,
             },
-            render_backend: RenderBackendKind::WebView,
+            render_backend: RenderBackendKind::NativeScene,
             document_url: "fixture://abehiroshi/index".to_string(),
             scene_items: Vec::new(),
             html_content: None,
@@ -1102,7 +1105,7 @@ mod tests {
                         width: 720,
                         height: 720,
                     },
-                    render_backend: RenderBackendKind::WebView,
+                    render_backend: RenderBackendKind::NativeScene,
                     document_url: "fixture://abehiroshi/top".to_string(),
                     scene_items: Vec::new(),
                     html_content: None,
@@ -1133,7 +1136,7 @@ mod tests {
                 width: 320,
                 height: 240,
             },
-            render_backend: RenderBackendKind::WebView,
+            render_backend: RenderBackendKind::NativeScene,
             document_url: current_url.to_string(),
             scene_items: Vec::new(),
             html_content: Some("<html></html>".to_string()),

@@ -95,21 +95,8 @@ let resizeTimer: number | null = null;
 let pageEpoch = 0;
 
 type RenderBackend = {
-  kind: "web_view" | "native_scene";
+  kind: "native_scene";
   renderLeafFrame: (frame: FrameViewModel, shell: HTMLElement) => void;
-};
-
-const webViewBackend: RenderBackend = {
-  kind: "web_view",
-  renderLeafFrame(frame, shell) {
-    const iframe = document.createElement("iframe");
-    iframe.className = "frame-document";
-    iframe.title = frame.title || frame.current_url;
-    // Ref: HTML Living Standard `iframe srcdoc` definition.
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc
-    iframe.srcdoc = frame.html_content ?? "<html><body></body></html>";
-    shell.appendChild(iframe);
-  },
 };
 
 const nativeSceneBackend: RenderBackend = {
@@ -125,6 +112,8 @@ const nativeSceneBackend: RenderBackend = {
     scene.style.height = "100%";
     scene.style.overflow = "hidden";
 
+    // Spec note: item order represents paint order from CSS2 visual formatting
+    // model after CSS Display layout resolution.
     for (const item of frame.scene_items) {
       scene.appendChild(renderSceneItem(frame, item));
     }
@@ -212,9 +201,11 @@ function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
 
 function resolveRenderBackend(frame: FrameViewModel): RenderBackend {
   // Backend replacement point: renderer selection is centralized here.
+  // Spec note: regardless of incoming hint, rendering consumes scene items that
+  // already encode HTML LS parsing + DOM Standard updates + CSS layout/paint order.
   switch (frame.render_backend) {
     case "web_view":
-      return webViewBackend;
+      return nativeSceneBackend;
     case "native_scene":
       return nativeSceneBackend;
   }
