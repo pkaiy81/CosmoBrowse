@@ -21,6 +21,8 @@ use saba_core::renderer::layout::layout_view::LayoutView;
 pub enum RelayoutTrigger {
     ViewportChanged,
     DomChanged,
+    StyleChanged,
+    IncrementalScenePatch,
 }
 
 impl RelayoutTrigger {
@@ -28,6 +30,8 @@ impl RelayoutTrigger {
         match self {
             Self::ViewportChanged => "Relayout trigger: viewport changed",
             Self::DomChanged => "Relayout trigger: DOM changed",
+            Self::StyleChanged => "Relayout trigger: style changed",
+            Self::IncrementalScenePatch => "Relayout trigger: incremental scene patch",
         }
     }
 }
@@ -43,6 +47,49 @@ pub struct ScriptLayoutResult {
     pub layout_scene: LayoutScene,
     pub diagnostics: Vec<String>,
     pub dom_updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneDiffResult {
+    pub added: Vec<SceneItem>,
+    pub removed: Vec<SceneItem>,
+    pub changed: Vec<SceneItem>,
+}
+
+impl SceneDiffResult {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Strict relayout gate: only viewport/style/dom changes rebuild layout tree.
+pub fn should_relayout(trigger: &RelayoutTrigger) -> bool {
+    !matches!(trigger, RelayoutTrigger::IncrementalScenePatch)
+}
+
+pub fn diff_scene_items(previous: &[SceneItem], next: &[SceneItem]) -> SceneDiffResult {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+
+    let shared = previous.len().min(next.len());
+    for idx in 0..shared {
+        if previous[idx] != next[idx] {
+            changed.push(next[idx].clone());
+        }
+    }
+    if next.len() > shared {
+        added.extend_from_slice(&next[shared..]);
+    }
+    if previous.len() > shared {
+        removed.extend_from_slice(&previous[shared..]);
+    }
+
+    SceneDiffResult {
+        added,
+        removed,
+        changed,
+    }
 }
 
 pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> ScriptLayoutResult {
@@ -91,6 +138,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 style,
                 layout_point,
                 layout_size,
+                paint_order,
+                clip_rect,
             } => {
                 let x = rect.x + layout_point.x();
                 let y = rect.y + layout_point.y();
@@ -103,6 +152,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     height: layout_size.height(),
                     background_color: style.background_color().code().to_string(),
                     opacity: style.opacity(),
+                    z_index: paint_order.z_index,
+                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 });
             }
             DisplayItem::Text {
@@ -110,6 +161,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 style,
                 layout_point,
                 href,
+                paint_order,
+                clip_rect,
             } => {
                 let x = rect.x + layout_point.x();
                 let y = rect.y + layout_point.y();
@@ -128,10 +181,18 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     opacity: style.opacity(),
                     href,
                     target: None,
+                    z_index: paint_order.z_index,
+                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 });
             }
         }
     }
+
+    scene_items.sort_by_key(|item| match item {
+        SceneItem::Rect { z_index, .. }
+        | SceneItem::Text { z_index, .. }
+        | SceneItem::Image { z_index, .. } => *z_index,
+    });
 
     LayoutScene {
         scene_items,
@@ -165,5 +226,38 @@ mod tests {
             SceneItem::Image { x, .. } => *x,
         };
         assert!(first_x >= rect.x);
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn diff_scene_items_detects_changed_rows() {
+        let prev = vec![SceneItem::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+            background_color: "#fff".to_string(),
+            opacity: 1.0,
+            z_index: 0,
+            clip_rect: None,
+        }];
+        let next = vec![SceneItem::Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+            background_color: "#fff".to_string(),
+            opacity: 1.0,
+            z_index: 1,
+            clip_rect: None,
+        }];
+        let diff = diff_scene_items(&prev, &next);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert_eq!(diff.changed.len(), 1);
     }
 }

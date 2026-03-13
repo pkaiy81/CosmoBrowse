@@ -243,4 +243,3 @@ fn collect_text(node: &Rc<RefCell<Node>>) -> String {
 
     text
 }
-

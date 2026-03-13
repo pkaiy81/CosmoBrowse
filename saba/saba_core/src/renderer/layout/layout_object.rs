@@ -1,6 +1,8 @@
 use crate::constants::CHAR_HEIGHT_WITH_PADDING;
 use crate::constants::CHAR_WIDTH;
+use crate::display_item::ClipRect;
 use crate::display_item::DisplayItem;
+use crate::display_item::PaintOrder;
 use crate::renderer::css::cssom::ComponentValue;
 use crate::renderer::css::cssom::Declaration;
 use crate::renderer::css::cssom::Selector;
@@ -318,6 +320,24 @@ impl LayoutObject {
                             style: self.style(),
                             layout_point: self.point(),
                             layout_size: self.size(),
+                            paint_order: PaintOrder {
+                                stacking_context: if self.style.position() != PositionType::Static {
+                                    1
+                                } else {
+                                    0
+                                },
+                                z_index: self.style.z_index(),
+                            },
+                            clip_rect: if self.style.overflow_clip() {
+                                Some(ClipRect {
+                                    x: self.point().x(),
+                                    y: self.point().y(),
+                                    width: self.size().width(),
+                                    height: self.size().height(),
+                                })
+                            } else {
+                                None
+                            },
                         }];
                     }
                 }
@@ -330,6 +350,24 @@ impl LayoutObject {
                             style: self.style(),
                             layout_point: self.point(),
                             layout_size: self.size(),
+                            paint_order: PaintOrder {
+                                stacking_context: if self.style.position() != PositionType::Static {
+                                    1
+                                } else {
+                                    0
+                                },
+                                z_index: self.style.z_index(),
+                            },
+                            clip_rect: if self.style.overflow_clip() {
+                                Some(ClipRect {
+                                    x: self.point().x(),
+                                    y: self.point().y(),
+                                    width: self.size().width(),
+                                    height: self.size().height(),
+                                })
+                            } else {
+                                None
+                            },
                         });
                     }
 
@@ -342,6 +380,15 @@ impl LayoutObject {
                                 self.point().y() + 10,
                             ),
                             href: self.link_href(),
+                            paint_order: PaintOrder {
+                                stacking_context: if self.style.position() != PositionType::Static {
+                                    1
+                                } else {
+                                    0
+                                },
+                                z_index: self.style.z_index(),
+                            },
+                            clip_rect: None,
                         });
                     }
 
@@ -373,6 +420,15 @@ impl LayoutObject {
                                 self.point().y() + CHAR_HEIGHT_WITH_PADDING * i as i64,
                             ),
                             href: href.clone(),
+                            paint_order: PaintOrder {
+                                stacking_context: if self.style.position() != PositionType::Static {
+                                    1
+                                } else {
+                                    0
+                                },
+                                z_index: self.style.z_index(),
+                            },
+                            clip_rect: None,
                         };
                         v.push(item);
                     }
@@ -643,6 +699,16 @@ impl LayoutObject {
                     }
                     _ => {}
                 },
+                "z-index" => match first_value {
+                    Some(ComponentValue::Number(value)) => self.style.set_z_index(*value as i32),
+                    _ => {}
+                },
+                "overflow" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style
+                            .set_overflow_clip(value == "hidden" || value == "clip");
+                    }
+                }
                 "margin" => {
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =

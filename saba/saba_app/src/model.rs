@@ -83,6 +83,8 @@ pub enum SceneItem {
         height: i64,
         background_color: String,
         opacity: f64,
+        z_index: i32,
+        clip_rect: Option<(i64, i64, i64, i64)>,
     },
     Text {
         x: i64,
@@ -95,6 +97,8 @@ pub enum SceneItem {
         opacity: f64,
         href: Option<String>,
         target: Option<String>,
+        z_index: i32,
+        clip_rect: Option<(i64, i64, i64, i64)>,
     },
     Image {
         x: i64,
@@ -106,6 +110,8 @@ pub enum SceneItem {
         opacity: f64,
         href: Option<String>,
         target: Option<String>,
+        z_index: i32,
+        clip_rect: Option<(i64, i64, i64, i64)>,
     },
 }
 
