@@ -2,6 +2,8 @@
 
 ## Current (SceneItem native pipeline)
 
+> Diagram source: `docs/architecture/mermaid/render-pipeline.mmd`
+
 ```mermaid
 flowchart LR
   A["HTML LS parsing + DOM Standard tree"] --> B["CSS Display/CSS2 visual formatting model layout"]

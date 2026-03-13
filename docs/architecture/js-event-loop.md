@@ -11,29 +11,16 @@
 5. **`dispatch_click` は DOM Standard の event dispatch を簡略化し、対象要素に登録済み click listener を task queue へ積む。**
 6. **DOM 変更（例: `textContent` 更新）が発生した場合は、`DOM更新 -> レイアウト再計算 -> 再描画` をトリガする。**
 
-```text
-+-------------------------+
-| Execute top-level script|
-+-----------+-------------+
-            |
-            v
-+-------------------------+
-| Drain microtasks        |
-+-----------+-------------+
-            |
-            v
-+--------------------------------+
-| Event loop tick (while tasks)  |
-| 1) pop task                    |
-| 2) run callback                |
-| 3) drain microtasks            |
-+-----------+--------------------+
-            |
-            v
-+--------------------------------+
-| If DOM invalidated:            |
-| relayout -> repaint            |
-+--------------------------------+
+> Diagram source: `docs/architecture/mermaid/js-event-loop.mmd`
+
+```mermaid
+flowchart TD
+  A["Execute top-level script"] --> B["Drain microtasks"]
+  B --> C["Event loop tick (while tasks)\n1) pop task\n2) run callback\n3) drain microtasks"]
+  C --> D{"DOM invalidated?"}
+  D -->|"Yes"| E["Relayout -> Repaint"]
+  D -->|"No"| C
+  E --> C
 ```
 
 ## Supported minimum set

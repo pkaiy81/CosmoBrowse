@@ -1,0 +1,8 @@
+flowchart TD
+  UI["cosmo-browse-ui (untrusted page content container)"] -->|"navigate/link click"| APP["cosmo_runtime session/loader"]
+  APP -->|"fetch pipeline: request->redirect->cache->response validation"| NET["reqwest fetch"]
+  NET -->|"connection pooling + TLS handshake"| TLS["OS/WebPKI trust store"]
+  NET -->|"response headers"| SEC["Security evaluator\n(same-origin + mixed-content + CORS + sandbox + cookie attrs)"]
+  SEC --> VM["FrameViewModel diagnostics + html_content"]
+  VM --> UI
+  EXT["Remote origins"] --> NET

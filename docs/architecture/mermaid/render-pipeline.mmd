@@ -1,0 +1,7 @@
+flowchart LR
+  A["HTML LS parsing + DOM Standard tree"] --> B["CSS Display/CSS2 visual formatting model layout"]
+  B --> C["Orbit Engine / Nebula Renderer tree"]
+  C --> D["Starship Runtime DTO: GalaxyFrame + scene_items"]
+  D --> E["cosmo-browse-ui RenderBackend resolver"]
+  E --> F["NativeSceneBackend"]
+  F --> G["SceneItem raster/compositor"]

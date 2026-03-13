@@ -4,6 +4,8 @@ CosmoBrowse applies a unified security boundary in `cosmo_runtime` so navigation
 
 ## Trust boundary diagram
 
+> Diagram source: `docs/architecture/mermaid/security-boundary.mmd`
+
 ```mermaid
 flowchart TD
   UI["cosmo-browse-ui (untrusted page content container)"] -->|navigate/link click| APP["cosmo_runtime session/loader"]
