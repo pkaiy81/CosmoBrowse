@@ -5,8 +5,8 @@
 ```mermaid
 flowchart LR
   A["HTML LS parsing + DOM Standard tree"] --> B["CSS Display/CSS2 visual formatting model layout"]
-  B --> C["saba_core layout/render tree"]
-  C --> D["saba_app DTO: FrameViewModel + scene_items"]
+  B --> C["Orbit Engine / Nebula Renderer tree"]
+  C --> D["Starship Runtime DTO: GalaxyFrame + scene_items"]
   D --> E["cosmo-browse-ui RenderBackend resolver"]
   E --> F["NativeSceneBackend"]
   F --> G["SceneItem raster/compositor"]
@@ -26,7 +26,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  A["saba_core layout/render tree"] --> B["saba_app DTO: FrameViewModel"]
+  A["Orbit Engine / Nebula Renderer tree"] --> B["Starship Runtime DTO: GalaxyFrame"]
   B --> C["cosmo-browse-ui RenderBackend resolver"]
   C --> D["WebViewBackend (deprecated)"]
   D --> E["iframe srcdoc"]
@@ -35,7 +35,7 @@ flowchart LR
 
 ## Backend swap points
 
-- `FrameViewModel.render_backend` is the backend selection hint transported from `saba_app`.
+- `FrameViewModel.render_backend` is the backend selection hint transported from `cosmo_runtime`.
 - `resolveRenderBackend(frame)` in `main.ts` is the single switch point for backend replacement.
 - `RenderBackend.renderLeafFrame(...)` now resolves to scene item rendering only; WebView is deprecated.
 

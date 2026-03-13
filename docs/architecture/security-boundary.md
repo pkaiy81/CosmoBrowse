@@ -1,12 +1,12 @@
 # Security Boundary
 
-CosmoBrowse applies a unified security boundary in `saba_app` so navigation, frame loading, and resource admission share the same origin/certificate/CSP baseline.
+CosmoBrowse applies a unified security boundary in `cosmo_runtime` so navigation, frame loading, and resource admission share the same origin/certificate/CSP baseline.
 
 ## Trust boundary diagram
 
 ```mermaid
 flowchart TD
-  UI["cosmo-browse-ui (untrusted page content container)"] -->|navigate/link click| APP["saba_app session/loader"]
+  UI["cosmo-browse-ui (untrusted page content container)"] -->|navigate/link click| APP["cosmo_runtime session/loader"]
   APP -->|fetch pipeline: request->redirect->cache->response validation| NET["reqwest fetch"]
   NET -->|connection pooling + TLS handshake| TLS["OS/WebPKI trust store"]
   NET -->|response headers| SEC["Security evaluator\n(same-origin + mixed-content + CORS + sandbox + cookie attrs)"]

@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-saba_app = { path = "../saba_app" }
+cosmo_app_legacy = { path = "../cosmo_app_legacy" }

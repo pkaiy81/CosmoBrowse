@@ -13,15 +13,15 @@
 
 ## High-Level Architecture
 - Frontend UI: `saba/ui/cosmo-browse-ui/src/main.ts`
-  - Collects user input, calls Tauri commands, renders the returned `PageViewModel`, listens for embedded navigation messages from `iframe srcdoc` documents, and delegates `_blank` / `mailto:` links to the host OS through the Tauri opener plugin.
+  - Collects user input, calls Tauri commands, renders the returned `OrbitSnapshot`, listens for embedded navigation messages from `iframe srcdoc` documents, and delegates `_blank` / `mailto:` links to the host OS through the Tauri opener plugin.
 - Tauri command bridge: `saba/ui/cosmo-browse-ui/src-tauri/src/lib.rs`
   - Exposes `open_url`, `activate_link`, `reload`, `back`, `forward`, `set_viewport`, `get_page_view`, `list_tabs`, `new_tab`, `close_tab`, `search`, and `get_metrics`.
-- Application service and navigation state: `saba/saba_app/src/session.rs`
+- Application service and navigation state: `saba/cosmo_app_legacy/src/session.rs`
   - Owns tabs, sessions, history, frame-target routing, page loading, and metrics.
-- Fetch / decode / frame parsing helpers: `saba/saba_app/src/loader.rs`
+- Fetch / decode / frame parsing helpers: `saba/cosmo_app_legacy/src/loader.rs`
   - Fetches documents, detects encoding, resolves URLs, parses `frameset` / `frame` / `noframes`, and injects `<base>` plus navigation script for leaf documents.
-- Shared view models: `saba/saba_app/src/model.rs`
-  - Defines `PageViewModel`, `FrameViewModel`, `NavigationState`, and metrics payloads.
+- Shared view models: `saba/cosmo_app_legacy/src/model.rs`
+  - Defines `OrbitSnapshot`, `GalaxyFrame`, `NavigationState`, and metrics payloads.
 - Inspection CLI: `saba/adapter_cli/src/main.rs`
   - Allows snapshot and metrics inspection outside the UI, including frame-targeted navigation replay.
 
@@ -46,35 +46,35 @@
   - Tauri commands lock shared app state and call the `AppService` implementation.
   - The return value is serialized back to the frontend as JSON.
 
-### 3. `SabaApp` dispatches to the active tab/session
+### 3. `Starship Runtime` dispatches to the active tab/session
 - Code:
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
 - Main types:
-  - `SabaApp`
+  - `Starship Runtime`
   - `Tab`
-  - `BrowserSession`
+  - `Orbit Session`
 - Behavior:
-  - `SabaApp` keeps multiple tabs and an active tab id.
-  - `BrowserSession` owns the per-tab history stack and current viewport.
+  - `Starship Runtime` keeps multiple tabs and an active tab id.
+  - `Orbit Session` owns the per-tab history stack and current viewport.
   - `execute_navigation(...)` wraps navigation calls and records timing / error metrics.
 
-### 4. A page load starts from `BrowserSession::load_page`
+### 4. A page load starts from `Orbit Session::load_page`
 - Code:
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
 - Main functions:
-  - `BrowserSession::open_url(...)`
-  - `BrowserSession::activate_link(...)`
-  - `BrowserSession::load_page(...)`
+  - `Orbit Session::open_url(...)`
+  - `Orbit Session::activate_link(...)`
+  - `Orbit Session::load_page(...)`
   - `load_frame_recursive(...)`
 - Behavior:
   - The session computes a root viewport rectangle.
   - The root document is loaded into a recursive frame tree.
-  - The resulting tree becomes `PageViewModel.root_frame`.
+  - The resulting tree becomes `OrbitSnapshot.root_frame`.
 - Page-level diagnostics are collected from the full frame tree and deduplicated before they are returned to the UI.
 
 ### 5. Documents are fetched and decoded
 - Code:
-  - `saba/saba_app/src/loader.rs`
+  - `saba/cosmo_app_legacy/src/loader.rs`
 - Main functions:
   - `fetch_document(...)`
   - `decode_html_bytes(...)`
@@ -88,8 +88,8 @@
 
 ### 6. Frame documents are parsed into a recursive frame tree
 - Code:
-  - `saba/saba_app/src/loader.rs`
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/loader.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
 - Main functions and types:
   - `parse_frameset_document(...)`
   - `parse_frameset_at(...)`
@@ -100,15 +100,15 @@
 - Behavior:
   - The loader parses inline nested `frameset` structures recursively.
   - `noframes` fallback HTML is retained on the parsed spec.
-  - Session code converts the parsed spec into nested `FrameViewModel` nodes.
+  - Session code converts the parsed spec into nested `GalaxyFrame` nodes.
   - External child frames recurse through `load_frame_recursive(...)`.
   - Inline nested framesets stay in the same document URL and only subdivide the rectangle tree.
   - When a `frameset` has no usable child frames but has `noframes`, the fallback is rendered as a leaf document.
 
 ### 7. Leaf documents are converted for WebView rendering
 - Code:
-  - `saba/saba_app/src/loader.rs`
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/loader.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
 - Main functions:
   - `prepare_html_for_display(...)`
   - `build_leaf_frame_view(...)`
@@ -127,17 +127,17 @@
   - `renderFrameTree(...)`
   - `renderFrame(...)`
 - Behavior:
-  - Each `FrameViewModel` becomes an absolutely positioned DOM section.
+  - Each `GalaxyFrame` becomes an absolutely positioned DOM section.
   - Container frames render nested children.
   - Leaf frames render an `<iframe>` whose `srcdoc` is the prepared HTML payload.
 
 ### 9. Clicking a link inside a frame triggers targeted navigation
 - Code:
   - `saba/ui/cosmo-browse-ui/src/main.ts`
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
 - Main functions:
   - `handleEmbeddedNavigation(...)`
-  - `BrowserSession::activate_link(...)`
+  - `Orbit Session::activate_link(...)`
   - `resolve_destination_frame_id(...)`
   - `find_frame_id_by_name(...)`
 - Behavior:
@@ -149,28 +149,28 @@
 
 ### 10. History and viewport changes re-render the current page
 - Code:
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
   - `saba/ui/cosmo-browse-ui/src/main.ts`
 - Main functions:
-  - `BrowserSession::back(...)`
-  - `BrowserSession::forward(...)`
-  - `BrowserSession::reload(...)`
-  - `BrowserSession::set_viewport(...)`
+  - `Orbit Session::back(...)`
+  - `Orbit Session::forward(...)`
+  - `Orbit Session::reload(...)`
+  - `Orbit Session::set_viewport(...)`
   - `syncViewport(...)`
 - Behavior:
   - History is stored at the tab/session level as full page snapshots.
   - Resizing the viewport causes a full page reload using the latest frame URL overrides.
 
 ## Core Data Structures
-- `PageViewModel`: `saba/saba_app/src/model.rs`
+- `OrbitSnapshot`: `saba/cosmo_app_legacy/src/model.rs`
   - The root payload returned to the UI.
   - Contains `current_url`, `title`, `diagnostics`, `content_size`, and `root_frame`.
-- `FrameViewModel`: `saba/saba_app/src/model.rs`
+- `GalaxyFrame`: `saba/cosmo_app_legacy/src/model.rs`
   - Represents a single frame node.
   - A frame is either a container (`child_frames` non-empty) or a leaf (`html_content` present).
-- `FramesetSpec`: `saba/saba_app/src/loader.rs`
+- `FramesetSpec`: `saba/cosmo_app_legacy/src/loader.rs`
   - Parsed legacy frameset structure before it becomes a view model tree.
-- `FramesetChild`: `saba/saba_app/src/loader.rs`
+- `FramesetChild`: `saba/cosmo_app_legacy/src/loader.rs`
   - Distinguishes leaf `frame` elements from nested inline `frameset` elements.
 
 ## Verification / Debugging Paths
@@ -184,8 +184,8 @@
 - Portable distribution script:
   - `powershell -ExecutionPolicy Bypass -File .\scripts\build-cosmobrowse-portable.ps1`
 - Current regression tests:
-  - `saba/saba_app/src/loader.rs`
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/loader.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
 
 ## Current Tradeoffs
 - Leaf document layout is delegated to the WebView engine instead of the legacy Rust layout engine.
@@ -196,15 +196,15 @@
 
 ## Files That Commonly Need Joint Updates
 - Frame parsing changes:
-  - `saba/saba_app/src/loader.rs`
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/loader.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
   - `saba/testdata/legacy_frames/*`
 - View model shape changes:
-  - `saba/saba_app/src/model.rs`
+  - `saba/cosmo_app_legacy/src/model.rs`
   - `saba/ui/cosmo-browse-ui/src/main.ts`
   - `saba/ui/cosmo-browse-ui/src-tauri/src/lib.rs`
 - Navigation behavior changes:
-  - `saba/saba_app/src/session.rs`
+  - `saba/cosmo_app_legacy/src/session.rs`
   - `saba/ui/cosmo-browse-ui/src/main.ts`
   - `saba/adapter_cli/src/main.rs`
 
