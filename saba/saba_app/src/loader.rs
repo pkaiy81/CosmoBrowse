@@ -1,12 +1,44 @@
 use crate::model::{AppError, AppResult, FrameRect};
-use crate::security::{classify_tls_policy_error, collect_cookie_diagnostics, passes_cors};
+use crate::security::{
+    classify_tls_policy_error, collect_cookie_diagnostics, evaluate_sandbox_policy,
+    passes_cors,
+};
 use encoding_rs::{Encoding, SHIFT_JIS, UTF_8};
 use regex::Regex;
 use reqwest::blocking::Client;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{
+    CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, HeaderMap, HeaderValue,
+};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use url::Url;
+
+const MAX_REDIRECTS: usize = 10;
+
+#[derive(Debug, Clone)]
+struct CachedEntry {
+    etag: Option<String>,
+    cache_control: Option<String>,
+    html: String,
+    final_url: String,
+    content_type: Option<String>,
+    expires_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct FetchRequest {
+    url: String,
+}
+
+#[derive(Debug, Clone)]
+struct FetchResponse {
+    final_url: String,
+    content_type: Option<String>,
+    body: Vec<u8>,
+    diagnostics: Vec<String>,
+    headers: HeaderMap,
+}
 
 #[derive(Debug)]
 pub struct LoadedDocument {
@@ -48,43 +80,212 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
         return Ok(document);
     }
 
-    let client = Client::builder()
-        .build()
-        .map_err(|error| AppError::network(format!("Failed to build HTTP client: {error}")))?;
-
-    // Spec: RFC 9110 request target and response status semantics are captured in diagnostics.
-    // https://www.rfc-editor.org/rfc/rfc9110
-    // Spec: RFC 9112 HTTP/1.1 framing and message completeness requirements.
-    // https://www.rfc-editor.org/rfc/rfc9112
-    let response = client.get(url).send().map_err(classify_request_error)?;
-    let final_url = response.url().to_string();
-    let status = response.status();
+    // Spec: TLS profile and certificate verification rely on reqwest/rustls defaults.
+    // https://datatracker.ietf.org/doc/html/rfc8446
+    let client = shared_http_client();
+    let request = FetchRequest {
+        url: url.to_string(),
+    };
     let mut diagnostics = Vec::new();
-    diagnostics.push(format!("HTTP GET {} -> {}", url, status));
-    if !passes_cors(url, &final_url, response.headers()) {
-        diagnostics.push(format!(
-            "CORS policy blocked cross-origin read: {} -> {}",
-            url, final_url
-        ));
-    }
-    diagnostics.extend(collect_cookie_diagnostics(response.headers(), &final_url));
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let bytes = response
-        .bytes()
-        .map_err(|error| AppError::network(format!("Failed to read response body: {error}")))?;
 
-    let decoded = decode_html_bytes(&bytes, content_type.as_deref());
+    // Spec: RFC 9110 request and redirect semantics.
+    // https://www.rfc-editor.org/rfc/rfc9110
+    // Spec: RFC 9111 cache validators and freshness model.
+    // https://www.rfc-editor.org/rfc/rfc9111
+    let response = fetch_with_pipeline(client, &request, &mut diagnostics)?;
+
+    validate_response_security(url, &response.final_url, &response.headers, &mut diagnostics);
+
+    let decoded = decode_html_bytes(&response.body, response.content_type.as_deref());
+    diagnostics.extend(response.diagnostics);
     diagnostics.extend(decoded.diagnostics.clone());
+    store_cache_entry(url, &response, &decoded.html);
+
     Ok(LoadedDocument {
-        final_url,
+        final_url: response.final_url,
         title: extract_title(&decoded.html),
         html: decoded.html,
         diagnostics,
     })
+}
+
+fn shared_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(8)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to build shared HTTP client")
+    })
+}
+
+fn response_cache() -> &'static Mutex<HashMap<String, CachedEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fetch_with_pipeline(
+    client: &Client,
+    request: &FetchRequest,
+    diagnostics: &mut Vec<String>,
+) -> AppResult<FetchResponse> {
+    let mut current_url = request.url.clone();
+    let mut redirect_count = 0usize;
+
+    loop {
+        let cached = lookup_cache_entry(&current_url);
+        let mut builder = client.get(&current_url);
+        if let Some(entry) = &cached {
+            if let Some(etag) = &entry.etag {
+                if let Ok(value) = HeaderValue::from_str(etag) {
+                    builder = builder.header(IF_NONE_MATCH, value);
+                    diagnostics.push(format!("cache revalidation with If-None-Match for {current_url}"));
+                }
+            }
+        }
+
+        let response = builder.send().map_err(classify_request_error)?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        diagnostics.push(format!("HTTP GET {} -> {}", current_url, status));
+
+        if status.is_redirection() {
+            if redirect_count >= MAX_REDIRECTS {
+                return Err(AppError::network(format!(
+                    "Redirect limit exceeded while fetching {}",
+                    request.url
+                )));
+            }
+            let Some(location) = headers.get(LOCATION).and_then(|value| value.to_str().ok()) else {
+                return Err(AppError::network(format!(
+                    "Redirect response without Location header at {}",
+                    current_url
+                )));
+            };
+            let next_url = resolve_url(&current_url, location)?;
+            diagnostics.push(format!("redirect followed: {} -> {}", current_url, next_url));
+            current_url = next_url;
+            redirect_count += 1;
+            continue;
+        }
+
+        if status.as_u16() == 304 {
+            if let Some(entry) = cached {
+                diagnostics.push(format!("cache hit with 304 Not Modified for {}", current_url));
+                return Ok(FetchResponse {
+                    final_url: entry.final_url,
+                    content_type: entry.content_type,
+                    body: entry.html.into_bytes(),
+                    diagnostics: Vec::new(),
+                    headers,
+                });
+            }
+        }
+
+        let final_url = response.url().to_string();
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response
+            .bytes()
+            .map_err(|error| AppError::network(format!("Failed to read response body: {error}")))?
+            .to_vec();
+
+        return Ok(FetchResponse {
+            final_url,
+            content_type,
+            body,
+            diagnostics: Vec::new(),
+            headers,
+        });
+    }
+}
+
+fn lookup_cache_entry(url: &str) -> Option<CachedEntry> {
+    let cache = response_cache().lock().ok()?;
+    let entry = cache.get(url)?.clone();
+    if entry.cache_control.as_deref().is_some_and(is_no_store) {
+        return None;
+    }
+    if let Some(expires) = entry.expires_at {
+        if Instant::now() > expires {
+            return None;
+        }
+    }
+    Some(entry)
+}
+
+fn store_cache_entry(original_url: &str, response: &FetchResponse, html: &str) {
+    let etag = response
+        .headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let cache_control = response
+        .headers
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    if cache_control.as_deref().is_some_and(is_no_store) {
+        return;
+    }
+
+    let entry = CachedEntry {
+        etag,
+        cache_control: cache_control.clone(),
+        html: html.to_string(),
+        final_url: response.final_url.clone(),
+        content_type: response.content_type.clone(),
+        expires_at: cache_control
+            .as_deref()
+            .and_then(cache_ttl_from_cache_control)
+            .map(|ttl| Instant::now() + ttl),
+    };
+
+    if let Ok(mut cache) = response_cache().lock() {
+        cache.insert(original_url.to_string(), entry.clone());
+        if original_url != response.final_url {
+            cache.insert(response.final_url.clone(), entry);
+        }
+    }
+}
+
+fn cache_ttl_from_cache_control(value: &str) -> Option<Duration> {
+    value
+        .split(',')
+        .map(str::trim)
+        .find_map(|directive| directive.strip_prefix("max-age="))
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn is_no_store(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|directive| directive.eq_ignore_ascii_case("no-store"))
+}
+
+fn validate_response_security(
+    initiator_url: &str,
+    final_url: &str,
+    headers: &HeaderMap,
+    diagnostics: &mut Vec<String>,
+) {
+    if !passes_cors(initiator_url, final_url, headers) {
+        diagnostics.push(format!(
+            "CORS policy blocked cross-origin read: {} -> {}",
+            initiator_url, final_url
+        ));
+    }
+
+    diagnostics.extend(collect_cookie_diagnostics(headers, final_url));
+
+    let sandbox = evaluate_sandbox_policy(initiator_url, final_url);
+    diagnostics.extend(sandbox.diagnostics);
 }
 
 // Spec: HTML Standard obsolete frames features and the `in frameset` parsing mode.
@@ -556,7 +757,7 @@ fn find_html_open_end_index(html: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_frameset_document, prepare_html_for_display, FrameSpec, FramesetChild};
+    use super::*;
 
     #[test]
     fn prepare_html_for_display_injects_before_case_insensitive_head_close() {
@@ -614,5 +815,18 @@ mod tests {
             FramesetChild::Frameset(nested) => assert_eq!(nested.children.len(), 2),
             FramesetChild::Frame(_) => panic!("expected nested frameset child"),
         }
+    }
+
+    #[test]
+    fn cache_control_parser_extracts_max_age() {
+        let ttl = cache_ttl_from_cache_control("public, max-age=120, must-revalidate")
+            .expect("ttl should parse");
+        assert_eq!(ttl.as_secs(), 120);
+    }
+
+    #[test]
+    fn cache_control_parser_detects_no_store() {
+        assert!(is_no_store("private, no-store"));
+        assert!(!is_no_store("max-age=60"));
     }
 }
