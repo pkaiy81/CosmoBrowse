@@ -22,5 +22,13 @@ sequenceDiagram
     Note over Session,Layout: Relayout trigger 2: DOM changed (navigation/reload)
 ```
 
-- Frameset 文書では `FrameRect` で子フレーム領域を分割し、leaf 文書で style/layout/paint を実行する。
+```mermaid
+flowchart LR
+    A[Style stage\nCSS Cascading/Inheritance\nselector match + computed style] -->
+    B[Layout stage\nCSS2 visual formatting model\nblock/inline + positioned offset]
+    B --> C[Paint stage\nDisplay items\nz-order + clip metadata]
+    C --> D[Composite stage\nScene items\nframe offset + incremental diff]
+```
+
+- Frameset 文書では `FrameRect` で子フレーム領域を分割し、leaf 文書で style/layout/paint/composite を実行する。
 - leaf 文書の `SceneItem` 座標は `FrameRect` の `(x, y)` を加算してページ座標へ変換する。

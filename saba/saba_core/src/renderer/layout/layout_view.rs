@@ -202,6 +202,23 @@ impl LayoutView {
     pub fn paint(&self) -> Vec<DisplayItem> {
         let mut display_items = Vec::new();
         Self::paint_node(&self.root, &mut display_items);
+
+        // Spec: CSS Positioned Layout + CSS2 painting order.
+        // Positioned/stacking descendants are painted by stacking context and z-index.
+        display_items.sort_by(|a, b| {
+            let (a_context, a_z) = match a {
+                DisplayItem::Rect { paint_order, .. } | DisplayItem::Text { paint_order, .. } => {
+                    (paint_order.stacking_context, paint_order.z_index)
+                }
+            };
+            let (b_context, b_z) = match b {
+                DisplayItem::Rect { paint_order, .. } | DisplayItem::Text { paint_order, .. } => {
+                    (paint_order.stacking_context, paint_order.z_index)
+                }
+            };
+            a_context.cmp(&b_context).then(a_z.cmp(&b_z))
+        });
+
         display_items
     }
 

@@ -84,6 +84,8 @@ pub struct ComputedStyle {
     position: Option<PositionType>,
     offset_top: Option<f64>,
     offset_left: Option<f64>,
+    z_index: Option<i32>,
+    overflow_clip: Option<bool>,
 }
 
 impl ComputedStyle {
@@ -107,6 +109,8 @@ impl ComputedStyle {
             position: None,
             offset_top: None,
             offset_left: None,
+            z_index: None,
+            overflow_clip: None,
         }
     }
 
@@ -184,6 +188,12 @@ impl ComputedStyle {
         }
         if self.offset_left.is_none() {
             self.offset_left = Some(0.0);
+        }
+        if self.z_index.is_none() {
+            self.z_index = Some(0);
+        }
+        if self.overflow_clip.is_none() {
+            self.overflow_clip = Some(false);
         }
     }
 
@@ -361,6 +371,24 @@ impl ComputedStyle {
     pub fn offset_left(&self) -> f64 {
         self.offset_left
             .expect("failed to access CSS property: left")
+    }
+
+    pub fn set_z_index(&mut self, z_index: i32) {
+        self.z_index = Some(z_index);
+    }
+
+    pub fn z_index(&self) -> i32 {
+        self.z_index
+            .expect("failed to access CSS property: z-index")
+    }
+
+    pub fn set_overflow_clip(&mut self, clip: bool) {
+        self.overflow_clip = Some(clip);
+    }
+
+    pub fn overflow_clip(&self) -> bool {
+        self.overflow_clip
+            .expect("failed to access CSS property: overflow")
     }
 }
 

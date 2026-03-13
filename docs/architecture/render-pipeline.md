@@ -12,6 +12,16 @@ flowchart LR
   F --> G["SceneItem raster/compositor"]
 ```
 
+## Stage responsibilities
+
+```mermaid
+flowchart TD
+  S[Style\n- CSS Cascading/Inheritance\n- ComputedStyle defaults/inheritance] -->
+  L[Layout\n- CSS2 visual formatting model\n- CSS Display block/inline tree\n- CSS Positioned Layout offsets]
+  L --> P[Paint\n- DisplayItem generation\n- stacking context + z-index\n- clipping metadata]
+  P --> C[Composite\n- SceneItem conversion\n- frame-space transform\n- diff friendly ordering]
+```
+
 ## Legacy (deprecated WebView compatibility path)
 
 ```mermaid
