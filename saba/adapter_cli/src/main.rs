@@ -1,5 +1,15 @@
 use cosmo_runtime::{AppService, PageViewModel, StarshipApp};
+use saba_core::renderer::css::cssom::CssParser;
+use saba_core::renderer::css::token::CssTokenizer;
+use saba_core::renderer::dom::api::{get_js_content, get_style_content};
+use saba_core::renderer::html::parser::HtmlParser;
+use saba_core::renderer::html::token::HtmlTokenizer;
+use saba_core::renderer::js::ast::JsParser;
+use saba_core::renderer::js::runtime::JsRuntime;
+use saba_core::renderer::js::token::JsLexer;
+use saba_core::renderer::layout::layout_view::LayoutView;
 use std::env;
+use std::fs;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -19,6 +29,10 @@ fn main() -> ExitCode {
             target,
         }) => activate_link(&url, &frame_id, &href, target.as_deref()),
         Ok(Command::Metrics(url)) => show_metrics(&url),
+        Ok(Command::VerifyEventLoop {
+            fixture_path,
+            click_target_id,
+        }) => verify_event_loop(&fixture_path, click_target_id.as_deref()),
         Ok(Command::Help) => {
             print_usage(&program);
             Ok(())
@@ -46,6 +60,10 @@ enum Command {
         target: Option<String>,
     },
     Metrics(String),
+    VerifyEventLoop {
+        fixture_path: String,
+        click_target_id: Option<String>,
+    },
     Help,
 }
 
@@ -60,6 +78,10 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             target: optional_arg(args, 5),
         }),
         Some("metrics") => Ok(Command::Metrics(required_arg(args, 2, "url")?)),
+        Some("verify-event-loop") => Ok(Command::VerifyEventLoop {
+            fixture_path: required_arg(args, 2, "fixture-path")?,
+            click_target_id: optional_arg(args, 3),
+        }),
         Some("help") | Some("--help") | Some("-h") | None => Ok(Command::Help),
         Some(command) => Err(format!("Unknown command: {command}")),
     }
@@ -135,6 +157,52 @@ fn show_metrics(url: &str) -> Result<(), ()> {
     Ok(())
 }
 
+fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Result<(), ()> {
+    let html = fs::read_to_string(fixture_path).map_err(|error| {
+        eprintln!("failed to read fixture {fixture_path}: {error}");
+    })?;
+
+    let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+    let dom = window.borrow().document();
+
+    let script = get_js_content(dom.clone());
+    let mut runtime = JsRuntime::new(dom.clone());
+    if !script.trim().is_empty() {
+        let lexer = JsLexer::new(script);
+        let mut parser = JsParser::new(lexer);
+        let program = parser.parse_ast();
+        runtime.execute(&program);
+    }
+
+    if let Some(target_id) = click_target_id {
+        runtime.dispatch_click(target_id);
+    }
+
+    let style = get_style_content(dom.clone());
+    let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+    let layout = LayoutView::new(dom, &cssom, 800);
+    let display_items = layout.paint();
+
+    println!("fixture: {fixture_path}");
+    println!("click_target_id: {}", click_target_id.unwrap_or("<none>"));
+    println!(
+        "render_pipeline_invalidated: {}",
+        runtime.render_pipeline_invalidated()
+    );
+    println!("display_items: {}", display_items.len());
+
+    let diagnostics = runtime.unsupported_apis();
+    if diagnostics.is_empty() {
+        println!("diagnostics: <none>");
+    } else {
+        for line in diagnostics {
+            println!("diagnostic: {line}");
+        }
+    }
+
+    Ok(())
+}
+
 fn print_page_summary(view: &PageViewModel) {
     println!("Title: {}", view.title);
     println!("URL: {}", view.current_url);
@@ -160,4 +228,5 @@ fn print_usage(program: &str) {
     println!("  {program} get-snapshot <url>");
     println!("  {program} activate-link <url> <frame-id> <href> [target]");
     println!("  {program} metrics <url>");
+    println!("  {program} verify-event-loop <fixture-path> [click-target-id]");
 }

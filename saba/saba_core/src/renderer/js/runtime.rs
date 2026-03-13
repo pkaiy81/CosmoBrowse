@@ -1,6 +1,6 @@
-use crate::renderer::dom::api::get_element_by_id;
+use crate::renderer::dom::api::DomApiBinding;
+use crate::renderer::dom::api::DomEventType;
 use crate::renderer::dom::node::Node as DomNode;
-use crate::renderer::dom::node::NodeKind as DomNodeKind;
 use crate::renderer::js::ast::Node;
 use crate::renderer::js::ast::Program;
 use alloc::format;
@@ -89,27 +89,25 @@ impl Environment {
 
 #[derive(Debug, Clone)]
 pub struct JsRuntime {
-    dom_root: Rc<RefCell<DomNode>>,
+    dom_api: DomApiBinding,
     env: Rc<RefCell<Environment>>,
     functions: Vec<Function>,
-    pending_tasks: Vec<String>,
-    pending_microtasks: Vec<String>,
-    click_handlers: Vec<(Rc<RefCell<DomNode>>, String)>,
+    task_queue: Vec<String>,
+    microtask_queue: Vec<String>,
     unsupported_apis: Vec<String>,
-    dom_updated: bool,
+    render_pipeline_invalidated: bool,
 }
 
 impl JsRuntime {
     pub fn new(dom_root: Rc<RefCell<DomNode>>) -> Self {
         Self {
-            dom_root,
+            dom_api: DomApiBinding::new(dom_root),
             functions: Vec::new(),
             env: Rc::new(RefCell::new(Environment::new(None))),
-            pending_tasks: Vec::new(),
-            pending_microtasks: Vec::new(),
-            click_handlers: Vec::new(),
+            task_queue: Vec::new(),
+            microtask_queue: Vec::new(),
             unsupported_apis: Vec::new(),
-            dom_updated: false,
+            render_pipeline_invalidated: false,
         }
     }
 
@@ -119,22 +117,19 @@ impl JsRuntime {
         for node in program.body() {
             self.eval(&Some(node.clone()), self.env.clone());
         }
+        // Spec: running script is a task; perform a microtask checkpoint after script execution.
+        // https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
+        self.drain_microtasks();
         self.process_event_loop();
     }
 
     // Spec: DOM events are dispatched to an event target and invoke registered listeners.
     // https://dom.spec.whatwg.org/#concept-event-dispatch
     pub fn dispatch_click(&mut self, target_id: &str) {
-        if let Some(target) = get_element_by_id(Some(self.dom_root.clone()), &target_id.to_string())
-        {
-            let mut callbacks = Vec::new();
-            for (registered_target, callback) in &self.click_handlers {
-                if Rc::ptr_eq(registered_target, &target) {
-                    callbacks.push(callback.clone());
-                }
-            }
+        if let Some(target) = self.dom_api.document_get_element_by_id(target_id) {
+            let callbacks = self.dom_api.dispatch_event(target, DomEventType::Click);
             for callback in callbacks {
-                self.pending_tasks.push(callback);
+                self.task_queue.push(callback);
             }
             self.process_event_loop();
         }
@@ -145,18 +140,30 @@ impl JsRuntime {
     }
 
     pub fn dom_updated(&self) -> bool {
-        self.dom_updated
+        self.render_pipeline_invalidated
+    }
+
+    pub fn render_pipeline_invalidated(&self) -> bool {
+        self.render_pipeline_invalidated
     }
 
     fn process_event_loop(&mut self) {
-        while !self.pending_tasks.is_empty() {
-            let callback = self.pending_tasks.remove(0);
+        while !self.task_queue.is_empty() {
+            let callback = self.task_queue.remove(0);
             self.invoke_named_function(&callback, self.env.clone());
 
-            while !self.pending_microtasks.is_empty() {
-                let microtask = self.pending_microtasks.remove(0);
-                self.invoke_named_function(&microtask, self.env.clone());
-            }
+            // Spec: after each task, drain the microtask queue before rendering.
+            // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+            // Spec: Promise reactions are queued as ECMAScript jobs (microtasks).
+            // https://262.ecma-international.org/#sec-jobs-and-job-queues
+            self.drain_microtasks();
+        }
+    }
+
+    fn drain_microtasks(&mut self) {
+        while !self.microtask_queue.is_empty() {
+            let microtask = self.microtask_queue.remove(0);
+            self.invoke_named_function(&microtask, self.env.clone());
         }
     }
 
@@ -196,7 +203,7 @@ impl JsRuntime {
                 Some(a) => a,
                 None => return (true, None),
             };
-            let target = match get_element_by_id(Some(self.dom_root.clone()), &arg.to_string()) {
+            let target = match self.dom_api.document_get_element_by_id(&arg.to_string()) {
                 // 3
                 Some(n) => n,
                 None => return (true, None),
@@ -217,26 +224,32 @@ impl JsRuntime {
                 return (true, None);
             }
             if let Some(callback) = self.eval(&arguments[0], env.clone()).map(|v| v.to_string()) {
-                self.pending_tasks.push(callback);
+                // Spec: timers queue tasks in the event loop task queue.
+                // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers
+                self.task_queue.push(callback);
                 return (
                     true,
-                    Some(RuntimeValue::Number(self.pending_tasks.len() as u64)),
+                    Some(RuntimeValue::Number(self.task_queue.len() as u64)),
                 );
             }
             self.report_unsupported_api("setTimeout(callback, delay)".to_string());
             return (true, None);
         }
 
-        if func == &RuntimeValue::StringLiteral("queueMicrotask".to_string()) {
+        if func == &RuntimeValue::StringLiteral("queueMicrotask".to_string())
+            || func == &RuntimeValue::StringLiteral("Promise.then".to_string())
+        {
             if arguments.is_empty() {
-                self.report_unsupported_api("queueMicrotask(callback)".to_string());
+                self.report_unsupported_api("queueMicrotask(callback)/Promise.then".to_string());
                 return (true, None);
             }
             if let Some(callback) = self.eval(&arguments[0], env.clone()).map(|v| v.to_string()) {
-                self.pending_microtasks.push(callback);
+                // Spec: host hooks queue Promise reactions as ECMAScript jobs (microtasks).
+                // https://262.ecma-international.org/#sec-jobs-and-job-queues
+                self.microtask_queue.push(callback);
                 return (true, None);
             }
-            self.report_unsupported_api("queueMicrotask(callback)".to_string());
+            self.report_unsupported_api("queueMicrotask(callback)/Promise.then".to_string());
             return (true, None);
         }
 
@@ -254,7 +267,11 @@ impl JsRuntime {
                 let callback = self.eval(&arguments[1], env.clone());
                 if event_type == Some(RuntimeValue::StringLiteral("click".to_string())) {
                     if let Some(callback) = callback.map(|v| v.to_string()) {
-                        self.click_handlers.push((object.clone(), callback));
+                        self.dom_api.element_add_event_listener(
+                            object.clone(),
+                            DomEventType::Click,
+                            callback,
+                        );
                         return (true, None);
                     }
                 }
@@ -338,15 +355,17 @@ impl JsRuntime {
                     if let Some(p) = property {
                         // Change the text of the node like target.textContent = "foobar";
                         if p == "textContent" {
-                            object
-                                .borrow_mut()
-                                .set_first_child(Some(Rc::new(RefCell::new(DomNode::new(
-                                    DomNodeKind::Text(right_value.to_string()),
-                                )))));
-                            self.dom_updated = true;
+                            self.dom_api
+                                .element_set_text_content(object.clone(), &right_value.to_string());
+                            // Spec: DOM mutation invalidates render output and requires update-the-rendering integration.
+                            // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
+                            self.render_pipeline_invalidated = true;
                         } else if p == "onclick" {
-                            self.click_handlers
-                                .push((object.clone(), right_value.to_string()));
+                            self.dom_api.element_add_event_listener(
+                                object.clone(),
+                                DomEventType::Click,
+                                right_value.to_string(),
+                            );
                         }
                     }
                 }
@@ -539,6 +558,10 @@ impl Display for RuntimeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::renderer::dom::api::get_element_by_id;
+    use crate::renderer::dom::node::NodeKind as DomNodeKind;
+    use crate::renderer::html::parser::HtmlParser;
+    use crate::renderer::html::token::HtmlTokenizer;
     use crate::renderer::js::ast::JsParser;
     use crate::renderer::js::token::JsLexer;
 
@@ -684,6 +707,60 @@ mod tests {
             assert_eq!(expected[i], result);
             i += 1;
         }
+    }
+
+    #[test]
+    fn test_event_loop_task_then_microtask_order() {
+        let html = r#"<html><body><p id="target">init</p></body></html>"#.to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let input = r#"function task(){ document.getElementById("target").textContent="T"; queueMicrotask(micro); } function micro(){ document.getElementById("target").textContent="TM"; } setTimeout(task, 0);"#.to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("TM".to_string())
+        );
+    }
+
+    #[test]
+    fn test_promise_then_queues_microtask() {
+        let html = r#"<html><body><p id="target">init</p></body></html>"#.to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let input = r#"function reaction(){ document.getElementById("target").textContent="P"; } Promise.then(reaction);"#.to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("P".to_string())
+        );
     }
 
     #[test]

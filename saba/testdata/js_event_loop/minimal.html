@@ -1,0 +1,24 @@
+<html>
+  <head>
+    <style>#target { color: #222; }</style>
+    <script>
+      var log = "";
+      var target = document.getElementById("target");
+      function onClickTask() {
+        log = log + "T";
+        Promise.then(onPromiseMicrotask);
+      }
+      function onPromiseMicrotask() {
+        log = log + "P";
+        target.textContent = log;
+      }
+      var button = document.getElementById("button");
+      button.addEventListener("click", onClickTask);
+      setTimeout(onClickTask, 0);
+    </script>
+  </head>
+  <body>
+    <div id="button">run</div>
+    <p id="target">init</p>
+  </body>
+</html>
