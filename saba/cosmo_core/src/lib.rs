@@ -2,9 +2,9 @@
 
 extern crate alloc;
 
-pub use saba_core::*;
+pub use cosmo_core_legacy::*;
 
 // Cosmic role aliases for gradual migration from legacy naming.
-pub use saba_core::browser as orbit_engine;
-pub use saba_core::renderer as nebula_renderer;
-pub use saba_core::display_item as stardust_display;
+pub use cosmo_core_legacy::browser as orbit_engine;
+pub use cosmo_core_legacy::display_item as stardust_display;
+pub use cosmo_core_legacy::renderer as nebula_renderer;

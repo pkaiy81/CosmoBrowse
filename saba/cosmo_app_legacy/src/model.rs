@@ -123,10 +123,10 @@ pub enum RenderBackendKind {
     NativeScene,
 }
 
-/// Rendering adapter contract used by `saba_app` to keep backend-specific code replaceable.
+/// Rendering adapter contract used by `cosmo_app_legacy` to keep backend-specific code replaceable.
 ///
 /// ```rust
-/// use saba_app::{FrameViewModel, RenderBackend, RenderBackendKind};
+/// use cosmo_app_legacy::{FrameViewModel, RenderBackend, RenderBackendKind};
 ///
 /// struct CompatBackend;
 ///
@@ -157,10 +157,10 @@ pub trait RenderBackend {
     }
 }
 
-/// Script execution contract exposed by `saba_app`.
+/// Script execution contract exposed by `cosmo_app_legacy`.
 ///
 /// ```rust
-/// use saba_app::{FrameViewModel, ScriptEngine};
+/// use cosmo_app_legacy::{FrameViewModel, ScriptEngine};
 ///
 /// struct NoopScriptEngine;
 ///
@@ -181,7 +181,7 @@ pub trait ScriptEngine {
 /// Security policy contract for navigation and content handling decisions.
 ///
 /// ```rust
-/// use saba_app::SecurityPolicy;
+/// use cosmo_app_legacy::SecurityPolicy;
 ///
 /// struct AllowAllPolicy;
 ///

@@ -6,15 +6,15 @@ use serde_json;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
-// 2. 既存のエンジン（saba_core）を取り込む
-use saba_core::display_item::DisplayItem;
-use saba_core::renderer::css::cssom::CssParser;
-use saba_core::renderer::css::token::CssTokenizer;
-use saba_core::renderer::dom::api::get_style_content;
-use saba_core::renderer::html::parser::HtmlParser;
-use saba_core::renderer::html::token::HtmlTokenizer;
-use saba_core::renderer::layout::computed_style::FontSize;
-use saba_core::renderer::layout::layout_view::LayoutView;
+// 2. 既存のエンジン（cosmo_core）を取り込む
+use cosmo_core::stardust_display::DisplayItem;
+use cosmo_core::nebula_renderer::css::cssom::CssParser;
+use cosmo_core::nebula_renderer::css::token::CssTokenizer;
+use cosmo_core::nebula_renderer::dom::api::get_style_content;
+use cosmo_core::nebula_renderer::html::parser::HtmlParser;
+use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
+use cosmo_core::nebula_renderer::layout::computed_style::FontSize;
+use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
 
 // 3. JS 側にシリアライズして渡すための構造体／enum 定義
 #[derive(Serialize)]

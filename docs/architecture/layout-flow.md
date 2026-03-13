@@ -4,11 +4,11 @@ CosmoBrowse の最小レイアウトパイプライン（style → layout → pa
 
 ```mermaid
 sequenceDiagram
-    participant Session as saba_app::BrowserSession
+    participant Session as cosmo_runtime::StarshipRuntimeSession
     participant Frame as Frame loader (frameset/leaf)
-    participant Style as saba_core::CSS parser
-    participant Layout as saba_core::layout::LayoutView
-    participant Paint as DisplayItem -> SceneItem
+    participant Style as cosmo_core::Nebula Renderer CSS parser
+    participant Layout as cosmo_core::Nebula Renderer LayoutView
+    participant Paint as StardustDisplay -> Comet UI SceneItem
 
     Session->>Frame: load_page(url, viewport, overrides)
     Frame->>Frame: frameset child_rects(FrameRect)

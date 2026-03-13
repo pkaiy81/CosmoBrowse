@@ -3,7 +3,7 @@
 ## 0. 結論（v2 方針）
 - 開発は **Tauri を継続採用**。
 - ただし構成は **UI 交換可能**を前提にし、`adapter` を差し替えるだけで `egui/iced/winit` へ移行できる設計にする。
-- Rust 資産（検索・ネットワーク・レンダリング）は `saba_core` を中心に再利用する。
+- Rust 資産（検索・ネットワーク・レンダリング）は `cosmo_core` を中心に再利用する。
 - 命名は段階的に CosmoBrowse へ移行する（`docs/cosmic-naming-migration.md`）。
 
 ---
@@ -13,28 +13,28 @@
 - Tauri (Rust): `tauri = "2"`, `tauri-build = "2"`, `tauri-plugin-opener = "2"`。
 - Tauri (JS): `@tauri-apps/api = "^2"`, `@tauri-apps/cli = "^2"`。
 - Frontend: `vite = "^6.0.3"`, `typescript = "~5.6.2"`。
-- Tauri 側は `saba_app` 経由で `open_url` / `reload` / `back` / `forward` / `tabs` / `search` / `metrics` を接続済み。
+- Tauri 側は `cosmo_runtime` 経由で `open_url` / `reload` / `back` / `forward` / `tabs` / `search` / `metrics` を接続済み。
 - `RenderSnapshot` は本文・リンク・diagnostics に加えて layout/style メタ情報を返却。
-- `adapter_cli` PoC を追加済みで、`open-url` / `get-snapshot` / `metrics` が同一 `saba_app` API で動作。
+- `adapter_cli` PoC を追加済みで、`open-url` / `get-snapshot` / `metrics` が同一 `cosmo_runtime` API で動作。
 
 ---
 
 ## 2. アーキテクチャ v2（UI 差し替え前提）
 
 ## 2.1 レイヤ
-1. **Core (`saba_core`)**
+1. **Core (`cosmo_core`)**
    - Browser/Page/DOM/Parser/Renderer などのドメインロジック。
    - UI 依存禁止。
-2. **Application (`saba_app` 新規)**
+2. **Application (`cosmo_runtime` 新規)**
    - ユースケース API を提供（`open_url`, `navigate`, `search`, `tabs`）。
    - DTO（画面向けデータ）を定義し、Core の内部型を隠蔽。
 3. **Adapter (`adapter_tauri`, 将来 `adapter_egui` 等)**
    - UI フレームワーク固有処理（command/event/state binding）。
-   - `saba_app` を呼ぶだけに限定。
+   - `cosmo_runtime` を呼ぶだけに限定。
 
 ## 2.2 依存ルール
-- `adapter_* -> saba_app -> saba_core` の単方向のみ許可。
-- UI が `saba_core` を直接 import するのは禁止。
+- `adapter_* -> cosmo_runtime -> cosmo_core` の単方向のみ許可。
+- UI が `cosmo_core` を直接 import するのは禁止。
 - Core の内部構造体をフロントへ直接返さない（必ず DTO に変換）。
 
 ## 2.3 DTO の最小セット（v2）
@@ -49,14 +49,14 @@
 ## 3. 実装ロードマップ v2（10週間）
 
 ## Phase A: 土台再編（Week 1-2）
-- [x] `saba_app` crate 新設。
+- [x] `cosmo_runtime` crate 新設。
 - [x] workspace に UI/Tauri crate を正式参加。
 - [x] `AppService`（同期/非同期 API）定義。
 - [x] DTO / Error 体系定義。
 
 **DoD**
 - `cargo check --workspace` 成功。
-- Tauri が `saba_app` 経由のみでコンパイル可能。
+- Tauri が `cosmo_runtime` 経由のみでコンパイル可能。
 
 ## Phase B: 最小ブラウズ体験（Week 3-4）
 - [x] `open_url`, `reload`, `back`, `forward` 実装。
@@ -68,7 +68,7 @@
 
 ## Phase C: タブ・検索統合（Week 5-6）
 - [x] タブ API（`new/switch/close/list`）。
-- [x] Rust 検索機能を `saba_app::search(query)` として統合。
+- [x] Rust 検索機能を `cosmo_runtime::search(query)` として統合。
 - [x] 検索結果から遷移までの一連フローを接続。
 
 **DoD**
@@ -84,7 +84,7 @@
 
 ## Phase E: UI 交換検証（Week 9-10）
 - [x] `adapter_cli` or `adapter_egui` の最小 PoC を追加。
-- [x] 同一 `saba_app` API で動作確認。
+- [x] 同一 `cosmo_runtime` API で動作確認。
 
 **DoD**
 - Tauri 以外の adapter で `open_url/get_snapshot` が動く。
@@ -119,9 +119,9 @@
 ---
 
 ## 5. 直近スプリント（次の2週間でやること）
-1. [x] `saba_app` crate を追加。
+1. [x] `cosmo_runtime` crate を追加。
 2. [x] `AppService` trait + 実装を作成。
-3. [x] `open_url` と `get_render_snapshot` を `saba_app` に実装。
+3. [x] `open_url` と `get_render_snapshot` を `cosmo_runtime` に実装。
 4. [x] Tauri command は上記2つのみ先に接続。
 5. [x] フロントに URL バー + 読み込みボタン + 表示領域を実装。
 6. [x] エラーDTOを画面表示。
@@ -129,13 +129,13 @@
 
 **2週間の完了基準**
 - URL入力から本文表示まで一気通貫で動作。
-- UI 直結ロジックが `saba_app` の外に漏れていない。
+- UI 直結ロジックが `cosmo_runtime` の外に漏れていない。
 
 ---
 
 ## 6. リスクと対策（v2）
 - **Tauri command 肥大化**
-  - 対策: command は引数検証 + `saba_app` 呼び出しのみ。
+  - 対策: command は引数検証 + `cosmo_runtime` 呼び出しのみ。
 - **Core 型漏れでUI依存固定化**
   - 対策: DTO境界を厳守、レビュー項目化。
 - **依存更新の破壊的影響**
@@ -162,5 +162,5 @@
    - Step 2: 新規実装は `invoke("dispatch_ipc", { request })` を使用。
    - Step 3: 移行完了後に互換 command の利用状況を監視し、削除可否を判断する。
 5. 移行期間のレビュー観点:
-   - `adapter_* -> saba_app -> saba_core` 依存方向を維持。
+   - `adapter_* -> cosmo_runtime -> cosmo_core` 依存方向を維持。
    - DTO/IPC 契約に `tauri` 固有型を混入させない。

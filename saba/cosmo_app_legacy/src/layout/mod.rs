@@ -1,15 +1,15 @@
 use crate::model::{ContentSize, FrameRect, SceneItem};
-use saba_core::display_item::DisplayItem;
-use saba_core::renderer::css::cssom::CssParser;
-use saba_core::renderer::css::token::CssTokenizer;
-use saba_core::renderer::dom::api::{get_js_content, get_style_content};
-use saba_core::renderer::html::parser::HtmlParser;
-use saba_core::renderer::html::token::HtmlTokenizer;
-use saba_core::renderer::js::ast::JsParser;
-use saba_core::renderer::js::runtime::JsRuntime;
-use saba_core::renderer::js::token::JsLexer;
-use saba_core::renderer::layout::computed_style::TextDecoration;
-use saba_core::renderer::layout::layout_view::LayoutView;
+use cosmo_core::stardust_display::DisplayItem;
+use cosmo_core::nebula_renderer::css::cssom::CssParser;
+use cosmo_core::nebula_renderer::css::token::CssTokenizer;
+use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
+use cosmo_core::nebula_renderer::html::parser::HtmlParser;
+use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
+use cosmo_core::nebula_renderer::js::ast::JsParser;
+use cosmo_core::nebula_renderer::js::runtime::JsRuntime;
+use cosmo_core::nebula_renderer::js::token::JsLexer;
+use cosmo_core::nebula_renderer::layout::computed_style::TextDecoration;
+use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
 
 /// Re-layout triggers used by `saba_app` when deciding whether the scene tree must be rebuilt.
 ///

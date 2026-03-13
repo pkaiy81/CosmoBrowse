@@ -1,6 +1,6 @@
-pub use saba_app::*;
+pub use cosmo_app_legacy::*;
 
-// Cosmic role aliases for gradual migration from legacy naming.
+// Cosmic app-layer aliases.
 pub type StarshipApp = SabaApp;
 pub type OrbitSnapshot = PageViewModel;
 pub type GalaxyFrame = FrameViewModel;

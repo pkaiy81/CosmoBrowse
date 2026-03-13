@@ -6,5 +6,5 @@ rust-version = "1.77"
 
 [dependencies]
 cosmo_runtime = { path = "../cosmo_runtime" }
-saba_core = { path = "../saba_core" }
+cosmo_core = { path = "../cosmo_core" }
 serde_json = "1"

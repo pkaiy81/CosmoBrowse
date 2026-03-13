@@ -12,10 +12,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: forbid direct saba_ imports outside compatibility layers
+        run: |
+          set -euo pipefail
+          if rg -n "\bsaba_(app|core)\b" \
+            --glob '!cosmo_app_legacy/**' \
+            --glob '!cosmo_core_legacy/**' \
+            --glob '!docs/**' \
+            --glob '!**/*.md' \
+            .; then
+            echo "Direct saba_ references remain outside compatibility layers."
+            exit 1
+          fi
       - name: cargo check stable-target crates
-        run: cargo check -p saba_core -p saba_app -p adapter_cli
+        run: cargo check -p cosmo_core_legacy -p cosmo_app_legacy -p adapter_cli
       - name: cargo test stable-target crates
-        run: cargo test -p saba_core -p saba_app -p adapter_cli
+        run: cargo test -p cosmo_core_legacy -p cosmo_app_legacy -p adapter_cli
 
   frontend:
     runs-on: ubuntu-latest
