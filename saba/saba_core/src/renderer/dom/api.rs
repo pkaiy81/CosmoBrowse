@@ -8,6 +8,72 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomEventType {
+    Click,
+}
+
+impl DomEventType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "click" => Some(Self::Click),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DomApiBinding {
+    root: Rc<RefCell<Node>>,
+    listeners: Vec<(Rc<RefCell<Node>>, DomEventType, String)>,
+}
+
+impl DomApiBinding {
+    pub fn new(root: Rc<RefCell<Node>>) -> Self {
+        Self {
+            root,
+            listeners: Vec::new(),
+        }
+    }
+
+    pub fn document_get_element_by_id(&self, id_name: &str) -> Option<Rc<RefCell<Node>>> {
+        get_element_by_id(Some(self.root.clone()), &id_name.to_string())
+    }
+
+    // Spec: `textContent` setter replaces descendants with a text node.
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    pub fn element_set_text_content(&mut self, target: Rc<RefCell<Node>>, text: &str) {
+        target
+            .borrow_mut()
+            .set_first_child(Some(Rc::new(RefCell::new(Node::new(NodeKind::Text(
+                text.to_string(),
+            ))))));
+    }
+
+    // Spec: event listeners are registered against an event target.
+    // https://dom.spec.whatwg.org/#concept-event-listener
+    pub fn element_add_event_listener(
+        &mut self,
+        target: Rc<RefCell<Node>>,
+        event: DomEventType,
+        callback: String,
+    ) {
+        self.listeners.push((target, event, callback));
+    }
+
+    // Spec: event dispatch invokes listeners registered on the target.
+    // https://dom.spec.whatwg.org/#concept-event-dispatch
+    pub fn dispatch_event(&self, target: Rc<RefCell<Node>>, event: DomEventType) -> Vec<String> {
+        let mut callbacks = Vec::new();
+        for (registered_target, registered_event, callback) in &self.listeners {
+            if Rc::ptr_eq(registered_target, &target) && *registered_event == event {
+                callbacks.push(callback.clone());
+            }
+        }
+        callbacks
+    }
+}
+
 pub fn get_element_by_id(
     node: Option<Rc<RefCell<Node>>>,
     id_name: &String,
