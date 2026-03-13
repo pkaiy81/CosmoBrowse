@@ -67,6 +67,62 @@ pub fn enforce_mixed_content_policy(initiator_url: &str, target_url: &str) -> Ap
 
 // Spec: Fetch CORS protocol with Access-Control-Allow-Origin matching.
 // https://fetch.spec.whatwg.org/#http-cors-protocol
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxPolicy {
+    AllowAll,
+    Strict,
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxEvaluation {
+    pub policy: SandboxPolicy,
+    pub allowed: bool,
+    pub diagnostics: Vec<String>,
+}
+
+pub fn evaluate_sandbox_policy(initiator_url: &str, target_url: &str) -> SandboxEvaluation {
+    // Spec: HTML sandboxing model and opaque origin behavior.
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox
+    let mut diagnostics = Vec::new();
+    let same_origin = is_same_origin(initiator_url, target_url);
+
+    if same_origin {
+        diagnostics.push(format!(
+            "Sandbox policy: same-origin navigation permitted ({initiator_url} -> {target_url})"
+        ));
+        return SandboxEvaluation {
+            policy: SandboxPolicy::AllowAll,
+            allowed: true,
+            diagnostics,
+        };
+    }
+
+    diagnostics.push(format!(
+        "Sandbox policy: cross-origin target restricted ({initiator_url} -> {target_url})"
+    ));
+
+    let mixed_content = enforce_mixed_content_policy(initiator_url, target_url).is_err();
+    if mixed_content {
+        diagnostics.push("Sandbox policy: mixed-content navigation denied".to_string());
+        return SandboxEvaluation {
+            policy: SandboxPolicy::Strict,
+            allowed: false,
+            diagnostics,
+        };
+    }
+
+    diagnostics.push(
+        "Sandbox policy: script and top-navigation privileges withheld for cross-origin content"
+            .to_string(),
+    );
+    SandboxEvaluation {
+        policy: SandboxPolicy::Strict,
+        allowed: true,
+        diagnostics,
+    }
+}
+
 pub fn passes_cors(initiator_url: &str, target_url: &str, response_headers: &HeaderMap) -> bool {
     if is_same_origin(initiator_url, target_url) {
         return true;
@@ -277,5 +333,34 @@ mod tests {
         let (_, diagnostics) =
             apply_minimum_csp("<html><head></head><body><script>alert(1)</script></body></html>");
         assert!(diagnostics.iter().any(|d| d.contains("CSP violation")));
+    }
+
+    #[test]
+    fn sandbox_policy_restricts_cross_origin() {
+        let evaluation = evaluate_sandbox_policy(
+            "https://app.example.com/root",
+            "https://cdn.example.net/embedded",
+        );
+        assert_eq!(evaluation.policy, SandboxPolicy::Strict);
+        assert!(evaluation.allowed);
+        assert!(
+            evaluation
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("cross-origin"))
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_blocks_mixed_content() {
+        let evaluation = evaluate_sandbox_policy("https://secure.example.com", "http://legacy.test");
+        assert_eq!(evaluation.policy, SandboxPolicy::Strict);
+        assert!(!evaluation.allowed);
+        assert!(
+            evaluation
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("mixed-content"))
+        );
     }
 }
