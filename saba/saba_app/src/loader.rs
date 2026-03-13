@@ -97,9 +97,9 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     validate_response_security(url, &response.final_url, &response.headers, &mut diagnostics);
 
     let decoded = decode_html_bytes(&response.body, response.content_type.as_deref());
+    store_cache_entry(url, &response, &decoded.html);
     diagnostics.extend(response.diagnostics);
     diagnostics.extend(decoded.diagnostics.clone());
-    store_cache_entry(url, &response, &decoded.html);
 
     Ok(LoadedDocument {
         final_url: response.final_url,
