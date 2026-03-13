@@ -1,0 +1,7 @@
+flowchart TD
+  A["Execute top-level script"] --> B["Drain microtasks"]
+  B --> C["Event loop tick (while tasks)\n1) pop task\n2) run callback\n3) drain microtasks"]
+  C --> D{"DOM invalidated?"}
+  D -->|"Yes"| E["Relayout -> Repaint"]
+  D -->|"No"| C
+  E --> C

@@ -1,0 +1,9 @@
+flowchart LR
+  BP["Browser Process\n- adapter_native\n- session/history control\n- network loader\n- crash dump writer"]
+  RP["Renderer Process (WebView)\n- frame tree drawing\n- diagnostics panel\n- user input"]
+  DUMP["/tmp/cosmobrowse-crash-report.json"]
+  LOG["network log / DOM snapshot / console"]
+
+  BP <-->|"Generic IPC\n(JSON message schema)"| RP
+  BP -->|"writes minimal crash dump"| DUMP
+  RP -->|"reads IpcResponse::Page(BrowserPageDto)"| LOG

@@ -1,0 +1,26 @@
+sequenceDiagram
+  participant User as User
+  participant UI as cosmo-browse-ui
+  participant IPC as Tauri IPC
+  participant Session as Orbit Session
+  participant Net as Loader/Network
+  participant Parse as DOM/Frameset Parser
+  participant Render as Render Pipeline
+
+  User->>UI: URL入力 / ナビゲーション操作
+  UI->>IPC: open_url / activate_link
+  IPC->>Session: execute_navigation
+  Session->>Net: fetch_document
+  Net-->>Session: HTML bytes + metadata
+  Session->>Parse: decode_html + parse_document
+  Parse-->>Session: Frame tree / DOM model
+  Session->>Render: build page snapshot
+  Render-->>UI: GalaxyFrame + scene_items
+  UI-->>User: 初回描画
+
+  User->>UI: click / key event
+  UI->>IPC: activate_link / dispatch event
+  IPC->>Session: event handling + state update
+  Session->>Render: relayout / repaint
+  Render-->>UI: updated snapshot
+  UI-->>User: 再描画

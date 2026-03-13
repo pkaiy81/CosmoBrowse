@@ -2,18 +2,18 @@
 
 CosmoBrowse fixes the Browser/Renderer boundary with the following two-process model.
 
-```text
-+---------------------------+          Generic IPC (JSON message schema)
-| Browser Process           | <-----------------------------------> +--------------------------+
-| - adapter_native          |                                       | Renderer Process (WebView)|
-| - session/history control |                                       | - frame tree drawing      |
-| - network loader          |                                       | - diagnostics panel       |
-| - crash dump writer       |                                       | - user input              |
-+---------------------------+                                       +--------------------------+
-            |                                                                    |
-            | writes minimal crash dump                                           | reads IpcResponse::Page(BrowserPageDto)
-            v                                                                    v
-  /tmp/cosmobrowse-crash-report.json                                   network log / DOM snapshot / console
+> Diagram source: `docs/architecture/mermaid/runtime-topology.mmd`
+
+```mermaid
+flowchart LR
+  BP["Browser Process\n- adapter_native\n- session/history control\n- network loader\n- crash dump writer"]
+  RP["Renderer Process (WebView)\n- frame tree drawing\n- diagnostics panel\n- user input"]
+  DUMP["/tmp/cosmobrowse-crash-report.json"]
+  LOG["network log / DOM snapshot / console"]
+
+  BP <-->|"Generic IPC\n(JSON message schema)"| RP
+  BP -->|"writes minimal crash dump"| DUMP
+  RP -->|"reads IpcResponse::Page(BrowserPageDto)"| LOG
 ```
 
 ## Boundary rules
