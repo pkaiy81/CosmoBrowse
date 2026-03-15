@@ -1,9 +1,11 @@
 flowchart LR
-  BP["Browser Process\n- adapter_native\n- session/history control\n- network loader\n- crash dump writer"]
-  RP["Renderer Process (WebView)\n- frame tree drawing\n- diagnostics panel\n- user input"]
-  DUMP["/tmp/cosmobrowse-crash-report.json"]
-  LOG["network log / DOM snapshot / console"]
+  UI["Renderer UI (cosmo-browse-ui)\n- URL入力/タブ操作\n- scene_items 描画\n- diagnostics 表示"]
+  IPC["Tauri IPC\n- dispatch_ipc\n- open_url / activate_link"]
+  CORE["Browser Core (cosmo_app_legacy)\n- session/history\n- frameset target解決\n- snapshot 生成"]
+  NET["Loader / Security\n- reqwest fetch (HTTP/HTTPS)\n- redirect/cache/charset\n- CORS/sandbox/cookie診断"]
+  EXT["Remote Origins\n- HTTP/HTTPS servers"]
 
-  BP <-->|"Generic IPC\n(JSON message schema)"| RP
-  BP -->|"writes minimal crash dump"| DUMP
-  RP -->|"reads IpcResponse::Page(BrowserPageDto)"| LOG
+  UI <--> IPC
+  IPC <--> CORE
+  CORE <--> NET
+  NET <--> EXT

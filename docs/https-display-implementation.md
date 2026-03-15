@@ -1,165 +1,80 @@
 # HTTPS Display Implementation
 
 ## Purpose
-- This document explains the implementation that lets CosmoBrowse open and display HTTPS pages, with the Abe Hiroshi website as the compatibility target.
-- Update this document whenever the HTTPS fetch path, decoding logic, frame loading, or frontend display bridge changes.
+- このドキュメントは、CosmoBrowse が HTTPS ページを取得・解析・描画する実装の現状をまとめたものです。
+- Abe Hiroshi サイト（`https://abehiroshi.la.coocan.jp/`）を互換性ターゲットとして、取得・文字コード・frameset・ターゲット遷移の流れを整理します。
 
-## Problem Statement
-- The original Rust-only rendering path was not sufficient for modern HTTPS pages and legacy frame-heavy HTML at the same time.
-- The Abe Hiroshi site requires all of the following in one flow: TLS-capable fetching, Shift_JIS decoding, `frameset/frame/noframes` parsing, relative URL resolution, and targeted navigation inside frames.
-- CosmoBrowse now splits this work between Rust for loading/state management and the Tauri WebView for final leaf-document layout.
-
-## Implementation Overview
-1. The frontend accepts a URL and sends it to the Tauri command bridge.
-2. Rust fetches the document over HTTP or HTTPS.
-3. Rust decodes the response body using HTTP headers, HTML meta charset hints, and UTF-8 fallback.
-4. Rust detects whether the document is a legacy `frameset` page or a leaf HTML page.
-5. Rust builds a recursive frame tree and converts leaf HTML into `iframe srcdoc` payloads.
-6. The frontend renders each frame rectangle and delegates leaf-document layout to the WebView engine.
-7. Link clicks inside leaf frames are posted back to the parent app, which either routes the navigation in Rust or opens the destination externally.
+## Current Status
+- ✅ HTTPS URL の取得は実装済みです（`reqwest` + Rust TLS スタック）。
+- ✅ Shift_JIS を含む HTML デコードは実装済みです。
+- ✅ `frameset/frame/noframes` の再帰解析とフレーム単位ナビゲーションは実装済みです。
+- ✅ 描画は `scene_items` を使う Native Scene パイプラインが既定です。
 
 ## Code Map
-- Frontend entry and rendering: `saba/ui/cosmo-browse-ui/src/main.ts`
+- UI レンダリング/イベント: `saba/ui/cosmo-browse-ui/src/main.ts`
   - `openUrl()`
   - `handleEmbeddedNavigation()`
   - `renderFrame()`
-  - `syncViewport()`
-- Tauri command bridge: `saba/ui/cosmo-browse-ui/src-tauri/src/lib.rs`
+  - `resolveRenderBackend()`
+- Tauri IPC エントリ: `saba/ui/cosmo-browse-ui/src-tauri/src/lib.rs`
+  - `dispatch_ipc()`
   - `open_url()`
   - `activate_link()`
-  - `set_viewport()`
-  - `tauri_plugin_opener::init()`
-- Rust session and navigation state: `saba/saba_app/src/session.rs`
+- セッション/履歴/フレーム遷移: `saba/cosmo_app_legacy/src/session.rs`
   - `BrowserSession::open_url(...)`
   - `BrowserSession::activate_link(...)`
-  - `BrowserSession::load_page(...)`
-  - `load_frame_recursive(...)`
+  - `load_page(...)`
   - `resolve_destination_frame_id(...)`
-  - `normalize_target_keyword(...)`
-- Rust loading helpers: `saba/saba_app/src/loader.rs`
+- ローダー/デコード/frameset 解析: `saba/cosmo_app_legacy/src/loader.rs`
   - `fetch_document(...)`
   - `decode_html_bytes(...)`
   - `resolve_url(...)`
   - `parse_frameset_document(...)`
   - `prepare_html_for_display(...)`
 
-## Step 1: HTTPS Fetching in Rust
-- File: `saba/saba_app/src/loader.rs`
-- Function: `fetch_document(...)`
-- Behavior:
-  - Build a `reqwest::blocking::Client`.
-  - Send a GET request to the requested URL.
-  - Record the final URL after redirects.
-  - Read the response body as bytes so charset detection can run before text conversion.
-- Why this matters:
-  - HTTPS support depends on `reqwest` and the Rust TLS stack, not on the old Wasabi networking path.
-  - Redirect-aware final URLs are required so `<base>` injection and later relative-link resolution remain correct.
-- Error handling:
-  - `classify_request_error(...)` maps TLS and certificate failures into explicit app error categories.
+## End-to-End Flow
+1. UI が URL を受け取り、Tauri IPC (`dispatch_ipc`) に `open_url` を送る。
+2. セッション層が `fetch_document(...)` を呼び、HTTP/HTTPS を取得する。
+3. レスポンス body を `decode_html_bytes(...)` で文字コード判定して UTF-8 文字列化する。
+4. `parse_frameset_document(...)` で frameset を判定し、必要なら再帰的にフレームツリーを構築する。
+5. 各フレームを `FrameViewModel + scene_items` に変換する。
+6. UI 側が `NativeSceneBackend` で `scene_items` を描画する。
+7. クリック時は `activate_link` を通じて Rust 側で target 解決し、必要なフレームだけ再読込する。
 
-## Step 2: Charset Detection and HTML Decoding
-- File: `saba/saba_app/src/loader.rs`
-- Function: `decode_html_bytes(...)`
-- Behavior:
-  - Read `charset=` from the HTTP `Content-Type` header when present.
-  - If the header is absent or incomplete, sniff the HTML prefix for `<meta charset>` or legacy `http-equiv` declarations.
-  - Fall back to UTF-8 when no explicit charset can be found.
-  - Record diagnostics when Shift_JIS decoding is used or replacement characters appear.
-- Relevant specs already referenced in code comments:
-  - HTML Living Standard character encoding detection.
-  - HTML Living Standard `meta charset` processing.
-- Why this matters:
-  - The Abe Hiroshi site serves Shift_JIS HTML, so incorrect decoding breaks titles, link labels, and diagnostics.
+## HTTPS Fetching Details
+- `fetch_document(...)` は共有 `reqwest::blocking::Client` を利用します。
+- リダイレクトは最大回数を設けて追跡し、最終 URL を保持します。
+- `ETag` / `If-None-Match` による再検証を行います。
+- TLS・証明書・接続エラーは `classify_request_error(...)` で分類します。
 
-## Step 3: URL Resolution and Redirect Safety
-- File: `saba/saba_app/src/loader.rs`
-- Function: `resolve_url(...)`
-- Behavior:
-  - Resolve relative URLs against the current document URL with the `url` crate.
-  - Preserve absolute `https://...` targets without rewriting them.
-- Relevant spec already referenced in code comments:
-  - RFC 3986 relative reference resolution.
-- Why this matters:
-  - Frame `src`, anchor `href`, and image URLs inside `srcdoc` documents all depend on correct base URL handling.
+## Charset Detection and Decoding
+- 優先順:
+  1. HTTP `Content-Type` の `charset=`
+  2. `<meta charset>` / `http-equiv` ヒント
+  3. UTF-8 フォールバック
+- Shift_JIS 検出時の診断情報を保持します。
 
-## Step 4: Legacy Frameset Parsing
-- Files:
-  - `saba/saba_app/src/loader.rs`
-  - `saba/saba_app/src/session.rs`
-- Functions and types:
-  - `parse_frameset_document(...)`
-  - `parse_frameset_at(...)`
-  - `FramesetSpec`
-  - `FramesetChild`
-  - `BrowserSession::load_page(...)`
-  - `load_frame_recursive(...)`
-- Behavior:
-  - Detect the first `<frameset>` in the loaded HTML.
-  - Parse `rows` and `cols` track definitions.
-  - Preserve nested inline `frameset` blocks recursively.
-  - Preserve `noframes` fallback HTML for frameset documents that need a leaf fallback.
-  - Build a nested `FrameViewModel` tree with stable frame ids and rectangles.
-- Why this matters:
-  - `https://abehiroshi.la.coocan.jp/` is not a single leaf document. The root page is a frameset that must keep left and right panes independent.
+## Frameset and Targeted Navigation
+- frameset 構造（`rows` / `cols`）を `FramesetSpec` として抽出します。
+- フレームには安定した ID を割り当て、`target="right"` のような名前付きターゲットを解決します。
+- `_self` / `_parent` / `_top` / `_blank` は ASCII 大文字小文字非依存で扱います。
 
-## Step 5: Leaf HTML Conversion for WebView Rendering
-- File: `saba/saba_app/src/loader.rs`
-- Function: `prepare_html_for_display(...)`
-- Behavior:
-  - Inject a `<base>` tag into each leaf HTML document.
-  - Inject a small script that intercepts anchor clicks and posts `cosmobrowse:navigate` messages to the parent window.
-  - Insert the payload before `</head>` case-insensitively.
-  - If the document has no `<head>`, synthesize one after `<html>`.
-- Relevant specs already referenced in code comments:
-  - HTML Living Standard document base URL.
-  - HTML Living Standard `iframe srcdoc` processing model.
-- Why this matters:
-  - Relative assets and links must keep working after the document is moved into `srcdoc`.
-  - This bridge lets the app keep Rust-side frame history and targeted navigation semantics.
+## Rendering Notes
+- 現在の既定描画は Native Scene で、`scene_items`（rect/text/image）を UI が直接描画します。
+- `render_backend` が `web_view` でも現状の実装では Native Scene にフォールバックします。
+- `prepare_html_for_display(...)` は互換目的で維持されていますが、主経路は scene 描画です。
 
-## Step 6: Session State, Targeted Navigation, and History
-- File: `saba/saba_app/src/session.rs`
-- Behavior:
-  - `BrowserSession` stores per-tab history as complete page snapshots.
-  - `activate_link(...)` resolves the clicked URL relative to the source frame.
-  - Target keywords such as `_self`, `_parent`, `_top`, and `_blank` are normalized using ASCII case-insensitive handling for keyword values.
-  - Named frame targets are resolved against the current frame tree.
-  - Only the destination frame is reloaded when a named target points at an existing child frame.
-- Why this matters:
-  - Abe Hiroshi menu navigation depends on `target="right"` updating only the main pane.
-  - Snapshot-based history lets back/forward restore the entire frame tree without diff reconstruction.
-
-## Step 7: Frontend Rendering and External Link Escape Hatch
-- File: `saba/ui/cosmo-browse-ui/src/main.ts`
-- Behavior:
-  - `renderFrame(...)` maps each `FrameViewModel` to an absolutely positioned DOM container.
-  - Leaf documents are rendered with `iframe.srcdoc`.
-  - `window.addEventListener("message", ...)` receives navigation messages from leaf frames.
-  - `_blank` and `mailto:` links are delegated to the Tauri opener plugin so the host OS browser or mail client handles them.
-  - All other navigations go back through the Rust `activate_link` command.
-- Why this matters:
-  - Tauri does not automatically create secondary browsing windows from `srcdoc` click interception.
-  - Delegating external navigation to the host shell fixes live Abe Hiroshi links such as the VIVANT external site link.
-
-## Diagnostics and Verification
-- Unit tests:
-  - `saba/saba_app/src/loader.rs`
-  - `saba/saba_app/src/session.rs`
-- Manual and CLI checks:
+## Verification
+- 単体テスト:
+  - `cargo test -p cosmo_app_legacy`
+- CLI:
   - `cargo run -p adapter_cli --offline -- get-snapshot https://abehiroshi.la.coocan.jp/`
   - `cargo run -p adapter_cli --offline -- activate-link https://abehiroshi.la.coocan.jp/ root/left https://abehiroshi.la.coocan.jp/movie/eiga.htm right`
-- UI verification:
-  - Open the Abe Hiroshi top page in the Tauri UI.
-  - Confirm left-to-right frame navigation still works.
-  - Confirm external `_blank` links open in the system browser.
-
-## Current Tradeoffs
-- Leaf layout is still delegated to the WebView engine rather than the Rust scene engine.
-- `_blank` links currently open outside the app instead of creating a second in-app browsing context.
-- The click bridge handles anchor activation, not arbitrary JavaScript-driven popup flows.
-- History uses full page snapshots, which is simple and reliable but not the most memory-efficient representation.
+- UI 手動確認:
+  - `npm run tauri dev` で起動し、Abe Hiroshi トップページを表示して左メニューから右フレーム更新を確認。
 
 ## Related Documents
-- Architecture overview: `docs/cosmobrowse-browser-architecture.md`
-- Abe Hiroshi delivery plan: `docs/abehiroshi-target-plan.md`
-- Windows trial artifact flow: `docs/windows-portable-distribution.md`
+- `docs/cosmobrowse-browser-architecture.md`
+- `docs/architecture/runtime-topology.md`
+- `docs/architecture/render-pipeline.md`
+- `docs/architecture/integrated-sequence.md`

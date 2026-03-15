@@ -1,6 +1,6 @@
 # CosmoBrowse Browser Architecture Index
 
-このドキュメントはブラウザアーキテクチャ図の上位インデックスです。詳細図は以下へ固定リンクします。
+CosmoBrowse の最新アーキテクチャ図と、HTTPS 表示実装の詳細への入口です。
 
 ## Detail diagrams
 
@@ -9,6 +9,10 @@
 - [JS Event Loop](./architecture/js-event-loop.md)
 - [Security Boundary](./architecture/security-boundary.md)
 - [Integrated Browser Sequence](./architecture/integrated-sequence.md)
+
+## HTTPS implementation notes
+
+- [HTTPS Display Implementation](./https-display-implementation.md)
 
 ## Diagram source-of-truth
 
