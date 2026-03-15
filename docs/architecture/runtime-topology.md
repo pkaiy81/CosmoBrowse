@@ -1,23 +1,24 @@
 # Runtime topology
 
-CosmoBrowse fixes the Browser/Renderer boundary with the following two-process model.
+CosmoBrowse は Browser Core（Rust）と Renderer UI（Tauri/WebView 上の TS）の 2 層で動作します。
 
 > Diagram source: `docs/architecture/mermaid/runtime-topology.mmd`
 
 ```mermaid
 flowchart LR
-  BP["Browser Process\n- adapter_native\n- session/history control\n- network loader\n- crash dump writer"]
-  RP["Renderer Process (WebView)\n- frame tree drawing\n- diagnostics panel\n- user input"]
-  DUMP["/tmp/cosmobrowse-crash-report.json"]
-  LOG["network log / DOM snapshot / console"]
+  UI["Renderer UI (cosmo-browse-ui)\n- URL入力/タブ操作\n- scene_items 描画\n- diagnostics 表示"]
+  IPC["Tauri IPC\n- dispatch_ipc\n- open_url / activate_link"]
+  CORE["Browser Core (cosmo_app_legacy)\n- session/history\n- frameset target解決\n- snapshot 生成"]
+  NET["Loader / Security\n- reqwest fetch (HTTP/HTTPS)\n- redirect/cache/charset\n- CORS/sandbox/cookie診断"]
+  EXT["Remote Origins\n- HTTP/HTTPS servers"]
 
-  BP <-->|"Generic IPC\n(JSON message schema)"| RP
-  BP -->|"writes minimal crash dump"| DUMP
-  RP -->|"reads IpcResponse::Page(BrowserPageDto)"| LOG
+  UI <--> IPC
+  IPC <--> CORE
+  CORE <--> NET
+  NET <--> EXT
 ```
 
 ## Boundary rules
-- Browser/Renderer communication uses framework-neutral schema (`IpcRequest`/`IpcResponse`).
-- The Renderer depends only on DTOs (`BrowserPageDto`, `NavigationState`, `TabSummary` etc.) and never on `saba_app` internal structures.
-- `dispatch_ipc` is the default command entrypoint, while per-command Tauri handlers are compatibility mode.
-- On crash, the panic hook emits a minimal JSON dump and reproduction steps.
+- UI は DTO（`PageViewModel`, `FrameViewModel`）のみを受け取り、ローダー実装には依存しません。
+- HTTPS 通信、文字コード判定、フレームターゲット解決は Rust 側で完結します。
+- UI は `scene_items` を描画し、クリックイベントを IPC 経由で Core に戻します。
