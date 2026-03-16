@@ -3,6 +3,21 @@
 CosmoBrowse は Rust + Tauri で実装している実験的ブラウザです。
 現在は **HTTP / HTTPS の取得、文字コード判定（Shift_JIS 含む）、frameset ページの分割表示、ネイティブ scene レンダリング** までをサポートしています。
 
+## 実装スタック（現状と目標）
+
+- ネットワーク取得、HTML/文字コード処理、frameset 解析、リンクターゲット遷移などのブラウザロジックは Rust 実装です。
+- **現状**のデスクトップ UI は Tauri を利用しており、表示ランタイムとして OS の WebView を使います（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK）。
+- **目標**は、表示レイヤも Rust ネイティブ化し、WebView 依存をなくすことです。
+
+## WebView 非依存化の設計方針
+
+1. `adapter_* -> cosmo_runtime -> cosmo_core` の依存方向を維持したまま、`adapter_tauri` を `adapter_native` へ段階置換する。
+2. UI は Web 技術（HTML/CSS）ではなく、Rust 側で `scene_items` を直接描画する（winit/pixels/tao 等のネイティブウィンドウ基盤を想定）。
+3. IPC 契約 (`dispatch_ipc`) は維持し、既存機能を壊さずに移行できるよう互換レイヤを残す。
+4. 移行完了後は Tauri/WebView 依存をオプション化し、標準実行経路をネイティブ描画に切り替える。
+
+詳細は `docs/ROADMAP.md` と `docs/architecture/runtime-topology.md` を参照してください。
+
 ## HTTPS ページ表示の現状
 
 - `reqwest` ベースのローダーで `https://` URL を取得します。
@@ -11,9 +26,11 @@ CosmoBrowse は Rust + Tauri で実装している実験的ブラウザです。
 
 詳細: [docs/https-display-implementation.md](docs/https-display-implementation.md)
 
-## ローカル確認手順（HTTPS）
+## ローカル起動方法
 
-### 1. CLI でスナップショット確認
+### A. 開発環境で起動する（Rust/Node あり）
+
+#### 1. CLI でスナップショット確認
 
 ```bash
 cd saba
@@ -24,7 +41,7 @@ cargo run -p adapter_cli --offline -- get-snapshot https://abehiroshi.la.coocan.
 - `root` 配下に `left` / `right` フレームが構築されること
 - diagnostics にデコード・取得関連の情報が出ること
 
-### 2. ターゲット付きリンク遷移確認
+#### 2. ターゲット付きリンク遷移確認
 
 ```bash
 cd saba
@@ -38,7 +55,7 @@ cargo run -p adapter_cli --offline -- activate-link \
 確認ポイント:
 - `target="right"` 相当で右フレームのみ更新されること
 
-### 3. Tauri UI での目視確認
+#### 3. 現行 UI (Tauri) での目視確認
 
 ```bash
 cd saba/ui/cosmo-browse-ui
@@ -50,10 +67,44 @@ npm run tauri dev
 - URL 欄に `https://abehiroshi.la.coocan.jp/` を入力して表示できること
 - 左メニュークリックで右フレームが切り替わること
 
+### B. Rust/Node を入れずに起動する（現行の配布済みバイナリ）
+
+エンドユーザー環境での実行は、ソースからビルドせずに **配布済み zip / 実行ファイル**を使用します。
+
+1. 配布された `cosmo-browse-ui-<version>-windows-portable.zip` を展開する。
+2. 展開先の `cosmo-browse-ui.exe` を実行する。
+3. URL 欄に `https://abehiroshi.la.coocan.jp/` を入力して動作確認する。
+
+配布物の作り方は `docs/windows-portable-distribution.md` を参照してください。
+実行側の PC には Rust / Node は不要です（現行配布物では Windows の WebView2 ランタイム＝Edge WebView が必要）。
+
+### C. WebView なしで Core/Adapter を確認する（native_ipc_cli）
+
+`adapter_native` に含まれる `native_ipc_cli` は、Tauri/WebView を起動せずに
+`dispatch_ipc` 契約を直接叩ける確認用 CLI です。
+
+```bash
+cd saba
+cargo run -p adapter_native --bin native_ipc_cli -- once '{"type":"open_url","payload":{"url":"https://abehiroshi.la.coocan.jp/"}}'
+```
+
+JSON をファイルで管理したい場合は `@<path>` 指定も使えます。
+
+```bash
+cd saba
+cargo run -p adapter_native --bin native_ipc_cli -- once @./requests/open-url.json
+```
+
+標準入力モードで複数リクエストを順次流すこともできます。
+
+```bash
+cd saba
+echo '{"type":"open_url","payload":{"url":"https://abehiroshi.la.coocan.jp/"}}' | cargo run -p adapter_native --bin native_ipc_cli -- stdin
+```
+
 ## アーキテクチャ資料
 
 - ブラウザ全体インデックス: [docs/cosmobrowse-browser-architecture.md](docs/cosmobrowse-browser-architecture.md)
 - Runtime Topology: [docs/architecture/runtime-topology.md](docs/architecture/runtime-topology.md)
 - Render Pipeline: [docs/architecture/render-pipeline.md](docs/architecture/render-pipeline.md)
 - Integrated Sequence: [docs/architecture/integrated-sequence.md](docs/architecture/integrated-sequence.md)
-
