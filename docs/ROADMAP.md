@@ -1,9 +1,9 @@
-# CosmoBrowse Roadmap v2 (Tauri-first, UI-switchable)
+# CosmoBrowse Roadmap v3 (WebView-free native rendering)
 
-## 0. 結論（v2 方針）
-- 開発は **Tauri を継続採用**。
-- ただし構成は **UI 交換可能**を前提にし、`adapter` を差し替えるだけで `egui/iced/winit` へ移行できる設計にする。
-- Rust 資産（検索・ネットワーク・レンダリング）は `cosmo_core` を中心に再利用する。
+## 0. 結論（v3 方針）
+- 最終目標は **WebView 非依存のネイティブ UI**（Chrome/Firefox のように専用描画スタックを持つ構成）。
+- 移行期間は既存 Tauri UI を互換レイヤとして維持しつつ、標準 adapter を `adapter_native` に切り替える。
+- Rust 資産（検索・ネットワーク・レンダリング）は `cosmo_core` / `cosmo_runtime` を中心に再利用する。
 - 命名は段階的に CosmoBrowse へ移行する（`docs/cosmic-naming-migration.md`）。
 
 ---
@@ -19,7 +19,7 @@
 
 ---
 
-## 2. アーキテクチャ v2（UI 差し替え前提）
+## 2. アーキテクチャ v3（WebView 非依存を既定）
 
 ## 2.1 レイヤ
 1. **Core (`cosmo_core`)**
@@ -28,8 +28,8 @@
 2. **Application (`cosmo_runtime` 新規)**
    - ユースケース API を提供（`open_url`, `navigate`, `search`, `tabs`）。
    - DTO（画面向けデータ）を定義し、Core の内部型を隠蔽。
-3. **Adapter (`adapter_tauri`, 将来 `adapter_egui` 等)**
-   - UI フレームワーク固有処理（command/event/state binding）。
+3. **Adapter (`adapter_native`, 互換: `adapter_tauri`)**
+   - UI フレームワーク固有処理（window/event/state binding）。
    - `cosmo_runtime` を呼ぶだけに限定。
 
 ## 2.2 依存ルール
@@ -37,7 +37,7 @@
 - UI が `cosmo_core` を直接 import するのは禁止。
 - Core の内部構造体をフロントへ直接返さない（必ず DTO に変換）。
 
-## 2.3 DTO の最小セット（v2）
+## 2.3 DTO の最小セット（v3）
 - `NavigationState { can_back, can_forward, current_url }`
 - `TabSummary { id, title, url, is_active }`
 - `RenderSnapshot { title, text_blocks, links, diagnostics, layout, style }`
@@ -46,7 +46,7 @@
 
 ---
 
-## 3. 実装ロードマップ v2（10週間）
+## 3. 実装ロードマップ v3（10週間）
 
 ## Phase A: 土台再編（Week 1-2）
 - [x] `cosmo_runtime` crate 新設。
@@ -82,27 +82,28 @@
 **DoD**
 - 代表ページ群で表示成功率と失敗理由が取得可能。
 
-## Phase E: UI 交換検証（Week 9-10）
-- [x] `adapter_cli` or `adapter_egui` の最小 PoC を追加。
-- [x] 同一 `cosmo_runtime` API で動作確認。
+## Phase E: WebView 依存除去（Week 9-10）
+- [ ] `adapter_native` を標準起動経路として有効化。
+- [ ] `adapter_tauri` をオプション機能に降格。
+- [ ] 同一 `cosmo_runtime` API で動作確認。
 
 **DoD**
-- Tauri 以外の adapter で `open_url/get_snapshot` が動く。
+- 既定構成で WebView ランタイムなしに `open_url/get_snapshot` が動く。
 
 ---
 
-## 4. バージョン運用 v2（見直し結果）
+## 4. バージョン運用 v3（見直し結果）
 
 ## 4.1 Rust
 - 現状 `stable` は妥当。
-- **v2 推奨**:
+- **v3 推奨**:
   - 開発中: `stable` 追従で速度優先。
   - ベータ前: `channel = "1.xx.0"` に pin（再現性重視）。
   - 全 crate に `rust-version` を記載して下限を固定。
 
 ## 4.2 Tauri
 - 現状の major=2 は妥当。
-- **v2 推奨**:
+- **v3 推奨**:
   - Rust 側は `"2"` のまま（互換性重視）。
   - JS 側は `^2` 維持、月次で lockfile 更新 + 動作確認。
   - リリース2週間前から dependency freeze（緊急修正のみ）。
@@ -133,7 +134,7 @@
 
 ---
 
-## 6. リスクと対策（v2）
+## 6. リスクと対策（v3）
 - **Tauri command 肥大化**
   - 対策: command は引数検証 + `cosmo_runtime` 呼び出しのみ。
 - **Core 型漏れでUI依存固定化**
@@ -143,7 +144,7 @@
 
 ---
 
-## 7. KPI（v2）
+## 7. KPI（v3）
 - ナビゲーション成功率
 - 平均ページ表示完了時間
 - コマンド失敗率（`open_url`, `search` など）
