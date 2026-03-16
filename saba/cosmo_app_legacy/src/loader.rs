@@ -152,7 +152,7 @@ fn fetch_with_pipeline(
 
         if status.is_redirection() {
             if redirect_count >= MAX_REDIRECTS {
-                return Err(AppError::network(format!(
+                return Err(AppError::navigation_guard(format!(
                     "Redirect limit exceeded while fetching {}",
                     request.url
                 )));
