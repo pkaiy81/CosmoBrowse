@@ -49,6 +49,14 @@ impl AppError {
             retryable: false,
         }
     }
+
+    pub fn navigation_guard(message: impl Into<String>) -> Self {
+        Self {
+            code: "navigation_guard_blocked".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
 }
 
 impl core::fmt::Display for AppError {

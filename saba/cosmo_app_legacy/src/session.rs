@@ -280,7 +280,7 @@ impl BrowserSession {
             .unwrap_or_else(|| current.current_url.clone());
         enforce_mixed_content_policy(&source_url, &normalized_href)?;
         if !is_same_origin(&source_url, &normalized_href) {
-            return Err(AppError::validation(format!(
+            return Err(AppError::navigation_guard(format!(
                 "Navigation blocked by same-origin policy: {} -> {}",
                 source_url, normalized_href
             )));
@@ -849,14 +849,14 @@ fn normalize_url(input: &str) -> AppResult<String> {
         .map_err(|error| AppError::validation(format!("Invalid URL: {error}")))?;
     match parsed.scheme() {
         "http" | "https" => Ok(parsed.to_string()),
+        "mailto" | "javascript" | "data" | "file" => Err(AppError::navigation_guard(
+            format!("Navigation blocked for dangerous scheme: {}", parsed.scheme()),
+        )),
         other => Err(AppError::validation(format!("Unsupported scheme: {other}"))),
     }
 }
 
 fn normalize_url_like(input: &str) -> AppResult<String> {
-    if input.trim().starts_with("mailto:") {
-        return Ok(input.trim().to_string());
-    }
     normalize_url(input)
 }
 
@@ -915,6 +915,24 @@ mod tests {
             normalize_url("https://abehiroshi.la.coocan.jp/").expect("valid url"),
             "https://abehiroshi.la.coocan.jp/"
         );
+    }
+
+    #[test]
+    fn normalize_url_like_blocks_mailto_scheme() {
+        let error = normalize_url_like("mailto:test@example.com").expect_err("mailto blocked");
+        assert_eq!(error.code, "navigation_guard_blocked");
+        assert!(error
+            .message
+            .contains("Navigation blocked for dangerous scheme: mailto"));
+    }
+
+    #[test]
+    fn normalize_url_blocks_javascript_scheme() {
+        let error = normalize_url("javascript:alert(1)").expect_err("javascript blocked");
+        assert_eq!(error.code, "navigation_guard_blocked");
+        assert!(error
+            .message
+            .contains("Navigation blocked for dangerous scheme: javascript"));
     }
 
     #[test]
