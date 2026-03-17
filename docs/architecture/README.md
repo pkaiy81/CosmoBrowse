@@ -36,3 +36,10 @@
 - [ ] スクリプト変更: JS Event Loop 図を更新した（または影響なし理由を記載）
 - [ ] IPC変更: Runtime Topology 図を更新した（または影響なし理由を記載）
 - [ ] 段階実装変更: Integrated Browser Sequence 図を更新した
+- [ ] ADR-0001 のレビュー観点（責務/障害時方針/IPC境界/依存方向）を確認した
+
+
+## ADR（設計決定記録）
+
+- ADR-0001: Process Model / Failure Policy / IPC Boundary / Dependency Direction
+  - `adr-0001-process-model-and-ipc-boundary.md`

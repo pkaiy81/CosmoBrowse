@@ -24,6 +24,13 @@
 - [ ] IPC を変更した場合、`runtime-topology` 図を更新した（または影響なし理由を記載した）
 - [ ] 段階実装を進めた場合、`integrated-sequence` 図を最新化した
 
+
+## ADR-0001 Review Gate（必須）
+- [ ] プロセス責務を逸脱していない（Browser / Renderer / Network / 将来 GPU の境界を維持）
+- [ ] Renderer 異常終了時の方針を満たす（再起動条件・セッション維持範囲・再試行上限）
+- [ ] IPC 境界が `IpcRequest` / `IpcResponse` の DTO 契約のみである（UI 固有型を含めない）
+- [ ] 依存方向が `adapter_* -> cosmo_runtime -> cosmo_core` のみである
+
 ## Checklist
 - [ ] 作業開始時に新規ブランチを作成した（`feature/<track>-<scope>`）
 - [ ] ブランチ名が命名規約に準拠している
