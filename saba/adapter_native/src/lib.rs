@@ -301,7 +301,7 @@ pub enum IpcRequestPayload {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum IpcResponsePayload {
     Page(BrowserPageDto),
@@ -321,7 +321,7 @@ pub struct IpcRequest {
     pub payload: IpcRequestPayload,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IpcResponse {
     pub version: u32,
     #[serde(flatten)]
