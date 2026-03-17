@@ -1,15 +1,24 @@
-use crate::model::{ContentSize, FrameRect, SceneItem};
-use cosmo_core::stardust_display::DisplayItem;
+use crate::model::{
+    ContentSize, FrameRect, RenderBox, RenderNode, RenderNodeKind, RenderTreeSnapshot,
+    ResolvedStyle, SceneItem,
+};
 use cosmo_core::nebula_renderer::css::cssom::CssParser;
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
 use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
+use cosmo_core::nebula_renderer::dom::node::NodeKind;
 use cosmo_core::nebula_renderer::html::parser::HtmlParser;
 use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
 use cosmo_core::nebula_renderer::js::ast::JsParser;
 use cosmo_core::nebula_renderer::js::runtime::JsRuntime;
 use cosmo_core::nebula_renderer::js::token::JsLexer;
-use cosmo_core::nebula_renderer::layout::computed_style::TextDecoration;
+use cosmo_core::nebula_renderer::layout::computed_style::{
+    DisplayType, PositionType, TextDecoration,
+};
+use cosmo_core::nebula_renderer::layout::layout_object::{LayoutObject, LayoutObjectKind};
 use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
+use cosmo_core::stardust_display::DisplayItem;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Re-layout triggers used by `saba_app` when deciding whether the scene tree must be rebuilt.
 ///
@@ -45,6 +54,7 @@ pub struct LayoutScene {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptLayoutResult {
     pub layout_scene: LayoutScene,
+    pub render_tree: RenderTreeSnapshot,
     pub diagnostics: Vec<String>,
     pub dom_updated: bool,
 }
@@ -111,6 +121,7 @@ pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> S
     let layout_view = LayoutView::new(dom, &cssom, rect.width.max(1));
 
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
+    let render_tree = render_tree_snapshot(&layout_view, rect);
     let mut diagnostics = runtime.unsupported_apis();
     if runtime.dom_updated() {
         diagnostics.push("Render loop: DOM mutation -> relayout -> repaint".to_string());
@@ -118,6 +129,7 @@ pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> S
 
     ScriptLayoutResult {
         layout_scene,
+        render_tree,
         diagnostics,
         dom_updated: runtime.dom_updated(),
     }
@@ -200,6 +212,74 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
             width: max_width.max(rect.width),
             height: max_height.max(rect.height),
         },
+    }
+}
+
+fn render_tree_snapshot(layout_view: &LayoutView, rect: &FrameRect) -> RenderTreeSnapshot {
+    RenderTreeSnapshot {
+        root: layout_view
+            .root()
+            .map(|node| layout_object_to_render_node(&node, rect)),
+    }
+}
+
+fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRect) -> RenderNode {
+    let borrowed = node.borrow();
+    let point = borrowed.point();
+    let size = borrowed.size();
+    let style = borrowed.style();
+
+    let kind = match borrowed.kind() {
+        LayoutObjectKind::Block => RenderNodeKind::Block,
+        LayoutObjectKind::Inline => RenderNodeKind::Inline,
+        LayoutObjectKind::Text => RenderNodeKind::Text,
+    };
+
+    let (node_name, text) = match borrowed.node_kind() {
+        NodeKind::Document => ("#document".to_string(), None),
+        NodeKind::Element(element) => (element.kind().to_string(), None),
+        NodeKind::Text(value) => ("#text".to_string(), Some(value)),
+    };
+
+    let mut children = Vec::new();
+    let mut child = borrowed.first_child();
+    drop(borrowed);
+    while let Some(current) = child {
+        children.push(layout_object_to_render_node(&current, rect));
+        child = current.borrow().next_sibling();
+    }
+
+    RenderNode {
+        kind,
+        node_name,
+        text,
+        box_info: RenderBox {
+            x: rect.x + point.x(),
+            y: rect.y + point.y(),
+            width: size.width(),
+            height: size.height(),
+        },
+        style: ResolvedStyle {
+            display: match style.display() {
+                DisplayType::Block => "block",
+                DisplayType::Inline => "inline",
+                DisplayType::DisplayNone => "none",
+            }
+            .to_string(),
+            position: match style.position() {
+                PositionType::Static => "static",
+                PositionType::Relative => "relative",
+                PositionType::Absolute => "absolute",
+            }
+            .to_string(),
+            color: style.color().code().to_string(),
+            background_color: style.background_color().code().to_string(),
+            font_px: style.font_size().px(),
+            font_family: style.font_family(),
+            opacity: style.opacity(),
+            z_index: style.z_index(),
+        },
+        children,
     }
 }
 

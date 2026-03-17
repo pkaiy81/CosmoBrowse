@@ -6,8 +6,7 @@ use crate::loader::{
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
     FrameViewModel, NavigationEvent, NavigationState, NavigationType, PageViewModel,
-    RenderBackendKind,
-    ScriptEngine, SearchResult, TabSummary,
+    RenderBackendKind, ScriptEngine, SearchResult, TabSummary,
 };
 use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
 use std::collections::{BTreeMap, HashSet};
@@ -372,7 +371,9 @@ impl BrowserSession {
     }
 
     fn current_page(&self) -> Option<PageViewModel> {
-        self.history.get(self.history_index).map(|entry| entry.view.clone())
+        self.history
+            .get(self.history_index)
+            .map(|entry| entry.view.clone())
     }
 
     fn current_url(&self) -> Option<String> {
@@ -390,7 +391,6 @@ impl BrowserSession {
             .and_then(|index| self.history.get(index))
             .map(|entry| entry.view.current_url.clone())
     }
-
 
     // Redirect chains are collapsed into a single history entry.
     // The entry keeps only the final response URL and is tagged as `Redirect`.
@@ -471,7 +471,10 @@ impl BrowserSession {
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
-        self.history.push(HistoryEntry { view, navigation_type });
+        self.history.push(HistoryEntry {
+            view,
+            navigation_type,
+        });
         self.history_index = self.history.len() - 1;
     }
 }
@@ -667,6 +670,7 @@ fn build_inline_frameset_view(
         render_backend: RenderBackendKind::NativeScene,
         document_url: current_url,
         scene_items: Vec::new(),
+        render_tree: None,
         html_content: None,
         child_frames,
     })
@@ -726,6 +730,7 @@ fn build_leaf_frame_view(
         render_backend: RenderBackendKind::NativeScene,
         document_url: current_url.to_string(),
         scene_items: script_layout.layout_scene.scene_items,
+        render_tree: Some(script_layout.render_tree),
         html_content: Some(prepared_html),
         child_frames: Vec::new(),
     }
@@ -754,6 +759,7 @@ fn blank_page_view(width: i64, height: i64) -> PageViewModel {
             render_backend: RenderBackendKind::NativeScene,
             document_url: String::new(),
             scene_items: Vec::new(),
+            render_tree: None,
             html_content: Some(
                 "<html><head><meta charset=\"utf-8\"></head><body></body></html>".to_string(),
             ),
@@ -906,9 +912,10 @@ fn normalize_url(input: &str) -> AppResult<String> {
         .map_err(|error| AppError::validation(format!("Invalid URL: {error}")))?;
     match parsed.scheme() {
         "http" | "https" => Ok(parsed.to_string()),
-        "mailto" | "javascript" | "data" | "file" => Err(AppError::navigation_guard(
-            format!("Navigation blocked for dangerous scheme: {}", parsed.scheme()),
-        )),
+        "mailto" | "javascript" | "data" | "file" => Err(AppError::navigation_guard(format!(
+            "Navigation blocked for dangerous scheme: {}",
+            parsed.scheme()
+        ))),
         other => Err(AppError::validation(format!("Unsupported scheme: {other}"))),
     }
 }
@@ -1156,26 +1163,39 @@ mod tests {
         assert!(next.root_frame.current_url.ends_with("/prof"));
     }
 
-
     #[test]
     fn navigation_state_for_normal_document_transition() {
         let mut session = BrowserSession::new();
-        session.push_history(sample_page("https://example.com/a", vec![]), NavigationType::Document);
-        session.push_history(sample_page("https://example.com/b", vec![]), NavigationType::Document);
+        session.push_history(
+            sample_page("https://example.com/a", vec![]),
+            NavigationType::Document,
+        );
+        session.push_history(
+            sample_page("https://example.com/b", vec![]),
+            NavigationType::Document,
+        );
 
         let state = session.navigation_state();
         assert!(state.can_back);
         assert!(!state.can_forward);
-        assert_eq!(state.current_navigation_type, Some(NavigationType::Document));
+        assert_eq!(
+            state.current_navigation_type,
+            Some(NavigationType::Document)
+        );
 
-        let back = session.back().expect("back should move to previous document");
+        let back = session
+            .back()
+            .expect("back should move to previous document");
         assert_eq!(back.current_url, "https://example.com/a");
     }
 
     #[test]
     fn hash_navigation_is_skipped_by_back_forward_state() {
         let mut session = BrowserSession::new();
-        session.push_history(sample_page("https://example.com/doc", vec![]), NavigationType::Document);
+        session.push_history(
+            sample_page("https://example.com/doc", vec![]),
+            NavigationType::Document,
+        );
         session.push_history(
             sample_page("https://example.com/doc#section-1", vec![]),
             NavigationType::Hash,
@@ -1197,7 +1217,10 @@ mod tests {
     #[test]
     fn redirect_navigation_keeps_single_step_in_back_history() {
         let mut session = BrowserSession::new();
-        session.push_history(sample_page("https://example.com/start", vec![]), NavigationType::Document);
+        session.push_history(
+            sample_page("https://example.com/start", vec![]),
+            NavigationType::Document,
+        );
         session.push_history(
             sample_page(
                 "https://example.com/final",
@@ -1205,15 +1228,23 @@ mod tests {
             ),
             NavigationType::Redirect,
         );
-        session.push_history(sample_page("https://example.com/next", vec![]), NavigationType::Document);
+        session.push_history(
+            sample_page("https://example.com/next", vec![]),
+            NavigationType::Document,
+        );
 
         let back = session
             .back()
             .expect("first back should land on redirect target document");
         assert_eq!(back.current_url, "https://example.com/final");
-        assert_eq!(session.navigation_state().current_navigation_type, Some(NavigationType::Redirect));
+        assert_eq!(
+            session.navigation_state().current_navigation_type,
+            Some(NavigationType::Redirect)
+        );
 
-        let back_again = session.back().expect("second back should land on origin document");
+        let back_again = session
+            .back()
+            .expect("second back should land on origin document");
         assert_eq!(back_again.current_url, "https://example.com/start");
     }
 
@@ -1236,7 +1267,6 @@ mod tests {
             NavigationType::Redirect
         );
     }
-
 
     fn sample_page(url: &str, diagnostics: Vec<&str>) -> PageViewModel {
         PageViewModel {
@@ -1272,6 +1302,7 @@ mod tests {
             render_backend: RenderBackendKind::NativeScene,
             document_url: "fixture://abehiroshi/index".to_string(),
             scene_items: Vec::new(),
+            render_tree: None,
             html_content: None,
             child_frames: vec![
                 sample_leaf_frame("root/left", Some("left"), "fixture://abehiroshi/menu"),
@@ -1294,6 +1325,7 @@ mod tests {
                     render_backend: RenderBackendKind::NativeScene,
                     document_url: "fixture://abehiroshi/top".to_string(),
                     scene_items: Vec::new(),
+                    render_tree: None,
                     html_content: None,
                     child_frames: vec![sample_leaf_frame(
                         "root/right/inner",
@@ -1325,6 +1357,7 @@ mod tests {
             render_backend: RenderBackendKind::NativeScene,
             document_url: current_url.to_string(),
             scene_items: Vec::new(),
+            render_tree: None,
             html_content: Some("<html></html>".to_string()),
             child_frames: Vec::new(),
         }

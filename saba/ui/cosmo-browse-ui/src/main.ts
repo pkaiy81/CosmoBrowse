@@ -3,6 +3,25 @@ import { openUrl as openExternalUrl } from "@tauri-apps/plugin-opener";
 
 type FrameRect = { x: number; y: number; width: number; height: number };
 type ContentSize = { width: number; height: number };
+type RenderTreeSnapshot = { root: RenderNode | null };
+type RenderNodeKind = "block" | "inline" | "text";
+type RenderNode = {
+  kind: RenderNodeKind;
+  node_name: string;
+  text: string | null;
+  box_info: FrameRect;
+  style: {
+    display: string;
+    position: string;
+    color: string;
+    background_color: string;
+    font_px: number;
+    font_family: string;
+    opacity: number;
+    z_index: number;
+  };
+  children: RenderNode[];
+};
 type FrameViewModel = {
   id: string;
   name: string | null;
@@ -14,6 +33,7 @@ type FrameViewModel = {
   render_backend: "web_view" | "native_scene";
   document_url: string;
   scene_items: SceneItem[];
+  render_tree: RenderTreeSnapshot | null;
   html_content: string | null;
   child_frames: FrameViewModel[];
 };
@@ -318,6 +338,35 @@ function renderTabs(tabs: TabSummary[]) {
   }
 }
 
+function renderRenderTreeNode(node: RenderNode, container: HTMLElement, depth = 0) {
+  const line = document.createElement("div");
+  line.className = `render-tree-node kind-${node.kind}`;
+  line.style.paddingLeft = `${depth * 12}px`;
+  const label = node.text?.trim() ? `${node.node_name} "${node.text.trim().slice(0, 24)}"` : node.node_name;
+  line.textContent = `${node.kind.toUpperCase()} ${label} [${node.box_info.x},${node.box_info.y} ${node.box_info.width}x${node.box_info.height}]`;
+  line.title = `display=${node.style.display}; position=${node.style.position}; color=${node.style.color}; bg=${node.style.background_color}`;
+  container.appendChild(line);
+  for (const child of node.children) {
+    renderRenderTreeNode(child, container, depth + 1);
+  }
+}
+
+function renderRenderTree(frame: FrameViewModel): HTMLElement | null {
+  const root = frame.render_tree?.root;
+  if (!root) return null;
+  const panel = document.createElement("aside");
+  panel.className = "render-tree-panel";
+  const heading = document.createElement("p");
+  heading.className = "render-tree-title";
+  heading.textContent = `RenderTree: ${frame.id}`;
+  panel.appendChild(heading);
+  const body = document.createElement("div");
+  body.className = "render-tree-body";
+  renderRenderTreeNode(root, body);
+  panel.appendChild(body);
+  return panel;
+}
+
 function renderFrame(frame: FrameViewModel, host: HTMLElement) {
   const shell = document.createElement("section");
   shell.className = frame.child_frames.length > 0 ? "frame-shell frameset-shell" : "frame-shell leaf-shell";
@@ -340,6 +389,8 @@ function renderFrame(frame: FrameViewModel, host: HTMLElement) {
     const backend = resolveRenderBackend(frame);
     backend.renderLeafFrame(frame, shell);
     shell.dataset.renderBackend = backend.kind;
+    const renderTreePanel = renderRenderTree(frame);
+    if (renderTreePanel) shell.appendChild(renderTreePanel);
   }
 
   host.appendChild(shell);

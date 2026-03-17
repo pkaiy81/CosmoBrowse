@@ -107,7 +107,9 @@ impl ProcessHost for StdProcessHost {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| AppError::state(format!("Failed to spawn renderer process: {error}")))?;
+            .map_err(|error| {
+                AppError::state(format!("Failed to spawn renderer process: {error}"))
+            })?;
         let pid = child.id();
         self.child = Some(child);
         Ok(pid)
@@ -115,9 +117,9 @@ impl ProcessHost for StdProcessHost {
 
     fn kill(&mut self) -> Result<(), AppError> {
         if let Some(mut child) = self.child.take() {
-            child
-                .kill()
-                .map_err(|error| AppError::state(format!("Failed to kill renderer process: {error}")))?;
+            child.kill().map_err(|error| {
+                AppError::state(format!("Failed to kill renderer process: {error}"))
+            })?;
             let _ = child.wait();
         }
         Ok(())
@@ -178,6 +180,7 @@ pub struct BrowserFrameDto {
     pub render_backend: String,
     pub document_url: String,
     pub scene_items: Vec<SceneItem>,
+    pub render_tree: Option<RenderTreeSnapshotDto>,
     pub html_content: Option<String>,
     pub child_frames: Vec<BrowserFrameDto>,
 }
@@ -200,6 +203,53 @@ pub struct FrameRectDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct RenderTreeSnapshotDto {
+    pub root: Option<RenderNodeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RenderNodeDto {
+    pub kind: RenderNodeKindDto,
+    pub node_name: String,
+    pub text: Option<String>,
+    pub box_info: RenderBoxDto,
+    pub style: ResolvedStyleDto,
+    pub children: Vec<RenderNodeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderNodeKindDto {
+    Block,
+    Inline,
+    Text,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RenderBoxDto {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ResolvedStyleDto {
+    pub display: String,
+    pub position: String,
+    pub color: String,
+    pub background_color: String,
+    pub font_px: i64,
+    pub font_family: String,
+    pub opacity: f64,
+    pub z_index: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CrashReportDto {
     pub path: String,
     pub crashed_at_ms: u64,
@@ -210,9 +260,14 @@ pub struct CrashReportDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum IpcRequestPayload {
-    OpenUrl { url: String },
+    OpenUrl {
+        url: String,
+    },
     GetPageView,
-    SetViewport { width: i64, height: i64 },
+    SetViewport {
+        width: i64,
+        height: i64,
+    },
     Reload,
     // Spec: navigation traversal should follow HTML Standard history traversal
     // semantics when integrating with joint session history.
@@ -234,10 +289,16 @@ pub enum IpcRequestPayload {
     GetMetrics,
     GetLatestCrashReport,
     NewTab,
-    SwitchTab { id: u32 },
-    CloseTab { id: u32 },
+    SwitchTab {
+        id: u32,
+    },
+    CloseTab {
+        id: u32,
+    },
     ListTabs,
-    Search { query: String },
+    Search {
+        query: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,7 +339,10 @@ impl NativeAdapter {
     ) -> Self {
         Self {
             app: Mutex::new(StarshipApp::default()),
-            renderer: Mutex::new(RendererProcessManager::new(process_host, healthcheck_interval)),
+            renderer: Mutex::new(RendererProcessManager::new(
+                process_host,
+                healthcheck_interval,
+            )),
         }
     }
 
@@ -299,9 +363,9 @@ impl NativeAdapter {
         let payload = match request.payload {
             IpcRequestPayload::OpenUrl { url } => self.open_url(&url).map(IpcResponsePayload::Page),
             IpcRequestPayload::GetPageView => self.get_page_view().map(IpcResponsePayload::Page),
-            IpcRequestPayload::SetViewport { width, height } => {
-                self.set_viewport(width, height).map(IpcResponsePayload::Page)
-            }
+            IpcRequestPayload::SetViewport { width, height } => self
+                .set_viewport(width, height)
+                .map(IpcResponsePayload::Page),
             IpcRequestPayload::Reload => self.reload().map(IpcResponsePayload::Page),
             IpcRequestPayload::Back => self.back().map(IpcResponsePayload::Page),
             IpcRequestPayload::Forward => self.forward().map(IpcResponsePayload::Page),
@@ -316,11 +380,13 @@ impl NativeAdapter {
                 .get_navigation_state()
                 .map(IpcResponsePayload::NavigationState),
             IpcRequestPayload::GetMetrics => self.get_metrics().map(IpcResponsePayload::Metrics),
-            IpcRequestPayload::GetLatestCrashReport => {
-                Ok(IpcResponsePayload::CrashReport(self.get_latest_crash_report()))
-            }
+            IpcRequestPayload::GetLatestCrashReport => Ok(IpcResponsePayload::CrashReport(
+                self.get_latest_crash_report(),
+            )),
             IpcRequestPayload::NewTab => self.new_tab().map(IpcResponsePayload::Tab),
-            IpcRequestPayload::SwitchTab { id } => self.switch_tab(id).map(IpcResponsePayload::Page),
+            IpcRequestPayload::SwitchTab { id } => {
+                self.switch_tab(id).map(IpcResponsePayload::Page)
+            }
             IpcRequestPayload::CloseTab { id } => self.close_tab(id).map(IpcResponsePayload::Tabs),
             IpcRequestPayload::ListTabs => self.list_tabs().map(IpcResponsePayload::Tabs),
             IpcRequestPayload::Search { query } => {
@@ -507,6 +573,7 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
             },
             document_url: frame.document_url,
             scene_items: frame.scene_items,
+            render_tree: frame.render_tree.map(RenderTreeSnapshotDto::from),
             html_content: frame.html_content,
             child_frames: frame
                 .child_frames
@@ -517,7 +584,55 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
     }
 }
 
-fn collect_dom_snapshots(frame: &cosmo_runtime::FrameViewModel, out: &mut Vec<DomSnapshotEntryDto>) {
+impl From<cosmo_runtime::RenderTreeSnapshot> for RenderTreeSnapshotDto {
+    fn from(snapshot: cosmo_runtime::RenderTreeSnapshot) -> Self {
+        Self {
+            root: snapshot.root.map(RenderNodeDto::from),
+        }
+    }
+}
+
+impl From<cosmo_runtime::RenderNode> for RenderNodeDto {
+    fn from(node: cosmo_runtime::RenderNode) -> Self {
+        Self {
+            kind: node.kind.into(),
+            node_name: node.node_name,
+            text: node.text,
+            box_info: RenderBoxDto {
+                x: node.box_info.x,
+                y: node.box_info.y,
+                width: node.box_info.width,
+                height: node.box_info.height,
+            },
+            style: ResolvedStyleDto {
+                display: node.style.display,
+                position: node.style.position,
+                color: node.style.color,
+                background_color: node.style.background_color,
+                font_px: node.style.font_px,
+                font_family: node.style.font_family,
+                opacity: node.style.opacity,
+                z_index: node.style.z_index,
+            },
+            children: node.children.into_iter().map(RenderNodeDto::from).collect(),
+        }
+    }
+}
+
+impl From<cosmo_runtime::RenderNodeKind> for RenderNodeKindDto {
+    fn from(kind: cosmo_runtime::RenderNodeKind) -> Self {
+        match kind {
+            cosmo_runtime::RenderNodeKind::Block => Self::Block,
+            cosmo_runtime::RenderNodeKind::Inline => Self::Inline,
+            cosmo_runtime::RenderNodeKind::Text => Self::Text,
+        }
+    }
+}
+
+fn collect_dom_snapshots(
+    frame: &cosmo_runtime::FrameViewModel,
+    out: &mut Vec<DomSnapshotEntryDto>,
+) {
     if let Some(html) = frame.html_content.as_ref() {
         out.push(DomSnapshotEntryDto {
             frame_id: frame.id.clone(),
@@ -673,6 +788,9 @@ mod tests {
         }
 
         let retry = adapter.dispatch(page_view_request());
-        assert!(retry.is_ok(), "retry should succeed after renderer recovery");
+        assert!(
+            retry.is_ok(),
+            "retry should succeed after renderer recovery"
+        );
     }
 }
