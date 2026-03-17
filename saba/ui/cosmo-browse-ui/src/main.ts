@@ -33,6 +33,7 @@ type FrameViewModel = {
   render_backend: "web_view" | "native_scene";
   document_url: string;
   scene_items: SceneItem[];
+  paint_commands: PaintCommand[];
   render_tree: RenderTreeSnapshot | null;
   html_content: string | null;
   child_frames: FrameViewModel[];
@@ -72,6 +73,11 @@ type SceneItemImage = {
   target: string | null;
 };
 type SceneItem = SceneItemRect | SceneItemText | SceneItemImage;
+
+type DrawRectCommand = SceneItemRect & { kind: "draw_rect" };
+type DrawTextCommand = SceneItemText & { kind: "draw_text" };
+type DrawImageCommand = SceneItemImage & { kind: "draw_image" };
+type PaintCommand = DrawRectCommand | DrawTextCommand | DrawImageCommand;
 type DomSnapshotEntry = { frame_id: string; document_url: string; html: string };
 type PageViewModel = {
   current_url: string;
@@ -159,15 +165,21 @@ const nativeSceneBackend: RenderBackend = {
 
     // Spec note: item order represents paint order from CSS2 visual formatting
     // model after CSS Display layout resolution.
-    for (const item of frame.scene_items) {
-      scene.appendChild(renderSceneItem(frame, item));
+    for (const command of frame.paint_commands) {
+      scene.appendChild(renderPaintCommand(frame, command));
     }
 
     shell.appendChild(scene);
   },
 };
 
-function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
+function renderPaintCommand(frame: FrameViewModel, command: PaintCommand): HTMLElement {
+  const item: SceneItem = command.kind === "draw_rect"
+    ? { ...command, kind: "rect" }
+    : command.kind === "draw_text"
+      ? { ...command, kind: "text" }
+      : { ...command, kind: "image" };
+
   if (item.kind === "rect") {
     const rect = document.createElement("div");
     rect.className = "scene-rect";

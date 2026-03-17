@@ -1,6 +1,6 @@
 use cosmo_runtime::{
-    AppError, AppMetricsSnapshot, AppService, NavigationState, OrbitSnapshot, SceneItem,
-    SearchResult, StarshipApp, TabSummary,
+    scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService, NavigationState,
+    OrbitSnapshot, PaintCommand, SceneItem, SearchResult, StarshipApp, TabSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -180,6 +180,7 @@ pub struct BrowserFrameDto {
     pub render_backend: String,
     pub document_url: String,
     pub scene_items: Vec<SceneItem>,
+    pub paint_commands: Vec<PaintCommand>,
     pub render_tree: Option<RenderTreeSnapshotDto>,
     pub html_content: Option<String>,
     pub child_frames: Vec<BrowserFrameDto>,
@@ -572,7 +573,17 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
                 }
             },
             document_url: frame.document_url,
-            scene_items: frame.scene_items,
+            scene_items: {
+                let (list, _errors) = scene_items_to_paint_commands(&frame.scene_items);
+                replay_paint_commands(&list.commands)
+            },
+            paint_commands: {
+                let (list, errors) = scene_items_to_paint_commands(&frame.scene_items);
+                for error in errors {
+                    log_recovery_event("paint_fallback", None, &error.message);
+                }
+                list.commands
+            },
             render_tree: frame.render_tree.map(RenderTreeSnapshotDto::from),
             html_content: frame.html_content,
             child_frames: frame
@@ -793,4 +804,51 @@ mod tests {
             "retry should succeed after renderer recovery"
         );
     }
+}
+
+
+fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
+    let mut items = Vec::new();
+    for command in commands {
+        match command {
+            PaintCommand::DrawRect(rect) => items.push(SceneItem::Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                background_color: rect.background_color.clone(),
+                opacity: rect.opacity,
+                z_index: rect.z_index,
+                clip_rect: rect.clip_rect,
+            }),
+            PaintCommand::DrawText(text) => items.push(SceneItem::Text {
+                x: text.x,
+                y: text.y,
+                text: text.text.clone(),
+                color: text.color.clone(),
+                font_px: text.font_px,
+                font_family: text.font_family.clone(),
+                underline: text.underline,
+                opacity: text.opacity,
+                href: text.href.clone(),
+                target: text.target.clone(),
+                z_index: text.z_index,
+                clip_rect: text.clip_rect,
+            }),
+            PaintCommand::DrawImage(image) => items.push(SceneItem::Image {
+                x: image.x,
+                y: image.y,
+                width: image.width,
+                height: image.height,
+                src: image.src.clone(),
+                alt: image.alt.clone(),
+                opacity: image.opacity,
+                href: image.href.clone(),
+                target: image.target.clone(),
+                z_index: image.z_index,
+                clip_rect: image.clip_rect,
+            }),
+        }
+    }
+    items
 }
