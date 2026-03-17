@@ -688,7 +688,7 @@ impl Display for RuntimeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renderer::dom::api::get_element_by_id;
+    use crate::renderer::dom::api::{get_element_by_id, get_js_content};
     use crate::renderer::dom::node::NodeKind as DomNodeKind;
     use crate::renderer::html::parser::HtmlParser;
     use crate::renderer::html::token::HtmlTokenizer;
@@ -937,6 +937,37 @@ mod tests {
             .warning_logs()
             .iter()
             .any(|log| log.contains("Microtask drain guard triggered")));
+    }
+
+    #[test]
+    fn test_static_fixture_dom_content_loaded_invalidates_render_pipeline() {
+        // Spec: DOMContentLoaded is queued after parsing, and its listener callback runs as a task.
+        // https://html.spec.whatwg.org/multipage/parsing.html#the-end
+        // This regression mirrors scripts/run_smoke_regression.py e7_t2_static fixture behavior.
+        let html = include_str!("../../../../testdata/js_event_loop/e7_t2_static.html").to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let script = get_js_content(dom.clone());
+        let lexer = JsLexer::new(script);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+
+        assert!(runtime.render_pipeline_invalidated());
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("Static Ready".to_string())
+        );
     }
 
     #[test]
