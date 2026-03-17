@@ -260,8 +260,52 @@ pub struct FrameViewModel {
     // Canonical document URL used as a base for resource/link resolution.
     pub document_url: String,
     pub scene_items: Vec<SceneItem>,
+    pub render_tree: Option<RenderTreeSnapshot>,
     pub html_content: Option<String>,
     pub child_frames: Vec<FrameViewModel>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RenderTreeSnapshot {
+    pub root: Option<RenderNode>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RenderNode {
+    pub kind: RenderNodeKind,
+    pub node_name: String,
+    pub text: Option<String>,
+    pub box_info: RenderBox,
+    pub style: ResolvedStyle,
+    pub children: Vec<RenderNode>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderNodeKind {
+    Block,
+    Inline,
+    Text,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RenderBox {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ResolvedStyle {
+    pub display: String,
+    pub position: String,
+    pub color: String,
+    pub background_color: String,
+    pub font_px: i64,
+    pub font_family: String,
+    pub opacity: f64,
+    pub z_index: i32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
