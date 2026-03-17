@@ -94,6 +94,9 @@ fn margin_component(component: &ComponentValue, base_font_size: FontSize) -> Opt
     }
 }
 
+// Spec: CSS Box Model margin shorthand supports `auto` values, which are positional tokens
+// and must not be dropped during 1/2/3/4-value expansion.
+// https://drafts.csswg.org/css-box-4/#margin-shorthand
 fn parse_margin_shorthand(
     value: &[ComponentValue],
     base_font_size: FontSize,
@@ -834,7 +837,9 @@ impl LayoutObject {
                     if let Some((top, right, bottom, left)) =
                         parse_margin_shorthand(&declaration.value, base_font_size)
                     {
-                        let current = self.style.margin();
+                        // Spec: CSS initial margin is 0, so when cascade runs before defaulting, fallback to 0.
+                        // https://www.w3.org/TR/CSS22/box.html#margin-properties
+                        let current = self.style.margin_or_default();
                         self.style.set_margin(
                             crate::renderer::layout::computed_style::EdgeSize::from_values(
                                 top.unwrap_or(current.top()),

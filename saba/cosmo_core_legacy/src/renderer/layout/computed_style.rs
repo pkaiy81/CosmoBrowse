@@ -339,6 +339,13 @@ impl ComputedStyle {
         self.margin.expect("failed to access CSS property: margin")
     }
 
+    /// Returns computed margin if already cascaded/defaulted, otherwise CSS initial value (0).
+    /// Spec: CSS2.2 margin initial value is `0`.
+    /// https://www.w3.org/TR/CSS22/box.html#margin-properties
+    pub fn margin_or_default(&self) -> EdgeSize {
+        self.margin.unwrap_or(EdgeSize::zero())
+    }
+
     pub fn set_padding_all(&mut self, value: f64) {
         self.padding = Some(EdgeSize::all(value));
     }
