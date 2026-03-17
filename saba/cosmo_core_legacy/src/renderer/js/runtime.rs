@@ -96,6 +96,7 @@ pub struct JsRuntime {
     microtask_queue: Vec<String>,
     unsupported_apis: Vec<String>,
     render_pipeline_invalidated: bool,
+    dom_content_loaded_listeners: Vec<String>,
 }
 
 impl JsRuntime {
@@ -108,6 +109,7 @@ impl JsRuntime {
             microtask_queue: Vec::new(),
             unsupported_apis: Vec::new(),
             render_pipeline_invalidated: false,
+            dom_content_loaded_listeners: Vec::new(),
         }
     }
 
@@ -120,14 +122,27 @@ impl JsRuntime {
         // Spec: running script is a task; perform a microtask checkpoint after script execution.
         // https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
         self.drain_microtasks();
+        self.fire_dom_content_loaded();
         self.process_event_loop();
     }
 
     // Spec: DOM events are dispatched to an event target and invoke registered listeners.
     // https://dom.spec.whatwg.org/#concept-event-dispatch
     pub fn dispatch_click(&mut self, target_id: &str) {
+        self.dispatch_event(target_id, DomEventType::Click);
+    }
+
+    pub fn dispatch_input(&mut self, target_id: &str) {
+        self.dispatch_event(target_id, DomEventType::Input);
+    }
+
+    pub fn dispatch_change(&mut self, target_id: &str) {
+        self.dispatch_event(target_id, DomEventType::Change);
+    }
+
+    fn dispatch_event(&mut self, target_id: &str, event_type: DomEventType) {
         if let Some(target) = self.dom_api.document_get_element_by_id(target_id) {
-            let callbacks = self.dom_api.dispatch_event(target, DomEventType::Click);
+            let callbacks = self.dom_api.dispatch_event(target, event_type);
             for callback in callbacks {
                 self.task_queue.push(callback);
             }
@@ -157,6 +172,14 @@ impl JsRuntime {
             // Spec: Promise reactions are queued as ECMAScript jobs (microtasks).
             // https://262.ecma-international.org/#sec-jobs-and-job-queues
             self.drain_microtasks();
+        }
+    }
+
+    fn fire_dom_content_loaded(&mut self) {
+        // Spec: DOMContentLoaded fires after parsing and deferred script execution completes.
+        // https://html.spec.whatwg.org/multipage/parsing.html#the-end
+        for callback in self.dom_content_loaded_listeners.clone() {
+            self.task_queue.push(callback);
         }
     }
 
@@ -218,6 +241,23 @@ impl JsRuntime {
             );
         }
 
+        if func == &RuntimeValue::StringLiteral("document.addEventListener".to_string()) {
+            if arguments.len() < 2 {
+                self.report_unsupported_api("document.addEventListener".to_string());
+                return (true, None);
+            }
+            let event_type = self.eval(&arguments[0], env.clone());
+            let callback = self.eval(&arguments[1], env.clone());
+            if event_type == Some(RuntimeValue::StringLiteral("DOMContentLoaded".to_string())) {
+                if let Some(callback) = callback.map(|v| v.to_string()) {
+                    self.dom_content_loaded_listeners.push(callback);
+                    return (true, None);
+                }
+            }
+            self.report_unsupported_api("document.addEventListener".to_string());
+            return (true, None);
+        }
+
         if func == &RuntimeValue::StringLiteral("setTimeout".to_string()) {
             if arguments.is_empty() {
                 self.report_unsupported_api("setTimeout(callback, delay)".to_string());
@@ -265,14 +305,16 @@ impl JsRuntime {
                 }
                 let event_type = self.eval(&arguments[0], env.clone());
                 let callback = self.eval(&arguments[1], env.clone());
-                if event_type == Some(RuntimeValue::StringLiteral("click".to_string())) {
-                    if let Some(callback) = callback.map(|v| v.to_string()) {
-                        self.dom_api.element_add_event_listener(
-                            object.clone(),
-                            DomEventType::Click,
-                            callback,
-                        );
-                        return (true, None);
+                if let Some(RuntimeValue::StringLiteral(event_name)) = event_type {
+                    if let Some(event_type) = DomEventType::from_name(&event_name) {
+                        if let Some(callback) = callback.map(|v| v.to_string()) {
+                            self.dom_api.element_add_event_listener(
+                                object.clone(),
+                                event_type,
+                                callback,
+                            );
+                            return (true, None);
+                        }
                     }
                 }
                 self.report_unsupported_api("Element.addEventListener".to_string());
@@ -364,6 +406,18 @@ impl JsRuntime {
                             self.dom_api.element_add_event_listener(
                                 object.clone(),
                                 DomEventType::Click,
+                                right_value.to_string(),
+                            );
+                        } else if p == "oninput" {
+                            self.dom_api.element_add_event_listener(
+                                object.clone(),
+                                DomEventType::Input,
+                                right_value.to_string(),
+                            );
+                        } else if p == "onchange" {
+                            self.dom_api.element_add_event_listener(
+                                object.clone(),
+                                DomEventType::Change,
                                 right_value.to_string(),
                             );
                         }
@@ -760,6 +814,64 @@ mod tests {
                 .borrow()
                 .kind(),
             DomNodeKind::Text("P".to_string())
+        );
+    }
+
+    #[test]
+    fn test_dom_content_loaded_handler_runs_after_bootstrap() {
+        let html = r#"<html><body><p id="target">init</p></body></html>"#.to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let input = r#"function ready(){ document.getElementById("target").textContent="ready"; } document.addEventListener("DOMContentLoaded", ready);"#.to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("ready".to_string())
+        );
+    }
+
+    #[test]
+    fn test_input_and_change_dispatch() {
+        let html =
+            r#"<html><body><input id="field" value="a" /><p id="target">init</p></body></html>"#
+                .to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let input = r#"var field=document.getElementById("field"); function oninputhandler(){ document.getElementById("target").textContent="input"; } function onchangehandler(){ document.getElementById("target").textContent="change"; } field.addEventListener("input", oninputhandler); field.onchange = onchangehandler;"#.to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+        runtime.dispatch_input("field");
+        runtime.dispatch_change("field");
+
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("change".to_string())
         );
     }
 

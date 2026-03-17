@@ -8,8 +8,9 @@
 2. **task queue は FIFO で 1 件ずつ実行し、各 task 後に microtask queue を空になるまで drain する。**
 3. **`setTimeout(callback, delay)` は task queue へ callback を追加する（`delay` は現状無視）。**
 4. **`queueMicrotask(callback)` と `Promise.then(callback)` は microtask queue へ callback を追加する。**
-5. **`dispatch_click` は DOM Standard の event dispatch を簡略化し、対象要素に登録済み click listener を task queue へ積む。**
-6. **DOM 変更（例: `textContent` 更新）が発生した場合は、`DOM更新 -> レイアウト再計算 -> 再描画` をトリガする。**
+5. **`DOMContentLoaded` はパース完了後に dispatch し、登録済み listener を task queue へ積む。**
+6. **`dispatch_click`/`dispatch_input`/`dispatch_change` は DOM Standard の event dispatch を簡略化し、対象要素に登録済み listener を task queue へ積む。**
+7. **DOM 変更（例: `textContent` 更新）が発生した場合は、`DOM更新 -> レイアウト再計算 -> 再描画` をトリガする。**
 
 > Diagram source: `docs/architecture/mermaid/js-event-loop.mmd`
 
@@ -26,9 +27,12 @@ flowchart TD
 ## Supported minimum set
 
 - Event dispatch
+  - `document.addEventListener("DOMContentLoaded", handler)`
   - `element.onclick = handler`
-  - `element.addEventListener("click", handler)`
-  - runtime API: `dispatch_click(target_id)`
+  - `element.oninput = handler`
+  - `element.onchange = handler`
+  - `element.addEventListener("click"|"input"|"change", handler)`
+  - runtime API: `dispatch_click(target_id)` / `dispatch_input(target_id)` / `dispatch_change(target_id)`
 - Timer task
   - `setTimeout(callback, delay)`
 - Microtasks / jobs
@@ -46,10 +50,11 @@ flowchart TD
 
 ## Spec references
 
-- HTML LS: event loop processing model / microtask checkpoint / update the rendering
+- HTML LS: event loop processing model / microtask checkpoint / update the rendering / DOMContentLoaded timing
   - https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
   - https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
   - https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
+  - https://html.spec.whatwg.org/multipage/parsing.html#the-end
 - HTML LS: timers
   - https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers
 - DOM Standard: event dispatch / event listener

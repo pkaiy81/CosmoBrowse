@@ -47,6 +47,18 @@
 - Current consumers can continue using `SabaApp` without code changes.
 - Future backends/policies can incrementally override the new `AppService` methods and provide custom trait objects.
 
+### `JsDomRuntimeBridge` (`cosmo_core`)
+- Responsibility: define a stable boundary for JS runtime bootstrap and DOM event dispatch wiring.
+- Minimal surface:
+  - `execute_bootstrap(&mut self)`
+  - `dispatch_dom_event_by_id(event, target_id)` where `event ∈ {DOMContentLoaded, click, input, change}`
+  - `diagnostics(&self)`
+- Spec mapping:
+  - HTML LS parsing completion + `DOMContentLoaded` timing
+    - https://html.spec.whatwg.org/multipage/parsing.html#the-end
+  - DOM Standard event dispatch for target-bound listeners
+    - https://dom.spec.whatwg.org/#concept-event-dispatch
+
 ### `ScriptEngine` lifecycle integration (minimum runtime)
 - `saba_app` now executes inline script during frame build and reflects DOM mutations in the same render cycle.
 - Current minimum runtime scope:
@@ -73,3 +85,11 @@
 - Compatibility policy:
   - Existing Tauri command names remain available via `adapter_tauri` compatibility commands.
   - Default integration path is schema-based IPC (`dispatch_ipc(IpcRequest) -> IpcResponse`) so Renderer can migrate away from `invoke`-specific coupling.
+
+
+## AppError runtime taxonomy
+- Runtime-related failures are normalized with dedicated codes:
+  - `runtime_error`
+  - `runtime_init_error`
+  - `script_timeout`
+- Existing categories (`network_error`, `parse_error`, `invalid_state` etc.) remain intact for backward compatibility.

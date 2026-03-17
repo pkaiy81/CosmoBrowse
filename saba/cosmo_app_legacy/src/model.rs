@@ -65,6 +65,30 @@ impl AppError {
             retryable: true,
         }
     }
+
+    pub fn runtime(message: impl Into<String>) -> Self {
+        Self {
+            code: "runtime_error".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn runtime_init(message: impl Into<String>) -> Self {
+        Self {
+            code: "runtime_init_error".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn script_timeout(message: impl Into<String>) -> Self {
+        Self {
+            code: "script_timeout".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
 }
 
 impl core::fmt::Display for AppError {

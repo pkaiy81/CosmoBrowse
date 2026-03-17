@@ -10,13 +10,19 @@ use core::cell::RefCell;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomEventType {
+    DomContentLoaded,
     Click,
+    Input,
+    Change,
 }
 
 impl DomEventType {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "DOMContentLoaded" => Some(Self::DomContentLoaded),
             "click" => Some(Self::Click),
+            "input" => Some(Self::Input),
+            "change" => Some(Self::Change),
             _ => None,
         }
     }

@@ -1,4 +1,3 @@
-use cosmo_runtime::{AppService, PageViewModel, StarshipApp};
 use cosmo_core::nebula_renderer::css::cssom::CssParser;
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
 use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
@@ -8,6 +7,7 @@ use cosmo_core::nebula_renderer::js::ast::JsParser;
 use cosmo_core::nebula_renderer::js::runtime::JsRuntime;
 use cosmo_core::nebula_renderer::js::token::JsLexer;
 use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
+use cosmo_runtime::{AppService, PageViewModel, StarshipApp};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -175,6 +175,10 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
     }
 
     if let Some(target_id) = click_target_id {
+        // Spec: input/change/click are dispatched through EventTarget dispatch steps.
+        // https://dom.spec.whatwg.org/#concept-event-dispatch
+        runtime.dispatch_input(target_id);
+        runtime.dispatch_change(target_id);
         runtime.dispatch_click(target_id);
     }
 
