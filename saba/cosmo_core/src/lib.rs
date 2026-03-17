@@ -10,3 +10,5 @@ pub use cosmo_core_legacy::display_item as stardust_display;
 pub use cosmo_core_legacy::renderer as nebula_renderer;
 
 pub mod paint_mapper;
+
+pub mod paint_commands;
