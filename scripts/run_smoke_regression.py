@@ -284,6 +284,9 @@ def run_navigation_and_tab_smoke(session: IpcSession, base_url: str) -> None:
 
 def run_e7_t2_js_runtime_smoke(repo_root: Path) -> None:
     """E7-T2 runtime smoke: static + lightweight SPA boot/event wiring."""
+    # Spec: DOMContentLoaded is fired after the document has been parsed.
+    # https://html.spec.whatwg.org/multipage/parsing.html#the-end
+    # Note: our minimum JS lexer does not yet support `//` comments; keep fixtures comment-free.
     saba_dir = repo_root / "saba"
     cmd_base = ["cargo", "run", "-p", "adapter_cli", "--", "verify-event-loop"]
 

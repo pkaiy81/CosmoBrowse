@@ -2,8 +2,6 @@
   <head>
     <script>
       function onReady() {
-        // Spec: DOMContentLoaded fires after parsing completes.
-        // https://html.spec.whatwg.org/multipage/parsing.html#the-end
         document.getElementById("target").textContent = "Static Ready";
       }
       document.addEventListener("DOMContentLoaded", onReady);
