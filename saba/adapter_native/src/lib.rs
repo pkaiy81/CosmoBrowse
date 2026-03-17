@@ -4,13 +4,145 @@ use cosmo_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const IPC_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Default)]
 pub struct NativeAdapter {
     app: Mutex<StarshipApp>,
+    renderer: Mutex<RendererProcessManager>,
+}
+
+pub trait ProcessHost: Send {
+    fn spawn(&mut self) -> Result<u32, AppError>;
+    fn kill(&mut self) -> Result<(), AppError>;
+    fn healthcheck(&mut self) -> Result<(), AppError>;
+    fn restart(&mut self) -> Result<u32, AppError>;
+}
+
+struct RendererProcessManager {
+    host: Box<dyn ProcessHost>,
+    healthcheck_interval: Duration,
+    last_healthcheck: Option<Instant>,
+}
+
+impl RendererProcessManager {
+    fn new(mut host: Box<dyn ProcessHost>, healthcheck_interval: Duration) -> Self {
+        if let Err(error) = host.spawn() {
+            log_recovery_event("renderer_spawn_failed", None, &error.message);
+        }
+
+        Self {
+            host,
+            healthcheck_interval,
+            last_healthcheck: None,
+        }
+    }
+
+    fn ensure_healthy(&mut self) -> Result<(), AppError> {
+        let now = Instant::now();
+        if self
+            .last_healthcheck
+            .is_some_and(|last| now.duration_since(last) < self.healthcheck_interval)
+        {
+            return Ok(());
+        }
+        self.last_healthcheck = Some(now);
+
+        if self.host.healthcheck().is_ok() {
+            return Ok(());
+        }
+
+        match self.host.restart() {
+            Ok(pid) => {
+                log_recovery_event(
+                    "renderer_recovered",
+                    Some(pid),
+                    "renderer restarted after failed healthcheck",
+                );
+                Err(AppError::recovering(
+                    "renderer process was restarted; retry the request",
+                ))
+            }
+            Err(error) => {
+                log_recovery_event("renderer_recovery_failed", None, &error.message);
+                Err(AppError::recovering(format!(
+                    "renderer recovery in progress: {}",
+                    error.message
+                )))
+            }
+        }
+    }
+}
+
+struct StdProcessHost {
+    child: Option<Child>,
+    command: String,
+    args: Vec<String>,
+}
+
+impl StdProcessHost {
+    fn from_env() -> Self {
+        let command = std::env::var("COSMO_RENDERER_PATH").unwrap_or_else(|_| "sleep".to_string());
+        let args = std::env::var("COSMO_RENDERER_ARGS")
+            .unwrap_or_else(|_| "3600".to_string())
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        Self {
+            child: None,
+            command,
+            args,
+        }
+    }
+}
+
+impl ProcessHost for StdProcessHost {
+    fn spawn(&mut self) -> Result<u32, AppError> {
+        let child = Command::new(&self.command)
+            .args(&self.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| AppError::state(format!("Failed to spawn renderer process: {error}")))?;
+        let pid = child.id();
+        self.child = Some(child);
+        Ok(pid)
+    }
+
+    fn kill(&mut self) -> Result<(), AppError> {
+        if let Some(mut child) = self.child.take() {
+            child
+                .kill()
+                .map_err(|error| AppError::state(format!("Failed to kill renderer process: {error}")))?;
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+
+    fn healthcheck(&mut self) -> Result<(), AppError> {
+        let Some(child) = self.child.as_mut() else {
+            return Err(AppError::state("Renderer process is not running"));
+        };
+
+        match child
+            .try_wait()
+            .map_err(|error| AppError::state(format!("Renderer healthcheck failed: {error}")))?
+        {
+            Some(status) => Err(AppError::state(format!(
+                "Renderer process exited unexpectedly: {status}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn restart(&mut self) -> Result<u32, AppError> {
+        let _ = self.kill();
+        self.spawn()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,9 +272,21 @@ const fn ipc_schema_version() -> u32 {
 }
 
 impl NativeAdapter {
+    pub fn with_process_host(
+        process_host: Box<dyn ProcessHost>,
+        healthcheck_interval: Duration,
+    ) -> Self {
+        Self {
+            app: Mutex::new(StarshipApp::default()),
+            renderer: Mutex::new(RendererProcessManager::new(process_host, healthcheck_interval)),
+        }
+    }
+
     pub fn dispatch(&self, request: IpcRequest) -> Result<IpcResponse, AppError> {
+        self.ensure_renderer_healthy()?;
+
         if request.version != IPC_SCHEMA_VERSION {
-            return Err(AppError::invalid_input(format!(
+            return Err(AppError::validation(format!(
                 "Unsupported IPC version: {} (expected {})",
                 request.version, IPC_SCHEMA_VERSION
             )));
@@ -276,6 +420,35 @@ impl NativeAdapter {
             .lock()
             .map_err(|_| AppError::state("Failed to lock app state"))
     }
+
+    fn ensure_renderer_healthy(&self) -> Result<(), AppError> {
+        let mut renderer = self
+            .renderer
+            .lock()
+            .map_err(|_| AppError::state("Failed to lock renderer process state"))?;
+        renderer.ensure_healthy()
+    }
+}
+
+impl Default for NativeAdapter {
+    fn default() -> Self {
+        let interval_ms = std::env::var("COSMO_RENDERER_HEALTHCHECK_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1000);
+        Self::with_process_host(
+            Box::new(StdProcessHost::from_env()),
+            Duration::from_millis(interval_ms),
+        )
+    }
+}
+
+impl Drop for NativeAdapter {
+    fn drop(&mut self) {
+        if let Ok(mut renderer) = self.renderer.lock() {
+            let _ = renderer.host.kill();
+        }
+    }
 }
 
 impl From<OrbitSnapshot> for BrowserPageDto {
@@ -373,4 +546,133 @@ fn is_console_log_entry(entry: &str) -> bool {
 
 fn crash_report_path() -> std::path::PathBuf {
     std::env::temp_dir().join("cosmobrowse-crash-report.json")
+}
+
+fn log_recovery_event(event: &str, pid: Option<u32>, detail: &str) {
+    #[derive(Serialize)]
+    struct RecoveryLog<'a> {
+        event: &'a str,
+        component: &'a str,
+        pid: Option<u32>,
+        detail: &'a str,
+        timestamp_ms: u128,
+    }
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+
+    let line = serde_json::to_string(&RecoveryLog {
+        event,
+        component: "renderer_process_manager",
+        pid,
+        detail,
+        timestamp_ms,
+    })
+    .unwrap_or_else(|_| {
+        format!(
+            "{{\"event\":\"{}\",\"component\":\"renderer_process_manager\",\"detail\":\"{}\"}}",
+            event, detail
+        )
+    });
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct FakeProcessState {
+        running: bool,
+        spawn_count: u32,
+        restart_count: u32,
+    }
+
+    struct FakeProcessHost {
+        state: Arc<Mutex<FakeProcessState>>,
+    }
+
+    impl FakeProcessHost {
+        fn new(state: Arc<Mutex<FakeProcessState>>) -> Self {
+            Self { state }
+        }
+    }
+
+    impl ProcessHost for FakeProcessHost {
+        fn spawn(&mut self) -> Result<u32, AppError> {
+            let mut state = self.state.lock().expect("state lock");
+            state.running = true;
+            state.spawn_count += 1;
+            Ok(state.spawn_count)
+        }
+
+        fn kill(&mut self) -> Result<(), AppError> {
+            let mut state = self.state.lock().expect("state lock");
+            state.running = false;
+            Ok(())
+        }
+
+        fn healthcheck(&mut self) -> Result<(), AppError> {
+            let state = self.state.lock().expect("state lock");
+            if state.running {
+                Ok(())
+            } else {
+                Err(AppError::state("renderer has exited"))
+            }
+        }
+
+        fn restart(&mut self) -> Result<u32, AppError> {
+            let mut state = self.state.lock().expect("state lock");
+            state.restart_count += 1;
+            state.running = true;
+            state.spawn_count += 1;
+            Ok(state.spawn_count)
+        }
+    }
+
+    fn page_view_request() -> IpcRequest {
+        IpcRequest {
+            version: IPC_SCHEMA_VERSION,
+            payload: IpcRequestPayload::GetPageView,
+        }
+    }
+
+    #[test]
+    fn forced_renderer_exit_triggers_restart_and_allows_retry_success() {
+        let state = Arc::new(Mutex::new(FakeProcessState::default()));
+        let adapter = NativeAdapter::with_process_host(
+            Box::new(FakeProcessHost::new(state.clone())),
+            Duration::ZERO,
+        );
+
+        {
+            let state = state.lock().expect("state lock");
+            assert_eq!(state.spawn_count, 1);
+            assert!(state.running);
+        }
+
+        {
+            let mut state = state.lock().expect("state lock");
+            state.running = false;
+        }
+
+        let error = adapter
+            .dispatch(page_view_request())
+            .expect_err("first request should surface recovering error");
+        assert_eq!(error.code, "renderer_recovering");
+        assert!(error.retryable);
+
+        {
+            let state = state.lock().expect("state lock");
+            assert_eq!(state.restart_count, 1);
+            assert_eq!(state.spawn_count, 2);
+            assert!(state.running);
+        }
+
+        let retry = adapter.dispatch(page_view_request());
+        assert!(retry.is_ok(), "retry should succeed after renderer recovery");
+    }
 }
