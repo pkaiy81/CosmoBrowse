@@ -1,11 +1,15 @@
 flowchart LR
-  UI["Renderer UI (cosmo-browse-ui)\n- URL入力/タブ操作\n- scene_items 描画\n- diagnostics 表示"]
-  IPC["Tauri IPC\n- dispatch_ipc\n- open_url / activate_link"]
+  UI["Renderer UI (adapter_tauri / adapter_native)\n- URL入力/タブ操作\n- scene_items 描画\n- diagnostics 表示"]
+  IPC["Adapter Boundary\n- dispatch_ipc (互換レイヤ)\n- IpcRequest/IpcResponse v1"]
+  PM["Renderer Process Manager (adapter_native)\n- spawn/kill/healthcheck/restart\n- renderer_recovering を返却"]
+  RP["Renderer Child Process\n- native scene rendering worker"]
   CORE["Browser Core (cosmo_app_legacy)\n- session/history\n- frameset target解決\n- snapshot 生成"]
   NET["Loader / Security\n- reqwest fetch (HTTP/HTTPS)\n- redirect/cache/charset\n- CORS/sandbox/cookie診断"]
   EXT["Remote Origins\n- HTTP/HTTPS servers"]
 
   UI <--> IPC
+  IPC <--> PM
+  PM <--> RP
   IPC <--> CORE
   CORE <--> NET
   NET <--> EXT

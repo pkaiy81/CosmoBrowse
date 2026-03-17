@@ -8,7 +8,7 @@
 
 ---
 
-## 1. 現状確認（2026-03-08 時点）
+## 1. 現状確認（2026-03-17 時点）
 - Rust toolchain: `stable`（`saba/rust-toolchain.toml`）。
 - Tauri (Rust): `tauri = "2"`, `tauri-build = "2"`, `tauri-plugin-opener = "2"`。
 - Tauri (JS): `@tauri-apps/api = "^2"`, `@tauri-apps/cli = "^2"`。
@@ -16,6 +16,10 @@
 - Tauri 側は `cosmo_runtime` 経由で `open_url` / `reload` / `back` / `forward` / `tabs` / `search` / `metrics` を接続済み。
 - `RenderSnapshot` は本文・リンク・diagnostics に加えて layout/style メタ情報を返却。
 - `adapter_cli` PoC を追加済みで、`open-url` / `get-snapshot` / `metrics` が同一 `cosmo_runtime` API で動作。
+- `adapter_native` に Renderer 子プロセス管理（`ProcessHost`: spawn/kill/healthcheck/restart）を導入済み。
+- Renderer 異常終了時は自動再起動し、`renderer_recovered` / `renderer_recovery_failed` を構造化ログで記録。
+- 復旧中は retryable な `AppError`（`renderer_recovering`）を返却し、`cosmo_runtime` 経由で再試行可能にした。
+- 障害注入テスト（強制終了→再起動→再試行成功）を `adapter_native` に追加済み。
 
 ---
 
@@ -85,10 +89,13 @@
 ## Phase E: WebView 依存除去（Week 9-10）
 - [ ] `adapter_native` を標準起動経路として有効化。
 - [ ] `adapter_tauri` をオプション機能に降格。
-- [ ] 同一 `cosmo_runtime` API で動作確認。
+- [x] Renderer 子プロセス管理（spawn/kill/healthcheck/restart）を `adapter_native` に導入。
+- [x] 異常終了時の自動再起動 + 構造化復旧ログ + retryable `AppError` 経路を実装。
+- [ ] 同一 `cosmo_runtime` API で動作確認（tauri/native の両経路）。
 
 **DoD**
 - 既定構成で WebView ランタイムなしに `open_url/get_snapshot` が動く。
+- Renderer 障害注入時に復旧ログが残り、再試行で成功する。
 
 ---
 
@@ -157,12 +164,14 @@
 ## 8. IPC adapter migration plan（invoke互換維持）
 1. `adapter_native` を Browser Process の標準 adapter として導入し、`IpcRequest` / `IpcResponse` を IPC 契約として固定する。
 2. `ui/cosmo-browse-ui/src-tauri` の command 群は `adapter_tauri` 互換レイヤとして維持し、内部では `adapter_native` を呼び出す。
-3. デフォルト実行経路は `dispatch_ipc`（schema-based）へ切替える。
-4. 既存フロントは段階移行:
+3. `adapter_native` では Renderer プロセスの healthcheck/restart を常時実施し、復旧イベントを構造化ログに記録する。
+4. 復旧中は retryable な `AppError`（`renderer_recovering`）を返し、フロントは再試行 UI へフォールバックする。
+5. デフォルト実行経路は `dispatch_ipc`（schema-based）へ切替える。
+6. 既存フロントは段階移行:
    - Step 1: 既存 `invoke("open_url")` 等を維持（互換モード）。
    - Step 2: 新規実装は `invoke("dispatch_ipc", { request })` を使用。
    - Step 3: 移行完了後に互換 command の利用状況を監視し、削除可否を判断する。
-5. 移行期間のレビュー観点:
+7. 移行期間のレビュー観点:
    - `adapter_* -> cosmo_runtime -> cosmo_core` 依存方向を維持。
    - DTO/IPC 契約に `tauri` 固有型を混入させない。
 
@@ -176,9 +185,10 @@
 - [ ] **E1-T1 プロセス責務定義を ADR 化**
   - Browser/Renderer/Network/GPU(将来) の責務、障害時の復旧方針、IPC 境界を明文化。
   - **完了条件**: ADR が `docs/architecture/` に追加され、レビューで承認済み。
-- [ ] **E1-T2 `adapter_native` に ProcessHost を実装**
+- [x] **E1-T2 `adapter_native` に ProcessHost を実装**
   - Renderer 子プロセスの起動・停止・ヘルスチェック API を追加。
   - **完了条件**: 異常終了時に自動再起動し、復旧ログが残る。
+  - 進捗メモ: `ProcessHost`（spawn/kill/healthcheck/restart）と fault injection テストを導入し、`renderer_recovering` の再試行経路まで接続済み。
 - [ ] **E1-T3 IPC 契約を schema 固定**
   - `IpcRequest/IpcResponse` を version 付きで定義し、後方互換ルールを策定。
   - **完了条件**: schema 変更時に CI で破壊的変更を検知可能。

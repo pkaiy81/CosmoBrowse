@@ -57,6 +57,14 @@ impl AppError {
             retryable: false,
         }
     }
+
+    pub fn recovering(message: impl Into<String>) -> Self {
+        Self {
+            code: "renderer_recovering".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
 }
 
 impl core::fmt::Display for AppError {
