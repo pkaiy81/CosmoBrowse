@@ -1,0 +1,22 @@
+name: smoke-nightly
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  smoke_regression_nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: run nightly smoke regression
+        run: python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly
+      - name: upload smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-regression-nightly-failure
+          path: smoke-artifacts/nightly
+          if-no-files-found: warn

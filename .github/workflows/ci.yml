@@ -44,6 +44,21 @@ jobs:
       - name: npm run build
         run: npm run build
 
+  smoke_regression_pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: run PR smoke regression (light)
+        run: python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr
+      - name: upload smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-regression-pr-failure
+          path: smoke-artifacts/pr
+          if-no-files-found: warn
+
   ipc_contract:
     runs-on: ubuntu-latest
     steps:

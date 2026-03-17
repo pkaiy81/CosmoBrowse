@@ -102,6 +102,28 @@ cd saba
 echo '{"type":"open_url","payload":{"url":"https://abehiroshi.la.coocan.jp/"}}' | cargo run -p adapter_native --bin native_ipc_cli -- stdin
 ```
 
+## リグレッションスモーク（navigation / rendering / input）
+
+`scripts/run_smoke_regression.py` はローカル fixture サーバーを起動し、
+`native_ipc_cli` に対して代表ケースの検証を行います。
+
+- 代表ケース: 静的ページ / 軽量 SPA / redirect / エラーページ
+- 検証: `open_url` -> snapshot 取得 -> タイトル・主要テキスト・リンク数
+- 追加シナリオ: `back` / `forward` とタブ切替の最小フロー
+- 失敗時: `AppMetricsSnapshot` とセッションログを `smoke-artifacts/` に保存
+
+PR 向け軽量版:
+
+```bash
+python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr
+```
+
+nightly 想定のフル版:
+
+```bash
+python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly
+```
+
 ## アーキテクチャ資料
 
 - ブラウザ全体インデックス: [docs/cosmobrowse-browser-architecture.md](docs/cosmobrowse-browser-architecture.md)
