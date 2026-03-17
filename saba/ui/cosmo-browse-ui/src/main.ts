@@ -63,7 +63,8 @@ type PageViewModel = {
   dom_snapshot: DomSnapshotEntry[];
   root_frame: FrameViewModel;
 };
-type NavigationState = { can_back: boolean; can_forward: boolean; current_url: string | null };
+type NavigationType = "document" | "hash" | "redirect";
+type NavigationState = { can_back: boolean; can_forward: boolean; current_url: string | null; current_navigation_type?: NavigationType | null };
 type TabSummary = { id: number; title: string; url: string | null; is_active: boolean };
 type SearchResult = { id: number; title: string; url: string; snippet: string };
 type AppError = { code: string; message: string; retryable: boolean };
