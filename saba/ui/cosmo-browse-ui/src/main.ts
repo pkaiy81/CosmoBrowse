@@ -75,17 +75,26 @@ type EmbeddedNavigationMessage = {
 };
 
 type IpcRequest = {
+  version: number;
   type: string;
   payload?: Record<string, unknown>;
 };
 
 type IpcEnvelope<T> = {
+  version: number;
   type: string;
   payload: T;
 };
 
-async function invokeIpc<T>(request: IpcRequest): Promise<T> {
-  const response = await invoke<IpcEnvelope<T>>("dispatch_ipc", { request });
+const IPC_SCHEMA_VERSION = 1;
+
+async function invokeIpc<T>(request: Omit<IpcRequest, "version">): Promise<T> {
+  const response = await invoke<IpcEnvelope<T>>("dispatch_ipc", {
+    request: { version: IPC_SCHEMA_VERSION, ...request },
+  });
+  if (response.version !== IPC_SCHEMA_VERSION) {
+    throw new Error(`Unsupported IPC response version: ${response.version}`);
+  }
   return response.payload;
 }
 

@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "commands": {
+    "activate_link": {
+      "request_payload": {
+        "properties": {
+          "frame_id": {
+            "type": "string"
+          },
+          "href": {
+            "type": "string"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "frame_id",
+          "href"
+        ]
+      },
+      "response_type": "page"
+    },
+    "back": {
+      "request_payload": null,
+      "response_type": "page"
+    },
+    "close_tab": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "tabs"
+    },
+    "forward": {
+      "request_payload": null,
+      "response_type": "page"
+    },
+    "get_latest_crash_report": {
+      "request_payload": null,
+      "response_type": "crash_report"
+    },
+    "get_metrics": {
+      "request_payload": null,
+      "response_type": "metrics"
+    },
+    "get_navigation_state": {
+      "request_payload": null,
+      "response_type": "navigation_state"
+    },
+    "get_page_view": {
+      "request_payload": null,
+      "response_type": "page"
+    },
+    "list_tabs": {
+      "request_payload": null,
+      "response_type": "tabs"
+    },
+    "new_tab": {
+      "request_payload": null,
+      "response_type": "tab"
+    },
+    "open_url": {
+      "request_payload": {
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ]
+      },
+      "response_type": "page"
+    },
+    "reload": {
+      "request_payload": null,
+      "response_type": "page"
+    },
+    "search": {
+      "request_payload": {
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "response_type": "search_results"
+    },
+    "set_viewport": {
+      "request_payload": {
+        "properties": {
+          "height": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height"
+        ]
+      },
+      "response_type": "page"
+    },
+    "switch_tab": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "page"
+    }
+  },
+  "request_envelope": {
+    "properties": {
+      "payload": {
+        "type": "object"
+      },
+      "type": {
+        "enum": [
+          "open_url",
+          "get_page_view",
+          "set_viewport",
+          "reload",
+          "back",
+          "forward",
+          "activate_link",
+          "get_navigation_state",
+          "get_metrics",
+          "get_latest_crash_report",
+          "new_tab",
+          "switch_tab",
+          "close_tab",
+          "list_tabs",
+          "search"
+        ],
+        "type": "string"
+      },
+      "version": {
+        "const": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "version",
+      "type"
+    ],
+    "type": "object"
+  },
+  "response_envelope": {
+    "properties": {
+      "payload": {
+        "type": "object"
+      },
+      "type": {
+        "type": "string"
+      },
+      "version": {
+        "const": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "version",
+      "type",
+      "payload"
+    ],
+    "type": "object"
+  },
+  "schema_version": 1,
+  "title": "CosmoBrowse IPC Contract"
+}

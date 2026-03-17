@@ -1,4 +1,4 @@
-use adapter_native::{IpcRequest, NativeAdapter};
+use adapter_native::{IpcRequest, IpcRequestPayload, IPC_SCHEMA_VERSION, NativeAdapter};
 use serde::Serialize;
 use std::env;
 use std::fs;
@@ -153,7 +153,7 @@ fn print_usage(program: &str) {
     println!();
     println!("Request JSON example:");
     println!(
-        "  {{\"type\":\"open_url\",\"payload\":{{\"url\":\"https://example.com\"}}}}"
+        "  {{\"version\":1,\"type\":\"open_url\",\"payload\":{{\"url\":\"https://example.com\"}}}}"
     );
 }
 
@@ -166,13 +166,13 @@ mod tests {
         let args = vec![
             "native_ipc_cli".to_string(),
             "once".to_string(),
-            "{\"type\":\"get_page_view\"}".to_string(),
+            "{\"version\":1,\"type\":\"get_page_view\"}".to_string(),
         ];
 
         assert_eq!(
             parse_mode(&args),
             Mode::Once {
-                request_json: "{\"type\":\"get_page_view\"}".to_string(),
+                request_json: "{\"version\":1,\"type\":\"get_page_view\"}".to_string(),
             }
         );
     }
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn load_request_source_reads_inline_or_file() {
-        let inline = "{\"type\":\"list_tabs\"}";
+        let inline = "{\"version\":1,\"type\":\"list_tabs\"}";
         assert_eq!(load_request_source(inline).unwrap(), inline);
 
         let temp_path = std::env::temp_dir().join("native_ipc_cli_request_test.json");
@@ -200,8 +200,9 @@ mod tests {
 
     #[test]
     fn parse_request_accepts_valid_shape() {
-        let request = parse_request("{\"type\":\"get_page_view\"}").unwrap();
-        assert!(matches!(request, IpcRequest::GetPageView));
+        let request = parse_request("{\"version\":1,\"type\":\"get_page_view\"}").unwrap();
+        assert_eq!(request.version, IPC_SCHEMA_VERSION);
+        assert!(matches!(request.payload, IpcRequestPayload::GetPageView));
     }
 
     #[test]
