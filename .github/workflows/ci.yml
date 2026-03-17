@@ -43,3 +43,20 @@ jobs:
         run: npm install
       - name: npm run build
         run: npm run build
+
+  ipc_contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate IPC schema snapshot
+        run: python scripts/generate_ipc_schema.py
+      - name: check backward compatibility
+        run: |
+          python scripts/check_ipc_compat.py \
+            docs/ipc/ipc-schema-v1.json \
+            docs/ipc/ipc-schema-v1.generated.json
+      - name: upload IPC schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipc-schema-v1
+          path: docs/ipc/ipc-schema-v1.generated.json

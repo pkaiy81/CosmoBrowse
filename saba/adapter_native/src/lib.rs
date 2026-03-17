@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::Mutex;
 
+pub const IPC_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Default)]
 pub struct NativeAdapter {
     app: Mutex<StarshipApp>,
@@ -75,7 +77,7 @@ pub struct CrashReportDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum IpcRequest {
+pub enum IpcRequestPayload {
     OpenUrl { url: String },
     GetPageView,
     SetViewport { width: i64, height: i64 },
@@ -108,7 +110,7 @@ pub enum IpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum IpcResponse {
+pub enum IpcResponsePayload {
     Page(BrowserPageDto),
     NavigationState(NavigationState),
     Metrics(AppMetricsSnapshot),
@@ -118,41 +120,74 @@ pub enum IpcResponse {
     SearchResults(Vec<SearchResult>),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcRequest {
+    #[serde(default = "ipc_schema_version")]
+    pub version: u32,
+    #[serde(flatten)]
+    pub payload: IpcRequestPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcResponse {
+    pub version: u32,
+    #[serde(flatten)]
+    pub payload: IpcResponsePayload,
+}
+
+const fn ipc_schema_version() -> u32 {
+    IPC_SCHEMA_VERSION
+}
+
 impl NativeAdapter {
     pub fn dispatch(&self, request: IpcRequest) -> Result<IpcResponse, AppError> {
+        if request.version != IPC_SCHEMA_VERSION {
+            return Err(AppError::invalid_input(format!(
+                "Unsupported IPC version: {} (expected {})",
+                request.version, IPC_SCHEMA_VERSION
+            )));
+        }
+
         // Spec: IPC requests are processed serially so browser state updates are
         // observed in deterministic task order, mirroring DOM event loop task
         // execution constraints where tasks run to completion.
         // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
-        match request {
-            IpcRequest::OpenUrl { url } => self.open_url(&url).map(IpcResponse::Page),
-            IpcRequest::GetPageView => self.get_page_view().map(IpcResponse::Page),
-            IpcRequest::SetViewport { width, height } => {
-                self.set_viewport(width, height).map(IpcResponse::Page)
+        let payload = match request.payload {
+            IpcRequestPayload::OpenUrl { url } => self.open_url(&url).map(IpcResponsePayload::Page),
+            IpcRequestPayload::GetPageView => self.get_page_view().map(IpcResponsePayload::Page),
+            IpcRequestPayload::SetViewport { width, height } => {
+                self.set_viewport(width, height).map(IpcResponsePayload::Page)
             }
-            IpcRequest::Reload => self.reload().map(IpcResponse::Page),
-            IpcRequest::Back => self.back().map(IpcResponse::Page),
-            IpcRequest::Forward => self.forward().map(IpcResponse::Page),
-            IpcRequest::ActivateLink {
+            IpcRequestPayload::Reload => self.reload().map(IpcResponsePayload::Page),
+            IpcRequestPayload::Back => self.back().map(IpcResponsePayload::Page),
+            IpcRequestPayload::Forward => self.forward().map(IpcResponsePayload::Page),
+            IpcRequestPayload::ActivateLink {
                 frame_id,
                 href,
                 target,
             } => self
                 .activate_link(&frame_id, &href, target.as_deref())
-                .map(IpcResponse::Page),
-            IpcRequest::GetNavigationState => self
+                .map(IpcResponsePayload::Page),
+            IpcRequestPayload::GetNavigationState => self
                 .get_navigation_state()
-                .map(IpcResponse::NavigationState),
-            IpcRequest::GetMetrics => self.get_metrics().map(IpcResponse::Metrics),
-            IpcRequest::GetLatestCrashReport => {
-                Ok(IpcResponse::CrashReport(self.get_latest_crash_report()))
+                .map(IpcResponsePayload::NavigationState),
+            IpcRequestPayload::GetMetrics => self.get_metrics().map(IpcResponsePayload::Metrics),
+            IpcRequestPayload::GetLatestCrashReport => {
+                Ok(IpcResponsePayload::CrashReport(self.get_latest_crash_report()))
             }
-            IpcRequest::NewTab => self.new_tab().map(IpcResponse::Tab),
-            IpcRequest::SwitchTab { id } => self.switch_tab(id).map(IpcResponse::Page),
-            IpcRequest::CloseTab { id } => self.close_tab(id).map(IpcResponse::Tabs),
-            IpcRequest::ListTabs => self.list_tabs().map(IpcResponse::Tabs),
-            IpcRequest::Search { query } => self.search(&query).map(IpcResponse::SearchResults),
-        }
+            IpcRequestPayload::NewTab => self.new_tab().map(IpcResponsePayload::Tab),
+            IpcRequestPayload::SwitchTab { id } => self.switch_tab(id).map(IpcResponsePayload::Page),
+            IpcRequestPayload::CloseTab { id } => self.close_tab(id).map(IpcResponsePayload::Tabs),
+            IpcRequestPayload::ListTabs => self.list_tabs().map(IpcResponsePayload::Tabs),
+            IpcRequestPayload::Search { query } => {
+                self.search(&query).map(IpcResponsePayload::SearchResults)
+            }
+        }?;
+
+        Ok(IpcResponse {
+            version: IPC_SCHEMA_VERSION,
+            payload,
+        })
     }
 
     pub fn open_url(&self, url: &str) -> Result<BrowserPageDto, AppError> {
