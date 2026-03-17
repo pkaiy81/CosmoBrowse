@@ -248,7 +248,7 @@ pub struct ResolvedStyleDto {
     pub z_index: i32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CrashReportDto {
     pub path: String,
