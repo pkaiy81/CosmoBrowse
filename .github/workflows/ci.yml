@@ -51,6 +51,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: run PR smoke regression (light)
         run: python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr
+      - name: print layout breakage summary
+        run: cat smoke-artifacts/pr/layout_regression_summary.json
       - name: upload smoke artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

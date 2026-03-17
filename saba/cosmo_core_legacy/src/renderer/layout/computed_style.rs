@@ -81,6 +81,7 @@ pub struct ComputedStyle {
     margin_right_auto: bool,
     margin: Option<EdgeSize>,
     padding: Option<EdgeSize>,
+    border: Option<EdgeSize>,
     position: Option<PositionType>,
     offset_top: Option<f64>,
     offset_left: Option<f64>,
@@ -106,6 +107,7 @@ impl ComputedStyle {
             margin_right_auto: false,
             margin: None,
             padding: None,
+            border: None,
             position: None,
             offset_top: None,
             offset_left: None,
@@ -182,6 +184,9 @@ impl ComputedStyle {
         }
         if self.position.is_none() {
             self.position = Some(PositionType::Static);
+        }
+        if self.border.is_none() {
+            self.border = Some(EdgeSize::zero());
         }
         if self.offset_top.is_none() {
             self.offset_top = Some(0.0);
@@ -345,6 +350,18 @@ impl ComputedStyle {
     pub fn padding(&self) -> EdgeSize {
         self.padding
             .expect("failed to access CSS property: padding")
+    }
+
+    pub fn set_border_all(&mut self, value: f64) {
+        self.border = Some(EdgeSize::all(value));
+    }
+
+    pub fn set_border(&mut self, border: EdgeSize) {
+        self.border = Some(border);
+    }
+
+    pub fn border(&self) -> EdgeSize {
+        self.border.expect("failed to access CSS property: border")
     }
 
     pub fn set_position(&mut self, position: PositionType) {

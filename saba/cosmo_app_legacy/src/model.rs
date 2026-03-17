@@ -294,6 +294,11 @@ pub struct RenderBox {
     pub y: i64,
     pub width: i64,
     pub height: i64,
+    pub content_width: i64,
+    pub content_height: i64,
+    pub margin: (i64, i64, i64, i64),
+    pub padding: (i64, i64, i64, i64),
+    pub border: (i64, i64, i64, i64),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

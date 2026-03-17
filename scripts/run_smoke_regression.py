@@ -36,6 +36,7 @@ REPRESENTATIVE_CASES = [
 ]
 
 PR_CASES = {"static_page", "redirect"}
+LAYOUT_BREAKAGE_THRESHOLD = 0.10
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
@@ -212,6 +213,49 @@ def ensure_page(case: SmokeCase, page_response: dict[str, Any], expected_url: st
         raise AssertionError(f"{case.name}: expected current_url {expected_url}, got {current_url}")
 
 
+
+
+def collect_layout_issues(page_response: dict[str, Any]) -> list[str]:
+    payload = page_response.get("payload", {})
+    root_frame = payload.get("root_frame", {})
+    tree = root_frame.get("render_tree", {}) or {}
+    root = tree.get("root")
+    if not isinstance(root, dict):
+        return ["missing_render_tree_root"]
+
+    issues: list[str] = []
+
+    def walk(node: dict[str, Any]) -> None:
+        box = node.get("box_info") or {}
+        children = node.get("children") or []
+        width = int(box.get("width", 0))
+        height = int(box.get("height", 0))
+        content_width = int(box.get("content_width", 0))
+        content_height = int(box.get("content_height", 0))
+
+        node_name = str(node.get("node_name", "?"))
+        if node_name != "#text" and (width <= 0 or height <= 0):
+            issues.append(f"missing_box:{node_name}")
+
+        if content_width > width or content_height > height:
+            issues.append(f"overflow_box_model:{node_name}")
+
+        for child in children:
+            child_box = child.get("box_info") or {}
+            cx = int(child_box.get("x", 0))
+            cy = int(child_box.get("y", 0))
+            cw = int(child_box.get("width", 0))
+            ch = int(child_box.get("height", 0))
+            x = int(box.get("x", 0))
+            y = int(box.get("y", 0))
+            if cw > 0 and ch > 0 and width > 0 and height > 0:
+                if cx < x or cy < y or cx + cw > x + width or cy + ch > y + height:
+                    issues.append(f"child_out_of_parent:{node_name}->{child.get('node_name', '?')}")
+            walk(child)
+
+    walk(root)
+    return issues
+
 def run_navigation_and_tab_smoke(session: IpcSession, base_url: str) -> None:
     static_url = f"{base_url}/static"
     spa_url = f"{base_url}/spa"
@@ -267,6 +311,7 @@ def main() -> int:
 
     failures: list[str] = []
     snapshots: dict[str, Any] = {}
+    layout_failures: dict[str, list[str]] = {}
 
     try:
         ipc_cli_path = ensure_native_ipc_cli_built(saba_dir, smoke_log)
@@ -289,6 +334,10 @@ def main() -> int:
                 ensure_page(case, response, expected_url=url)
             except AssertionError as error:
                 failures.append(str(error))
+
+            issues = collect_layout_issues(response)
+            if issues:
+                layout_failures[case.name] = issues
         run_navigation_and_tab_smoke(session, base_url)
     except Exception as error:  # noqa: BLE001
         failures.append(f"runner_exception: {error}")
@@ -297,7 +346,22 @@ def main() -> int:
             write_json(artifacts_dir / "app_metrics_snapshot.json", session.request("get_metrics"))
         except Exception as error:  # noqa: BLE001
             failures.append(f"metrics_collection_failed: {error}")
+        total_cases = max(len(cases), 1)
+        breakage_rate = len(layout_failures) / total_cases
+        summary = {
+            "mode": args.mode,
+            "cases": [c.name for c in cases],
+            "layout_failures": layout_failures,
+            "breakage_rate": breakage_rate,
+            "threshold": LAYOUT_BREAKAGE_THRESHOLD,
+            "pass": breakage_rate <= LAYOUT_BREAKAGE_THRESHOLD,
+        }
+        write_json(artifacts_dir / "layout_regression_summary.json", summary)
         write_json(artifacts_dir / "page_snapshots.json", snapshots)
+        if breakage_rate > LAYOUT_BREAKAGE_THRESHOLD:
+            failures.append(
+                f"layout_breakage_rate_exceeded: {breakage_rate:.2%} > {LAYOUT_BREAKAGE_THRESHOLD:.2%}"
+            )
         if failures:
             write_json(artifacts_dir / "failures.json", failures)
             for line in failures:
