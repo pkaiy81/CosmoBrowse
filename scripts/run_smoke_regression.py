@@ -282,6 +282,42 @@ def run_navigation_and_tab_smoke(session: IpcSession, base_url: str) -> None:
         raise AssertionError("tab scenario: expected one more tab after new_tab")
 
 
+def run_e7_t2_js_runtime_smoke(repo_root: Path) -> None:
+    """E7-T2 runtime smoke: static + lightweight SPA boot/event wiring."""
+    # Spec: DOMContentLoaded is fired after the document has been parsed.
+    # https://html.spec.whatwg.org/multipage/parsing.html#the-end
+    # Note: our minimum JS lexer does not yet support `//` comments; keep fixtures comment-free.
+    saba_dir = repo_root / "saba"
+    cmd_base = ["cargo", "run", "-p", "adapter_cli", "--", "verify-event-loop"]
+
+    static_fixture = saba_dir / "testdata" / "js_event_loop" / "e7_t2_static.html"
+    spa_fixture = saba_dir / "testdata" / "js_event_loop" / "e7_t2_spa.html"
+
+    static_run = subprocess.run(
+        cmd_base + [str(static_fixture)],
+        cwd=saba_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if static_run.returncode != 0:
+        raise AssertionError(f"e7_t2_static runtime smoke failed: {static_run.stderr or static_run.stdout}")
+    if "render_pipeline_invalidated: true" not in static_run.stdout:
+        raise AssertionError("e7_t2_static expected DOMContentLoaded-driven render invalidation")
+
+    spa_run = subprocess.run(
+        cmd_base + [str(spa_fixture), "field"],
+        cwd=saba_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if spa_run.returncode != 0:
+        raise AssertionError(f"e7_t2_spa runtime smoke failed: {spa_run.stderr or spa_run.stdout}")
+    if "render_pipeline_invalidated: true" not in spa_run.stdout:
+        raise AssertionError("e7_t2_spa expected input/change/click dispatch to invalidate render pipeline")
+
+
 def start_fixture_server() -> tuple[ThreadingHTTPServer, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -339,6 +375,7 @@ def main() -> int:
             if issues:
                 layout_failures[case.name] = issues
         run_navigation_and_tab_smoke(session, base_url)
+        run_e7_t2_js_runtime_smoke(repo_root)
     except Exception as error:  # noqa: BLE001
         failures.append(f"runner_exception: {error}")
     finally:

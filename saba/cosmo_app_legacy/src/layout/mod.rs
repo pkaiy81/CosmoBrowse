@@ -2,6 +2,7 @@ use crate::model::{
     ContentSize, FrameRect, RenderBox, RenderNode, RenderNodeKind, RenderTreeSnapshot,
     ResolvedStyle, SceneItem,
 };
+use cosmo_core::js_runtime::JsDomRuntimeBridge;
 use cosmo_core::nebula_renderer::css::cssom::CssParser;
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
 use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
@@ -124,7 +125,7 @@ pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> S
 
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
     let render_tree = render_tree_snapshot(&layout_view, rect);
-    let mut diagnostics = runtime.unsupported_apis();
+    let mut diagnostics = runtime.diagnostics();
     if runtime.dom_updated() {
         diagnostics.push("Render loop: DOM mutation -> relayout -> repaint".to_string());
     }
