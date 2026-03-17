@@ -14,7 +14,9 @@ use cosmo_core::nebula_renderer::js::token::JsLexer;
 use cosmo_core::nebula_renderer::layout::computed_style::{
     DisplayType, PositionType, TextDecoration,
 };
-use cosmo_core::nebula_renderer::layout::layout_object::{LayoutObject, LayoutObjectKind};
+use cosmo_core::nebula_renderer::layout::layout_object::{
+    compute_box_model_metrics, LayoutObject, LayoutObjectKind,
+};
 use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
 use cosmo_core::stardust_display::DisplayItem;
 use std::cell::RefCell;
@@ -228,6 +230,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
     let point = borrowed.point();
     let size = borrowed.size();
     let style = borrowed.style();
+    let content_size = borrowed.content_size();
 
     let kind = match borrowed.kind() {
         LayoutObjectKind::Block => RenderNodeKind::Block,
@@ -249,6 +252,8 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
         child = current.borrow().next_sibling();
     }
 
+    let box_model = compute_box_model_metrics(&style);
+
     RenderNode {
         kind,
         node_name,
@@ -258,6 +263,26 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
             y: rect.y + point.y(),
             width: size.width(),
             height: size.height(),
+            content_width: content_size.width(),
+            content_height: content_size.height(),
+            margin: (
+                box_model.margin.top,
+                box_model.margin.right,
+                box_model.margin.bottom,
+                box_model.margin.left,
+            ),
+            padding: (
+                box_model.padding.top,
+                box_model.padding.right,
+                box_model.padding.bottom,
+                box_model.padding.left,
+            ),
+            border: (
+                box_model.border.top,
+                box_model.border.right,
+                box_model.border.bottom,
+                box_model.border.left,
+            ),
         },
         style: ResolvedStyle {
             display: match style.display() {

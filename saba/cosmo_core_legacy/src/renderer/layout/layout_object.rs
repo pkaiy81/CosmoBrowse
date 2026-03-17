@@ -86,6 +86,35 @@ fn parse_spacing_shorthand(
     }
 }
 
+
+fn margin_component(component: &ComponentValue, base_font_size: FontSize) -> Option<Option<f64>> {
+    match component {
+        ComponentValue::Ident(name) if name == "auto" => Some(None),
+        _ => spacing_component_to_px(component, base_font_size).map(Some),
+    }
+}
+
+// Spec: CSS Box Model margin shorthand supports `auto` values, which are positional tokens
+// and must not be dropped during 1/2/3/4-value expansion.
+// https://drafts.csswg.org/css-box-4/#margin-shorthand
+fn parse_margin_shorthand(
+    value: &[ComponentValue],
+    base_font_size: FontSize,
+) -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+    let components = value
+        .iter()
+        .map(|component| margin_component(component, base_font_size))
+        .collect::<Option<Vec<_>>>()?;
+
+    match components.as_slice() {
+        [all] => Some((*all, *all, *all, *all)),
+        [vertical, horizontal] => Some((*vertical, *horizontal, *vertical, *horizontal)),
+        [top, horizontal, bottom] => Some((*top, *horizontal, *bottom, *horizontal)),
+        [top, right, bottom, left] => Some((*top, *right, *bottom, *left)),
+        _ => None,
+    }
+}
+
 fn parse_margin_auto_flags(value: &[ComponentValue]) -> (bool, bool) {
     let flags = value
         .iter()
@@ -177,6 +206,107 @@ pub enum LayoutObjectKind {
     Block,
     Inline,
     Text,
+}
+
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum LayoutFlow {
+    BlockFormattingContext,
+    InlineFlow,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct NormalFlowSpec {
+    pub flow: LayoutFlow,
+    pub stacks_vertically: bool,
+    pub keeps_inline_line: bool,
+}
+
+impl LayoutObjectKind {
+    pub fn normal_flow_spec(&self) -> NormalFlowSpec {
+        match self {
+            LayoutObjectKind::Block => NormalFlowSpec {
+                flow: LayoutFlow::BlockFormattingContext,
+                stacks_vertically: true,
+                keeps_inline_line: false,
+            },
+            LayoutObjectKind::Inline | LayoutObjectKind::Text => NormalFlowSpec {
+                flow: LayoutFlow::InlineFlow,
+                stacks_vertically: false,
+                keeps_inline_line: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct BoxEdges {
+    pub top: i64,
+    pub right: i64,
+    pub bottom: i64,
+    pub left: i64,
+}
+
+impl BoxEdges {
+    pub fn horizontal(&self) -> i64 {
+        self.left + self.right
+    }
+
+    pub fn vertical(&self) -> i64 {
+        self.top + self.bottom
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct BoxModelMetrics {
+    pub margin: BoxEdges,
+    pub padding: BoxEdges,
+    pub border: BoxEdges,
+}
+
+impl BoxModelMetrics {
+    pub fn outer_horizontal(&self) -> i64 {
+        self.margin.horizontal() + self.padding.horizontal() + self.border.horizontal()
+    }
+
+    pub fn outer_vertical(&self) -> i64 {
+        self.margin.vertical() + self.padding.vertical() + self.border.vertical()
+    }
+
+    pub fn inner_horizontal(&self) -> i64 {
+        self.padding.horizontal() + self.border.horizontal()
+    }
+
+    pub fn inner_vertical(&self) -> i64 {
+        self.padding.vertical() + self.border.vertical()
+    }
+}
+
+pub fn compute_box_model_metrics(style: &ComputedStyle) -> BoxModelMetrics {
+    let margin = style.margin();
+    let padding = style.padding();
+    let border = style.border();
+
+    BoxModelMetrics {
+        margin: BoxEdges {
+            top: edge_to_i64(margin.top()),
+            right: edge_to_i64(margin.right()),
+            bottom: edge_to_i64(margin.bottom()),
+            left: edge_to_i64(margin.left()),
+        },
+        padding: BoxEdges {
+            top: edge_to_i64(padding.top()),
+            right: edge_to_i64(padding.right()),
+            bottom: edge_to_i64(padding.bottom()),
+            left: edge_to_i64(padding.left()),
+        },
+        border: BoxEdges {
+            top: edge_to_i64(border.top()),
+            right: edge_to_i64(border.right()),
+            bottom: edge_to_i64(border.bottom()),
+            left: edge_to_i64(border.left()),
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -443,63 +573,61 @@ impl LayoutObject {
 
     pub fn compute_size(&mut self, parent_size: LayoutSize) {
         let mut size = LayoutSize::new(0, 0);
-        let margin = self.style.margin();
-        let padding = self.style.padding();
-        let margin_h = edge_to_i64(margin.horizontal());
-        let padding_h = edge_to_i64(padding.horizontal());
-        let padding_v = edge_to_i64(padding.vertical());
+        let metrics = compute_box_model_metrics(&self.style);
 
         match self.kind() {
             LayoutObjectKind::Block => {
-                let available_width = (parent_size.width() - margin_h).max(0);
+                let available_width = (parent_size.width() - metrics.outer_horizontal()).max(0);
                 let explicit_width = self.resolved_width(parent_size);
-                let width = if explicit_width > 0 {
+                let content_width = if explicit_width > 0 {
                     explicit_width.min(available_width)
                 } else {
                     available_width
                 };
 
-                let mut height = padding_v;
+                let mut content_height = 0;
                 let mut child = self.first_child();
                 let mut previous_child_kind = LayoutObjectKind::Block;
                 while child.is_some() {
                     let c = child.expect("first child should exist");
-                    if previous_child_kind == LayoutObjectKind::Block
-                        || c.borrow().kind() == LayoutObjectKind::Block
+                    let c_kind = c.borrow().kind();
+                    if previous_child_kind.normal_flow_spec().stacks_vertically
+                        || c_kind.normal_flow_spec().stacks_vertically
                     {
-                        height += c.borrow().size.height();
+                        content_height += c.borrow().size.height();
                     } else {
-                        height = height.max(c.borrow().size.height() + padding_v);
+                        content_height = content_height.max(c.borrow().size.height());
                     }
-                    previous_child_kind = c.borrow().kind();
+                    previous_child_kind = c_kind;
                     child = c.borrow().next_sibling();
                 }
 
                 let explicit_height = self.resolved_height(parent_size);
-                size.set_width(width.max(0));
-                size.set_height(if explicit_height > 0 {
+                let content_height = if explicit_height > 0 {
                     explicit_height
                 } else {
-                    height.max(0)
-                });
+                    content_height.max(0)
+                };
+                size.set_width((content_width + metrics.inner_horizontal()).max(0));
+                size.set_height((content_height + metrics.inner_vertical()).max(0));
             }
             LayoutObjectKind::Inline => {
                 if let Some(intrinsic) = self.intrinsic_inline_size(parent_size) {
-                    size.set_width((intrinsic.width() + padding_h).max(0));
-                    size.set_height((intrinsic.height() + padding_v).max(0));
+                    size.set_width((intrinsic.width() + metrics.inner_horizontal()).max(0));
+                    size.set_height((intrinsic.height() + metrics.inner_vertical()).max(0));
                 } else {
-                    let mut width = padding_h;
-                    let mut height = padding_v;
+                    let mut content_width = 0;
+                    let mut content_height = 0;
                     let mut child = self.first_child();
                     while child.is_some() {
                         let c = child.expect("child should exist");
-                        width += c.borrow().size.width();
-                        height = height.max(c.borrow().size.height() + padding_v);
+                        content_width += c.borrow().size.width();
+                        content_height = content_height.max(c.borrow().size.height());
                         child = c.borrow().next_sibling();
                     }
 
-                    size.set_width(width.max(0));
-                    size.set_height(height.max(0));
+                    size.set_width((content_width + metrics.inner_horizontal()).max(0));
+                    size.set_height((content_height + metrics.inner_vertical()).max(0));
                 }
             }
             LayoutObjectKind::Text => {
@@ -512,7 +640,7 @@ impl LayoutObject {
                         .collect::<Vec<_>>()
                         .join(" ");
                     let max_width =
-                        (parent_size.width() - margin_h - padding_h).max(CHAR_WIDTH * ratio);
+                        (parent_size.width() - metrics.outer_horizontal()).max(CHAR_WIDTH * ratio);
                     let lines = split_text(plain_text.clone(), CHAR_WIDTH * ratio, max_width);
                     let width = lines
                         .iter()
@@ -524,8 +652,8 @@ impl LayoutObject {
                     } else {
                         CHAR_HEIGHT_WITH_PADDING * ratio * lines.len() as i64
                     };
-                    size.set_width(width.max(0));
-                    size.set_height(height.max(0));
+                    size.set_width((width + metrics.inner_horizontal()).max(0));
+                    size.set_height((height + metrics.inner_vertical()).max(0));
                 }
             }
         }
@@ -542,18 +670,17 @@ impl LayoutObject {
         previous_sibling_size: Option<LayoutSize>,
     ) {
         let mut point = LayoutPoint::new(0, 0);
-        let margin = self.style.margin();
-        let margin_left = edge_to_i64(margin.left());
-        let margin_right = edge_to_i64(margin.right());
-        let margin_top = edge_to_i64(margin.top());
-        let margin_bottom = edge_to_i64(margin.bottom());
+        let metrics = compute_box_model_metrics(&self.style);
 
-        match (self.kind(), previous_sibling_kind) {
-            (LayoutObjectKind::Block, _) | (_, LayoutObjectKind::Block) => {
+        match (
+            self.kind().normal_flow_spec().flow,
+            previous_sibling_kind.normal_flow_spec().flow,
+        ) {
+            (LayoutFlow::BlockFormattingContext, _) | (_, LayoutFlow::BlockFormattingContext) => {
                 if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
-                    point.set_y(pos.y() + size.height() + margin_top + margin_bottom);
+                    point.set_y(pos.y() + size.height() + metrics.margin.top + metrics.margin.bottom);
                 } else {
-                    point.set_y(parent_point.y() + margin_top);
+                    point.set_y(parent_point.y() + metrics.margin.top);
                 }
 
                 // Ref: CSS 2.1 §10.3.3, auto horizontal margins center a block when width is known.
@@ -561,24 +688,20 @@ impl LayoutObject {
                 let available_width = parent_size.width() - self.size.width();
                 if self.style.margin_horizontal_auto() && available_width > 0 {
                     point.set_x(parent_point.x() + available_width / 2);
-                } else if self.style.margin_left_auto() && available_width > margin_right {
-                    point.set_x(parent_point.x() + available_width - margin_right);
+                } else if self.style.margin_left_auto() && available_width > metrics.margin.right {
+                    point.set_x(parent_point.x() + available_width - metrics.margin.right);
                 } else {
-                    point.set_x(parent_point.x() + margin_left);
+                    point.set_x(parent_point.x() + metrics.margin.left);
                 }
             }
-            (LayoutObjectKind::Inline, LayoutObjectKind::Inline) => {
+            (LayoutFlow::InlineFlow, LayoutFlow::InlineFlow) => {
                 if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
-                    point.set_x(pos.x() + size.width() + margin_left);
-                    point.set_y(pos.y() + margin_top);
+                    point.set_x(pos.x() + size.width() + metrics.margin.left);
+                    point.set_y(pos.y() + metrics.margin.top);
                 } else {
-                    point.set_x(parent_point.x() + margin_left);
-                    point.set_y(parent_point.y() + margin_top);
+                    point.set_x(parent_point.x() + metrics.margin.left);
+                    point.set_y(parent_point.y() + metrics.margin.top);
                 }
-            }
-            _ => {
-                point.set_x(parent_point.x() + margin_left);
-                point.set_y(parent_point.y() + margin_top);
             }
         }
 
@@ -712,11 +835,17 @@ impl LayoutObject {
                 "margin" => {
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =
-                        parse_spacing_shorthand(&declaration.value, base_font_size)
+                        parse_margin_shorthand(&declaration.value, base_font_size)
                     {
+                        // Spec: CSS initial margin is 0, so when cascade runs before defaulting, fallback to 0.
+                        // https://www.w3.org/TR/CSS22/box.html#margin-properties
+                        let current = self.style.margin_or_default();
                         self.style.set_margin(
                             crate::renderer::layout::computed_style::EdgeSize::from_values(
-                                top, right, bottom, left,
+                                top.unwrap_or(current.top()),
+                                right.unwrap_or(current.right()),
+                                bottom.unwrap_or(current.bottom()),
+                                left.unwrap_or(current.left()),
                             ),
                         );
                     }
@@ -730,6 +859,18 @@ impl LayoutObject {
                         parse_spacing_shorthand(&declaration.value, base_font_size)
                     {
                         self.style.set_padding(
+                            crate::renderer::layout::computed_style::EdgeSize::from_values(
+                                top, right, bottom, left,
+                            ),
+                        );
+                    }
+                }
+                "border" | "border-width" => {
+                    let base_font_size = self.style.font_size_or_default();
+                    if let Some((top, right, bottom, left)) =
+                        parse_spacing_shorthand(&declaration.value, base_font_size)
+                    {
+                        self.style.set_border(
                             crate::renderer::layout::computed_style::EdgeSize::from_values(
                                 top, right, bottom, left,
                             ),
@@ -837,18 +978,18 @@ impl LayoutObject {
     }
 
     pub fn content_origin(&self) -> LayoutPoint {
-        let padding = self.style.padding();
+        let metrics = compute_box_model_metrics(&self.style);
         LayoutPoint::new(
-            self.point.x() + edge_to_i64(padding.left()),
-            self.point.y() + edge_to_i64(padding.top()),
+            self.point.x() + metrics.padding.left + metrics.border.left,
+            self.point.y() + metrics.padding.top + metrics.border.top,
         )
     }
 
     pub fn content_size(&self) -> LayoutSize {
-        let padding = self.style.padding();
+        let metrics = compute_box_model_metrics(&self.style);
         LayoutSize::new(
-            (self.size.width() - edge_to_i64(padding.horizontal())).max(0),
-            (self.size.height() - edge_to_i64(padding.vertical())).max(0),
+            (self.size.width() - metrics.inner_horizontal()).max(0),
+            (self.size.height() - metrics.inner_vertical()).max(0),
         )
     }
 }
@@ -906,5 +1047,40 @@ impl LayoutSize {
 
     pub fn set_height(&mut self, height: i64) {
         self.height = height;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::layout::computed_style::EdgeSize;
+
+    #[test]
+    fn compute_box_model_metrics_includes_margin_padding_border() {
+        let mut style = ComputedStyle::new();
+        style.set_margin(EdgeSize::from_values(4.0, 6.0, 8.0, 10.0));
+        style.set_padding(EdgeSize::from_values(1.0, 2.0, 3.0, 4.0));
+        style.set_border(EdgeSize::from_values(2.0, 2.0, 2.0, 2.0));
+
+        let metrics = compute_box_model_metrics(&style);
+
+        assert_eq!(metrics.outer_horizontal(), 26);
+        assert_eq!(metrics.outer_vertical(), 20);
+        assert_eq!(metrics.inner_horizontal(), 10);
+        assert_eq!(metrics.inner_vertical(), 8);
+    }
+
+    #[test]
+    fn normal_flow_spec_maps_block_and_inline() {
+        assert_eq!(
+            LayoutObjectKind::Block.normal_flow_spec(),
+            NormalFlowSpec {
+                flow: LayoutFlow::BlockFormattingContext,
+                stacks_vertically: true,
+                keeps_inline_line: false,
+            }
+        );
+        assert_eq!(LayoutObjectKind::Inline.normal_flow_spec().flow, LayoutFlow::InlineFlow);
+        assert_eq!(LayoutObjectKind::Text.normal_flow_spec().flow, LayoutFlow::InlineFlow);
     }
 }
