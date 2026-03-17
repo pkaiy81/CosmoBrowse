@@ -86,6 +86,32 @@ fn parse_spacing_shorthand(
     }
 }
 
+
+fn margin_component(component: &ComponentValue, base_font_size: FontSize) -> Option<Option<f64>> {
+    match component {
+        ComponentValue::Ident(name) if name == "auto" => Some(None),
+        _ => spacing_component_to_px(component, base_font_size).map(Some),
+    }
+}
+
+fn parse_margin_shorthand(
+    value: &[ComponentValue],
+    base_font_size: FontSize,
+) -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+    let components = value
+        .iter()
+        .map(|component| margin_component(component, base_font_size))
+        .collect::<Option<Vec<_>>>()?;
+
+    match components.as_slice() {
+        [all] => Some((*all, *all, *all, *all)),
+        [vertical, horizontal] => Some((*vertical, *horizontal, *vertical, *horizontal)),
+        [top, horizontal, bottom] => Some((*top, *horizontal, *bottom, *horizontal)),
+        [top, right, bottom, left] => Some((*top, *right, *bottom, *left)),
+        _ => None,
+    }
+}
+
 fn parse_margin_auto_flags(value: &[ComponentValue]) -> (bool, bool) {
     let flags = value
         .iter()
@@ -806,11 +832,15 @@ impl LayoutObject {
                 "margin" => {
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =
-                        parse_spacing_shorthand(&declaration.value, base_font_size)
+                        parse_margin_shorthand(&declaration.value, base_font_size)
                     {
+                        let current = self.style.margin();
                         self.style.set_margin(
                             crate::renderer::layout::computed_style::EdgeSize::from_values(
-                                top, right, bottom, left,
+                                top.unwrap_or(current.top()),
+                                right.unwrap_or(current.right()),
+                                bottom.unwrap_or(current.bottom()),
+                                left.unwrap_or(current.left()),
                             ),
                         );
                     }
@@ -1029,7 +1059,7 @@ mod tests {
 
         let metrics = compute_box_model_metrics(&style);
 
-        assert_eq!(metrics.outer_horizontal(), 24);
+        assert_eq!(metrics.outer_horizontal(), 26);
         assert_eq!(metrics.outer_vertical(), 20);
         assert_eq!(metrics.inner_horizontal(), 10);
         assert_eq!(metrics.inner_vertical(), 8);

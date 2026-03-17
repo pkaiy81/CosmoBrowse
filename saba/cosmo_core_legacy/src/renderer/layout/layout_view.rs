@@ -385,9 +385,9 @@ mod tests {
         let paragraph = body.borrow().first_child().expect("paragraph should exist");
         let text = paragraph.borrow().first_child().expect("text should exist");
 
-        assert_eq!(body.borrow().point().x(), 300);
+        assert_eq!(body.borrow().point().x(), 280);
         assert_eq!(body.borrow().point().y(), 10);
-        assert_eq!(text.borrow().point().x(), 320);
+        assert_eq!(text.borrow().point().x(), 300);
         assert_eq!(text.borrow().point().y(), 18);
     }
 
