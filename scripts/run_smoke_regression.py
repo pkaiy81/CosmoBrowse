@@ -186,7 +186,7 @@ def collect_html(page_payload: dict[str, Any]) -> str:
 
 
 def count_links(html: str) -> int:
-    return len(re.findall(r"<a\\b", html, flags=re.IGNORECASE))
+    return len(re.findall(r"<a\b", html, flags=re.IGNORECASE))
 
 
 def ensure_page(case: SmokeCase, page_response: dict[str, Any], expected_url: str) -> None:
