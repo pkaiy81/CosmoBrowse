@@ -147,7 +147,7 @@ impl ProcessHost for StdProcessHost {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BrowserPageDto {
     pub current_url: String,
@@ -160,7 +160,7 @@ pub struct BrowserPageDto {
     pub root_frame: BrowserFrameDto,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DomSnapshotEntryDto {
     pub frame_id: String,
@@ -168,7 +168,7 @@ pub struct DomSnapshotEntryDto {
     pub html: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BrowserFrameDto {
     pub id: String,
@@ -185,14 +185,14 @@ pub struct BrowserFrameDto {
     pub child_frames: Vec<BrowserFrameDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ContentSizeDto {
     pub width: i64,
     pub height: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FrameRectDto {
     pub x: i64,
@@ -201,13 +201,13 @@ pub struct FrameRectDto {
     pub height: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RenderTreeSnapshotDto {
     pub root: Option<RenderNodeDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RenderNodeDto {
     pub kind: RenderNodeKindDto,
@@ -218,7 +218,7 @@ pub struct RenderNodeDto {
     pub children: Vec<RenderNodeDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderNodeKindDto {
     Block,
@@ -226,7 +226,7 @@ pub enum RenderNodeKindDto {
     Text,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RenderBoxDto {
     pub x: i64,
@@ -235,7 +235,7 @@ pub struct RenderBoxDto {
     pub height: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ResolvedStyleDto {
     pub display: String,
@@ -248,7 +248,7 @@ pub struct ResolvedStyleDto {
     pub z_index: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CrashReportDto {
     pub path: String,
