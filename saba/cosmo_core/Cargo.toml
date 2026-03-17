@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 cosmo_core_legacy = { path = "../cosmo_core_legacy" }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+serde_json = "1"

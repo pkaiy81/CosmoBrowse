@@ -33,6 +33,7 @@ type FrameViewModel = {
   render_backend: "web_view" | "native_scene";
   document_url: string;
   scene_items: SceneItem[];
+  paint_commands: PaintCommand[];
   render_tree: RenderTreeSnapshot | null;
   html_content: string | null;
   child_frames: FrameViewModel[];
@@ -72,6 +73,48 @@ type SceneItemImage = {
   target: string | null;
 };
 type SceneItem = SceneItemRect | SceneItemText | SceneItemImage;
+
+type DrawRectCommand = {
+  kind: "draw_rect";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  background_color: string;
+  opacity: number;
+  z_index: number;
+  clip_rect: [number, number, number, number] | null;
+};
+type DrawTextCommand = {
+  kind: "draw_text";
+  x: number;
+  y: number;
+  text: string;
+  color: string;
+  font_px: number;
+  font_family: string;
+  underline: boolean;
+  opacity: number;
+  href: string | null;
+  target: string | null;
+  z_index: number;
+  clip_rect: [number, number, number, number] | null;
+};
+type DrawImageCommand = {
+  kind: "draw_image";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  src: string;
+  alt: string;
+  opacity: number;
+  href: string | null;
+  target: string | null;
+  z_index: number;
+  clip_rect: [number, number, number, number] | null;
+};
+type PaintCommand = DrawRectCommand | DrawTextCommand | DrawImageCommand;
 type DomSnapshotEntry = { frame_id: string; document_url: string; html: string };
 type PageViewModel = {
   current_url: string;
@@ -159,41 +202,41 @@ const nativeSceneBackend: RenderBackend = {
 
     // Spec note: item order represents paint order from CSS2 visual formatting
     // model after CSS Display layout resolution.
-    for (const item of frame.scene_items) {
-      scene.appendChild(renderSceneItem(frame, item));
+    for (const command of frame.paint_commands) {
+      scene.appendChild(renderPaintCommand(frame, command));
     }
 
     shell.appendChild(scene);
   },
 };
 
-function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
-  if (item.kind === "rect") {
+function renderPaintCommand(frame: FrameViewModel, command: PaintCommand): HTMLElement {
+  if (command.kind === "draw_rect") {
     const rect = document.createElement("div");
     rect.className = "scene-rect";
     rect.style.position = "absolute";
-    rect.style.left = `${item.x}px`;
-    rect.style.top = `${item.y}px`;
-    rect.style.width = `${Math.max(item.width, 1)}px`;
-    rect.style.height = `${Math.max(item.height, 1)}px`;
-    rect.style.backgroundColor = item.background_color;
-    rect.style.opacity = `${Math.min(Math.max(item.opacity, 0), 1)}`;
+    rect.style.left = `${command.x}px`;
+    rect.style.top = `${command.y}px`;
+    rect.style.width = `${Math.max(command.width, 1)}px`;
+    rect.style.height = `${Math.max(command.height, 1)}px`;
+    rect.style.backgroundColor = command.background_color;
+    rect.style.opacity = `${Math.min(Math.max(command.opacity, 0), 1)}`;
     return rect;
   }
 
-  if (item.kind === "text") {
-    const textEl = document.createElement(item.href ? "button" : "span");
-    textEl.className = item.href ? "scene-text scene-link" : "scene-text";
-    textEl.textContent = item.text;
+  if (command.kind === "draw_text") {
+    const textEl = document.createElement(command.href ? "button" : "span");
+    textEl.className = command.href ? "scene-text scene-link" : "scene-text";
+    textEl.textContent = command.text;
     textEl.style.position = "absolute";
-    textEl.style.left = `${item.x}px`;
-    textEl.style.top = `${item.y}px`;
-    textEl.style.color = item.color;
-    textEl.style.fontSize = `${Math.max(item.font_px, 1)}px`;
-    textEl.style.fontFamily = item.font_family;
-    textEl.style.opacity = `${Math.min(Math.max(item.opacity, 0), 1)}`;
-    textEl.style.textDecoration = item.underline ? "underline" : "none";
-    if (item.href) {
+    textEl.style.left = `${command.x}px`;
+    textEl.style.top = `${command.y}px`;
+    textEl.style.color = command.color;
+    textEl.style.fontSize = `${Math.max(command.font_px, 1)}px`;
+    textEl.style.fontFamily = command.font_family;
+    textEl.style.opacity = `${Math.min(Math.max(command.opacity, 0), 1)}`;
+    textEl.style.textDecoration = command.underline ? "underline" : "none";
+    if (command.href) {
       // Ref: HTML Standard browsing context target keyword handling (`_blank`,
       // `_self`, `_parent`, `_top`) must use ASCII case-insensitive comparison.
       // https://html.spec.whatwg.org/multipage/browsing-the-web.html#valid-browsing-context-name-or-keyword
@@ -201,8 +244,8 @@ function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
         void handleEmbeddedNavigation({
           type: "cosmobrowse:navigate",
           frameId: frame.id,
-          href: item.href ?? "",
-          target: item.target ?? "",
+          href: command.href ?? "",
+          target: command.target ?? "",
         });
       });
     }
@@ -211,22 +254,22 @@ function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
 
   const imgEl = document.createElement("img");
   imgEl.className = "scene-image";
-  imgEl.alt = item.alt;
-  imgEl.src = item.src;
+  imgEl.alt = command.alt;
+  imgEl.src = command.src;
   imgEl.style.position = "absolute";
-  imgEl.style.left = `${item.x}px`;
-  imgEl.style.top = `${item.y}px`;
-  imgEl.style.width = `${Math.max(item.width, 1)}px`;
-  imgEl.style.height = `${Math.max(item.height, 1)}px`;
-  imgEl.style.opacity = `${Math.min(Math.max(item.opacity, 0), 1)}`;
-  if (item.href) {
+  imgEl.style.left = `${command.x}px`;
+  imgEl.style.top = `${command.y}px`;
+  imgEl.style.width = `${Math.max(command.width, 1)}px`;
+  imgEl.style.height = `${Math.max(command.height, 1)}px`;
+  imgEl.style.opacity = `${Math.min(Math.max(command.opacity, 0), 1)}`;
+  if (command.href) {
     const wrapper = document.createElement("button");
     wrapper.className = "scene-link-image";
     wrapper.style.position = "absolute";
-    wrapper.style.left = `${item.x}px`;
-    wrapper.style.top = `${item.y}px`;
-    wrapper.style.width = `${Math.max(item.width, 1)}px`;
-    wrapper.style.height = `${Math.max(item.height, 1)}px`;
+    wrapper.style.left = `${command.x}px`;
+    wrapper.style.top = `${command.y}px`;
+    wrapper.style.width = `${Math.max(command.width, 1)}px`;
+    wrapper.style.height = `${Math.max(command.height, 1)}px`;
     wrapper.style.padding = "0";
     wrapper.style.border = "none";
     wrapper.style.background = "transparent";
@@ -235,8 +278,8 @@ function renderSceneItem(frame: FrameViewModel, item: SceneItem): HTMLElement {
       void handleEmbeddedNavigation({
         type: "cosmobrowse:navigate",
         frameId: frame.id,
-        href: item.href ?? "",
-        target: item.target ?? "",
+        href: command.href ?? "",
+        target: command.target ?? "",
       });
     });
     return wrapper;

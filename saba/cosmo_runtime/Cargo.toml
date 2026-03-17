@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 cosmo_app_legacy = { path = "../cosmo_app_legacy" }
+cosmo_core = { path = "../cosmo_core" }
