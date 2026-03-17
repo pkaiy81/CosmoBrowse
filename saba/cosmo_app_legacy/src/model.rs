@@ -279,6 +279,15 @@ pub struct NavigationState {
     pub can_back: bool,
     pub can_forward: bool,
     pub current_url: Option<String>,
+    pub current_navigation_type: Option<NavigationType>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationType {
+    Document,
+    Hash,
+    Redirect,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

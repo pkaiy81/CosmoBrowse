@@ -5,7 +5,8 @@ use crate::loader::{
 };
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
-    FrameViewModel, NavigationEvent, NavigationState, PageViewModel, RenderBackendKind,
+    FrameViewModel, NavigationEvent, NavigationState, NavigationType, PageViewModel,
+    RenderBackendKind,
     ScriptEngine, SearchResult, TabSummary,
 };
 use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
@@ -232,9 +233,15 @@ impl Tab {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    view: PageViewModel,
+    navigation_type: NavigationType,
+}
+
 #[derive(Debug, Default)]
 struct BrowserSession {
-    history: Vec<PageViewModel>,
+    history: Vec<HistoryEntry>,
     history_index: usize,
     viewport_width: i64,
     viewport_height: i64,
@@ -253,7 +260,8 @@ impl BrowserSession {
     fn open_url(&mut self, url: &str) -> AppResult<PageViewModel> {
         let normalized_url = normalize_url(url)?;
         let view = self.load_page(&normalized_url, None, Some(RelayoutTrigger::DomChanged))?;
-        self.push_history(view.clone());
+        let navigation_type = self.classify_navigation(self.current_page().as_ref(), &view);
+        self.push_history(view.clone(), navigation_type);
         Ok(view)
     }
 
@@ -272,7 +280,8 @@ impl BrowserSession {
             || current.root_frame.child_frames.is_empty()
         {
             let view = self.load_page(&normalized_href, None, Some(RelayoutTrigger::DomChanged))?;
-            self.push_history(view.clone());
+            let navigation_type = self.classify_navigation(self.current_page().as_ref(), &view);
+            self.push_history(view.clone(), navigation_type);
             return Ok(view);
         }
         let mut overrides = snapshot_frame_urls(&current.root_frame);
@@ -297,7 +306,8 @@ impl BrowserSession {
             Some(&overrides),
             Some(RelayoutTrigger::DomChanged),
         )?;
-        self.push_history(view.clone());
+        let navigation_type = self.classify_navigation(self.current_page().as_ref(), &view);
+        self.push_history(view.clone(), navigation_type);
         Ok(view)
     }
 
@@ -318,7 +328,7 @@ impl BrowserSession {
             Some(&overrides),
             Some(RelayoutTrigger::ViewportChanged),
         )?;
-        self.history[self.history_index] = rerendered.clone();
+        self.history[self.history_index].view = rerendered.clone();
         Ok(rerendered)
     }
 
@@ -332,36 +342,37 @@ impl BrowserSession {
             Some(&overrides),
             Some(RelayoutTrigger::DomChanged),
         )?;
-        self.history[self.history_index] = rerendered.clone();
+        self.history[self.history_index].view = rerendered.clone();
         Ok(rerendered)
     }
 
     fn back(&mut self) -> AppResult<PageViewModel> {
-        if self.history.is_empty() || self.history_index == 0 {
+        let Some(previous_index) = self.previous_document_index() else {
             return Err(AppError::state("No back history"));
-        }
-        self.history_index -= 1;
-        Ok(self.history[self.history_index].clone())
+        };
+        self.history_index = previous_index;
+        Ok(self.history[self.history_index].view.clone())
     }
 
     fn forward(&mut self) -> AppResult<PageViewModel> {
-        if self.history.is_empty() || self.history_index + 1 >= self.history.len() {
+        let Some(next_index) = self.next_document_index() else {
             return Err(AppError::state("No forward history"));
-        }
-        self.history_index += 1;
-        Ok(self.history[self.history_index].clone())
+        };
+        self.history_index = next_index;
+        Ok(self.history[self.history_index].view.clone())
     }
 
     fn navigation_state(&self) -> NavigationState {
         NavigationState {
-            can_back: !self.history.is_empty() && self.history_index > 0,
-            can_forward: !self.history.is_empty() && self.history_index + 1 < self.history.len(),
+            can_back: self.previous_document_index().is_some(),
+            can_forward: self.next_document_index().is_some(),
             current_url: self.current_url(),
+            current_navigation_type: self.current_navigation_type(),
         }
     }
 
     fn current_page(&self) -> Option<PageViewModel> {
-        self.history.get(self.history_index).cloned()
+        self.history.get(self.history_index).map(|entry| entry.view.clone())
     }
 
     fn current_url(&self) -> Option<String> {
@@ -369,15 +380,61 @@ impl BrowserSession {
     }
 
     fn previous_url(&self) -> Option<String> {
-        self.history
-            .get(self.history_index.saturating_sub(1))
-            .map(|page| page.current_url.clone())
+        self.previous_document_index()
+            .and_then(|index| self.history.get(index))
+            .map(|entry| entry.view.current_url.clone())
     }
 
     fn next_url(&self) -> Option<String> {
+        self.next_document_index()
+            .and_then(|index| self.history.get(index))
+            .map(|entry| entry.view.current_url.clone())
+    }
+
+
+    // Redirect chains are collapsed into a single history entry.
+    // The entry keeps only the final response URL and is tagged as `Redirect`.
+    fn classify_navigation(
+        &self,
+        previous: Option<&PageViewModel>,
+        current: &PageViewModel,
+    ) -> NavigationType {
+        if current
+            .diagnostics
+            .iter()
+            .any(|entry| entry.starts_with("redirect followed:"))
+        {
+            return NavigationType::Redirect;
+        }
+        if let Some(previous) = previous {
+            if is_hash_navigation(&previous.current_url, &current.current_url) {
+                return NavigationType::Hash;
+            }
+        }
+        NavigationType::Document
+    }
+
+    fn current_navigation_type(&self) -> Option<NavigationType> {
         self.history
-            .get(self.history_index + 1)
-            .map(|page| page.current_url.clone())
+            .get(self.history_index)
+            .map(|entry| entry.navigation_type)
+    }
+
+    fn previous_document_index(&self) -> Option<usize> {
+        if self.history.is_empty() || self.history_index == 0 {
+            return None;
+        }
+        (0..self.history_index)
+            .rev()
+            .find(|index| self.history[*index].navigation_type != NavigationType::Hash)
+    }
+
+    fn next_document_index(&self) -> Option<usize> {
+        if self.history.is_empty() || self.history_index + 1 >= self.history.len() {
+            return None;
+        }
+        ((self.history_index + 1)..self.history.len())
+            .find(|index| self.history[*index].navigation_type != NavigationType::Hash)
     }
 
     fn load_page(
@@ -410,11 +467,11 @@ impl BrowserSession {
         })
     }
 
-    fn push_history(&mut self, view: PageViewModel) {
+    fn push_history(&mut self, view: PageViewModel, navigation_type: NavigationType) {
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
-        self.history.push(view);
+        self.history.push(HistoryEntry { view, navigation_type });
         self.history_index = self.history.len() - 1;
     }
 }
@@ -860,6 +917,21 @@ fn normalize_url_like(input: &str) -> AppResult<String> {
     normalize_url(input)
 }
 
+fn is_hash_navigation(previous_url: &str, current_url: &str) -> bool {
+    if previous_url == current_url {
+        return false;
+    }
+    strip_fragment(previous_url) == strip_fragment(current_url)
+}
+
+fn strip_fragment(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+    url.split('#').next().unwrap_or(url).to_string()
+}
+
 fn build_search_results(query: &str) -> AppResult<Vec<SearchResult>> {
     let normalized = query.trim();
     if normalized.is_empty() {
@@ -1082,6 +1154,102 @@ mod tests {
         assert_eq!(next.current_url, "fixture://abehiroshi/prof");
         assert!(next.root_frame.child_frames.is_empty());
         assert!(next.root_frame.current_url.ends_with("/prof"));
+    }
+
+
+    #[test]
+    fn navigation_state_for_normal_document_transition() {
+        let mut session = BrowserSession::new();
+        session.push_history(sample_page("https://example.com/a", vec![]), NavigationType::Document);
+        session.push_history(sample_page("https://example.com/b", vec![]), NavigationType::Document);
+
+        let state = session.navigation_state();
+        assert!(state.can_back);
+        assert!(!state.can_forward);
+        assert_eq!(state.current_navigation_type, Some(NavigationType::Document));
+
+        let back = session.back().expect("back should move to previous document");
+        assert_eq!(back.current_url, "https://example.com/a");
+    }
+
+    #[test]
+    fn hash_navigation_is_skipped_by_back_forward_state() {
+        let mut session = BrowserSession::new();
+        session.push_history(sample_page("https://example.com/doc", vec![]), NavigationType::Document);
+        session.push_history(
+            sample_page("https://example.com/doc#section-1", vec![]),
+            NavigationType::Hash,
+        );
+        session.push_history(
+            sample_page("https://example.com/doc#section-2", vec![]),
+            NavigationType::Hash,
+        );
+
+        let state = session.navigation_state();
+        assert!(state.can_back);
+        assert!(!state.can_forward);
+        assert_eq!(state.current_navigation_type, Some(NavigationType::Hash));
+
+        let back = session.back().expect("back should jump over hash entries");
+        assert_eq!(back.current_url, "https://example.com/doc");
+    }
+
+    #[test]
+    fn redirect_navigation_keeps_single_step_in_back_history() {
+        let mut session = BrowserSession::new();
+        session.push_history(sample_page("https://example.com/start", vec![]), NavigationType::Document);
+        session.push_history(
+            sample_page(
+                "https://example.com/final",
+                vec!["redirect followed: https://example.com/start -> https://example.com/final"],
+            ),
+            NavigationType::Redirect,
+        );
+        session.push_history(sample_page("https://example.com/next", vec![]), NavigationType::Document);
+
+        let back = session
+            .back()
+            .expect("first back should land on redirect target document");
+        assert_eq!(back.current_url, "https://example.com/final");
+        assert_eq!(session.navigation_state().current_navigation_type, Some(NavigationType::Redirect));
+
+        let back_again = session.back().expect("second back should land on origin document");
+        assert_eq!(back_again.current_url, "https://example.com/start");
+    }
+
+    #[test]
+    fn classify_navigation_marks_hash_and_redirect() {
+        let session = BrowserSession::new();
+        let previous = sample_page("https://example.com/doc", vec![]);
+        let hash = sample_page("https://example.com/doc#x", vec![]);
+        let redirect = sample_page(
+            "https://example.com/final",
+            vec!["redirect followed: https://example.com/doc -> https://example.com/final"],
+        );
+
+        assert_eq!(
+            session.classify_navigation(Some(&previous), &hash),
+            NavigationType::Hash
+        );
+        assert_eq!(
+            session.classify_navigation(Some(&previous), &redirect),
+            NavigationType::Redirect
+        );
+    }
+
+
+    fn sample_page(url: &str, diagnostics: Vec<&str>) -> PageViewModel {
+        PageViewModel {
+            current_url: url.to_string(),
+            title: url.to_string(),
+            diagnostics: diagnostics.into_iter().map(str::to_string).collect(),
+            content_size: ContentSize {
+                width: 960,
+                height: 720,
+            },
+            scene_items: Vec::new(),
+            root_frame: sample_leaf_frame("root", None, url),
+        }
     }
 
     fn sample_nested_root_frame() -> FrameViewModel {
