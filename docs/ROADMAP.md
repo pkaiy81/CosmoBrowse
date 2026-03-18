@@ -304,13 +304,36 @@
 6. [ ] **NG-T3 E4-T3 ストレージ/クッキー基盤**
    - origin 単位の cookie/local storage 管理と永続化ポリシーを実装。
 
-### Sprint H（並行）: ネットワーク/セキュリティ強化
-7. [ ] **NH-T1 E5-T1 HTTP スタック拡張**
-   - redirect policy / cache-control / content-encoding / timeout を統合。
-8. [ ] **NH-T2 E5-T2 Same-Origin/CORS 実装**
-   - Fetch/XHR の preflight 判定を含むポリシー評価を導入。
-9. [ ] **NH-T3 E5-T3 TLS エラーUX**
-   - 証明書エラー interstitial + 例外登録フローを追加。
+### Sprint H1（2週間）: HTTP 信頼性基盤 + 失敗理由統一
+7. [ ] **NH1-T1 E5-T1 HTTP スタック統合フェーズ 1**
+   - redirect policy / cache-control / content-encoding / timeout を Loader に統合。
+   - 失敗理由を `AppError` コードに統一マッピングし、UI では単一のエラー描画経路へ収束。
+   - 失敗率 KPI（`open_url` / `search`）を nightly 収集へ追加し、導入前後を時系列比較可能にする。
+   - 仕様準拠メモ:
+     - Redirect は RFC 9110 Section 15.4（3xx）と RFC 9111 Section 4（キャッシュキー/再利用条件）に合わせ、上限回数超過時は deterministic に `AppError::NetworkRedirectLoop` へマップする。
+     - `Cache-Control` は RFC 9111 Section 5.2（`no-store` / `max-age`）を最低限実装し、再検証が必要な応答は stale 利用を禁止する。
+     - `Content-Encoding` は RFC 9110 Section 8.4 に基づき、`gzip` / `deflate` 展開失敗を transport 成功扱いせず `AppError::NetworkContentDecoding` として明示する。
+     - Timeout は RFC 9110 Section 9.2.2（冪等メソッドの再試行）を前提に `GET` 系のみ自動リトライ可とし、非冪等メソッドは即失敗する。
+
+### Sprint H2（2週間）: CORS 強制 + 回避不能テスト
+8. [ ] **NH2-T1 E5-T2 Same-Origin/CORS 実装フェーズ 2**
+   - Fetch/XHR の Same-Origin 判定、CORS ヘッダー評価、preflight（`OPTIONS`）を実装。
+   - 回避不能な検証ケース（opaque response / wildcard + credentials 禁止 / preflight 失敗）を自動テストに追加する。
+   - H1 で追加した `AppError` taxonomy に CORS 系コード（`CorsPreflightFailed` など）を接続し、UI へ同一フォーマットで表示する。
+   - 仕様準拠メモ:
+     - Origin 判定は RFC 6454 Section 4（scheme/host/port tuple）で実施し、tuple 不一致は cross-origin とみなす。
+     - CORS 判定は Fetch Standard「HTTP fetch」「CORS-preflight fetch」の手順に合わせ、`Access-Control-Allow-Origin` と `credentials mode` の組み合わせを厳密評価する。
+     - XHR のエラー可視化は WHATWG XHR Standard（network error / CORS error）に準拠し、JavaScript には詳細を漏らさず UI 診断ログにのみ原因を残す。
+
+### Sprint H3（2週間）: 危険接続 interstitial + 監視定着
+9. [ ] **NH3-T1 E5-T3 TLS/証明書エラー UX フェーズ 3**
+   - 証明書エラー時に interstitial を必ず表示し、ユーザー明示操作による例外登録フローを実装。
+   - 危険接続検知率 KPI（証明書エラー検知数 / 危険接続試行数）を nightly 継続監視へ追加。
+   - 表示時間 KPI（interstitial 表示までの時間、例外登録後の再遷移時間）を計測し、失敗率改善と同時に追跡する。
+   - 仕様準拠メモ:
+     - 証明書エラー分類は RFC 5280（有効期限/発行者/パス検証）に合わせ、原因別 `AppError` を固定コード化する。
+     - HTTPS 失敗時の警告 UX は Chromium SSL interstitial の設計原則（ユーザーに危険性を明示し、デフォルトは接続継続不可）を踏襲し、例外登録は 1) 明示操作 2) 期限付き 3) Origin 単位に制限する。
+     - HSTS 対象相当の接続では例外登録を禁止し、危険接続保護を優先する（RFC 6797 の fail-closed 方針）。
 
 ### Sprint I（GA前）: デフォルト切替・運用完成
 10. [ ] **NI-T1 E8-T1 native デフォルト起動の段階ロールアウト**
