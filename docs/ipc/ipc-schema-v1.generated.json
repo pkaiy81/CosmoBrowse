@@ -28,6 +28,19 @@
       "request_payload": null,
       "response_type": "page"
     },
+    "cancel_download": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "download"
+    },
     "close_tab": {
       "request_payload": {
         "properties": {
@@ -41,9 +54,35 @@
       },
       "response_type": "tabs"
     },
+    "enqueue_download": {
+      "request_payload": {
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ]
+      },
+      "response_type": "download"
+    },
     "forward": {
       "request_payload": null,
       "response_type": "page"
+    },
+    "get_download_progress": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "download"
     },
     "get_latest_crash_report": {
       "request_payload": null,
@@ -61,6 +100,10 @@
       "request_payload": null,
       "response_type": "page"
     },
+    "list_downloads": {
+      "request_payload": null,
+      "response_type": "downloads"
+    },
     "list_tabs": {
       "request_payload": null,
       "response_type": "tabs"
@@ -68,6 +111,19 @@
     "new_tab": {
       "request_payload": null,
       "response_type": "tab"
+    },
+    "open_download": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "download"
     },
     "open_url": {
       "request_payload": {
@@ -81,6 +137,19 @@
         ]
       },
       "response_type": "page"
+    },
+    "pause_download": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "download"
     },
     "register_tls_exception": {
       "request_payload": {
@@ -98,6 +167,32 @@
     "reload": {
       "request_payload": null,
       "response_type": "page"
+    },
+    "resume_download": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "download"
+    },
+    "reveal_download": {
+      "request_payload": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "response_type": "download"
     },
     "search": {
       "request_payload": {
@@ -165,7 +260,15 @@
           "close_tab",
           "list_tabs",
           "search",
-          "register_tls_exception"
+          "register_tls_exception",
+          "enqueue_download",
+          "list_downloads",
+          "get_download_progress",
+          "pause_download",
+          "resume_download",
+          "cancel_download",
+          "open_download",
+          "reveal_download"
         ],
         "type": "string"
       },

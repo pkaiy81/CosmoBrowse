@@ -1,14 +1,16 @@
+use crate::download::DownloadManager;
 use crate::layout::{build_layout_scene_with_script_runtime, RelayoutTrigger};
 use crate::loader::{
     build_frame_id, fetch_document, parse_frameset_document, prepare_html_for_display,
     register_tls_exception_for_url, resolve_url, FramesetChild, FramesetSpec, LoadedDocument,
 };
 use crate::model::{
-    AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
-    FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel, HistoryEntrySnapshot,
-    NavigationEvent, NavigationState, NavigationType, OmniboxSuggestion, OmniboxSuggestionKind,
-    OmniboxSuggestionSet, PageViewModel, RenderBackendKind, ScriptEngine, ScrollPosition,
-    SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary, SESSION_SNAPSHOT_SCHEMA_VERSION,
+    AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, DownloadEntry, ErrorMetric,
+    FrameRect, FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel,
+    HistoryEntrySnapshot, NavigationEvent, NavigationState, NavigationType, OmniboxSuggestion,
+    OmniboxSuggestionKind, OmniboxSuggestionSet, PageViewModel, RenderBackendKind, ScriptEngine,
+    ScrollPosition, SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary,
+    SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
 use std::collections::{BTreeMap, HashSet};
@@ -37,6 +39,7 @@ pub struct SabaApp {
     active_tab_id: u32,
     next_tab_id: u32,
     metrics: AppMetrics,
+    downloads: DownloadManager,
 }
 
 impl Default for SabaApp {
@@ -46,6 +49,7 @@ impl Default for SabaApp {
             active_tab_id: 1,
             next_tab_id: 2,
             metrics: AppMetrics::default(),
+            downloads: DownloadManager::default(),
         }
     }
 }
@@ -254,6 +258,38 @@ impl AppService for SabaApp {
     ) -> AppResult<()> {
         self.active_session_mut()?
             .update_scroll_positions(&positions)
+    }
+
+    fn enqueue_download(&mut self, url: &str) -> AppResult<DownloadEntry> {
+        self.downloads.enqueue(url)
+    }
+
+    fn list_downloads(&self) -> Vec<DownloadEntry> {
+        self.downloads.list()
+    }
+
+    fn get_download_progress(&self, id: u64) -> AppResult<DownloadEntry> {
+        self.downloads.progress(id)
+    }
+
+    fn pause_download(&mut self, id: u64) -> AppResult<DownloadEntry> {
+        self.downloads.pause(id)
+    }
+
+    fn resume_download(&mut self, id: u64) -> AppResult<DownloadEntry> {
+        self.downloads.resume(id)
+    }
+
+    fn cancel_download(&mut self, id: u64) -> AppResult<DownloadEntry> {
+        self.downloads.cancel(id)
+    }
+
+    fn open_download(&self, id: u64) -> AppResult<DownloadEntry> {
+        self.downloads.open(id)
+    }
+
+    fn reveal_download(&self, id: u64) -> AppResult<DownloadEntry> {
+        self.downloads.reveal(id)
     }
 }
 

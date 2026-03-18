@@ -155,6 +155,28 @@ type OmniboxSuggestionSet = {
 };
 type FrameScrollPositionSnapshot = { frame_id: string; position: ScrollPosition };
 type AppError = { code: string; message: string; retryable: boolean };
+type DownloadState = "queued" | "downloading" | "paused" | "completed" | "cancelled" | "failed";
+type DownloadSavePolicy = {
+  directory: string;
+  conflict_policy: string;
+  requires_user_confirmation: boolean;
+};
+type DownloadEntry = {
+  id: number;
+  url: string;
+  final_url: string | null;
+  file_name: string;
+  save_path: string;
+  total_bytes: number | null;
+  downloaded_bytes: number;
+  state: DownloadState;
+  supports_resume: boolean | null;
+  save_policy: DownloadSavePolicy;
+  last_error: AppError | null;
+  status_message: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
 type EmbeddedNavigationMessage = {
   type: "cosmobrowse:navigate";
   frameId: string;
@@ -256,6 +278,14 @@ const legacyTransportHandlers: Record<string, (payload?: Record<string, unknown>
     legacyInvoke<boolean>("update_scroll_positions", {
       positions: Array.isArray(payload?.positions) ? payload.positions : [],
     }),
+  enqueue_download: (payload) => legacyInvoke<DownloadEntry>("enqueue_download", { url: `${payload?.url ?? ""}` }),
+  list_downloads: () => legacyInvoke<DownloadEntry[]>("list_downloads"),
+  get_download_progress: (payload) => legacyInvoke<DownloadEntry>("get_download_progress", { id: Number(payload?.id ?? 0) }),
+  pause_download: (payload) => legacyInvoke<DownloadEntry>("pause_download", { id: Number(payload?.id ?? 0) }),
+  resume_download: (payload) => legacyInvoke<DownloadEntry>("resume_download", { id: Number(payload?.id ?? 0) }),
+  cancel_download: (payload) => legacyInvoke<DownloadEntry>("cancel_download", { id: Number(payload?.id ?? 0) }),
+  open_download: (payload) => legacyInvoke<DownloadEntry>("open_download", { id: Number(payload?.id ?? 0) }),
+  reveal_download: (payload) => legacyInvoke<DownloadEntry>("reveal_download", { id: Number(payload?.id ?? 0) }),
 };
 
 const nativeTransport: AppTransport = {
@@ -373,12 +403,17 @@ let consoleLogEl: HTMLElement | null;
 let domSnapshotEl: HTMLElement | null;
 let crashReportEl: HTMLElement | null;
 let securityInterstitialEl: HTMLElement | null;
+let downloadsListEl: HTMLUListElement | null;
+let downloadSummaryEl: HTMLElement | null;
+let downloadCurrentButtonEl: HTMLButtonElement | null;
+let refreshDownloadsButtonEl: HTMLButtonElement | null;
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
 let scrollSyncTimer: number | null = null;
 let pageEpoch = 0;
 let latestOmniboxSuggestions: OmniboxSuggestionSet = { query: "", active_index: null, suggestions: [] };
 let draggedTabId: number | null = null;
+let downloadPollTimer: number | null = null;
 
 type RenderBackend = {
   kind: "native_scene";
@@ -541,9 +576,40 @@ function formatError(errorValue: unknown): string {
     tls_error: "The certificate or TLS configuration could not be validated.",
     tls_certificate_expired: "The certificate has expired.",
     tls_certificate_self_signed: "The connection uses a self-signed certificate and cannot be trusted automatically.",
+    download_required: "The response is marked for download and will not be rendered inline.",
+    download_save_failed: "The file could not be written to the selected download location.",
+    download_permission_denied: "CosmoBrowse does not have permission to write to the download location.",
+    download_resume_unsupported: "The server does not support HTTP range resume, so the download restarts from the beginning.",
   };
   const base = descriptions[error.code] ? `${descriptions[error.code]} (${error.code})` : error.code;
   return `${base}: ${error.message}`;
+}
+
+function formatBytes(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return "?";
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = value;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return `${amount.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function downloadProgressRatio(entry: DownloadEntry): number | null {
+  if (!entry.total_bytes || entry.total_bytes <= 0) return null;
+  return Math.max(0, Math.min(entry.downloaded_bytes / entry.total_bytes, 1));
+}
+
+function parentDirectory(path: string): string {
+  const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return separatorIndex >= 0 ? path.slice(0, separatorIndex) : path;
+}
+
+function pathToFileUrl(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.startsWith("/") ? `file://${encodeURI(normalized)}` : `file:///${encodeURI(normalized)}`;
 }
 
 function hideSecurityInterstitial() {
@@ -603,7 +669,10 @@ URL: ${requestedUrl}`;
 
 function handleCommandError(errorValue: unknown, requestedUrl?: string) {
   const appError = parseAppError(errorValue);
-  setStatus(formatError(appError), "error");
+  const downloadHint = appError.code === "download_required" && requestedUrl
+    ? ` Use the download shelf to explicitly save ${requestedUrl}.`
+    : "";
+  setStatus(`${formatError(appError)}${downloadHint}`, "error");
   maybeRenderSecurityInterstitial({ appError, requestedUrl });
 }
 
@@ -940,6 +1009,148 @@ async function refreshCrashReport() {
       : "Crash report: none";
   } catch {
     if (crashReportEl) crashReportEl.textContent = "Crash report: unavailable";
+  }
+}
+
+function renderDownloads(downloads: DownloadEntry[]) {
+  if (downloadsListEl) downloadsListEl.innerHTML = "";
+  if (downloadSummaryEl) {
+    const activeCount = downloads.filter((entry) => entry.state === "queued" || entry.state === "downloading" || entry.state === "paused").length;
+    downloadSummaryEl.textContent = downloads.length === 0
+      ? "No downloads yet."
+      : `${downloads.length} item(s), ${activeCount} active.`;
+  }
+  if (!downloadsListEl) return;
+
+  downloads
+    .slice()
+    .sort((left, right) => right.created_at_ms - left.created_at_ms)
+    .forEach((entry) => {
+      const item = document.createElement("li");
+      item.className = `download-item state-${entry.state}`;
+
+      const header = document.createElement("div");
+      header.className = "download-item-header";
+      const title = document.createElement("strong");
+      title.textContent = entry.file_name;
+      const badge = document.createElement("span");
+      badge.className = "download-state-badge";
+      badge.textContent = entry.state;
+      header.append(title, badge);
+
+      const meta = document.createElement("p");
+      meta.className = "download-meta";
+      const ratio = downloadProgressRatio(entry);
+      meta.textContent = ratio == null
+        ? `${formatBytes(entry.downloaded_bytes)} downloaded • save to ${entry.save_path}`
+        : `${Math.round(ratio * 100)}% • ${formatBytes(entry.downloaded_bytes)} / ${formatBytes(entry.total_bytes)} • save to ${entry.save_path}`;
+
+      const progress = document.createElement("div");
+      progress.className = "download-progress";
+      const progressBar = document.createElement("span");
+      progressBar.className = "download-progress-bar";
+      progressBar.style.width = `${Math.round((ratio ?? 0) * 100)}%`;
+      progress.appendChild(progressBar);
+
+      const message = document.createElement("p");
+      message.className = "download-message";
+      const resumeLabel = entry.supports_resume === false ? "Resume unsupported by server; restart fallback used." : entry.supports_resume === true ? "Resume supported." : "Resume capability pending.";
+      message.textContent = [entry.status_message, resumeLabel, entry.last_error ? `${entry.last_error.code}: ${entry.last_error.message}` : null]
+        .filter((value): value is string => Boolean(value && value.trim().length > 0))
+        .join(" ");
+
+      const actions = document.createElement("div");
+      actions.className = "download-actions";
+
+      const pauseButton = document.createElement("button");
+      pauseButton.type = "button";
+      pauseButton.textContent = "Pause";
+      pauseButton.disabled = !(entry.state === "queued" || entry.state === "downloading");
+      pauseButton.addEventListener("click", () => void controlDownload("pause_download", entry.id));
+
+      const resumeButton = document.createElement("button");
+      resumeButton.type = "button";
+      resumeButton.textContent = entry.state === "failed" ? "Retry" : "Resume";
+      resumeButton.disabled = !(entry.state === "paused" || entry.state === "failed");
+      resumeButton.addEventListener("click", () => void controlDownload("resume_download", entry.id));
+
+      const cancelButton = document.createElement("button");
+      cancelButton.type = "button";
+      cancelButton.textContent = entry.state === "completed" ? "Done" : "Cancel";
+      cancelButton.disabled = !(entry.state === "queued" || entry.state === "downloading" || entry.state === "paused");
+      cancelButton.addEventListener("click", () => void controlDownload("cancel_download", entry.id));
+
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.textContent = "Open";
+      openButton.disabled = entry.state !== "completed";
+      openButton.addEventListener("click", () => void triggerDownloadOpen(entry.id));
+
+      const revealButton = document.createElement("button");
+      revealButton.type = "button";
+      revealButton.textContent = "Reveal";
+      revealButton.disabled = entry.state !== "completed";
+      revealButton.addEventListener("click", () => void triggerDownloadReveal(entry.id));
+
+      actions.append(pauseButton, resumeButton, cancelButton, openButton, revealButton);
+      item.append(header, meta, progress, message, actions);
+      downloadsListEl?.appendChild(item);
+    });
+}
+
+async function refreshDownloads(silent = false) {
+  try {
+    const downloads = await requestAppCommand<DownloadEntry[]>({ type: "list_downloads" });
+    renderDownloads(downloads);
+  } catch (errorValue) {
+    if (!silent) handleCommandError(errorValue);
+  }
+}
+
+async function enqueueCurrentUrlDownload() {
+  const candidate = urlInputEl?.value.trim() ?? "";
+  if (!candidate) {
+    setStatus("Enter or navigate to a URL before starting a download.", "error");
+    return;
+  }
+  try {
+    const entry = await requestAppCommand<DownloadEntry>({
+      type: "enqueue_download",
+      payload: { url: candidate },
+    });
+    setStatus(`Download queued: ${entry.file_name}`);
+    await refreshDownloads(true);
+  } catch (errorValue) {
+    handleCommandError(errorValue, candidate);
+  }
+}
+
+async function controlDownload(command: "pause_download" | "resume_download" | "cancel_download", id: number) {
+  try {
+    await requestAppCommand<DownloadEntry>({ type: command, payload: { id } });
+    await refreshDownloads(true);
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function triggerDownloadOpen(id: number) {
+  try {
+    const entry = await requestAppCommand<DownloadEntry>({ type: "open_download", payload: { id } });
+    await openExternalUrl(pathToFileUrl(entry.save_path));
+    setStatus(`Opened download: ${entry.file_name}`);
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function triggerDownloadReveal(id: number) {
+  try {
+    const entry = await requestAppCommand<DownloadEntry>({ type: "reveal_download", payload: { id } });
+    await openExternalUrl(pathToFileUrl(parentDirectory(entry.save_path)));
+    setStatus(`Opened download folder for: ${entry.file_name}`);
+  } catch (errorValue) {
+    handleCommandError(errorValue);
   }
 }
 
@@ -1338,6 +1549,10 @@ window.addEventListener("DOMContentLoaded", () => {
   domSnapshotEl = document.querySelector("#dom-snapshot");
   crashReportEl = document.querySelector("#crash-report");
   securityInterstitialEl = document.querySelector("#security-interstitial");
+  downloadsListEl = document.querySelector("#downloads-list");
+  downloadSummaryEl = document.querySelector("#download-summary");
+  downloadCurrentButtonEl = document.querySelector("#download-current-button");
+  refreshDownloadsButtonEl = document.querySelector("#refresh-downloads-button");
 
   document.querySelector("#url-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1347,6 +1562,8 @@ window.addEventListener("DOMContentLoaded", () => {
   forwardButtonEl?.addEventListener("click", () => void executeNavigationCommand("forward", "Going forward..."));
   reloadButtonEl?.addEventListener("click", () => void executeNavigationCommand("reload", "Reloading..."));
   newTabButtonEl?.addEventListener("click", () => void createTab());
+  downloadCurrentButtonEl?.addEventListener("click", () => void enqueueCurrentUrlDownload());
+  refreshDownloadsButtonEl?.addEventListener("click", () => void refreshDownloads());
   installKeyboardHandlers();
 
   if (viewportEl) {
@@ -1357,7 +1574,10 @@ window.addEventListener("DOMContentLoaded", () => {
 
   window.addEventListener("beforeunload", () => {
     void flushScrollPositions();
+    if (downloadPollTimer) window.clearInterval(downloadPollTimer);
   });
+  downloadPollTimer = window.setInterval(() => void refreshDownloads(true), 1000);
   void refreshCrashReport();
+  void refreshDownloads(true);
   void loadInitialPageView();
 });

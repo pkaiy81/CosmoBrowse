@@ -30,6 +30,14 @@ IPC_SCHEMA = {
                     "list_tabs",
                     "search",
                     "register_tls_exception",
+                    "enqueue_download",
+                    "list_downloads",
+                    "get_download_progress",
+                    "pause_download",
+                    "resume_download",
+                    "cancel_download",
+                    "open_download",
+                    "reveal_download",
                 ],
             },
             "payload": {"type": "object"},
@@ -115,6 +123,56 @@ IPC_SCHEMA = {
                 "properties": {"url": {"type": "string"}},
             },
             "response_type": "ack",
+        },
+        "enqueue_download": {
+            "request_payload": {
+                "required": ["url"],
+                "properties": {"url": {"type": "string"}},
+            },
+            "response_type": "download",
+        },
+        "list_downloads": {"request_payload": None, "response_type": "downloads"},
+        "get_download_progress": {
+            "request_payload": {
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}},
+            },
+            "response_type": "download",
+        },
+        "pause_download": {
+            "request_payload": {
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}},
+            },
+            "response_type": "download",
+        },
+        "resume_download": {
+            "request_payload": {
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}},
+            },
+            "response_type": "download",
+        },
+        "cancel_download": {
+            "request_payload": {
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}},
+            },
+            "response_type": "download",
+        },
+        "open_download": {
+            "request_payload": {
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}},
+            },
+            "response_type": "download",
+        },
+        "reveal_download": {
+            "request_payload": {
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}},
+            },
+            "response_type": "download",
         },
     },
 }

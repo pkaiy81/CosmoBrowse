@@ -8,8 +8,8 @@ use encoding_rs::{Encoding, SHIFT_JIS, UTF_8};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{
-    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-    LOCATION,
+    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE,
+    ETAG, IF_NONE_MATCH, LOCATION,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -104,6 +104,13 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
         &response.headers,
         &mut diagnostics,
     );
+
+    if is_attachment_response(&response.headers) {
+        return Err(AppError::download_required(format!(
+            "The response requested download handling via Content-Disposition attachment for {}. Use the explicit download pipeline instead.",
+            response.final_url
+        )));
+    }
 
     let decoded = decode_html_bytes(&response.body, response.content_type.as_deref());
     store_cache_entry(url, &response, &decoded.html);
@@ -332,6 +339,18 @@ fn is_no_store(value: &str) -> bool {
         .split(',')
         .map(str::trim)
         .any(|directive| directive.eq_ignore_ascii_case("no-store"))
+}
+
+fn is_attachment_response(headers: &HeaderMap) -> bool {
+    // Spec: RFC 9110 defines `Content-Disposition: attachment` as representation
+    // metadata that instructs user agents to treat the response as a download rather
+    // than inline navigation content. The navigation pipeline therefore rejects it
+    // and lets the explicit download manager own persistence and progress UI.
+    // https://www.rfc-editor.org/rfc/rfc9110.html#field.content-disposition
+    headers
+        .get(CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("attachment"))
 }
 
 fn validate_response_security(
