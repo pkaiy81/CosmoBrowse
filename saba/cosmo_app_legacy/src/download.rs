@@ -619,12 +619,10 @@ mod tests {
                 let range_header = request
                     .lines()
                     .find_map(|line| {
-                        let lower = line.to_ascii_lowercase();
-                        lower
-                            .starts_with("range: bytes=")
-                            .then(|| line.split_once(": ").map(|(_, value)| value).unwrap_or(""))
+                        let lower = line.trim().to_ascii_lowercase();
+                        lower.strip_prefix("range: bytes=").map(str::to_string)
                     })
-                    .and_then(|line| line.split('-').next())
+                    .and_then(|line| line.split('-').next().map(str::to_string))
                     .and_then(|value| value.parse::<usize>().ok());
                 let start = if range_enabled {
                     range_header.unwrap_or(0)
