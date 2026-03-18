@@ -602,7 +602,12 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let body = vec![b'a'; 512 * 1024];
         let handle = thread::spawn(move || {
-            for stream in listener.incoming().take(4) {
+            // Test-fixture note: the client intentionally tears down the first
+            // connection during pause/resume. Browsers may abort an in-flight body
+            // when a download is paused, so the fixture must treat BrokenPipe /
+            // ConnectionReset as expected transport cancellation rather than a test
+            // failure.
+            for stream in listener.incoming().take(2) {
                 let mut stream = stream.expect("stream");
                 let mut buffer = [0u8; 4096];
                 let read = stream.read(&mut buffer).expect("read request");
@@ -640,9 +645,21 @@ mod tests {
                     ));
                 }
                 headers.push_str("\r\n");
-                stream.write_all(headers.as_bytes()).expect("write headers");
+                if stream.write_all(headers.as_bytes()).is_err() {
+                    continue;
+                }
                 for chunk in payload.chunks(16 * 1024) {
-                    stream.write_all(chunk).expect("write chunk");
+                    if let Err(error) = stream.write_all(chunk) {
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            break;
+                        }
+                        panic!("write chunk: {error}");
+                    }
                     if slow {
                         thread::sleep(Duration::from_millis(15));
                     }
