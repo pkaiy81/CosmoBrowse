@@ -51,8 +51,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: run PR smoke regression (light)
         run: python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr
+      - name: collect legacy command usage
+        run: python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/pr/legacy-command-usage.json
+      - name: evaluate WebView-free GA gate for PR pipeline
+        run: |
+          python3 scripts/evaluate_release_gate.py \
+            --kpi-summary smoke-artifacts/pr/kpi_summary.json \
+            --layout-summary smoke-artifacts/pr/layout_regression_summary.json \
+            --legacy-usage-summary smoke-artifacts/pr/legacy-command-usage.json \
+            --report-out smoke-artifacts/pr/ga-gate-report.json \
+            --required-consecutive-passes 1
       - name: print layout breakage summary
         run: cat smoke-artifacts/pr/layout_regression_summary.json
+      - name: print GA gate report
+        run: cat smoke-artifacts/pr/ga-gate-report.json
       - name: upload smoke artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

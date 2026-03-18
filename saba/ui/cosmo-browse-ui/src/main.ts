@@ -155,9 +155,26 @@ type IpcEnvelope<T> = {
   payload: T;
 };
 
-const IPC_SCHEMA_VERSION = 1;
+type ReleaseRolloutStatus = {
+  channel: string;
+  native_default_enabled: boolean;
+  adapter_tauri_fallback_enabled: boolean;
+  rollout_percentage: number;
+  assignment_bucket: number;
+  assigned_transport: "adapter_native" | "adapter_tauri";
+};
 
-async function invokeIpc<T>(request: Omit<IpcRequest, "version">): Promise<T> {
+type TransportKind = "adapter_native" | "adapter_tauri";
+
+type AppTransport = {
+  kind: TransportKind;
+  request: <T>(request: Omit<IpcRequest, "version">) => Promise<T>;
+};
+
+const IPC_SCHEMA_VERSION = 1;
+const TRANSPORT_OVERRIDE_KEY = "cosmobrowse.transport.override";
+
+async function invokeNativeIpc<T>(request: Omit<IpcRequest, "version">): Promise<T> {
   const response = await invoke<IpcEnvelope<T>>("dispatch_ipc", {
     request: { version: IPC_SCHEMA_VERSION, ...request },
   });
@@ -165,6 +182,132 @@ async function invokeIpc<T>(request: Omit<IpcRequest, "version">): Promise<T> {
     throw new Error(`Unsupported IPC response version: ${response.version}`);
   }
   return response.payload;
+}
+
+function legacyInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  return invoke<T>(command, args);
+}
+
+const legacyTransportHandlers: Record<string, (payload?: Record<string, unknown>) => Promise<unknown>> = {
+  open_url: (payload) => legacyInvoke<PageViewModel>("open_url", { url: `${payload?.url ?? ""}` }),
+  activate_link: (payload) =>
+    legacyInvoke<PageViewModel>("activate_link", {
+      frameId: `${payload?.frame_id ?? ""}`,
+      href: `${payload?.href ?? ""}`,
+      target: typeof payload?.target === "string" ? payload.target : null,
+    }),
+  get_page_view: () => legacyInvoke<PageViewModel>("get_page_view"),
+  set_viewport: (payload) =>
+    legacyInvoke<PageViewModel>("set_viewport", {
+      width: Number(payload?.width ?? 0),
+      height: Number(payload?.height ?? 0),
+    }),
+  reload: () => legacyInvoke<PageViewModel>("reload"),
+  back: () => legacyInvoke<PageViewModel>("back"),
+  forward: () => legacyInvoke<PageViewModel>("forward"),
+  get_navigation_state: () => legacyInvoke<NavigationState>("get_navigation_state"),
+  new_tab: () => legacyInvoke<TabSummary>("new_tab"),
+  switch_tab: (payload) => legacyInvoke<PageViewModel>("switch_tab", { id: Number(payload?.id ?? 0) }),
+  close_tab: (payload) => legacyInvoke<TabSummary[]>("close_tab", { id: Number(payload?.id ?? 0) }),
+  list_tabs: () => legacyInvoke<TabSummary[]>("list_tabs"),
+  search: (payload) => legacyInvoke<SearchResult[]>("search", { query: `${payload?.query ?? ""}` }),
+};
+
+const nativeTransport: AppTransport = {
+  kind: "adapter_native",
+  request: invokeNativeIpc,
+};
+
+const legacyTransport: AppTransport = {
+  kind: "adapter_tauri",
+  async request<T>(request: Omit<IpcRequest, "version">): Promise<T> {
+    const handler = legacyTransportHandlers[request.type];
+    if (!handler) {
+      throw new Error(`Legacy fallback does not support ${request.type}`);
+    }
+    return (await handler(request.payload)) as T;
+  },
+};
+
+let activeTransport: AppTransport | null = null;
+let releaseRolloutStatus: ReleaseRolloutStatus | null = null;
+
+function readTransportOverride(): TransportKind | null {
+  try {
+    const stored = window.localStorage.getItem(TRANSPORT_OVERRIDE_KEY);
+    return stored === "adapter_native" || stored === "adapter_tauri" ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeTransportOverride(kind: TransportKind) {
+  try {
+    // Ref: HTML Living Standard, Web Storage stores string key/value data per origin
+    // across top-level browsing sessions. We persist only the selected transport so
+    // rollback decisions survive reloads without mutating application content state.
+    // https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute
+    window.localStorage.setItem(TRANSPORT_OVERRIDE_KEY, kind);
+  } catch {
+    // Ignore environments where storage is unavailable.
+  }
+}
+
+function legacyTransportSupports(command: string): boolean {
+  return command in legacyTransportHandlers;
+}
+
+function shouldFallbackToLegacy(errorValue: unknown): boolean {
+  const message = errorValue instanceof Error ? errorValue.message : `${errorValue}`;
+  return (
+    message.includes("dispatch_ipc")
+    || message.includes("Unsupported IPC response version")
+    || message.includes("unknown command")
+    || message.includes("invalid args")
+  );
+}
+
+function activateTransport(kind: TransportKind, reason?: string) {
+  activeTransport = kind === "adapter_native" ? nativeTransport : legacyTransport;
+  writeTransportOverride(kind);
+  if (reason) {
+    console.warn(`[CosmoBrowse] transport switched to ${kind}: ${reason}`);
+  }
+}
+
+async function initializeTransport(): Promise<AppTransport> {
+  const override = readTransportOverride();
+  if (override) {
+    activeTransport = override === "adapter_native" ? nativeTransport : legacyTransport;
+    return activeTransport;
+  }
+
+  try {
+    releaseRolloutStatus = await invoke<ReleaseRolloutStatus>("release_rollout_status");
+    activeTransport = releaseRolloutStatus.native_default_enabled ? nativeTransport : legacyTransport;
+  } catch (errorValue) {
+    console.warn("[CosmoBrowse] failed to load release rollout status; defaulting to adapter_native", errorValue);
+    activeTransport = nativeTransport;
+  }
+  return activeTransport;
+}
+
+async function requestAppCommand<T>(request: Omit<IpcRequest, "version">): Promise<T> {
+  const transport = activeTransport ?? (await initializeTransport());
+  try {
+    return await transport.request<T>(request);
+  } catch (errorValue) {
+    if (
+      transport.kind === "adapter_native"
+      && releaseRolloutStatus?.adapter_tauri_fallback_enabled !== false
+      && legacyTransportSupports(request.type)
+      && shouldFallbackToLegacy(errorValue)
+    ) {
+      activateTransport("adapter_tauri", errorValue instanceof Error ? errorValue.message : `${errorValue}`);
+      return legacyTransport.request<T>(request);
+    }
+    throw errorValue;
+  }
 }
 
 let urlInputEl: HTMLInputElement | null;
@@ -364,7 +507,7 @@ async function registerTlsExceptionAndRetry(url: string) {
   // Spec: certificate exception registration must be explicit user action.
   // Ref: browser interstitial UX guidance for dangerous TLS connections.
   try {
-    await invokeIpc<boolean>({ type: "register_tls_exception", payload: { url } });
+    await invokeNativeIpc<boolean>({ type: "register_tls_exception", payload: { url } });
     setStatus("A temporary certificate exception was registered. Retrying the connection...");
     await openUrl(url);
   } catch (errorValue) {
@@ -547,7 +690,7 @@ function renderDiagnostics(view: PageViewModel) {
 
 async function refreshCrashReport() {
   try {
-    const report = await invokeIpc<{ path: string; reason: string; crashed_at_ms: number; reproduction: string[] } | null>({ type: "get_latest_crash_report" });
+    const report = await invokeNativeIpc<{ path: string; reason: string; crashed_at_ms: number; reproduction: string[] } | null>({ type: "get_latest_crash_report" });
     if (!crashReportEl) return;
     crashReportEl.textContent = report
       ? `Crash report: ${report.reason} @ ${new Date(report.crashed_at_ms).toISOString()} (${report.path})`
@@ -570,13 +713,13 @@ function renderPageView(view: PageViewModel) {
 }
 
 async function refreshTabs() {
-  const tabs = await invokeIpc<TabSummary[]>({ type: "list_tabs" });
+  const tabs = await requestAppCommand<TabSummary[]>({ type: "list_tabs" });
   renderTabs(tabs);
 }
 
 async function refreshNavigationState() {
   try {
-    const nav = await invokeIpc<NavigationState>({ type: "get_navigation_state" });
+    const nav = await requestAppCommand<NavigationState>({ type: "get_navigation_state" });
     setNavButtons(nav);
   } catch {
     if (backButtonEl) backButtonEl.disabled = true;
@@ -593,7 +736,7 @@ async function syncViewport(force = false, epoch = pageEpoch) {
   if (!force && resizeTimer) window.clearTimeout(resizeTimer);
   const run = async () => {
     try {
-      const view = await invokeIpc<PageViewModel>({ type: "set_viewport", payload: { width, height } });
+      const view = await requestAppCommand<PageViewModel>({ type: "set_viewport", payload: { width, height } });
       if (!isCurrentPageEpoch(epoch)) return;
       renderPageView(view);
       await refreshNavigationState();
@@ -615,7 +758,7 @@ async function executeNavigationCommand(command: string, loadingMessage: string)
   try {
     clearSearchResults();
     setStatus(loadingMessage);
-    const view = await invokeIpc<PageViewModel>({ type: command });
+    const view = await requestAppCommand<PageViewModel>({ type: command });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -631,7 +774,7 @@ async function openUrl(url: string) {
   try {
     clearSearchResults();
     setStatus("Loading...");
-    const view = await invokeIpc<PageViewModel>({ type: "open_url", payload: { url } });
+    const view = await requestAppCommand<PageViewModel>({ type: "open_url", payload: { url } });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -674,7 +817,7 @@ async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
   const epoch = beginPageEpoch();
   try {
     setStatus("Navigating...");
-    const view = await invokeIpc<PageViewModel>({
+    const view = await requestAppCommand<PageViewModel>({
       type: "activate_link",
       payload: {
         frame_id: message.frameId,
@@ -705,7 +848,7 @@ async function openCurrentInput() {
   }
 
   try {
-    const results = await invokeIpc<SearchResult[]>({ type: "search", payload: { query: value } });
+    const results = await requestAppCommand<SearchResult[]>({ type: "search", payload: { query: value } });
     renderSearchResults(results);
     setStatus(`Found ${results.length} search results.`);
   } catch (errorValue) {
@@ -717,7 +860,7 @@ async function switchTab(id: number) {
   const epoch = beginPageEpoch();
   try {
     clearSearchResults();
-    const view = await invokeIpc<PageViewModel>({ type: "switch_tab", payload: { id } });
+    const view = await requestAppCommand<PageViewModel>({ type: "switch_tab", payload: { id } });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -732,9 +875,9 @@ async function closeTab(id: number) {
   const epoch = beginPageEpoch();
   try {
     clearSearchResults();
-    await invokeIpc<TabSummary[]>({ type: "close_tab", payload: { id } });
+    await requestAppCommand<TabSummary[]>({ type: "close_tab", payload: { id } });
     if (!isCurrentPageEpoch(epoch)) return;
-    const view = await invokeIpc<PageViewModel>({ type: "get_page_view" });
+    const view = await requestAppCommand<PageViewModel>({ type: "get_page_view" });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -749,9 +892,9 @@ async function createTab() {
   const epoch = beginPageEpoch();
   try {
     clearSearchResults();
-    await invokeIpc<TabSummary>({ type: "new_tab" });
+    await requestAppCommand<TabSummary>({ type: "new_tab" });
     if (!isCurrentPageEpoch(epoch)) return;
-    const view = await invokeIpc<PageViewModel>({ type: "get_page_view" });
+    const view = await requestAppCommand<PageViewModel>({ type: "get_page_view" });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();
@@ -767,7 +910,7 @@ async function loadInitialPageView() {
   try {
     await syncViewport(true, epoch);
     if (!isCurrentPageEpoch(epoch)) return;
-    const view = await invokeIpc<PageViewModel>({ type: "get_page_view" });
+    const view = await requestAppCommand<PageViewModel>({ type: "get_page_view" });
     if (!isCurrentPageEpoch(epoch)) return;
     renderPageView(view);
     await refreshNavigationState();

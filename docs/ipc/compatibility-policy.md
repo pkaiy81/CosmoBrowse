@@ -32,8 +32,6 @@
 | `back()` | `{ "type": "back" }` |
 | `forward()` | `{ "type": "forward" }` |
 | `get_navigation_state()` | `{ "type": "get_navigation_state" }` |
-| `get_metrics()` | `{ "type": "get_metrics" }` |
-| `get_latest_crash_report()` | `{ "type": "get_latest_crash_report" }` |
 | `new_tab()` | `{ "type": "new_tab" }` |
 | `switch_tab(id)` | `{ "type": "switch_tab", "payload": { "id": 1 } }` |
 | `close_tab(id)` | `{ "type": "close_tab", "payload": { "id": 1 } }` |
@@ -41,3 +39,8 @@
 | `search(query)` | `{ "type": "search", "payload": { "query": "rust" } }` |
 
 > `dispatch_ipc` 実呼び出し時は envelope に `version: 1` を必ず含める。
+
+## Legacy Surface Reduction Policy
+- `adapter_tauri` の direct `invoke()` command は rollback に必要な最小集合だけ残す。
+- `get_metrics` と `get_latest_crash_report` は `dispatch_ipc` 専用に切り替え、旧 command 互換面から削除した。
+- 利用統計は `scripts/collect_legacy_command_usage.py` が PR / nightly artifact に `legacy-command-usage.json` として出力する。
