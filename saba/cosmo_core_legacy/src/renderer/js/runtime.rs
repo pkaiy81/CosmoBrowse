@@ -851,7 +851,7 @@ mod tests {
         }
         assert_eq!(
             runtime.local_storage_entries(),
-            vec![("theme".to_string(), "dark".to_string())]
+            alloc::vec![("theme".to_string(), "dark".to_string())]
         );
     }
 
