@@ -212,34 +212,41 @@
   - `RenderSnapshot` に加え、ボックス情報・スタイル解決済みノードを返却。
   - **完了条件**: テキスト/リンク以外に block/inline 構造を UI で描画可能。
   - 進捗メモ: RenderTree DTO を `cosmo_runtime` 境界で固定し、tauri/native 両経路で同一 payload を再生確認。
-- [ ] **E3-T2 最小レイアウトエンジン v1**
+- [x] **E3-T2 最小レイアウトエンジン v1**
   - normal flow（block/inline）、margin/padding/border の計算を実装。
   - **完了条件**: 代表ページで要素重なり崩れ率を計測し、基準値以下。
-- [ ] **E3-T3 ペイントコマンド生成**
+  - 進捗メモ: `LayoutView` ベースの normal flow と box model 計算を `RenderTreeSnapshot` へ反映し、`layout-regression-policy` と smoke 集計で崩れ率を継続計測できる状態にした。
+- [x] **E3-T3 ペイントコマンド生成**
   - `DrawRect/DrawText/DrawImage` コマンド列を生成し、backend 非依存化。
   - **完了条件**: 同一コマンド列を native/tauri 互換で再生可能。
+  - 進捗メモ: `scene_items_to_paint_commands` と paint snapshot test を導入し、native/tauri 双方の UI で同じ paint command を再生する経路を固定した。
 
 ### Epic 4: Web Platform 機能（最低限の実利用ライン）
-- [ ] **E4-T1 JavaScript 実行基盤の統合**
+- [x] **E4-T1 JavaScript 実行基盤の統合**
   - JS runtime を導入し、DOM 読み取り/イベント dispatch まで接続。
   - **完了条件**: 静的サイト + 軽量 SPA の初期描画が完了する。
-- [ ] **E4-T2 イベントループ/タスクキュー実装**
+  - 進捗メモ: `build_layout_scene_with_script_runtime` に `JsRuntime` を統合し、DOM 更新後の relayout/repaint と lightweight SPA smoke を接続済み。
+- [x] **E4-T2 イベントループ/タスクキュー実装**
   - microtask/macrotask の実行順序を定義し、タイマー API を追加。
   - **完了条件**: Promise/timeout を使うページでハングしない。
+  - 進捗メモ: `setTimeout` / `queueMicrotask` / `Promise.then` と guard 付き event loop を実装し、`adapter_cli verify-event-loop` と単体テストで順序とハング検知を検証可能にした。
 - [ ] **E4-T3 ストレージ/クッキー/権限モデル**
   - origin 単位で cookie/local storage を管理。
   - **完了条件**: ログイン状態を持つサイトで再訪時セッション維持。
 
 ### Epic 5: ネットワーク/セキュリティ
-- [ ] **E5-T1 HTTP スタック拡張**
+- [x] **E5-T1 HTTP スタック拡張**
   - redirect policy、cache-control、content-encoding、timeout 制御を統合。
   - **完了条件**: 計測対象サイトで失敗率と表示時間を改善。
-- [ ] **E5-T2 Same-Origin/CORS の導入**
+  - 進捗メモ: `reqwest` loader に redirect 上限、`ETag`/`Cache-Control` 再検証、`Content-Encoding` 診断、timeout/error code 分類を統合した。
+- [x] **E5-T2 Same-Origin/CORS の導入**
   - Fetch/XHR ポリシー評価と preflight を実装。
   - **完了条件**: セキュリティテストで CORS 回避が不可。
-- [ ] **E5-T3 TLS/証明書エラー UX**
+  - 進捗メモ: `evaluate_cors_request` で same-origin 判定・credentials 制約・preflight 検証を実装し、拒否ケースの回帰テストを追加した。
+- [x] **E5-T3 TLS/証明書エラー UX**
   - 証明書期限切れ・自己署名の警告画面と例外登録。
   - **完了条件**: 危険接続時に必ず interstitial が表示される。
+  - 進捗メモ: TLS エラー分類、origin/TTL 付き例外登録、UI interstitial と再試行フローを `dispatch_ipc` 経路へ接続済み。
 
 ### Epic 6: UI/UX（タブ・アドレスバー・開発者体験）
 - [ ] **E6-T1 タブストリップ改善**
@@ -287,25 +294,25 @@
 > 前回計画（E1-T1/E1-T3/E2-T1/E3-T1/E7-T2）完了を前提に、GA 到達までの残作業を再編。
 
 ### Sprint F（次の2週間）: レイアウト/ペイントの実用化
-1. [ ] **NF-T1 E3-T2 最小レイアウトエンジン v1 を実装**
+1. [x] **NF-T1 E3-T2 最小レイアウトエンジン v1 を実装**
    - block/inline の normal flow、margin/padding/border の計算を本実装へ。
    - 代表ページ群で「要素重なり崩れ率」を定量化し、基準値をドキュメント化。
-2. [ ] **NF-T2 E3-T3 ペイントコマンド backend 非依存化**
+2. [x] **NF-T2 E3-T3 ペイントコマンド backend 非依存化**
    - `DrawRect/DrawText/DrawImage` を標準描画コマンドとして固定。
    - tauri/native 双方で同一コマンド列再生テストを CI に追加。
-3. [ ] **NF-T3 描画回帰テスト拡張**
+3. [x] **NF-T3 描画回帰テスト拡張**
    - RenderTree と paint command の snapshot テストを導入し、差分を可視化。
 
 ### Sprint G（続く2週間）: Web Platform 最低ライン
-4. [ ] **NG-T1 E4-T1 JavaScript 実行基盤を統合**
+4. [x] **NG-T1 E4-T1 JavaScript 実行基盤を統合**
    - DOM 読み取り・イベント dispatch を最小接続し、軽量 SPA 初期描画を成立。
-5. [ ] **NG-T2 E4-T2 イベントループ/タスクキュー実装**
+5. [x] **NG-T2 E4-T2 イベントループ/タスクキュー実装**
    - microtask/macrotask の順序を仕様化し、Promise/timeout のハングを解消。
 6. [ ] **NG-T3 E4-T3 ストレージ/クッキー基盤**
    - origin 単位の cookie/local storage 管理と永続化ポリシーを実装。
 
 ### Sprint H1（2週間）: HTTP 信頼性基盤 + 失敗理由統一
-7. [ ] **NH1-T1 E5-T1 HTTP スタック統合フェーズ 1**
+7. [x] **NH1-T1 E5-T1 HTTP スタック統合フェーズ 1**
    - redirect policy / cache-control / content-encoding / timeout を Loader に統合。
    - 失敗理由を `AppError` コードに統一マッピングし、UI では単一のエラー描画経路へ収束。
    - 失敗率 KPI（`open_url` / `search`）を nightly 収集へ追加し、導入前後を時系列比較可能にする。
@@ -316,7 +323,7 @@
      - Timeout は RFC 9110 Section 9.2.2（冪等メソッドの再試行）を前提に `GET` 系のみ自動リトライ可とし、非冪等メソッドは即失敗する。
 
 ### Sprint H2（2週間）: CORS 強制 + 回避不能テスト
-8. [ ] **NH2-T1 E5-T2 Same-Origin/CORS 実装フェーズ 2**
+8. [x] **NH2-T1 E5-T2 Same-Origin/CORS 実装フェーズ 2**
    - Fetch/XHR の Same-Origin 判定、CORS ヘッダー評価、preflight（`OPTIONS`）を実装。
    - 回避不能な検証ケース（opaque response / wildcard + credentials 禁止 / preflight 失敗）を自動テストに追加する。
    - H1 で追加した `AppError` taxonomy に CORS 系コード（`CorsPreflightFailed` など）を接続し、UI へ同一フォーマットで表示する。
@@ -326,7 +333,7 @@
      - XHR のエラー可視化は WHATWG XHR Standard（network error / CORS error）に準拠し、JavaScript には詳細を漏らさず UI 診断ログにのみ原因を残す。
 
 ### Sprint H3（2週間）: 危険接続 interstitial + 監視定着
-9. [ ] **NH3-T1 E5-T3 TLS/証明書エラー UX フェーズ 3**
+9. [x] **NH3-T1 E5-T3 TLS/証明書エラー UX フェーズ 3**
    - 証明書エラー時に interstitial を必ず表示し、ユーザー明示操作による例外登録フローを実装。
    - 危険接続検知率 KPI（証明書エラー検知数 / 危険接続試行数）を nightly 継続監視へ追加。
    - 表示時間 KPI（interstitial 表示までの時間、例外登録後の再遷移時間）を計測し、失敗率改善と同時に追跡する。
@@ -335,12 +342,27 @@
      - HTTPS 失敗時の警告 UX は Chromium SSL interstitial の設計原則（ユーザーに危険性を明示し、デフォルトは接続継続不可）を踏襲し、例外登録は 1) 明示操作 2) 期限付き 3) Origin 単位に制限する。
      - HSTS 対象相当の接続では例外登録を禁止し、危険接続保護を優先する（RFC 6797 の fail-closed 方針）。
 
+
+### Sprint J（次の再計画候補）: セッション復元・UX・運用ギャップ解消
+10. [ ] **NJ-T1 E2-T2 セッション復元（クラッシュ復旧）**
+    - タブ一覧・履歴スタック・スクロール位置をクラッシュセーフなスナップショットへ保存し、起動時に restore する。
+    - 完了時には `renderer_recovered` 後の再起動経路でも、最後の active tab が自動復元されることをスモークで保証する。
+11. [ ] **NJ-T2 E4-T3 origin 単位ストレージ/クッキー永続化**
+    - Cookie jar / local storage / 権限判断キャッシュを origin 単位で保存し、SameSite/Secure/HttpOnly 診断と接続する。
+    - セッション復元と干渉しないよう、永続化形式と消去ポリシーを ADR 化する。
+12. [ ] **NJ-T3 E6-T1/E6-T2 タブストリップ + Omnibox 改善**
+    - ピン留め/複製/並べ替えと URL・履歴・検索候補を統合した入力補完を導入する。
+    - 20 タブ規模の UI 操作遅延と主要ショートカット回帰を Playwright か smoke harness で定量評価する。
+13. [ ] **NJ-T4 E7-T1/E7-T3 KPI ダッシュボード + クラッシュレポート強化**
+    - 既存 `kpi_summary.json` を拡張して FCP 相当・メモリ使用量・クラッシュ分類を時系列可視化し、panic report を release artifacts と紐付ける。
+    - minidump/symbol 管理までは到達していないため、まず nightly artifact 集約と再現テンプレート自動添付を完了条件にする。
+
 ### Sprint I（GA前）: デフォルト切替・運用完成
-10. [x] **NI-T1 E8-T1 native デフォルト起動の段階ロールアウト**
+14. [x] **NI-T1 E8-T1 native デフォルト起動の段階ロールアウト**
     - feature flag とフォールバックを運用し、安定チャネルへ展開。
-11. [x] **NI-T2 E8-T2 互換 command の利用統計/削減**
+15. [x] **NI-T2 E8-T2 互換 command の利用統計/削減**
     - `adapter_tauri` の未使用 API を削減し、保守対象を最小化。
-12. [x] **NI-T3 E8-T3 GA 判定ゲート運用**
+16. [x] **NI-T3 E8-T3 GA 判定ゲート運用**
     - 性能・安定性・互換性しきい値を CI/release pipeline に強制適用。
 
 ### 完了基準（更新）
