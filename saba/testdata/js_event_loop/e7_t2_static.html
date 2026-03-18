@@ -2,7 +2,8 @@
   <head>
     <script>
       function onready() {
-        document.getElementById("target").textContent = "Static Ready";
+        var target = document.getElementById("target");
+        target.textContent = "Static Ready";
       }
       document.addEventListener("DOMContentLoaded", onready);
     </script>
