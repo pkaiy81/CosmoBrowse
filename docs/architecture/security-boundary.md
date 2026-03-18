@@ -25,6 +25,7 @@ flowchart TD
 - Cross-origin response access is reported through Fetch-style CORS checks (`Access-Control-Allow-Origin`).
 - Sandbox evaluation marks cross-origin loads as restricted (script/top-navigation privileges are treated as withheld unless explicitly allowed by policy).
 - Cookie attribute checks evaluate `Secure`, `HttpOnly`, and `SameSite` combinations and emit diagnostics.
+- Accepted cookies, `localStorage`, and permission decisions are retained in a process-local origin-scoped persistence model keyed by RFC 6454 serialized origins.
 - A minimum CSP baseline is injected when absent (`default-src 'self'; object-src 'none'; base-uri 'self'`) and inline-script diagnostics are emitted.
 
 ## Network boundary and permission constraints

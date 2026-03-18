@@ -2,7 +2,7 @@ use regex::Regex;
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS,
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    SET_COOKIE,
+    COOKIE, SET_COOKIE,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -321,9 +321,105 @@ pub enum SameSitePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieAttributes {
     pub name: String,
+    pub value: String,
     pub secure: bool,
     pub http_only: bool,
     pub same_site: Option<SameSitePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCookie {
+    pub name: String,
+    pub value: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: Option<SameSitePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionCacheEntry {
+    pub initiator_origin: String,
+    pub target_origin: String,
+    pub allowed: bool,
+    pub updated_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct PersistentSecurityState {
+    pub cookie_jar: HashMap<String, Vec<StoredCookie>>,
+    pub local_storage: HashMap<String, HashMap<String, String>>,
+    pub permission_cache: HashMap<(String, String), PermissionCacheEntry>,
+}
+
+fn persistent_security_state() -> &'static Mutex<PersistentSecurityState> {
+    static STATE: OnceLock<Mutex<PersistentSecurityState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(PersistentSecurityState::default()))
+}
+
+#[cfg(test)]
+fn clear_persistent_state_for_tests() {
+    if let Ok(mut state) = persistent_security_state().lock() {
+        *state = PersistentSecurityState::default();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CookieDisposition {
+    Accepted,
+    Rejected(String),
+}
+
+fn origin_key(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    Origin::from_url(&parsed).map(|origin| origin.serialize())
+}
+
+fn is_secure_cookie_context(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .map(|url| url.scheme() == "https")
+        .unwrap_or(false)
+}
+
+fn is_schemeful_same_site(request_url: &str, site_for_cookies_url: &str) -> bool {
+    // Spec: RFC 6265bis defines SameSite in terms of "site for cookies".
+    // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html
+    // Compliance note: this legacy app persists cookies in an RFC 6454 origin-keyed jar,
+    // so the site-for-cookies check is intentionally implemented as a stricter same-origin
+    // comparison instead of registrable-domain matching because no public suffix list exists here.
+    // https://datatracker.ietf.org/doc/html/rfc6454
+    is_same_origin(request_url, site_for_cookies_url)
+}
+
+fn evaluate_cookie_storage(attrs: &CookieAttributes, response_url: &str) -> CookieDisposition {
+    if attrs.same_site == Some(SameSitePolicy::None) && !attrs.secure {
+        return CookieDisposition::Rejected(format!(
+            "Cookie '{}' rejected: SameSite=None requires Secure",
+            attrs.name
+        ));
+    }
+
+    if attrs.secure && !is_secure_cookie_context(response_url) {
+        return CookieDisposition::Rejected(format!(
+            "Cookie '{}' rejected: Secure attribute on non-HTTPS response",
+            attrs.name
+        ));
+    }
+
+    CookieDisposition::Accepted
+}
+
+fn can_send_cookie(cookie: &StoredCookie, request_url: &str, site_for_cookies_url: &str) -> bool {
+    if cookie.secure && !is_secure_cookie_context(request_url) {
+        return false;
+    }
+
+    match cookie.same_site {
+        Some(SameSitePolicy::Strict) | Some(SameSitePolicy::Lax) => {
+            is_schemeful_same_site(request_url, site_for_cookies_url)
+        }
+        Some(SameSitePolicy::None) | None => true,
+    }
 }
 
 // Spec: RFC 6265bis cookie attributes (Secure/HttpOnly/SameSite).
@@ -332,9 +428,10 @@ pub fn parse_set_cookie(value: &HeaderValue) -> Option<CookieAttributes> {
     let raw = value.to_str().ok()?;
     let mut segments = raw.split(';').map(str::trim);
     let name_value = segments.next()?;
-    let (name, _) = name_value.split_once('=')?;
+    let (name, value) = name_value.split_once('=')?;
     let mut attrs = CookieAttributes {
         name: name.trim().to_string(),
+        value: value.trim().to_string(),
         secure: false,
         http_only: false,
         same_site: None,
@@ -365,33 +462,16 @@ pub fn parse_set_cookie(value: &HeaderValue) -> Option<CookieAttributes> {
 }
 
 pub fn evaluate_cookie(attrs: &CookieAttributes, response_url: &str) -> String {
-    let secure_context = Url::parse(response_url)
-        .ok()
-        .map(|url| url.scheme() == "https")
-        .unwrap_or(false);
-
-    if attrs.same_site == Some(SameSitePolicy::None) && !attrs.secure {
-        return format!(
-            "Cookie '{}' rejected: SameSite=None requires Secure",
-            attrs.name
-        );
+    match evaluate_cookie_storage(attrs, response_url) {
+        CookieDisposition::Rejected(reason) => reason,
+        CookieDisposition::Accepted if attrs.http_only => {
+            format!(
+                "Cookie '{}' accepted with HttpOnly (hidden from scripts)",
+                attrs.name
+            )
+        }
+        CookieDisposition::Accepted => format!("Cookie '{}' accepted", attrs.name),
     }
-
-    if attrs.secure && !secure_context {
-        return format!(
-            "Cookie '{}' rejected: Secure attribute on non-HTTPS response",
-            attrs.name
-        );
-    }
-
-    if attrs.http_only {
-        return format!(
-            "Cookie '{}' accepted with HttpOnly (hidden from scripts)",
-            attrs.name
-        );
-    }
-
-    format!("Cookie '{}' accepted", attrs.name)
 }
 
 // Spec: Content Security Policy Level 3 baseline policy.
@@ -442,6 +522,132 @@ pub fn collect_cookie_diagnostics(headers: &HeaderMap, response_url: &str) -> Ve
         .filter_map(parse_set_cookie)
         .map(|cookie| evaluate_cookie(&cookie, response_url))
         .collect()
+}
+
+pub fn apply_set_cookie_headers(headers: &HeaderMap, response_url: &str) -> Vec<String> {
+    let Some(origin) = origin_key(response_url) else {
+        return Vec::new();
+    };
+    let Ok(mut state) = persistent_security_state().lock() else {
+        return collect_cookie_diagnostics(headers, response_url);
+    };
+
+    let jar = state.cookie_jar.entry(origin).or_default();
+    let mut diagnostics = Vec::new();
+    for attrs in headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(parse_set_cookie)
+    {
+        match evaluate_cookie_storage(&attrs, response_url) {
+            CookieDisposition::Rejected(reason) => diagnostics.push(reason),
+            CookieDisposition::Accepted => {
+                if let Some(existing) = jar.iter_mut().find(|cookie| cookie.name == attrs.name) {
+                    existing.value = attrs.value.clone();
+                    existing.secure = attrs.secure;
+                    existing.http_only = attrs.http_only;
+                    existing.same_site = attrs.same_site.clone();
+                } else {
+                    jar.push(StoredCookie {
+                        name: attrs.name.clone(),
+                        value: attrs.value.clone(),
+                        secure: attrs.secure,
+                        http_only: attrs.http_only,
+                        same_site: attrs.same_site.clone(),
+                    });
+                }
+                diagnostics.push(evaluate_cookie(&attrs, response_url));
+            }
+        }
+    }
+    diagnostics
+}
+
+pub fn cookie_header_value(request_url: &str, site_for_cookies_url: &str) -> Option<HeaderValue> {
+    let origin = origin_key(request_url)?;
+    let state = persistent_security_state().lock().ok()?;
+    let cookies = state.cookie_jar.get(&origin)?;
+
+    let value = cookies
+        .iter()
+        .filter(|cookie| can_send_cookie(cookie, request_url, site_for_cookies_url))
+        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if value.is_empty() {
+        return None;
+    }
+
+    HeaderValue::from_str(&value).ok()
+}
+
+pub fn attach_cookie_header(
+    headers: &mut HeaderMap,
+    request_url: &str,
+    site_for_cookies_url: &str,
+) -> bool {
+    let Some(value) = cookie_header_value(request_url, site_for_cookies_url) else {
+        return false;
+    };
+    headers.insert(COOKIE, value);
+    true
+}
+
+pub fn cache_permission_decision(initiator_url: &str, target_url: &str, allowed: bool) {
+    let Some(initiator_origin) = origin_key(initiator_url) else {
+        return;
+    };
+    let Some(target_origin) = origin_key(target_url) else {
+        return;
+    };
+    let Ok(mut state) = persistent_security_state().lock() else {
+        return;
+    };
+    state.permission_cache.insert(
+        (initiator_origin.clone(), target_origin.clone()),
+        PermissionCacheEntry {
+            initiator_origin,
+            target_origin,
+            allowed,
+            updated_at: Instant::now(),
+        },
+    );
+}
+
+pub fn local_storage_snapshot(url: &str) -> Vec<(String, String)> {
+    let Some(origin) = origin_key(url) else {
+        return Vec::new();
+    };
+    let Ok(state) = persistent_security_state().lock() else {
+        return Vec::new();
+    };
+    state
+        .local_storage
+        .get(&origin)
+        .map(|entries| {
+            let mut pairs = entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            pairs.sort_by(|left, right| left.0.cmp(&right.0));
+            pairs
+        })
+        .unwrap_or_default()
+}
+
+pub fn replace_local_storage(url: &str, entries: &[(String, String)]) {
+    let Some(origin) = origin_key(url) else {
+        return;
+    };
+    let Ok(mut state) = persistent_security_state().lock() else {
+        return;
+    };
+    let store = state.local_storage.entry(origin).or_default();
+    store.clear();
+    for (key, value) in entries {
+        store.insert(key.clone(), value.clone());
+    }
 }
 
 fn tls_exception_store() -> &'static Mutex<HashMap<String, Instant>> {
@@ -575,6 +781,61 @@ mod tests {
     }
 
     #[test]
+    fn set_cookie_updates_origin_scoped_jar_and_request_header() {
+        clear_persistent_state_for_tests();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SET_COOKIE,
+            HeaderValue::from_static("sid=abc; Secure; HttpOnly; SameSite=None"),
+        );
+
+        let diagnostics = apply_set_cookie_headers(&headers, "https://example.com/login");
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("HttpOnly")));
+
+        let header = cookie_header_value("https://example.com/app", "https://example.com/app")
+            .expect("cookie header");
+        assert_eq!(header.to_str().expect("cookie header str"), "sid=abc");
+    }
+
+    #[test]
+    fn insecure_same_site_none_cookie_is_rejected_and_not_stored() {
+        clear_persistent_state_for_tests();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SET_COOKIE,
+            HeaderValue::from_static("sid=abc; SameSite=None"),
+        );
+
+        let diagnostics = apply_set_cookie_headers(&headers, "https://example.com/login");
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("requires Secure")));
+        assert!(
+            cookie_header_value("https://example.com/app", "https://example.com/app").is_none()
+        );
+    }
+
+    #[test]
+    fn local_storage_snapshots_are_origin_scoped() {
+        clear_persistent_state_for_tests();
+
+        replace_local_storage(
+            "https://example.com/app",
+            &[("theme".to_string(), "dark".to_string())],
+        );
+
+        assert_eq!(
+            local_storage_snapshot("https://example.com/other"),
+            vec![("theme".to_string(), "dark".to_string())]
+        );
+        assert!(local_storage_snapshot("https://example.org/other").is_empty());
+    }
+
+    #[test]
     fn sandbox_policy_restricts_cross_origin() {
         let evaluation = evaluate_sandbox_policy(
             "https://app.example.com/root",
@@ -582,25 +843,22 @@ mod tests {
         );
         assert_eq!(evaluation.policy, SandboxPolicy::Strict);
         assert!(evaluation.allowed);
-        assert!(
-            evaluation
-                .diagnostics
-                .iter()
-                .any(|message| message.contains("cross-origin"))
-        );
+        assert!(evaluation
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("cross-origin")));
     }
 
     #[test]
     fn sandbox_policy_blocks_mixed_content() {
-        let evaluation = evaluate_sandbox_policy("https://secure.example.com", "http://legacy.test");
+        let evaluation =
+            evaluate_sandbox_policy("https://secure.example.com", "http://legacy.test");
         assert_eq!(evaluation.policy, SandboxPolicy::Strict);
         assert!(!evaluation.allowed);
-        assert!(
-            evaluation
-                .diagnostics
-                .iter()
-                .any(|message| message.contains("mixed-content"))
-        );
+        assert!(evaluation
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("mixed-content")));
     }
     #[test]
     fn cors_requires_preflight_for_non_simple_method() {
@@ -650,8 +908,14 @@ mod tests {
             ACCESS_CONTROL_ALLOW_ORIGIN,
             HeaderValue::from_static("https://app.example.com:443"),
         );
-        preflight_headers.insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("PUT"));
-        preflight_headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+        preflight_headers.insert(
+            ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("PUT"),
+        );
+        preflight_headers.insert(
+            ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("content-type"),
+        );
         let preflight = CorsPreflightResult {
             status: 204,
             headers: preflight_headers,

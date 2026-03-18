@@ -872,7 +872,7 @@ fn build_leaf_frame_view(
     // Spec mapping: HTML LS parsing + DOM Standard tree updates happen in the
     // layout/JS runtime stage, and resulting computed boxes are painted in
     // CSS Display + CSS2 visual formatting model order as `scene_items`.
-    let script_layout = build_layout_scene_with_script_runtime(html, &rect);
+    let script_layout = build_layout_scene_with_script_runtime(current_url, html, &rect);
     diagnostics.extend(script_layout.diagnostics.clone());
     if script_layout.dom_updated {
         diagnostics.push(RelayoutTrigger::DomChanged.as_diagnostic().to_string());

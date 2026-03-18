@@ -38,6 +38,10 @@ pub trait JsDomRuntimeBridge {
     fn dispatch_dom_event_by_id(&mut self, event: DomRuntimeEvent, target_id: &str);
 
     fn diagnostics(&self) -> Vec<String>;
+
+    fn replace_local_storage_entries(&mut self, entries: Vec<(String, String)>);
+
+    fn local_storage_entries(&self) -> Vec<(String, String)>;
 }
 
 impl JsDomRuntimeBridge for JsRuntime {
@@ -54,5 +58,13 @@ impl JsDomRuntimeBridge for JsRuntime {
 
     fn diagnostics(&self) -> Vec<String> {
         self.unsupported_apis()
+    }
+
+    fn replace_local_storage_entries(&mut self, entries: Vec<(String, String)>) {
+        JsRuntime::replace_local_storage(self, entries);
+    }
+
+    fn local_storage_entries(&self) -> Vec<(String, String)> {
+        JsRuntime::local_storage_entries(self)
     }
 }

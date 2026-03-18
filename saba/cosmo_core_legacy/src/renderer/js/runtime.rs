@@ -30,6 +30,7 @@ struct TimerTask {
 pub enum RuntimeValue {
     /// https://262.ecma-international.org/#sec-numeric-types
     Number(u64),
+    Null,
     StringLiteral(String),
     HtmlElement {
         object: Rc<RefCell<DomNode>>,
@@ -110,6 +111,7 @@ pub struct JsRuntime {
     next_timer_id: u64,
     render_pipeline_invalidated: bool,
     dom_content_loaded_listeners: Vec<String>,
+    local_storage: Vec<(String, String)>,
 }
 
 impl JsRuntime {
@@ -127,6 +129,7 @@ impl JsRuntime {
             next_timer_id: 1,
             render_pipeline_invalidated: false,
             dom_content_loaded_listeners: Vec::new(),
+            local_storage: Vec::new(),
         }
     }
 
@@ -181,6 +184,14 @@ impl JsRuntime {
 
     pub fn render_pipeline_invalidated(&self) -> bool {
         self.render_pipeline_invalidated
+    }
+
+    pub fn replace_local_storage(&mut self, entries: Vec<(String, String)>) {
+        self.local_storage = entries;
+    }
+
+    pub fn local_storage_entries(&self) -> Vec<(String, String)> {
+        self.local_storage.clone()
     }
 
     fn process_event_loop(&mut self) {
@@ -366,6 +377,74 @@ impl JsRuntime {
                 return (true, None);
             }
             self.report_unsupported_api("queueMicrotask(callback)/Promise.then".to_string());
+            return (true, None);
+        }
+
+        // Spec: HTML Standard Web Storage exposes a per-origin `Storage` object with
+        // string key/value pairs visible to scripts from that origin.
+        // https://html.spec.whatwg.org/multipage/webstorage.html#the-storage-interface
+        // Compliance note: this minimal runtime only exposes origin-scoped localStorage
+        // methods (`getItem`/`setItem`/`removeItem`/`clear`), and cookie state stays
+        // outside the script surface so HttpOnly cookies remain invisible to JS.
+        if func == &RuntimeValue::StringLiteral("localStorage.getItem".to_string()) {
+            if arguments.is_empty() {
+                self.report_unsupported_api("localStorage.getItem(key)".to_string());
+                return (true, None);
+            }
+            let key = self
+                .eval(&arguments[0], env.clone())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let value = self
+                .local_storage
+                .iter()
+                .find(|(stored_key, _)| stored_key == &key)
+                .map(|(_, value)| RuntimeValue::StringLiteral(value.clone()))
+                .unwrap_or(RuntimeValue::Null);
+            return (true, Some(value));
+        }
+
+        if func == &RuntimeValue::StringLiteral("localStorage.setItem".to_string()) {
+            if arguments.len() < 2 {
+                self.report_unsupported_api("localStorage.setItem(key, value)".to_string());
+                return (true, None);
+            }
+            let key = self
+                .eval(&arguments[0], env.clone())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let value = self
+                .eval(&arguments[1], env.clone())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            if let Some((_, stored_value)) = self
+                .local_storage
+                .iter_mut()
+                .find(|(stored_key, _)| stored_key == &key)
+            {
+                *stored_value = value;
+            } else {
+                self.local_storage.push((key, value));
+            }
+            return (true, None);
+        }
+
+        if func == &RuntimeValue::StringLiteral("localStorage.removeItem".to_string()) {
+            if arguments.is_empty() {
+                self.report_unsupported_api("localStorage.removeItem(key)".to_string());
+                return (true, None);
+            }
+            let key = self
+                .eval(&arguments[0], env.clone())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            self.local_storage
+                .retain(|(stored_key, _)| stored_key != &key);
+            return (true, None);
+        }
+
+        if func == &RuntimeValue::StringLiteral("localStorage.clear".to_string()) {
+            self.local_storage.clear();
             return (true, None);
         }
 
@@ -673,6 +752,7 @@ impl Display for RuntimeValue {
     fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
         let s = match self {
             RuntimeValue::Number(value) => format!("{}", value),
+            RuntimeValue::Null => "null".to_string(),
             RuntimeValue::StringLiteral(value) => value.to_string(),
             RuntimeValue::HtmlElement {
                 object,
@@ -747,6 +827,32 @@ mod tests {
             assert_eq!(expected[i], result);
             i += 1;
         }
+    }
+
+    #[test]
+    fn test_local_storage_api_round_trip() {
+        let dom = Rc::new(RefCell::new(DomNode::new(DomNodeKind::Document)));
+        let input = r#"
+            localStorage.setItem("theme", "dark");
+            localStorage.getItem("theme");
+        "#
+        .to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom);
+        let expected = [None, Some(RuntimeValue::StringLiteral("dark".to_string()))];
+        let mut i = 0;
+
+        for node in ast.body() {
+            let result = runtime.eval(&Some(node.clone()), runtime.env.clone());
+            assert_eq!(expected[i], result);
+            i += 1;
+        }
+        assert_eq!(
+            runtime.local_storage_entries(),
+            alloc::vec![("theme".to_string(), "dark".to_string())]
+        );
     }
 
     #[test]
