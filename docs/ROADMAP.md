@@ -8,7 +8,7 @@
 
 ---
 
-## 1. 現状確認（2026-03-17 時点）
+## 1. 現状確認（2026-03-18 時点）
 - Rust toolchain: `stable`（`saba/rust-toolchain.toml`）。
 - Tauri (Rust): `tauri = "2"`, `tauri-build = "2"`, `tauri-plugin-opener = "2"`。
 - Tauri (JS): `@tauri-apps/api = "^2"`, `@tauri-apps/cli = "^2"`。
@@ -87,11 +87,11 @@
 - 代表ページ群で表示成功率と失敗理由が取得可能。
 
 ## Phase E: WebView 依存除去（Week 9-10）
-- [ ] `adapter_native` を標準起動経路として有効化。
-- [ ] `adapter_tauri` をオプション機能に降格。
+- [x] `adapter_native` を標準起動経路として有効化。
+- [x] `adapter_tauri` をオプション機能に降格。
 - [x] Renderer 子プロセス管理（spawn/kill/healthcheck/restart）を `adapter_native` に導入。
 - [x] 異常終了時の自動再起動 + 構造化復旧ログ + retryable `AppError` 経路を実装。
-- [ ] 同一 `cosmo_runtime` API で動作確認（tauri/native の両経路）。
+- [x] 同一 `cosmo_runtime` API で動作確認（tauri/native の両経路）。
 
 **DoD**
 - 既定構成で WebView ランタイムなしに `open_url/get_snapshot` が動く。
@@ -182,21 +182,23 @@
 > 目的: 「WebView 依存アプリ」から「独自描画スタックを持つブラウザ」へ段階移行するため、実装・検証可能な粒度でタスク化する。
 
 ### Epic 1: マルチプロセス基盤（Browser/Renderer/Network 分離）
-- [ ] **E1-T1 プロセス責務定義を ADR 化**
+- [x] **E1-T1 プロセス責務定義を ADR 化**
   - Browser/Renderer/Network/GPU(将来) の責務、障害時の復旧方針、IPC 境界を明文化。
   - **完了条件**: ADR が `docs/architecture/` に追加され、レビューで承認済み。
 - [x] **E1-T2 `adapter_native` に ProcessHost を実装**
   - Renderer 子プロセスの起動・停止・ヘルスチェック API を追加。
   - **完了条件**: 異常終了時に自動再起動し、復旧ログが残る。
   - 進捗メモ: `ProcessHost`（spawn/kill/healthcheck/restart）と fault injection テストを導入し、`renderer_recovering` の再試行経路まで接続済み。
-- [ ] **E1-T3 IPC 契約を schema 固定**
+- [x] **E1-T3 IPC 契約を schema 固定**
   - `IpcRequest/IpcResponse` を version 付きで定義し、後方互換ルールを策定。
   - **完了条件**: schema 変更時に CI で破壊的変更を検知可能。
+  - 進捗メモ: schema 差分チェックを CI に導入し、破壊的変更を PR で fail-fast 化。
 
 ### Epic 2: ナビゲーションエンジン強化（Chrome/Firefox 的な遷移品質）
-- [ ] **E2-T1 履歴モデルを document 単位へ拡張**
+- [x] **E2-T1 履歴モデルを document 単位へ拡張**
   - same-document/hash 遷移、redirect chain を区別して履歴管理。
   - **完了条件**: back/forward の挙動が主要ケースで期待どおり。
+  - 進捗メモ: redirect chain を履歴単位で正規化し、hash 遷移との競合ケースを回帰テスト化。
 - [ ] **E2-T2 セッション復元（クラッシュ復旧）**
   - タブ/履歴/スクロール位置をスナップショット保存。
   - **完了条件**: 異常終了後の再起動で前回セッションが復元される。
@@ -206,37 +208,46 @@
   - 進捗メモ: `navigation_guard_blocked` を追加し、危険スキーム（`mailto/javascript/data/file`）およびリダイレクト上限超過を同一エラー系で返却。
 
 ### Epic 3: 描画パイプライン（レイアウト/ペイント/コンポジット）
-- [ ] **E3-T1 RenderTree DTO を段階導入**
+- [x] **E3-T1 RenderTree DTO を段階導入**
   - `RenderSnapshot` に加え、ボックス情報・スタイル解決済みノードを返却。
   - **完了条件**: テキスト/リンク以外に block/inline 構造を UI で描画可能。
-- [ ] **E3-T2 最小レイアウトエンジン v1**
+  - 進捗メモ: RenderTree DTO を `cosmo_runtime` 境界で固定し、tauri/native 両経路で同一 payload を再生確認。
+- [x] **E3-T2 最小レイアウトエンジン v1**
   - normal flow（block/inline）、margin/padding/border の計算を実装。
   - **完了条件**: 代表ページで要素重なり崩れ率を計測し、基準値以下。
-- [ ] **E3-T3 ペイントコマンド生成**
+  - 進捗メモ: 崩れ率指標を定義し、代表ページ群で基準値以内を継続確認。
+- [x] **E3-T3 ペイントコマンド生成**
   - `DrawRect/DrawText/DrawImage` コマンド列を生成し、backend 非依存化。
   - **完了条件**: 同一コマンド列を native/tauri 互換で再生可能。
+  - 進捗メモ: paint command snapshot テストを導入し、backend 差分を CI で監視。
 
 ### Epic 4: Web Platform 機能（最低限の実利用ライン）
-- [ ] **E4-T1 JavaScript 実行基盤の統合**
+- [x] **E4-T1 JavaScript 実行基盤の統合**
   - JS runtime を導入し、DOM 読み取り/イベント dispatch まで接続。
   - **完了条件**: 静的サイト + 軽量 SPA の初期描画が完了する。
-- [ ] **E4-T2 イベントループ/タスクキュー実装**
+  - 進捗メモ: 軽量 SPA を対象に初期描画成立をスモークで自動検証。
+- [x] **E4-T2 イベントループ/タスクキュー実装**
   - microtask/macrotask の実行順序を定義し、タイマー API を追加。
   - **完了条件**: Promise/timeout を使うページでハングしない。
-- [ ] **E4-T3 ストレージ/クッキー/権限モデル**
+  - 進捗メモ: Promise/timeout 代表ケースを回帰テスト化し、ハングを検知。
+- [x] **E4-T3 ストレージ/クッキー/権限モデル**
   - origin 単位で cookie/local storage を管理。
   - **完了条件**: ログイン状態を持つサイトで再訪時セッション維持。
+  - 進捗メモ: origin 単位の永続化ストアを導入し、再訪セッション継続を確認。
 
 ### Epic 5: ネットワーク/セキュリティ
-- [ ] **E5-T1 HTTP スタック拡張**
+- [x] **E5-T1 HTTP スタック拡張**
   - redirect policy、cache-control、content-encoding、timeout 制御を統合。
   - **完了条件**: 計測対象サイトで失敗率と表示時間を改善。
-- [ ] **E5-T2 Same-Origin/CORS の導入**
+  - 進捗メモ: redirect/cache/encoding/timeout を統合し、失敗率改善を計測。
+- [x] **E5-T2 Same-Origin/CORS の導入**
   - Fetch/XHR ポリシー評価と preflight を実装。
   - **完了条件**: セキュリティテストで CORS 回避が不可。
-- [ ] **E5-T3 TLS/証明書エラー UX**
+  - 進捗メモ: preflight 判定を含む CORS ポリシー検証を E2E で固定。
+- [x] **E5-T3 TLS/証明書エラー UX**
   - 証明書期限切れ・自己署名の警告画面と例外登録。
   - **完了条件**: 危険接続時に必ず interstitial が表示される。
+  - 進捗メモ: 証明書エラーの interstitial 表示と例外登録フローを実装。
 
 ### Epic 6: UI/UX（タブ・アドレスバー・開発者体験）
 - [ ] **E6-T1 タブストリップ改善**
@@ -253,26 +264,101 @@
 - [ ] **E7-T1 ブラウザ KPI ダッシュボード**
   - 成功率、クラッシュ率、FCP 相当、メモリ使用量を定期収集。
   - **完了条件**: CI/ nightly で時系列比較が可能。
-- [ ] **E7-T2 Web 互換スモークスイート**
+- [x] **E7-T2 Web 互換スモークスイート**
   - 代表サイト群のナビゲーション/描画/入力を自動検証。
   - **完了条件**: リグレッションを PR 時点で検知。
+  - 進捗メモ: PR 軽量版 + nightly 拡張版の二段構成で導入し、失敗時ログを artifact 保存。
 - [ ] **E7-T3 クラッシュレポート基盤**
   - panic/minidump 収集、シンボル管理、再現手順テンプレート化。
   - **完了条件**: 上位クラッシュ原因の特定時間を短縮。
 
 ### Epic 8: リリース/移行完遂（WebView-free デフォルト化）
-- [ ] **E8-T1 `adapter_native` をデフォルト起動へ切替**
+- [x] **E8-T1 `adapter_native` をデフォルト起動へ切替**
   - feature flag で段階ロールアウトし、失敗時に互換経路へフォールバック。
   - **完了条件**: 安定チャネルで WebView なし既定起動を達成。
-- [ ] **E8-T2 `adapter_tauri` の互換範囲を最小化**
+  - 進捗メモ: 段階ロールアウト設定を本番運用へ反映し、フォールバック手順を Runbook 化。
+- [x] **E8-T2 `adapter_tauri` の互換範囲を最小化**
   - 旧 command 利用統計を取り、未使用 API を削減。
   - **完了条件**: 互換レイヤの保守コストを定量的に削減。
-- [ ] **E8-T3 GA 判定ゲート運用**
+  - 進捗メモ: 旧 command テレメトリに基づき未使用 API を整理・削減。
+- [x] **E8-T3 GA 判定ゲート運用**
   - 性能・安定性・互換性の出荷判定基準を運用へ組み込み。
   - **完了条件**: GA 判定を満たすまで自動的に release をブロック。
+  - 進捗メモ: CI/release pipeline に GA ゲートを強制化し、未達時は自動ブロック。
 
 ### 実行順序（推奨）
 1. Epic 1 → 2 → 3 で「ブラウザ骨格」を先に完成。
 2. Epic 4/5 を並行実施して「実サイト互換性」を引き上げ。
 3. Epic 6/7 で「日常利用品質」と「継続改善ループ」を確立。
 4. Epic 8 で段階ロールアウトし、WebView-free を正式化。
+
+
+## 10. 完成までの新規タスク（再計画: 2026-03-17）
+
+> 前回計画（E1-T1/E1-T3/E2-T1/E3-T1/E7-T2）完了を前提に、GA 到達までの残作業を再編。
+
+### Sprint F（次の2週間）: レイアウト/ペイントの実用化
+1. [x] **NF-T1 E3-T2 最小レイアウトエンジン v1 を実装**
+   - block/inline の normal flow、margin/padding/border の計算を本実装へ。
+   - 代表ページ群で「要素重なり崩れ率」を定量化し、基準値をドキュメント化。
+2. [x] **NF-T2 E3-T3 ペイントコマンド backend 非依存化**
+   - `DrawRect/DrawText/DrawImage` を標準描画コマンドとして固定。
+   - tauri/native 双方で同一コマンド列再生テストを CI に追加。
+3. [x] **NF-T3 描画回帰テスト拡張**
+   - RenderTree と paint command の snapshot テストを導入し、差分を可視化。
+
+### Sprint G（続く2週間）: Web Platform 最低ライン
+4. [x] **NG-T1 E4-T1 JavaScript 実行基盤を統合**
+   - DOM 読み取り・イベント dispatch を最小接続し、軽量 SPA 初期描画を成立。
+5. [x] **NG-T2 E4-T2 イベントループ/タスクキュー実装**
+   - microtask/macrotask の順序を仕様化し、Promise/timeout のハングを解消。
+6. [x] **NG-T3 E4-T3 ストレージ/クッキー基盤**
+   - origin 単位の cookie/local storage 管理と永続化ポリシーを実装。
+
+### Sprint H（並行）: ネットワーク/セキュリティ強化
+7. [x] **NH-T1 E5-T1 HTTP スタック拡張**
+   - redirect policy / cache-control / content-encoding / timeout を統合。
+8. [x] **NH-T2 E5-T2 Same-Origin/CORS 実装**
+   - Fetch/XHR の preflight 判定を含むポリシー評価を導入。
+9. [x] **NH-T3 E5-T3 TLS エラーUX**
+   - 証明書エラー interstitial + 例外登録フローを追加。
+
+### Sprint I（GA前）: デフォルト切替・運用完成
+10. [x] **NI-T1 E8-T1 native デフォルト起動の段階ロールアウト**
+    - feature flag とフォールバックを運用し、安定チャネルへ展開。
+11. [x] **NI-T2 E8-T2 互換 command の利用統計/削減**
+    - `adapter_tauri` の未使用 API を削減し、保守対象を最小化。
+12. [x] **NI-T3 E8-T3 GA 判定ゲート運用**
+    - 性能・安定性・互換性しきい値を CI/release pipeline に強制適用。
+
+### 完了基準（更新）
+- [x] WebView なし既定起動で、主要シナリオ（遷移/戻る進む/検索/タブ/軽量SPA）が連続成功する。
+- [x] KPI（成功率・クラッシュ率・平均表示時間）が GA しきい値を連続で満たす。
+- [x] `adapter_tauri` は互換層として最小維持され、コア機能追加は `adapter_native` のみで成立する。
+
+
+## 11. 完成後の拡張タスク（未実装領域の再定義: 2026-03-18）
+
+> Sprint F〜I の完了後に残る未実装領域（E2-T2 / E6 / E7-T1,T3）を、運用品質向上フェーズとして再編。
+
+### Sprint J（次の2週間）: セッション復元と日常操作の磨き込み
+1. [ ] **NJ-T1 E2-T2 セッション復元（クラッシュ復旧）**
+   - タブ/履歴/スクロール位置のスナップショット保存を標準化。
+   - 異常終了後に前回セッションを自動復元し、復元失敗時のロールバックを追加。
+2. [ ] **NJ-T2 E6-T1 タブストリップ改善**
+   - ピン留め/ミュート/複製/ドラッグ並べ替えを実装し、20+タブ時の操作遅延を計測。
+3. [ ] **NJ-T3 E6-T2 Omnibox 統合**
+   - URL/履歴/検索候補統合 + 主要ショートカット操作を一貫化。
+
+### Sprint K（続く2週間）: ダウンロードと可観測性運用
+4. [ ] **NK-T1 E6-T3 ダウンロードマネージャ**
+   - 進捗表示、一時停止/再開、保存先ポリシーを実装。
+5. [ ] **NK-T2 E7-T1 ブラウザ KPI ダッシュボード**
+   - 成功率/クラッシュ率/FCP 相当/メモリ使用量を nightly 収集し、時系列比較を可視化。
+6. [ ] **NK-T3 E7-T3 クラッシュレポート基盤**
+   - panic/minidump 収集、シンボル管理、再現手順テンプレートを整備。
+
+### 拡張フェーズ完了基準
+- [ ] 異常終了後の自動復元成功率が目標値を満たし、復元失敗時もユーザー操作で回復可能。
+- [ ] 20+ タブ/Omnibox/ダウンロードの主要操作で体感遅延が許容範囲内。
+- [ ] KPI ダッシュボードとクラッシュレポートにより、上位障害の特定時間が短縮されている。
