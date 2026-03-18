@@ -341,14 +341,14 @@ function parseAppError(errorValue: unknown): AppError {
 function formatError(errorValue: unknown): string {
   const error = parseAppError(errorValue);
   const descriptions: Record<string, string> = {
-    network_timeout: "通信がタイムアウトしました。ネットワーク状態を確認してください。",
-    network_redirect_loop: "リダイレクトが多すぎるため遷移を中断しました。",
-    network_content_decoding: "レスポンスの展開に失敗しました。",
-    cors_blocked: "CORS ポリシーにより応答の参照が拒否されました。",
-    cors_preflight_failed: "CORS preflight 検証に失敗しました。",
-    tls_error: "証明書または TLS 設定を検証できません。",
-    tls_certificate_expired: "証明書の有効期限が切れています。",
-    tls_certificate_self_signed: "自己署名証明書のため接続を保護できません。",
+    network_timeout: "The request timed out. Check your network connection and try again.",
+    network_redirect_loop: "Navigation was stopped because the redirect chain exceeded the limit.",
+    network_content_decoding: "The response body could not be decoded successfully.",
+    cors_blocked: "The response was blocked by the CORS policy.",
+    cors_preflight_failed: "The CORS preflight validation failed.",
+    tls_error: "The certificate or TLS configuration could not be validated.",
+    tls_certificate_expired: "The certificate has expired.",
+    tls_certificate_self_signed: "The connection uses a self-signed certificate and cannot be trusted automatically.",
   };
   const base = descriptions[error.code] ? `${descriptions[error.code]} (${error.code})` : error.code;
   return `${base}: ${error.message}`;
@@ -365,7 +365,7 @@ async function registerTlsExceptionAndRetry(url: string) {
   // Ref: browser interstitial UX guidance for dangerous TLS connections.
   try {
     await invokeIpc<boolean>({ type: "register_tls_exception", payload: { url } });
-    setStatus("一時的な証明書例外を登録しました。再接続しています…");
+    setStatus("A temporary certificate exception was registered. Retrying the connection...");
     await openUrl(url);
   } catch (errorValue) {
     handleCommandError(errorValue, url);
@@ -385,24 +385,24 @@ function maybeRenderSecurityInterstitial(context: ErrorContext) {
   securityInterstitialEl.innerHTML = "";
 
   const heading = document.createElement("h3");
-  heading.textContent = "危険な接続が検出されました";
+  heading.textContent = "Potentially unsafe connection detected";
   const detail = document.createElement("p");
   detail.textContent = `${formatError(appError)}
 URL: ${requestedUrl}`;
   const guidance = document.createElement("p");
-  guidance.textContent = "この接続は改ざん・盗聴の危険があります。理解した場合のみ一時的に続行してください。";
+  guidance.textContent = "This connection may expose the page to interception or tampering. Proceed only if you understand the risk.";
 
   const actions = document.createElement("div");
   actions.className = "interstitial-actions";
   const backButton = document.createElement("button");
   backButton.type = "button";
-  backButton.textContent = "戻る";
+  backButton.textContent = "Go back";
   backButton.addEventListener("click", () => hideSecurityInterstitial());
 
   const proceedButton = document.createElement("button");
   proceedButton.type = "button";
   proceedButton.className = "danger-button";
-  proceedButton.textContent = "理解して続行（15分）";
+  proceedButton.textContent = "Proceed anyway (15 min)";
   proceedButton.addEventListener("click", () => void registerTlsExceptionAndRetry(requestedUrl));
 
   actions.append(backButton, proceedButton);
