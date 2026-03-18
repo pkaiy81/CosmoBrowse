@@ -1,7 +1,10 @@
 use adapter_native::{BrowserPageDto, CrashReportDto, IpcRequest, IpcResponse, NativeAdapter};
-use cosmo_runtime::{AppError, AppMetricsSnapshot, NavigationState, SearchResult, TabSummary};
+use cosmo_runtime::{AppError, NavigationState, SearchResult, TabSummary};
+use serde::Serialize;
 use std::backtrace::Backtrace;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +14,16 @@ struct AppState {
     adapter: NativeAdapter,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ReleaseRolloutStatus {
+    channel: String,
+    native_default_enabled: bool,
+    adapter_tauri_fallback_enabled: bool,
+    rollout_percentage: u8,
+    assignment_bucket: u8,
+    assigned_transport: String,
+}
 
 #[tauri::command]
 fn dispatch_ipc(
@@ -72,13 +85,39 @@ fn get_navigation_state(state: tauri::State<'_, AppState>) -> Result<NavigationS
 }
 
 #[tauri::command]
-fn get_metrics(state: tauri::State<'_, AppState>) -> Result<AppMetricsSnapshot, AppError> {
-    state.adapter.get_metrics()
-}
+fn release_rollout_status() -> ReleaseRolloutStatus {
+    let channel = std::env::var("COSMO_RELEASE_CHANNEL").unwrap_or_else(|_| "stable".to_string());
+    let rollout_percentage = std::env::var("COSMO_NATIVE_DEFAULT_ROLLOUT_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .map(|value| value.min(100))
+        .unwrap_or_else(|| default_rollout_percentage(&channel));
+    let assignment_bucket = stable_rollout_bucket();
+    let adapter_tauri_fallback_enabled = std::env::var("COSMO_DISABLE_ADAPTER_TAURI_FALLBACK")
+        .map(|value| value != "1")
+        .unwrap_or(true);
+    let assigned_transport = std::env::var("COSMO_FORCE_TRANSPORT")
+        .ok()
+        .filter(|value| matches!(value.as_str(), "adapter_native" | "adapter_tauri"));
 
-#[tauri::command]
-fn get_latest_crash_report(state: tauri::State<'_, AppState>) -> Option<CrashReportDto> {
-    state.adapter.get_latest_crash_report()
+    let native_default_enabled = match assigned_transport.as_deref() {
+        Some("adapter_native") => true,
+        Some("adapter_tauri") => false,
+        _ => assignment_bucket < rollout_percentage,
+    };
+
+    ReleaseRolloutStatus {
+        channel,
+        native_default_enabled,
+        adapter_tauri_fallback_enabled,
+        rollout_percentage,
+        assignment_bucket,
+        assigned_transport: if native_default_enabled {
+            "adapter_native".to_string()
+        } else {
+            "adapter_tauri".to_string()
+        },
+    }
 }
 
 #[tauri::command]
@@ -152,6 +191,29 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn default_rollout_percentage(channel: &str) -> u8 {
+    match channel {
+        "dev" | "nightly" => 100,
+        "beta" => 50,
+        _ => 10,
+    }
+}
+
+fn stable_rollout_bucket() -> u8 {
+    let fingerprint = std::env::var("COSMO_ROLLOUT_DEVICE_ID")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "anonymous-device".to_string());
+    let mut hasher = DefaultHasher::new();
+    // Release rollout buckets must remain stable across launches so the same
+    // device stays on the same transport until operators intentionally change
+    // the percentage or force a rollback.
+    fingerprint.hash(&mut hasher);
+    (hasher.finish() % 100) as u8
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_crash_hook();
@@ -168,8 +230,7 @@ pub fn run() {
             back,
             forward,
             get_navigation_state,
-            get_metrics,
-            get_latest_crash_report,
+            release_rollout_status,
             new_tab,
             switch_tab,
             close_tab,

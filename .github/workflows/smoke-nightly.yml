@@ -13,10 +13,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: run nightly smoke regression
         run: python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly
-      - name: upload smoke artifacts on failure
-        if: failure()
+      - name: collect legacy command usage
+        run: python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/nightly/legacy-command-usage.json
+      - name: evaluate nightly GA gate snapshot
+        run: |
+          python3 scripts/evaluate_release_gate.py \
+            --kpi-summary smoke-artifacts/nightly/kpi_summary.json \
+            --layout-summary smoke-artifacts/nightly/layout_regression_summary.json \
+            --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json \
+            --report-out smoke-artifacts/nightly/ga-gate-report.json \
+            --required-consecutive-passes 1
+      - name: upload nightly smoke artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-regression-nightly-failure
+          name: smoke-regression-nightly
           path: smoke-artifacts/nightly
+          if-no-files-found: warn
+      - name: upload GA gate history artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ga-gate-nightly
+          path: smoke-artifacts/nightly/ga-gate-report.json
           if-no-files-found: warn

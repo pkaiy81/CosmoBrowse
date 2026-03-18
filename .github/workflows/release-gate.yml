@@ -1,0 +1,39 @@
+name: release-gate
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  block_until_ga:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: download recent nightly GA history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/download_ga_history.py \
+            --output-dir release-artifacts/ga-history \
+            --limit 3
+      - name: require consecutive GA passes before release
+        run: |
+          python3 scripts/check_release_streak.py \
+            --history-dir release-artifacts/ga-history \
+            --report-out release-artifacts/release-gate-report.json \
+            --required-consecutive-passes 3
+      - name: print release gate report
+        if: always()
+        run: cat release-artifacts/release-gate-report.json
+      - name: upload release gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-report
+          path: release-artifacts/release-gate-report.json
+          if-no-files-found: warn

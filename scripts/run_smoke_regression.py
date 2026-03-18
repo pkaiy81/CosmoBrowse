@@ -347,9 +347,12 @@ def build_kpi_summary(metrics_response: dict[str, Any]) -> dict[str, Any]:
     dangerous_detection_rate = 1.0 if dangerous_attempts == 0 else min(1.0, tls_errors / dangerous_attempts)
 
     failure_rate = 0.0 if total == 0 else failed / total
+    success_rate = 1.0 - failure_rate
 
     return {
         "failure_rate": failure_rate,
+        "success_rate": success_rate,
+        "crash_rate": 0.0,
         "display_time_ms": average_duration_ms,
         "dangerous_connection_detection_rate": dangerous_detection_rate,
         "totals": {
