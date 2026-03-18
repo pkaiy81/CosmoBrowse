@@ -1,7 +1,7 @@
 use crate::layout::{build_layout_scene_with_script_runtime, RelayoutTrigger};
 use crate::loader::{
-    build_frame_id, fetch_document, parse_frameset_document, prepare_html_for_display, resolve_url,
-    FramesetChild, FramesetSpec, LoadedDocument,
+    build_frame_id, fetch_document, parse_frameset_document, prepare_html_for_display,
+    register_tls_exception_for_url, resolve_url, FramesetChild, FramesetSpec, LoadedDocument,
 };
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
@@ -169,6 +169,11 @@ impl AppService for SabaApp {
 }
 
 impl SabaApp {
+    pub fn register_tls_exception(&mut self, url: &str) -> AppResult<()> {
+        register_tls_exception_for_url(url)?;
+        Ok(())
+    }
+
     fn active_session_mut(&mut self) -> AppResult<&mut BrowserSession> {
         self.tabs
             .iter_mut()

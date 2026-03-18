@@ -29,6 +29,7 @@ IPC_SCHEMA = {
                     "close_tab",
                     "list_tabs",
                     "search",
+                    "register_tls_exception",
                 ],
             },
             "payload": {"type": "object"},
@@ -107,6 +108,13 @@ IPC_SCHEMA = {
                 "properties": {"query": {"type": "string"}},
             },
             "response_type": "search_results",
+        },
+        "register_tls_exception": {
+            "request_payload": {
+                "required": ["url"],
+                "properties": {"url": {"type": "string"}},
+            },
+            "response_type": "ack",
         },
     },
 }

@@ -1,13 +1,15 @@
 use crate::model::{AppError, AppResult, FrameRect};
 use crate::security::{
-    classify_tls_policy_error, collect_cookie_diagnostics, evaluate_sandbox_policy,
-    passes_cors,
+    classify_tls_policy_error, collect_cookie_diagnostics, evaluate_cors_request,
+    evaluate_sandbox_policy, has_tls_exception, register_tls_exception, CorsRequest,
+    CredentialsMode,
 };
 use encoding_rs::{Encoding, SHIFT_JIS, UTF_8};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{
-    CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, HeaderMap, HeaderValue,
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, HeaderMap,
+    HeaderValue,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -15,6 +17,9 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 const MAX_REDIRECTS: usize = 10;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const TLS_EXCEPTION_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
 struct CachedEntry {
@@ -82,7 +87,6 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
 
     // Spec: TLS profile and certificate verification rely on reqwest/rustls defaults.
     // https://datatracker.ietf.org/doc/html/rfc8446
-    let client = shared_http_client();
     let request = FetchRequest {
         url: url.to_string(),
     };
@@ -92,7 +96,7 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     // https://www.rfc-editor.org/rfc/rfc9110
     // Spec: RFC 9111 cache validators and freshness model.
     // https://www.rfc-editor.org/rfc/rfc9111
-    let response = fetch_with_pipeline(client, &request, &mut diagnostics)?;
+    let response = fetch_with_pipeline(&request, &mut diagnostics)?;
 
     validate_response_security(url, &response.final_url, &response.headers, &mut diagnostics);
 
@@ -109,15 +113,55 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     })
 }
 
+
+// Spec: certificate exception is a user-explicit, origin-scoped temporary override.
+// Ref: RFC 5280 validation and browser interstitial exception UX constraints.
+// https://www.rfc-editor.org/rfc/rfc5280
+pub fn register_tls_exception_for_url(url: &str) -> AppResult<String> {
+    register_tls_exception(url, TLS_EXCEPTION_TTL)
+}
+
 fn shared_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         Client::builder()
             .pool_max_idle_per_host(8)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build shared HTTP client")
     })
+}
+
+fn insecure_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(2)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .danger_accept_invalid_certs(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to build insecure HTTP client")
+    })
+}
+
+fn select_http_client(url: &str, diagnostics: &mut Vec<String>) -> &'static Client {
+    // Spec: certificate errors must fail closed unless a user-scoped exception was
+    // explicitly registered via interstitial UX.
+    // Ref: RFC 5280 certificate validation + RFC 6797 fail-closed transport intent.
+    // https://www.rfc-editor.org/rfc/rfc5280
+    // https://www.rfc-editor.org/rfc/rfc6797
+    if has_tls_exception(url) {
+        diagnostics.push(format!(
+            "TLS exception applied for origin while fetching {} (temporary override)",
+            url
+        ));
+        return insecure_http_client();
+    }
+    shared_http_client()
 }
 
 fn response_cache() -> &'static Mutex<HashMap<String, CachedEntry>> {
@@ -126,7 +170,6 @@ fn response_cache() -> &'static Mutex<HashMap<String, CachedEntry>> {
 }
 
 fn fetch_with_pipeline(
-    client: &Client,
     request: &FetchRequest,
     diagnostics: &mut Vec<String>,
 ) -> AppResult<FetchResponse> {
@@ -135,6 +178,7 @@ fn fetch_with_pipeline(
 
     loop {
         let cached = lookup_cache_entry(&current_url);
+        let client = select_http_client(&current_url, diagnostics);
         let mut builder = client.get(&current_url);
         if let Some(entry) = &cached {
             if let Some(etag) = &entry.etag {
@@ -152,7 +196,7 @@ fn fetch_with_pipeline(
 
         if status.is_redirection() {
             if redirect_count >= MAX_REDIRECTS {
-                return Err(AppError::navigation_guard(format!(
+                return Err(AppError::network_redirect_loop(format!(
                     "Redirect limit exceeded while fetching {}",
                     request.url
                 )));
@@ -177,7 +221,7 @@ fn fetch_with_pipeline(
                     final_url: entry.final_url,
                     content_type: entry.content_type,
                     body: entry.html.into_bytes(),
-                    diagnostics: Vec::new(),
+                    diagnostics: diagnostics.clone(),
                     headers,
                 });
             }
@@ -188,16 +232,22 @@ fn fetch_with_pipeline(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        if let Some(content_encoding) = headers
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+        {
+            diagnostics.push(format!("content-encoding negotiated: {content_encoding}"));
+        }
         let body = response
             .bytes()
-            .map_err(|error| AppError::network(format!("Failed to read response body: {error}")))?
+            .map_err(classify_request_error)?
             .to_vec();
 
         return Ok(FetchResponse {
             final_url,
             content_type,
             body,
-            diagnostics: Vec::new(),
+            diagnostics: diagnostics.clone(),
             headers,
         });
     }
@@ -275,10 +325,17 @@ fn validate_response_security(
     headers: &HeaderMap,
     diagnostics: &mut Vec<String>,
 ) {
-    if !passes_cors(initiator_url, final_url, headers) {
+    let cors_request = CorsRequest {
+        initiator_url,
+        target_url: final_url,
+        method: "GET",
+        request_headers: Vec::new(),
+        credentials_mode: CredentialsMode::Omit,
+    };
+    if let Err(error) = evaluate_cors_request(&cors_request, headers, None) {
         diagnostics.push(format!(
-            "CORS policy blocked cross-origin read: {} -> {}",
-            initiator_url, final_url
+            "CORS evaluation blocked cross-origin read: {} -> {} ({})",
+            initiator_url, final_url, error.code
         ));
     }
 
@@ -483,6 +540,12 @@ pub fn load_fixture_document(url: &str) -> Option<LoadedDocument> {
 
 fn classify_request_error(error: reqwest::Error) -> AppError {
     let message = format!("Failed to fetch URL: {error}");
+    if error.is_timeout() {
+        return AppError::network_timeout(message);
+    }
+    if error.is_decode() {
+        return AppError::network_content_decoding(message);
+    }
     classify_tls_policy_error(&message)
 }
 

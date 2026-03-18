@@ -138,6 +138,11 @@ type EmbeddedNavigationMessage = {
   target: string;
 };
 
+type ErrorContext = {
+  appError: AppError;
+  requestedUrl?: string;
+};
+
 type IpcRequest = {
   version: number;
   type: string;
@@ -178,6 +183,7 @@ let networkLogEl: HTMLElement | null;
 let consoleLogEl: HTMLElement | null;
 let domSnapshotEl: HTMLElement | null;
 let crashReportEl: HTMLElement | null;
+let securityInterstitialEl: HTMLElement | null;
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
 let pageEpoch = 0;
@@ -323,11 +329,90 @@ function setNavButtons(nav: NavigationState) {
   if (forwardButtonEl) forwardButtonEl.disabled = !nav.can_forward;
 }
 
-function formatError(errorValue: unknown): string {
+function parseAppError(errorValue: unknown): AppError {
   const error = errorValue as Partial<AppError>;
-  const code = error.code ?? "unknown_error";
-  const message = error.message ?? "Unknown error";
-  return `${code}: ${message}`;
+  return {
+    code: error.code ?? "unknown_error",
+    message: error.message ?? "Unknown error",
+    retryable: Boolean(error.retryable),
+  };
+}
+
+function formatError(errorValue: unknown): string {
+  const error = parseAppError(errorValue);
+  const descriptions: Record<string, string> = {
+    network_timeout: "The request timed out. Check your network connection and try again.",
+    network_redirect_loop: "Navigation was stopped because the redirect chain exceeded the limit.",
+    network_content_decoding: "The response body could not be decoded successfully.",
+    cors_blocked: "The response was blocked by the CORS policy.",
+    cors_preflight_failed: "The CORS preflight validation failed.",
+    tls_error: "The certificate or TLS configuration could not be validated.",
+    tls_certificate_expired: "The certificate has expired.",
+    tls_certificate_self_signed: "The connection uses a self-signed certificate and cannot be trusted automatically.",
+  };
+  const base = descriptions[error.code] ? `${descriptions[error.code]} (${error.code})` : error.code;
+  return `${base}: ${error.message}`;
+}
+
+function hideSecurityInterstitial() {
+  if (!securityInterstitialEl) return;
+  securityInterstitialEl.classList.add("hidden");
+  securityInterstitialEl.innerHTML = "";
+}
+
+async function registerTlsExceptionAndRetry(url: string) {
+  // Spec: certificate exception registration must be explicit user action.
+  // Ref: browser interstitial UX guidance for dangerous TLS connections.
+  try {
+    await invokeIpc<boolean>({ type: "register_tls_exception", payload: { url } });
+    setStatus("A temporary certificate exception was registered. Retrying the connection...");
+    await openUrl(url);
+  } catch (errorValue) {
+    handleCommandError(errorValue, url);
+  }
+}
+
+function maybeRenderSecurityInterstitial(context: ErrorContext) {
+  if (!securityInterstitialEl) return;
+  const { appError, requestedUrl } = context;
+  const tlsCodes = new Set(["tls_error", "tls_certificate_expired", "tls_certificate_self_signed"]);
+  if (!tlsCodes.has(appError.code) || !requestedUrl) {
+    hideSecurityInterstitial();
+    return;
+  }
+
+  securityInterstitialEl.classList.remove("hidden");
+  securityInterstitialEl.innerHTML = "";
+
+  const heading = document.createElement("h3");
+  heading.textContent = "Potentially unsafe connection detected";
+  const detail = document.createElement("p");
+  detail.textContent = `${formatError(appError)}
+URL: ${requestedUrl}`;
+  const guidance = document.createElement("p");
+  guidance.textContent = "This connection may expose the page to interception or tampering. Proceed only if you understand the risk.";
+
+  const actions = document.createElement("div");
+  actions.className = "interstitial-actions";
+  const backButton = document.createElement("button");
+  backButton.type = "button";
+  backButton.textContent = "Go back";
+  backButton.addEventListener("click", () => hideSecurityInterstitial());
+
+  const proceedButton = document.createElement("button");
+  proceedButton.type = "button";
+  proceedButton.className = "danger-button";
+  proceedButton.textContent = "Proceed anyway (15 min)";
+  proceedButton.addEventListener("click", () => void registerTlsExceptionAndRetry(requestedUrl));
+
+  actions.append(backButton, proceedButton);
+  securityInterstitialEl.append(heading, detail, guidance, actions);
+}
+
+function handleCommandError(errorValue: unknown, requestedUrl?: string) {
+  const appError = parseAppError(errorValue);
+  setStatus(formatError(appError), "error");
+  maybeRenderSecurityInterstitial({ appError, requestedUrl });
 }
 
 function clearSearchResults() {
@@ -473,6 +558,7 @@ async function refreshCrashReport() {
 }
 
 function renderPageView(view: PageViewModel) {
+  hideSecurityInterstitial();
   if (currentUrlEl) currentUrlEl.textContent = view.current_url ? `URL: ${view.current_url}` : "URL: (none)";
   if (pageTitleEl) pageTitleEl.textContent = view.title || "New Tab";
   if (urlInputEl && view.current_url) urlInputEl.value = view.current_url;
@@ -536,7 +622,7 @@ async function executeNavigationCommand(command: string, loadingMessage: string)
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue);
   }
 }
 
@@ -552,7 +638,7 @@ async function openUrl(url: string) {
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue, url);
   }
 }
 
@@ -580,7 +666,7 @@ async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
       await openExternalNavigation(message.href);
       setStatus(`Opened externally: ${message.href}`);
     } catch (errorValue) {
-      setStatus(formatError(errorValue), "error");
+      handleCommandError(errorValue);
     }
     return;
   }
@@ -602,7 +688,7 @@ async function handleEmbeddedNavigation(message: EmbeddedNavigationMessage) {
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue, message.href);
   }
 }
 async function openCurrentInput() {
@@ -623,7 +709,7 @@ async function openCurrentInput() {
     renderSearchResults(results);
     setStatus(`Found ${results.length} search results.`);
   } catch (errorValue) {
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue);
   }
 }
 
@@ -638,7 +724,7 @@ async function switchTab(id: number) {
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue);
   }
 }
 
@@ -655,7 +741,7 @@ async function closeTab(id: number) {
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue);
   }
 }
 
@@ -672,7 +758,7 @@ async function createTab() {
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
-    setStatus(formatError(errorValue), "error");
+    handleCommandError(errorValue);
   }
 }
 
@@ -715,6 +801,7 @@ window.addEventListener("DOMContentLoaded", () => {
   consoleLogEl = document.querySelector("#console-log");
   domSnapshotEl = document.querySelector("#dom-snapshot");
   crashReportEl = document.querySelector("#crash-report");
+  securityInterstitialEl = document.querySelector("#security-interstitial");
 
   document.querySelector("#url-form")?.addEventListener("submit", (event) => {
     event.preventDefault();

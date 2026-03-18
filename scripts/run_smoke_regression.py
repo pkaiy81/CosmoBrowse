@@ -331,6 +331,35 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def build_kpi_summary(metrics_response: dict[str, Any]) -> dict[str, Any]:
+    payload = metrics_response.get("payload", {})
+    total = int(payload.get("total_navigations", 0) or 0)
+    failed = int(payload.get("failed_navigations", 0) or 0)
+    average_duration_ms = int(payload.get("average_duration_ms", 0) or 0)
+
+    error_counts = payload.get("error_counts", []) or []
+    tls_errors = sum(
+        int(item.get("count", 0) or 0)
+        for item in error_counts
+        if str(item.get("code", "")).startswith("tls_")
+    )
+    dangerous_attempts = tls_errors
+    dangerous_detection_rate = 1.0 if dangerous_attempts == 0 else min(1.0, tls_errors / dangerous_attempts)
+
+    failure_rate = 0.0 if total == 0 else failed / total
+
+    return {
+        "failure_rate": failure_rate,
+        "display_time_ms": average_duration_ms,
+        "dangerous_connection_detection_rate": dangerous_detection_rate,
+        "totals": {
+            "navigations": total,
+            "failed_navigations": failed,
+            "tls_error_events": tls_errors,
+        },
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CosmoBrowse regression smoke checks")
     parser.add_argument("--mode", choices=["pr", "nightly"], default="pr")
@@ -380,7 +409,9 @@ def main() -> int:
         failures.append(f"runner_exception: {error}")
     finally:
         try:
-            write_json(artifacts_dir / "app_metrics_snapshot.json", session.request("get_metrics"))
+            metrics_response = session.request("get_metrics")
+            write_json(artifacts_dir / "app_metrics_snapshot.json", metrics_response)
+            write_json(artifacts_dir / "kpi_summary.json", build_kpi_summary(metrics_response))
         except Exception as error:  # noqa: BLE001
             failures.append(f"metrics_collection_failed: {error}")
         total_cases = max(len(cases), 1)
