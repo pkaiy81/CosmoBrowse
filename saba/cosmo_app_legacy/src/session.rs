@@ -5,8 +5,10 @@ use crate::loader::{
 };
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
-    FrameViewModel, NavigationEvent, NavigationState, NavigationType, PageViewModel,
-    RenderBackendKind, ScriptEngine, SearchResult, TabSummary,
+    FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel, HistoryEntrySnapshot,
+    NavigationEvent, NavigationState, NavigationType, PageViewModel, RenderBackendKind,
+    ScriptEngine, ScrollPosition, SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary,
+    SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
 use std::collections::{BTreeMap, HashSet};
@@ -166,11 +168,73 @@ impl AppService for SabaApp {
     fn script_engine(&self) -> Box<dyn ScriptEngine> {
         Box::new(MinimumScriptEngine)
     }
+
+    fn export_session_snapshot(&self) -> SessionSnapshot {
+        SabaApp::export_session_snapshot(self)
+    }
+
+    fn import_session_snapshot(&mut self, snapshot: SessionSnapshot) -> AppResult<()> {
+        SabaApp::import_session_snapshot(self, snapshot)
+    }
+
+    fn update_scroll_positions(
+        &mut self,
+        positions: Vec<FrameScrollPositionSnapshot>,
+    ) -> AppResult<()> {
+        self.active_session_mut()?
+            .update_scroll_positions(&positions)
+    }
 }
 
 impl SabaApp {
     pub fn register_tls_exception(&mut self, url: &str) -> AppResult<()> {
         register_tls_exception_for_url(url)?;
+        Ok(())
+    }
+
+    pub fn export_session_snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            version: SESSION_SNAPSHOT_SCHEMA_VERSION,
+            active_tab_id: self.active_tab_id,
+            tabs: self.tabs.iter().map(Tab::snapshot).collect(),
+        }
+    }
+
+    pub fn import_session_snapshot(&mut self, snapshot: SessionSnapshot) -> AppResult<()> {
+        let SessionSnapshot {
+            version,
+            active_tab_id,
+            tabs: tab_snapshots,
+        } = snapshot;
+
+        if version != SESSION_SNAPSHOT_SCHEMA_VERSION {
+            return Err(AppError::validation(format!(
+                "Unsupported session snapshot version: {}",
+                version
+            )));
+        }
+
+        let mut tabs = Vec::with_capacity(tab_snapshots.len().max(1));
+        let mut max_tab_id = 0;
+        for tab_snapshot in tab_snapshots {
+            max_tab_id = max_tab_id.max(tab_snapshot.id);
+            tabs.push(Tab::from_snapshot(tab_snapshot)?);
+        }
+        if tabs.is_empty() {
+            tabs.push(Tab::new(1));
+            max_tab_id = 1;
+        }
+
+        self.tabs = tabs;
+        self.active_tab_id = if self.tabs.iter().any(|tab| tab.id == active_tab_id) {
+            active_tab_id
+        } else {
+            self.tabs
+                .first()
+                .map(|tab| tab.id)
+                .ok_or_else(|| AppError::state("Failed to resolve restored active tab"))?
+        };
+        self.next_tab_id = max_tab_id + 1;
         Ok(())
     }
 
@@ -234,6 +298,23 @@ impl Tab {
             id,
             session: BrowserSession::new(),
         }
+    }
+
+    fn snapshot(&self) -> TabSessionSnapshot {
+        TabSessionSnapshot {
+            id: self.id,
+            history: self.session.history_snapshot(),
+            history_index: self.session.history_index,
+            viewport_width: self.session.viewport_width,
+            viewport_height: self.session.viewport_height,
+        }
+    }
+
+    fn from_snapshot(snapshot: TabSessionSnapshot) -> AppResult<Self> {
+        Ok(Self {
+            id: snapshot.id,
+            session: BrowserSession::from_snapshot(snapshot)?,
+        })
     }
 }
 
@@ -318,6 +399,39 @@ impl BrowserSession {
     fn get_page_view(&self) -> PageViewModel {
         self.current_page()
             .unwrap_or_else(|| blank_page_view(self.viewport_width, self.viewport_height))
+    }
+
+    fn from_snapshot(snapshot: TabSessionSnapshot) -> AppResult<Self> {
+        let TabSessionSnapshot {
+            id: _,
+            history,
+            history_index,
+            viewport_width,
+            viewport_height,
+        } = snapshot;
+        let mut session = Self {
+            history: Vec::with_capacity(history.len()),
+            history_index: 0,
+            viewport_width: viewport_width.max(320),
+            viewport_height: viewport_height.max(200),
+        };
+
+        // Spec mapping: each persisted `HistoryEntrySnapshot` corresponds to an HTML
+        // session history entry, `history_index` identifies the currently active
+        // entry, and restoring by reloading `current_url` plus child-frame URL
+        // overrides reconstructs the traversable's active document state before
+        // the UI re-applies per-frame scroll offsets.
+        // https://html.spec.whatwg.org/multipage/nav-history-apis.html#session-history-entry
+        // https://html.spec.whatwg.org/multipage/nav-history-apis.html#history-traversal
+        for entry in history {
+            session.history.push(session.restore_history_entry(entry)?);
+        }
+
+        if !session.history.is_empty() {
+            session.history_index = history_index.min(session.history.len() - 1);
+        }
+
+        Ok(session)
     }
 
     fn set_viewport(&mut self, width: i64, height: i64) -> AppResult<PageViewModel> {
@@ -481,6 +595,44 @@ impl BrowserSession {
             navigation_type,
         });
         self.history_index = self.history.len() - 1;
+    }
+
+    fn history_snapshot(&self) -> Vec<HistoryEntrySnapshot> {
+        self.history
+            .iter()
+            .map(|entry| HistoryEntrySnapshot {
+                current_url: entry.view.current_url.clone(),
+                navigation_type: entry.navigation_type,
+                frame_url_overrides: snapshot_frame_url_overrides(&entry.view.root_frame),
+                scroll_positions: snapshot_scroll_positions(&entry.view.root_frame),
+            })
+            .collect()
+    }
+
+    fn restore_history_entry(&self, snapshot: HistoryEntrySnapshot) -> AppResult<HistoryEntry> {
+        let overrides = frame_url_overrides_map(&snapshot.frame_url_overrides);
+        let mut view = self.load_page(
+            &snapshot.current_url,
+            Some(&overrides),
+            Some(RelayoutTrigger::DomChanged),
+        )?;
+        apply_scroll_snapshot(&mut view.root_frame, &snapshot.scroll_positions);
+        Ok(HistoryEntry {
+            view,
+            navigation_type: snapshot.navigation_type,
+        })
+    }
+
+    fn update_scroll_positions(
+        &mut self,
+        positions: &[FrameScrollPositionSnapshot],
+    ) -> AppResult<()> {
+        let current = self
+            .history
+            .get_mut(self.history_index)
+            .ok_or_else(|| AppError::state("No page loaded"))?;
+        apply_scroll_snapshot(&mut current.view.root_frame, positions);
+        Ok(())
     }
 }
 
@@ -672,6 +824,7 @@ fn build_inline_frameset_view(
             width: rect.width,
             height: rect.height,
         },
+        scroll_position: ScrollPosition::default(),
         render_backend: RenderBackendKind::NativeScene,
         document_url: current_url,
         scene_items: Vec::new(),
@@ -732,6 +885,7 @@ fn build_leaf_frame_view(
         diagnostics,
         rect: rect.clone(),
         content_size: script_layout.layout_scene.content_size,
+        scroll_position: ScrollPosition::default(),
         render_backend: RenderBackendKind::NativeScene,
         document_url: current_url.to_string(),
         scene_items: script_layout.layout_scene.scene_items,
@@ -761,6 +915,7 @@ fn blank_page_view(width: i64, height: i64) -> PageViewModel {
                 height,
             },
             content_size: ContentSize { width, height },
+            scroll_position: ScrollPosition::default(),
             render_backend: RenderBackendKind::NativeScene,
             document_url: String::new(),
             scene_items: Vec::new(),
@@ -845,6 +1000,62 @@ fn collect_frame_urls(frame: &FrameViewModel, urls: &mut BTreeMap<String, String
     }
     for child in &frame.child_frames {
         collect_frame_urls(child, urls);
+    }
+}
+
+fn snapshot_frame_url_overrides(frame: &FrameViewModel) -> Vec<FrameUrlOverrideSnapshot> {
+    snapshot_frame_urls(frame)
+        .into_iter()
+        .map(|(frame_id, current_url)| FrameUrlOverrideSnapshot {
+            frame_id,
+            current_url,
+        })
+        .collect()
+}
+
+fn frame_url_overrides_map(overrides: &[FrameUrlOverrideSnapshot]) -> BTreeMap<String, String> {
+    overrides
+        .iter()
+        .map(|entry| (entry.frame_id.clone(), entry.current_url.clone()))
+        .collect()
+}
+
+fn snapshot_scroll_positions(frame: &FrameViewModel) -> Vec<FrameScrollPositionSnapshot> {
+    let mut positions = Vec::new();
+    collect_scroll_positions(frame, &mut positions);
+    positions
+}
+
+fn collect_scroll_positions(
+    frame: &FrameViewModel,
+    positions: &mut Vec<FrameScrollPositionSnapshot>,
+) {
+    positions.push(FrameScrollPositionSnapshot {
+        frame_id: frame.id.clone(),
+        position: frame.scroll_position,
+    });
+    for child in &frame.child_frames {
+        collect_scroll_positions(child, positions);
+    }
+}
+
+fn apply_scroll_snapshot(frame: &mut FrameViewModel, positions: &[FrameScrollPositionSnapshot]) {
+    let scroll_positions = positions
+        .iter()
+        .map(|entry| (entry.frame_id.as_str(), entry.position))
+        .collect::<BTreeMap<_, _>>();
+    apply_scroll_snapshot_recursive(frame, &scroll_positions);
+}
+
+fn apply_scroll_snapshot_recursive(
+    frame: &mut FrameViewModel,
+    positions: &BTreeMap<&str, ScrollPosition>,
+) {
+    if let Some(position) = positions.get(frame.id.as_str()) {
+        frame.scroll_position = *position;
+    }
+    for child in &mut frame.child_frames {
+        apply_scroll_snapshot_recursive(child, positions);
     }
 }
 
@@ -1273,6 +1484,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_snapshot_round_trips_history_and_scroll_positions() {
+        let mut app = SabaApp::default();
+        let first = app
+            .open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+        let left_frame = first.root_frame.child_frames[0].id.clone();
+        let _ = app
+            .activate_link(&left_frame, "fixture://abehiroshi/prof", Some("right"))
+            .expect("targeted navigation should work");
+        app.update_scroll_positions(vec![
+            FrameScrollPositionSnapshot {
+                frame_id: "root".to_string(),
+                position: ScrollPosition { x: 0, y: 120 },
+            },
+            FrameScrollPositionSnapshot {
+                frame_id: "root/right".to_string(),
+                position: ScrollPosition { x: 8, y: 64 },
+            },
+        ])
+        .expect("scroll positions should update");
+
+        let snapshot = app.export_session_snapshot();
+
+        let mut restored = SabaApp::default();
+        restored
+            .import_session_snapshot(snapshot)
+            .expect("snapshot should restore");
+
+        let restored_view = restored.get_page_view();
+        assert_eq!(restored.active_tab_id, 1);
+        assert_eq!(
+            restored_view.root_frame.scroll_position,
+            ScrollPosition { x: 0, y: 120 }
+        );
+        assert_eq!(
+            restored_view.root_frame.child_frames[1].scroll_position,
+            ScrollPosition { x: 8, y: 64 }
+        );
+        assert_eq!(
+            restored_view.root_frame.child_frames[1].current_url,
+            "fixture://abehiroshi/prof"
+        );
+        assert_eq!(
+            restored.get_navigation_state().current_url.as_deref(),
+            Some("fixture://abehiroshi/index")
+        );
+    }
+
     fn sample_page(url: &str, diagnostics: Vec<&str>) -> PageViewModel {
         PageViewModel {
             current_url: url.to_string(),
@@ -1304,6 +1564,7 @@ mod tests {
                 width: 960,
                 height: 720,
             },
+            scroll_position: ScrollPosition::default(),
             render_backend: RenderBackendKind::NativeScene,
             document_url: "fixture://abehiroshi/index".to_string(),
             scene_items: Vec::new(),
@@ -1327,6 +1588,7 @@ mod tests {
                         width: 720,
                         height: 720,
                     },
+                    scroll_position: ScrollPosition::default(),
                     render_backend: RenderBackendKind::NativeScene,
                     document_url: "fixture://abehiroshi/top".to_string(),
                     scene_items: Vec::new(),
@@ -1359,6 +1621,7 @@ mod tests {
                 width: 320,
                 height: 240,
             },
+            scroll_position: ScrollPosition::default(),
             render_backend: RenderBackendKind::NativeScene,
             document_url: current_url.to_string(),
             scene_items: Vec::new(),

@@ -1,5 +1,7 @@
 use adapter_native::{BrowserPageDto, CrashReportDto, IpcRequest, IpcResponse, NativeAdapter};
-use cosmo_runtime::{AppError, NavigationState, SearchResult, TabSummary};
+use cosmo_runtime::{
+    AppError, FrameScrollPositionSnapshot, NavigationState, SearchResult, TabSummary,
+};
 use serde::Serialize;
 use std::backtrace::Backtrace;
 use std::collections::hash_map::DefaultHasher;
@@ -145,8 +147,18 @@ fn search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<Search
     state.adapter.search(&query)
 }
 
+#[tauri::command]
+fn update_scroll_positions(
+    state: tauri::State<'_, AppState>,
+    positions: Vec<FrameScrollPositionSnapshot>,
+) -> Result<bool, AppError> {
+    state.adapter.update_scroll_positions(positions)?;
+    Ok(true)
+}
+
 fn install_crash_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
+        let _ = persist_pre_crash_snapshot();
         let reason = if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
             (*message).to_string()
         } else if let Some(message) = panic_info.payload().downcast_ref::<String>() {
@@ -182,6 +194,28 @@ fn install_crash_hook() {
 
 fn crash_report_path() -> PathBuf {
     std::env::temp_dir().join("cosmobrowse-crash-report.json")
+}
+
+fn session_snapshot_path() -> PathBuf {
+    std::env::var("COSMO_SESSION_SNAPSHOT_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("cosmobrowse-session-snapshot.json"))
+}
+
+fn crash_session_snapshot_path() -> PathBuf {
+    std::env::var("COSMO_CRASH_SESSION_SNAPSHOT_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("cosmobrowse-session-snapshot-crash.json"))
+}
+
+fn persist_pre_crash_snapshot() -> std::io::Result<()> {
+    let source = session_snapshot_path();
+    let destination = crash_session_snapshot_path();
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = std::fs::read(&source)?;
+    std::fs::write(destination, payload)
 }
 
 fn unix_timestamp_ms() -> u64 {
@@ -235,7 +269,8 @@ pub fn run() {
             switch_tab,
             close_tab,
             list_tabs,
-            search
+            search,
+            update_scroll_positions
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

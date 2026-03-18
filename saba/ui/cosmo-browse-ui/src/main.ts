@@ -3,6 +3,7 @@ import { openUrl as openExternalUrl } from "@tauri-apps/plugin-opener";
 
 type FrameRect = { x: number; y: number; width: number; height: number };
 type ContentSize = { width: number; height: number };
+type ScrollPosition = { x: number; y: number };
 type RenderTreeSnapshot = { root: RenderNode | null };
 type RenderNodeKind = "block" | "inline" | "text";
 type RenderNode = {
@@ -30,6 +31,7 @@ type FrameViewModel = {
   diagnostics: string[];
   rect: FrameRect;
   content_size: ContentSize;
+  scroll_position: ScrollPosition;
   render_backend: "web_view" | "native_scene";
   document_url: string;
   scene_items: SceneItem[];
@@ -130,6 +132,7 @@ type NavigationType = "document" | "hash" | "redirect";
 type NavigationState = { can_back: boolean; can_forward: boolean; current_url: string | null; current_navigation_type?: NavigationType | null };
 type TabSummary = { id: number; title: string; url: string | null; is_active: boolean };
 type SearchResult = { id: number; title: string; url: string; snippet: string };
+type FrameScrollPositionSnapshot = { frame_id: string; position: ScrollPosition };
 type AppError = { code: string; message: string; retryable: boolean };
 type EmbeddedNavigationMessage = {
   type: "cosmobrowse:navigate";
@@ -211,6 +214,10 @@ const legacyTransportHandlers: Record<string, (payload?: Record<string, unknown>
   close_tab: (payload) => legacyInvoke<TabSummary[]>("close_tab", { id: Number(payload?.id ?? 0) }),
   list_tabs: () => legacyInvoke<TabSummary[]>("list_tabs"),
   search: (payload) => legacyInvoke<SearchResult[]>("search", { query: `${payload?.query ?? ""}` }),
+  update_scroll_positions: (payload) =>
+    legacyInvoke<boolean>("update_scroll_positions", {
+      positions: Array.isArray(payload?.positions) ? payload.positions : [],
+    }),
 };
 
 const nativeTransport: AppTransport = {
@@ -329,6 +336,7 @@ let crashReportEl: HTMLElement | null;
 let securityInterstitialEl: HTMLElement | null;
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
+let scrollSyncTimer: number | null = null;
 let pageEpoch = 0;
 
 type RenderBackend = {
@@ -345,8 +353,8 @@ const nativeSceneBackend: RenderBackend = {
     // laid out using inset offsets in their containing block.
     // https://www.w3.org/TR/CSS22/visuren.html#absolute-positioning
     scene.style.position = "relative";
-    scene.style.width = "100%";
-    scene.style.height = "100%";
+    scene.style.width = `${Math.max(frame.content_size.width, frame.rect.width, 1)}px`;
+    scene.style.height = `${Math.max(frame.content_size.height, frame.rect.height, 1)}px`;
     scene.style.overflow = "hidden";
 
     // Spec note: item order represents paint order from CSS2 visual formatting
@@ -648,6 +656,8 @@ function renderFrame(frame: FrameViewModel, host: HTMLElement) {
   shell.style.width = `${Math.max(frame.rect.width, 1)}px`;
   shell.style.height = `${Math.max(frame.rect.height, 1)}px`;
   shell.dataset.frameId = frame.id;
+  shell.style.overflow = frame.child_frames.length > 0 ? "hidden" : "auto";
+  shell.addEventListener("scroll", () => scheduleScrollSync(), { passive: true });
 
   if (frame.child_frames.length > 0) {
     const childrenRoot = document.createElement("div");
@@ -673,6 +683,38 @@ function renderFrameTree(view: PageViewModel) {
   sceneRootEl.style.width = `${Math.max(view.content_size.width, 320)}px`;
   sceneRootEl.style.height = `${Math.max(view.content_size.height, 240)}px`;
   renderFrame(view.root_frame, sceneRootEl);
+}
+
+function applyRestoredScrollPositions(view: PageViewModel) {
+  // Ref: HTML Standard history traversal restores a session history entry's
+  // persisted user state after activating the entry. We map that persisted user
+  // state to viewport/frame scroll offsets captured in the session snapshot.
+  // https://html.spec.whatwg.org/multipage/nav-history-apis.html#persisted-user-state-restoration
+  window.requestAnimationFrame(() => {
+    if (viewportEl) {
+      viewportEl.scrollTo({
+        left: Math.max(view.root_frame.scroll_position.x, 0),
+        top: Math.max(view.root_frame.scroll_position.y, 0),
+      });
+    }
+
+    const frameScrolls = new Map<string, ScrollPosition>();
+    collectFrameScrollPositions(view.root_frame, frameScrolls);
+    sceneRootEl?.querySelectorAll<HTMLElement>(".frame-shell[data-frame-id]").forEach((shell) => {
+      const frameId = shell.dataset.frameId;
+      if (!frameId) return;
+      const position = frameScrolls.get(frameId);
+      if (!position) return;
+      shell.scrollTo({ left: Math.max(position.x, 0), top: Math.max(position.y, 0) });
+    });
+  });
+}
+
+function collectFrameScrollPositions(frame: FrameViewModel, out: Map<string, ScrollPosition>) {
+  out.set(frame.id, frame.scroll_position);
+  for (const child of frame.child_frames) {
+    collectFrameScrollPositions(child, out);
+  }
 }
 
 
@@ -707,9 +749,56 @@ function renderPageView(view: PageViewModel) {
   if (urlInputEl && view.current_url) urlInputEl.value = view.current_url;
   document.title = view.title ? `${view.title} - CosmoBrowse` : "CosmoBrowse";
   renderFrameTree(view);
+  applyRestoredScrollPositions(view);
   renderDiagnostics(view);
   const diagnostics = view.diagnostics.filter((entry) => entry.trim().length > 0);
   setStatus(diagnostics.length > 0 ? diagnostics.join(" | ") : "Done.");
+}
+
+function collectCurrentScrollPositions(): FrameScrollPositionSnapshot[] {
+  const positions: FrameScrollPositionSnapshot[] = [];
+  if (viewportEl) {
+    positions.push({
+      frame_id: "root",
+      position: {
+        x: Math.round(viewportEl.scrollLeft),
+        y: Math.round(viewportEl.scrollTop),
+      },
+    });
+  }
+  sceneRootEl?.querySelectorAll<HTMLElement>(".frame-shell[data-frame-id]").forEach((shell) => {
+    const frameId = shell.dataset.frameId;
+    if (!frameId) return;
+    positions.push({
+      frame_id: frameId,
+      position: {
+        x: Math.round(shell.scrollLeft),
+        y: Math.round(shell.scrollTop),
+      },
+    });
+  });
+  return positions;
+}
+
+async function flushScrollPositions() {
+  const positions = collectCurrentScrollPositions();
+  if (positions.length === 0) return;
+  try {
+    await requestAppCommand<boolean>({
+      type: "update_scroll_positions",
+      payload: { positions },
+    });
+  } catch {
+    // Ignore best-effort persistence failures during interactive scrolling.
+  }
+}
+
+function scheduleScrollSync() {
+  if (scrollSyncTimer) window.clearTimeout(scrollSyncTimer);
+  scrollSyncTimer = window.setTimeout(() => {
+    scrollSyncTimer = null;
+    void flushScrollPositions();
+  }, 120);
 }
 
 async function refreshTabs() {
@@ -958,8 +1047,12 @@ window.addEventListener("DOMContentLoaded", () => {
   if (viewportEl) {
     resizeObserver = new ResizeObserver(() => void syncViewport());
     resizeObserver.observe(viewportEl);
+    viewportEl.addEventListener("scroll", () => scheduleScrollSync(), { passive: true });
   }
 
+  window.addEventListener("beforeunload", () => {
+    void flushScrollPositions();
+  });
   void refreshCrashReport();
   void loadInitialPageView();
 });

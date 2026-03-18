@@ -199,9 +199,10 @@
   - same-document/hash 遷移、redirect chain を区別して履歴管理。
   - **完了条件**: back/forward の挙動が主要ケースで期待どおり。
   - 進捗メモ: redirect chain を履歴単位で正規化し、hash 遷移との競合ケースを回帰テスト化。
-- [ ] **E2-T2 セッション復元（クラッシュ復旧）**
+- [x] **E2-T2 セッション復元（クラッシュ復旧）**
   - タブ/履歴/スクロール位置をスナップショット保存。
   - **完了条件**: 異常終了後の再起動で前回セッションが復元される。
+  - 進捗メモ: `SessionSnapshot` schema を `cosmo_runtime` 境界へ追加し、active tab・履歴スタック・frame URL override・scroll position を保存/復元、adapter/UI の restore smoke まで接続済み。
 - [x] **E2-T3 ナビゲーションガード**
   - 無効 URL・危険スキーム・無限リダイレクトの検知と `AppError` 整備。
   - **完了条件**: エラーコードが UI に統一表示される。
@@ -344,9 +345,10 @@
 
 
 ### Sprint J（次の再計画候補）: セッション復元・UX・運用ギャップ解消
-10. [ ] **NJ-T1 E2-T2 セッション復元（クラッシュ復旧）**
+10. [x] **NJ-T1 E2-T2 セッション復元（クラッシュ復旧）**
     - タブ一覧・履歴スタック・スクロール位置をクラッシュセーフなスナップショットへ保存し、起動時に restore する。
     - 完了時には `renderer_recovered` 後の再起動経路でも、最後の active tab が自動復元されることをスモークで保証する。
+    - 進捗メモ: `cosmo_app_legacy` / `adapter_native` / UI 間で session snapshot restore を実装し、session round-trip test と startup restore smoke で active tab・history_index・frame scroll の復元を検証済み。
 11. [ ] **NJ-T2 E4-T3 origin 単位ストレージ/クッキー永続化**
     - Cookie jar / local storage / 権限判断キャッシュを origin 単位で保存し、SameSite/Secure/HttpOnly 診断と接続する。
     - セッション復元と干渉しないよう、永続化形式と消去ポリシーを ADR 化する。
