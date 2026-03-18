@@ -1,10 +1,11 @@
 <html>
   <head>
     <script>
-      function onReady() {
-        document.getElementById("target").textContent = "Static Ready";
+      function onready() {
+        var target = document.getElementById("target");
+        target.textContent = "Static Ready";
       }
-      document.addEventListener("DOMContentLoaded", onReady);
+      document.addEventListener("DOMContentLoaded", onready);
     </script>
   </head>
   <body>

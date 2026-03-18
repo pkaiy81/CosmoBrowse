@@ -17,6 +17,15 @@ use core::ops::Sub;
 
 type VariableMap = Vec<(String, Option<RuntimeValue>)>;
 
+const MAX_EVENT_LOOP_ITERATIONS: usize = 10_000;
+const MAX_MICROTASK_DRAIN_ITERATIONS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimerTask {
+    due_turn: u64,
+    callback: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeValue {
     /// https://262.ecma-international.org/#sec-numeric-types
@@ -94,7 +103,11 @@ pub struct JsRuntime {
     functions: Vec<Function>,
     task_queue: Vec<String>,
     microtask_queue: Vec<String>,
+    timer_queue: Vec<TimerTask>,
     unsupported_apis: Vec<String>,
+    warning_logs: Vec<String>,
+    event_loop_turn: u64,
+    next_timer_id: u64,
     render_pipeline_invalidated: bool,
     dom_content_loaded_listeners: Vec<String>,
 }
@@ -107,7 +120,11 @@ impl JsRuntime {
             env: Rc::new(RefCell::new(Environment::new(None))),
             task_queue: Vec::new(),
             microtask_queue: Vec::new(),
+            timer_queue: Vec::new(),
             unsupported_apis: Vec::new(),
+            warning_logs: Vec::new(),
+            event_loop_turn: 0,
+            next_timer_id: 1,
             render_pipeline_invalidated: false,
             dom_content_loaded_listeners: Vec::new(),
         }
@@ -154,6 +171,10 @@ impl JsRuntime {
         self.unsupported_apis.clone()
     }
 
+    pub fn warning_logs(&self) -> Vec<String> {
+        self.warning_logs.clone()
+    }
+
     pub fn dom_updated(&self) -> bool {
         self.render_pipeline_invalidated
     }
@@ -163,15 +184,52 @@ impl JsRuntime {
     }
 
     fn process_event_loop(&mut self) {
-        while !self.task_queue.is_empty() {
-            let callback = self.task_queue.remove(0);
-            self.invoke_named_function(&callback, self.env.clone());
+        let mut iterations = 0;
+        loop {
+            iterations += 1;
+            if iterations > MAX_EVENT_LOOP_ITERATIONS {
+                self.warn(
+                    "Event loop iteration guard triggered; possible hang/starvation detected"
+                        .to_string(),
+                );
+                break;
+            }
 
-            // Spec: after each task, drain the microtask queue before rendering.
-            // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
-            // Spec: Promise reactions are queued as ECMAScript jobs (microtasks).
-            // https://262.ecma-international.org/#sec-jobs-and-job-queues
-            self.drain_microtasks();
+            // Spec: timer task source feeds into task queues, and the loop picks one task at a time.
+            // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers
+            self.promote_ready_timers_to_tasks();
+
+            if !self.task_queue.is_empty() {
+                let callback = self.task_queue.remove(0);
+                self.invoke_named_function(&callback, self.env.clone());
+
+                // Spec: after each task, drain the microtask queue before selecting the next task.
+                // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+                // Spec: Promise reactions are queued as ECMAScript jobs (microtasks).
+                // https://262.ecma-international.org/#sec-jobs-and-job-queues
+                self.drain_microtasks();
+                self.event_loop_turn = self.event_loop_turn.saturating_add(1);
+                continue;
+            }
+
+            if self.timer_queue.is_empty() {
+                break;
+            }
+
+            // Spec-aligned simplification: if only future timer tasks remain, advance to next turn.
+            self.event_loop_turn = self.event_loop_turn.saturating_add(1);
+        }
+    }
+
+    fn promote_ready_timers_to_tasks(&mut self) {
+        let mut i = 0;
+        while i < self.timer_queue.len() {
+            if self.timer_queue[i].due_turn <= self.event_loop_turn {
+                let timer = self.timer_queue.remove(i);
+                self.task_queue.push(timer.callback);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -184,10 +242,24 @@ impl JsRuntime {
     }
 
     fn drain_microtasks(&mut self) {
+        let mut iterations = 0;
         while !self.microtask_queue.is_empty() {
+            iterations += 1;
+            if iterations > MAX_MICROTASK_DRAIN_ITERATIONS {
+                self.warn(
+                    "Microtask drain guard triggered; possible infinite Promise/microtask chain"
+                        .to_string(),
+                );
+                self.microtask_queue.clear();
+                break;
+            }
             let microtask = self.microtask_queue.remove(0);
             self.invoke_named_function(&microtask, self.env.clone());
         }
+    }
+
+    fn warn(&mut self, message: String) {
+        self.warning_logs.push(message);
     }
 
     fn invoke_named_function(&mut self, callback: &str, env: Rc<RefCell<Environment>>) {
@@ -266,11 +338,15 @@ impl JsRuntime {
             if let Some(callback) = self.eval(&arguments[0], env.clone()).map(|v| v.to_string()) {
                 // Spec: timers queue tasks in the event loop task queue.
                 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers
-                self.task_queue.push(callback);
-                return (
-                    true,
-                    Some(RuntimeValue::Number(self.task_queue.len() as u64)),
-                );
+                // Compliance note: this minimum runtime assigns timers to a dedicated timer queue,
+                // then moves ready entries to the macrotask queue when the event-loop turn advances.
+                let timer_id = self.next_timer_id;
+                self.next_timer_id = self.next_timer_id.saturating_add(1);
+                self.timer_queue.push(TimerTask {
+                    due_turn: self.event_loop_turn.saturating_add(1),
+                    callback,
+                });
+                return (true, Some(RuntimeValue::Number(timer_id)));
             }
             self.report_unsupported_api("setTimeout(callback, delay)".to_string());
             return (true, None);
@@ -612,7 +688,7 @@ impl Display for RuntimeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renderer::dom::api::get_element_by_id;
+    use crate::renderer::dom::api::{get_element_by_id, get_js_content};
     use crate::renderer::dom::node::NodeKind as DomNodeKind;
     use crate::renderer::html::parser::HtmlParser;
     use crate::renderer::html::token::HtmlTokenizer;
@@ -814,6 +890,83 @@ mod tests {
                 .borrow()
                 .kind(),
             DomNodeKind::Text("P".to_string())
+        );
+    }
+
+    #[test]
+    fn test_microtask_runs_before_timer_task() {
+        let html = r#"<html><body><p id="target">init</p></body></html>"#.to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let input = r#"function timer(){ document.getElementById("target").textContent=document.getElementById("target").textContent+"T"; } function reaction(){ document.getElementById("target").textContent=document.getElementById("target").textContent+"P"; } setTimeout(timer, 0); Promise.then(reaction);"#.to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("initPT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_microtask_guard_reports_warning() {
+        let html = r#"<html><body><p id="target">init</p></body></html>"#.to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let input = r#"function loop(){ queueMicrotask(loop); } Promise.then(loop);"#.to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom);
+
+        runtime.execute(&ast);
+
+        assert!(runtime
+            .warning_logs()
+            .iter()
+            .any(|log| log.contains("Microtask drain guard triggered")));
+    }
+
+    #[test]
+    fn test_static_fixture_dom_content_loaded_invalidates_render_pipeline() {
+        // Spec: DOMContentLoaded is queued after parsing, and its listener callback runs as a task.
+        // https://html.spec.whatwg.org/multipage/parsing.html#the-end
+        // This regression mirrors scripts/run_smoke_regression.py e7_t2_static fixture behavior.
+        let html = include_str!("../../../../testdata/js_event_loop/e7_t2_static.html").to_string();
+        let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+        let dom = window.as_ref().borrow().document();
+        let script = get_js_content(dom.clone());
+        let lexer = JsLexer::new(script);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new(dom.clone());
+
+        runtime.execute(&ast);
+
+        assert!(runtime.render_pipeline_invalidated());
+        let target = get_element_by_id(Some(dom), &"target".to_string()).expect("target");
+        assert_eq!(
+            target
+                .as_ref()
+                .borrow()
+                .first_child()
+                .expect("text")
+                .as_ref()
+                .borrow()
+                .kind(),
+            DomNodeKind::Text("Static Ready".to_string())
         );
     }
 

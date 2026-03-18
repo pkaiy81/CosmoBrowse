@@ -6,23 +6,50 @@
 
 1. **Top-level script は 1 task として実行し、終了直後に microtask checkpoint を必ず行う。**
 2. **task queue は FIFO で 1 件ずつ実行し、各 task 後に microtask queue を空になるまで drain する。**
-3. **`setTimeout(callback, delay)` は task queue へ callback を追加する（`delay` は現状無視）。**
+3. **`setTimeout(callback, delay)` は timer queue に登録し、次の event-loop turn で macrotask(task queue) に昇格させる。**
 4. **`queueMicrotask(callback)` と `Promise.then(callback)` は microtask queue へ callback を追加する。**
-5. **`DOMContentLoaded` はパース完了後に dispatch し、登録済み listener を task queue へ積む。**
-6. **`dispatch_click`/`dispatch_input`/`dispatch_change` は DOM Standard の event dispatch を簡略化し、対象要素に登録済み listener を task queue へ積む。**
-7. **DOM 変更（例: `textContent` 更新）が発生した場合は、`DOM更新 -> レイアウト再計算 -> 再描画` をトリガする。**
+5. **task が無い turn でも、期限到達 timer が存在する場合は timer を task queue に移し、1 task 実行する。**
+6. **`DOMContentLoaded` はパース完了後に dispatch し、登録済み listener を task queue へ積む。**
+7. **`dispatch_click`/`dispatch_input`/`dispatch_change` は DOM Standard の event dispatch を簡略化し、対象要素に登録済み listener を task queue へ積む。**
+8. **DOM 変更（例: `textContent` 更新）が発生した場合は、`DOM更新 -> レイアウト再計算 -> 再描画` をトリガする。**
+9. **飢餓・ハング対策として、event loop / microtask drain の反復上限を超えた場合は警告ログを記録し処理を打ち切る。**
 
 > Diagram source: `docs/architecture/mermaid/js-event-loop.mmd`
 
 ```mermaid
 flowchart TD
   A["Execute top-level script"] --> B["Drain microtasks"]
-  B --> C["Event loop tick (while tasks)\n1) pop task\n2) run callback\n3) drain microtasks"]
-  C --> D{"DOM invalidated?"}
-  D -->|"Yes"| E["Relayout -> Repaint"]
-  D -->|"No"| C
-  E --> C
+  B --> C{"Any task in task queue?"}
+  C -->|"Yes"| D["Run oldest task"]
+  D --> E["Drain microtasks"]
+  E --> F["Advance event-loop turn"]
+  F --> G["Promote ready timers to task queue"]
+  G --> C
+  C -->|"No"| H{"Ready timer exists?"}
+  H -->|"Yes"| F
+  H -->|"No"| I["Idle"]
 ```
+
+## タスクキュー仕様（切替タイミング）
+
+- **microtask 優先**
+  - 各 macrotask 実行後は、次の macrotask を取り出す前に microtask queue を空になるまで実行する。
+  - Top-level script 完了時点でも同様に microtask checkpoint を行う。
+- **macrotask 切替タイミング**
+  - microtask queue が空になった時点でのみ次の macrotask へ切り替える。
+  - `setTimeout` で登録した timer は「次の turn 以降」に task queue へ移動し、同一 turn の microtask より後で実行される。
+- **安全ガード**
+  - `MAX_EVENT_LOOP_ITERATIONS` を超える連続 turn を検知した場合は `possible hang/starvation` 警告を記録する。
+  - `MAX_MICROTASK_DRAIN_ITERATIONS` を超える microtask 連鎖を検知した場合は `possible infinite Promise/microtask chain` 警告を記録し、drain を打ち切る。
+
+
+## ハング検知メトリクスの `AppMetricsSnapshot` 反映方針（検討）
+
+- 現時点では `JsRuntime` 内でハング/飢餓警告を `warning_logs` として保持する。
+- `AppMetricsSnapshot` へは次段階で次の 2 指標を連携する設計とする。
+  - `event_loop_hang_warning_count`: セッション中に guard が発火した回数
+  - `last_event_loop_hang_warning`: 直近の警告メッセージ
+- 先行してスキーマを変更すると IPC/UI 互換性に影響するため、本変更ではランタイム実装と仕様文書を優先し、メトリクス配線は follow-up とする。
 
 ## Supported minimum set
 
