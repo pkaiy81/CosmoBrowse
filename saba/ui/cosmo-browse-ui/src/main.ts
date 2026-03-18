@@ -130,8 +130,29 @@ type PageViewModel = {
 };
 type NavigationType = "document" | "hash" | "redirect";
 type NavigationState = { can_back: boolean; can_forward: boolean; current_url: string | null; current_navigation_type?: NavigationType | null };
-type TabSummary = { id: number; title: string; url: string | null; is_active: boolean };
+type TabSummary = {
+  id: number;
+  title: string;
+  url: string | null;
+  is_active: boolean;
+  is_pinned: boolean;
+  is_muted: boolean;
+};
 type SearchResult = { id: number; title: string; url: string; snippet: string };
+type OmniboxSuggestionKind = "history" | "search" | "url";
+type OmniboxSuggestion = {
+  id: number;
+  kind: OmniboxSuggestionKind;
+  title: string;
+  value: string;
+  url: string | null;
+  detail: string;
+};
+type OmniboxSuggestionSet = {
+  query: string;
+  active_index: number | null;
+  suggestions: OmniboxSuggestion[];
+};
 type FrameScrollPositionSnapshot = { frame_id: string; position: ScrollPosition };
 type AppError = { code: string; message: string; retryable: boolean };
 type EmbeddedNavigationMessage = {
@@ -210,10 +231,27 @@ const legacyTransportHandlers: Record<string, (payload?: Record<string, unknown>
   forward: () => legacyInvoke<PageViewModel>("forward"),
   get_navigation_state: () => legacyInvoke<NavigationState>("get_navigation_state"),
   new_tab: () => legacyInvoke<TabSummary>("new_tab"),
+  duplicate_tab: (payload) => legacyInvoke<TabSummary>("duplicate_tab", { id: Number(payload?.id ?? 0) }),
   switch_tab: (payload) => legacyInvoke<PageViewModel>("switch_tab", { id: Number(payload?.id ?? 0) }),
   close_tab: (payload) => legacyInvoke<TabSummary[]>("close_tab", { id: Number(payload?.id ?? 0) }),
+  move_tab: (payload) => legacyInvoke<TabSummary[]>("move_tab", {
+    id: Number(payload?.id ?? 0),
+    targetIndex: Number(payload?.target_index ?? 0),
+  }),
+  set_tab_pinned: (payload) => legacyInvoke<TabSummary[]>("set_tab_pinned", {
+    id: Number(payload?.id ?? 0),
+    pinned: Boolean(payload?.pinned),
+  }),
+  set_tab_muted: (payload) => legacyInvoke<TabSummary[]>("set_tab_muted", {
+    id: Number(payload?.id ?? 0),
+    muted: Boolean(payload?.muted),
+  }),
   list_tabs: () => legacyInvoke<TabSummary[]>("list_tabs"),
   search: (payload) => legacyInvoke<SearchResult[]>("search", { query: `${payload?.query ?? ""}` }),
+  omnibox_suggestions: (payload) => legacyInvoke<OmniboxSuggestionSet>("omnibox_suggestions", {
+    query: `${payload?.query ?? ""}`,
+    currentIndex: typeof payload?.current_index === "number" ? payload.current_index : null,
+  }),
   update_scroll_positions: (payload) =>
     legacyInvoke<boolean>("update_scroll_positions", {
       positions: Array.isArray(payload?.positions) ? payload.positions : [],
@@ -290,8 +328,9 @@ async function initializeTransport(): Promise<AppTransport> {
   }
 
   try {
-    releaseRolloutStatus = await invoke<ReleaseRolloutStatus>("release_rollout_status");
-    activeTransport = releaseRolloutStatus.native_default_enabled ? nativeTransport : legacyTransport;
+    const rolloutStatus = await invoke<ReleaseRolloutStatus>("release_rollout_status");
+    releaseRolloutStatus = rolloutStatus;
+    activeTransport = rolloutStatus.native_default_enabled ? nativeTransport : legacyTransport;
   } catch (errorValue) {
     console.warn("[CosmoBrowse] failed to load release rollout status; defaulting to adapter_native", errorValue);
     activeTransport = nativeTransport;
@@ -338,6 +377,8 @@ let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
 let scrollSyncTimer: number | null = null;
 let pageEpoch = 0;
+let latestOmniboxSuggestions: OmniboxSuggestionSet = { query: "", active_index: null, suggestions: [] };
+let draggedTabId: number | null = null;
 
 type RenderBackend = {
   kind: "native_scene";
@@ -567,41 +608,201 @@ function handleCommandError(errorValue: unknown, requestedUrl?: string) {
 }
 
 function clearSearchResults() {
+  latestOmniboxSuggestions = { query: "", active_index: null, suggestions: [] };
   if (!searchResultsEl) return;
   searchResultsEl.innerHTML = "";
   searchResultsEl.classList.add("hidden");
 }
 
-function renderSearchResults(results: SearchResult[]) {
-  if (!searchResultsEl) return;
-  searchResultsEl.innerHTML = "";
-  searchResultsEl.classList.toggle("hidden", results.length === 0);
-  for (const result of results) {
-    const item = document.createElement("li");
-    const button = document.createElement("button");
-    const detail = document.createElement("small");
-    button.type = "button";
-    button.className = "linklike";
-    button.textContent = result.title;
-    button.addEventListener("click", () => void openUrl(result.url));
-    detail.textContent = `${result.url} - ${result.snippet}`;
-    item.append(button, document.createElement("br"), detail);
-    searchResultsEl.appendChild(item);
+function normalizeActiveSuggestionIndex(resultSet: OmniboxSuggestionSet, requestedIndex?: number | null): OmniboxSuggestionSet {
+  if (resultSet.suggestions.length === 0) {
+    return { ...resultSet, active_index: null };
   }
+  const activeIndex = requestedIndex ?? resultSet.active_index ?? 0;
+  return {
+    ...resultSet,
+    active_index: Math.max(0, Math.min(activeIndex, resultSet.suggestions.length - 1)),
+  };
+}
+
+function suggestionTargetUrl(suggestion: OmniboxSuggestion): string {
+  return suggestion.url ?? suggestion.value;
+}
+
+async function activateSuggestion(suggestion: OmniboxSuggestion) {
+  clearSearchResults();
+  const targetUrl = suggestionTargetUrl(suggestion);
+  if (urlInputEl) urlInputEl.value = targetUrl;
+  await openUrl(targetUrl);
+}
+
+function renderSearchResults(resultSet: OmniboxSuggestionSet) {
+  latestOmniboxSuggestions = normalizeActiveSuggestionIndex(resultSet);
+  if (!searchResultsEl) return;
+  const host = searchResultsEl;
+  host.innerHTML = "";
+  host.classList.toggle("hidden", latestOmniboxSuggestions.suggestions.length === 0);
+  latestOmniboxSuggestions.suggestions.forEach((suggestion, index) => {
+    const item = document.createElement("li");
+    item.className = index === latestOmniboxSuggestions.active_index ? "selected" : "";
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", `${index === latestOmniboxSuggestions.active_index}`);
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "linklike suggestion-button";
+    button.addEventListener("mouseenter", () => {
+      latestOmniboxSuggestions = normalizeActiveSuggestionIndex(latestOmniboxSuggestions, index);
+      renderSearchResults(latestOmniboxSuggestions);
+    });
+    button.addEventListener("click", () => void activateSuggestion(suggestion));
+
+    const kind = document.createElement("span");
+    kind.className = "suggestion-kind";
+    kind.textContent = suggestion.kind;
+
+    const title = document.createElement("span");
+    title.className = "suggestion-title";
+    title.textContent = suggestion.title;
+
+    const meta = document.createElement("small");
+    meta.className = "suggestion-meta";
+    meta.textContent = `${suggestionTargetUrl(suggestion)} — ${suggestion.detail}`;
+
+    button.append(kind, title, meta);
+    item.appendChild(button);
+    host.appendChild(item);
+  });
+}
+
+async function updateOmniboxSuggestions(currentIndex?: number | null) {
+  if (!urlInputEl) return;
+  const query = urlInputEl.value.trim();
+  try {
+    const suggestions = await requestAppCommand<OmniboxSuggestionSet>({
+      type: "omnibox_suggestions",
+      payload: {
+        query,
+        current_index: currentIndex ?? latestOmniboxSuggestions.active_index,
+      },
+    });
+    renderSearchResults(normalizeActiveSuggestionIndex(suggestions, currentIndex));
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function moveOmniboxSelection(delta: number) {
+  if (latestOmniboxSuggestions.suggestions.length === 0) {
+    await updateOmniboxSuggestions(delta > 0 ? 0 : null);
+    return;
+  }
+  const currentIndex = latestOmniboxSuggestions.active_index ?? 0;
+  const nextIndex = (currentIndex + delta + latestOmniboxSuggestions.suggestions.length)
+    % latestOmniboxSuggestions.suggestions.length;
+  renderSearchResults(normalizeActiveSuggestionIndex(latestOmniboxSuggestions, nextIndex));
+}
+
+async function commitOmniboxSelection() {
+  const selectedIndex = latestOmniboxSuggestions.active_index;
+  if (selectedIndex != null) {
+    const selected = latestOmniboxSuggestions.suggestions[selectedIndex];
+    if (selected) {
+      await activateSuggestion(selected);
+      return;
+    }
+  }
+  await openCurrentInput();
 }
 
 function renderTabs(tabs: TabSummary[]) {
   if (!tabsListEl) return;
   tabsListEl.innerHTML = "";
-  for (const tab of tabs) {
+  for (const [index, tab] of tabs.entries()) {
     const item = document.createElement("li");
-    item.className = tab.is_active ? "tab-item active" : "tab-item";
+    item.className = `tab-item${tab.is_active ? " active" : ""}${tab.is_pinned ? " pinned" : ""}`;
+    item.draggable = true;
+    item.dataset.tabId = `${tab.id}`;
+    item.dataset.tabIndex = `${index}`;
+
+    // Ref: HTML Standard drag-and-drop dispatches dragstart/dragover/drop in the
+    // document event loop; we only mutate ordering on drop so the visible tab strip
+    // remains consistent with the final user-selected insertion point.
+    // https://html.spec.whatwg.org/multipage/dnd.html#drag-and-drop-processing-model
+    item.addEventListener("dragstart", (event) => {
+      draggedTabId = tab.id;
+      item.classList.add("dragging");
+      event.dataTransfer?.setData("text/plain", `${tab.id}`);
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+    });
+    item.addEventListener("dragend", () => {
+      draggedTabId = null;
+      tabsListEl?.querySelectorAll(".tab-item").forEach((node) => node.classList.remove("dragging", "drop-target"));
+    });
+    item.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      item.classList.add("drop-target");
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    });
+    item.addEventListener("dragleave", () => item.classList.remove("drop-target"));
+    item.addEventListener("drop", (event) => {
+      event.preventDefault();
+      item.classList.remove("drop-target");
+      const sourceId = draggedTabId ?? Number(event.dataTransfer?.getData("text/plain") ?? 0);
+      if (!Number.isFinite(sourceId) || sourceId === tab.id) return;
+      void moveTab(sourceId, index);
+    });
+
+    const dragHandle = document.createElement("button");
+    dragHandle.type = "button";
+    dragHandle.className = "tab-drag-handle";
+    dragHandle.textContent = "⋮⋮";
+    dragHandle.title = "Drag to reorder";
+    dragHandle.setAttribute("aria-label", `Reorder ${tab.title || tab.url || "tab"}`);
 
     const switchButton = document.createElement("button");
     switchButton.type = "button";
     switchButton.className = "tab-switch";
-    switchButton.textContent = tab.title || tab.url || "New Tab";
     switchButton.addEventListener("click", () => void switchTab(tab.id));
+
+    const stateIcons = document.createElement("span");
+    stateIcons.className = "tab-state-icons";
+    stateIcons.textContent = `${tab.is_pinned ? "📌" : ""}${tab.is_muted ? "🔇" : ""}` || "";
+
+    const title = document.createElement("span");
+    title.className = "tab-title";
+    title.textContent = tab.title || tab.url || "New Tab";
+    switchButton.append(stateIcons, title);
+
+    const pinButton = document.createElement("button");
+    pinButton.type = "button";
+    pinButton.className = "tab-action";
+    pinButton.textContent = tab.is_pinned ? "📍" : "📌";
+    pinButton.title = tab.is_pinned ? "Unpin tab" : "Pin tab";
+    pinButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void setTabPinned(tab.id, !tab.is_pinned);
+    });
+
+    const muteButton = document.createElement("button");
+    muteButton.type = "button";
+    muteButton.className = "tab-action";
+    muteButton.textContent = tab.is_muted ? "🔈" : "🔇";
+    muteButton.title = tab.is_muted ? "Unmute tab" : "Mute tab";
+    muteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void setTabMuted(tab.id, !tab.is_muted);
+    });
+
+    const duplicateButton = document.createElement("button");
+    duplicateButton.type = "button";
+    duplicateButton.className = "tab-action";
+    duplicateButton.textContent = "⧉";
+    duplicateButton.title = "Duplicate tab";
+    duplicateButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void duplicateTab(tab.id);
+    });
 
     const closeButton = document.createElement("button");
     closeButton.type = "button";
@@ -612,7 +813,7 @@ function renderTabs(tabs: TabSummary[]) {
       void closeTab(tab.id);
     });
 
-    item.append(switchButton, closeButton);
+    item.append(dragHandle, switchButton, pinButton, muteButton, duplicateButton, closeButton);
     tabsListEl.appendChild(item);
   }
 }
@@ -931,18 +1132,23 @@ async function openCurrentInput() {
     return;
   }
 
+  if (latestOmniboxSuggestions.suggestions.length > 0) {
+    await commitOmniboxSelection();
+    return;
+  }
+
   if (isUrlLikeInput(value)) {
     await openUrl(value);
     return;
   }
 
-  try {
-    const results = await requestAppCommand<SearchResult[]>({ type: "search", payload: { query: value } });
-    renderSearchResults(results);
-    setStatus(`Found ${results.length} search results.`);
-  } catch (errorValue) {
-    handleCommandError(errorValue);
+  await updateOmniboxSuggestions(0);
+  if (latestOmniboxSuggestions.suggestions.length > 0) {
+    setStatus(`Found ${latestOmniboxSuggestions.suggestions.length} suggestions.`);
+    return;
   }
+
+  await openUrl(value);
 }
 
 async function switchTab(id: number) {
@@ -956,6 +1162,50 @@ async function switchTab(id: number) {
     await refreshTabs();
   } catch (errorValue) {
     if (!isCurrentPageEpoch(epoch)) return;
+    handleCommandError(errorValue);
+  }
+}
+
+async function duplicateTab(id: number) {
+  const epoch = beginPageEpoch();
+  try {
+    clearSearchResults();
+    await requestAppCommand<TabSummary>({ type: "duplicate_tab", payload: { id } });
+    if (!isCurrentPageEpoch(epoch)) return;
+    const view = await requestAppCommand<PageViewModel>({ type: "get_page_view" });
+    if (!isCurrentPageEpoch(epoch)) return;
+    renderPageView(view);
+    await refreshNavigationState();
+    await refreshTabs();
+  } catch (errorValue) {
+    if (!isCurrentPageEpoch(epoch)) return;
+    handleCommandError(errorValue);
+  }
+}
+
+async function moveTab(id: number, targetIndex: number) {
+  try {
+    await requestAppCommand<TabSummary[]>({ type: "move_tab", payload: { id, target_index: targetIndex } });
+    await refreshTabs();
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function setTabPinned(id: number, pinned: boolean) {
+  try {
+    await requestAppCommand<TabSummary[]>({ type: "set_tab_pinned", payload: { id, pinned } });
+    await refreshTabs();
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function setTabMuted(id: number, muted: boolean) {
+  try {
+    await requestAppCommand<TabSummary[]>({ type: "set_tab_muted", payload: { id, muted } });
+    await refreshTabs();
+  } catch (errorValue) {
     handleCommandError(errorValue);
   }
 }
@@ -992,6 +1242,60 @@ async function createTab() {
     if (!isCurrentPageEpoch(epoch)) return;
     handleCommandError(errorValue);
   }
+}
+
+function focusAddressInput() {
+  urlInputEl?.focus();
+  urlInputEl?.select();
+}
+
+function shouldHandleGlobalShortcut(event: KeyboardEvent): boolean {
+  const target = event.target;
+  return !(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable));
+}
+
+function installKeyboardHandlers() {
+  urlInputEl?.addEventListener("input", () => void updateOmniboxSuggestions());
+  urlInputEl?.addEventListener("focus", () => void updateOmniboxSuggestions());
+  urlInputEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitOmniboxSelection();
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      void moveOmniboxSelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      void moveOmniboxSelection(-1);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      clearSearchResults();
+    }
+  });
+
+  window.addEventListener("keydown", (event) => {
+    const metaOrCtrl = event.metaKey || event.ctrlKey;
+    if (metaOrCtrl && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      focusAddressInput();
+      return;
+    }
+    if (event.altKey && event.key === "ArrowLeft" && shouldHandleGlobalShortcut(event)) {
+      event.preventDefault();
+      void executeNavigationCommand("back", "Going back...");
+      return;
+    }
+    if (event.altKey && event.key === "ArrowRight" && shouldHandleGlobalShortcut(event)) {
+      event.preventDefault();
+      void executeNavigationCommand("forward", "Going forward...");
+    }
+  });
 }
 
 async function loadInitialPageView() {
@@ -1043,6 +1347,7 @@ window.addEventListener("DOMContentLoaded", () => {
   forwardButtonEl?.addEventListener("click", () => void executeNavigationCommand("forward", "Going forward..."));
   reloadButtonEl?.addEventListener("click", () => void executeNavigationCommand("reload", "Reloading..."));
   newTabButtonEl?.addEventListener("click", () => void createTab());
+  installKeyboardHandlers();
 
   if (viewportEl) {
     resizeObserver = new ResizeObserver(() => void syncViewport());

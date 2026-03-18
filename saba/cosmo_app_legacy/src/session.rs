@@ -6,9 +6,9 @@ use crate::loader::{
 use crate::model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, ErrorMetric, FrameRect,
     FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel, HistoryEntrySnapshot,
-    NavigationEvent, NavigationState, NavigationType, PageViewModel, RenderBackendKind,
-    ScriptEngine, ScrollPosition, SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary,
-    SESSION_SNAPSHOT_SCHEMA_VERSION,
+    NavigationEvent, NavigationState, NavigationType, OmniboxSuggestion, OmniboxSuggestionKind,
+    OmniboxSuggestionSet, PageViewModel, RenderBackendKind, ScriptEngine, ScrollPosition,
+    SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary, SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
 use std::collections::{BTreeMap, HashSet};
@@ -120,6 +120,19 @@ impl AppService for SabaApp {
         self.tab_summary(id).expect("new tab should exist")
     }
 
+    fn duplicate_tab(&mut self, id: u32) -> AppResult<TabSummary> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Err(AppError::state(format!("Tab {id} does not exist")));
+        };
+        let duplicate_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let duplicate = self.tabs[index].duplicate(duplicate_id)?;
+        self.tabs.insert(index + 1, duplicate);
+        self.active_tab_id = duplicate_id;
+        self.tab_summary(duplicate_id)
+            .ok_or_else(|| AppError::state("Duplicated tab was not created"))
+    }
+
     fn switch_tab(&mut self, id: u32) -> AppResult<PageViewModel> {
         if self.tabs.iter().any(|tab| tab.id == id) {
             self.active_tab_id = id;
@@ -149,6 +162,54 @@ impl AppService for SabaApp {
         Ok(self.list_tabs())
     }
 
+    fn move_tab(&mut self, id: u32, target_index: usize) -> AppResult<Vec<TabSummary>> {
+        let Some(current_index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Err(AppError::state(format!("Tab {id} does not exist")));
+        };
+        let tab = self.tabs.remove(current_index);
+        let insert_index = target_index.min(self.tabs.len());
+        self.tabs.insert(insert_index, tab);
+        Ok(self.list_tabs())
+    }
+
+    fn set_tab_pinned(&mut self, id: u32, pinned: bool) -> AppResult<Vec<TabSummary>> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Err(AppError::state(format!("Tab {id} does not exist")));
+        };
+        if self.tabs[index].is_pinned == pinned {
+            return Ok(self.list_tabs());
+        }
+
+        self.tabs[index].is_pinned = pinned;
+        let tab = self.tabs.remove(index);
+        let insert_index = if pinned {
+            self.tabs
+                .iter()
+                .position(|candidate| !candidate.is_pinned)
+                .unwrap_or(self.tabs.len())
+        } else {
+            self.tabs
+                .iter()
+                .rposition(|candidate| candidate.is_pinned)
+                .map(|position| position + 1)
+                .unwrap_or(0)
+        };
+        self.tabs.insert(insert_index, tab);
+        Ok(self.list_tabs())
+    }
+
+    fn set_tab_muted(&mut self, id: u32, muted: bool) -> AppResult<Vec<TabSummary>> {
+        {
+            let tab = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .ok_or_else(|| AppError::state(format!("Tab {id} does not exist")))?;
+            tab.is_muted = muted;
+        }
+        Ok(self.list_tabs())
+    }
+
     fn list_tabs(&self) -> Vec<TabSummary> {
         self.tabs
             .iter()
@@ -157,12 +218,22 @@ impl AppService for SabaApp {
                 title: visible_tab_title(&tab.session.get_page_view()),
                 url: tab.session.current_url(),
                 is_active: tab.id == self.active_tab_id,
+                is_pinned: tab.is_pinned,
+                is_muted: tab.is_muted,
             })
             .collect()
     }
 
     fn search(&self, query: &str) -> AppResult<Vec<SearchResult>> {
         build_search_results(query)
+    }
+
+    fn omnibox_suggestions(
+        &self,
+        query: &str,
+        current_index: Option<usize>,
+    ) -> AppResult<OmniboxSuggestionSet> {
+        build_omnibox_suggestion_set(query, current_index, &self.tabs)
     }
 
     fn script_engine(&self) -> Box<dyn ScriptEngine> {
@@ -263,6 +334,8 @@ impl SabaApp {
                 title: visible_tab_title(&tab.session.get_page_view()),
                 url: tab.session.current_url(),
                 is_active: id == self.active_tab_id,
+                is_pinned: tab.is_pinned,
+                is_muted: tab.is_muted,
             })
     }
 
@@ -289,6 +362,8 @@ impl SabaApp {
 #[derive(Debug)]
 struct Tab {
     id: u32,
+    is_pinned: bool,
+    is_muted: bool,
     session: BrowserSession,
 }
 
@@ -296,13 +371,22 @@ impl Tab {
     fn new(id: u32) -> Self {
         Self {
             id,
+            is_pinned: false,
+            is_muted: false,
             session: BrowserSession::new(),
         }
+    }
+
+    fn duplicate(&self, id: u32) -> AppResult<Self> {
+        let snapshot = self.snapshot();
+        Tab::from_snapshot(TabSessionSnapshot { id, ..snapshot })
     }
 
     fn snapshot(&self) -> TabSessionSnapshot {
         TabSessionSnapshot {
             id: self.id,
+            is_pinned: self.is_pinned,
+            is_muted: self.is_muted,
             history: self.session.history_snapshot(),
             history_index: self.session.history_index,
             viewport_width: self.session.viewport_width,
@@ -313,6 +397,8 @@ impl Tab {
     fn from_snapshot(snapshot: TabSessionSnapshot) -> AppResult<Self> {
         Ok(Self {
             id: snapshot.id,
+            is_pinned: snapshot.is_pinned,
+            is_muted: snapshot.is_muted,
             session: BrowserSession::from_snapshot(snapshot)?,
         })
     }
@@ -404,6 +490,8 @@ impl BrowserSession {
     fn from_snapshot(snapshot: TabSessionSnapshot) -> AppResult<Self> {
         let TabSessionSnapshot {
             id: _,
+            is_pinned: _,
+            is_muted: _,
             history,
             history_index,
             viewport_width,
@@ -1191,6 +1279,90 @@ fn build_search_results(query: &str) -> AppResult<Vec<SearchResult>> {
     Ok(results)
 }
 
+fn build_omnibox_suggestion_set(
+    query: &str,
+    current_index: Option<usize>,
+    tabs: &[Tab],
+) -> AppResult<OmniboxSuggestionSet> {
+    let normalized = query.trim();
+    if normalized.is_empty() {
+        return Ok(OmniboxSuggestionSet {
+            query: String::new(),
+            active_index: None,
+            suggestions: collect_history_suggestions(tabs),
+        });
+    }
+
+    let mut suggestions = collect_history_suggestions(tabs)
+        .into_iter()
+        .filter(|suggestion| {
+            suggestion.title.contains(normalized)
+                || suggestion.value.contains(normalized)
+                || suggestion.detail.contains(normalized)
+        })
+        .collect::<Vec<_>>();
+
+    let mut next_id = suggestions
+        .iter()
+        .map(|suggestion| suggestion.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    for result in build_search_results(normalized)? {
+        suggestions.push(OmniboxSuggestion {
+            id: next_id,
+            kind: if result.id == 0 {
+                OmniboxSuggestionKind::Url
+            } else {
+                OmniboxSuggestionKind::Search
+            },
+            title: result.title,
+            value: result.url.clone(),
+            url: Some(result.url),
+            detail: result.snippet,
+        });
+        next_id += 1;
+    }
+
+    let active_index = match suggestions.is_empty() {
+        true => None,
+        false => Some(current_index.unwrap_or(0).min(suggestions.len() - 1)),
+    };
+
+    Ok(OmniboxSuggestionSet {
+        query: normalized.to_string(),
+        active_index,
+        suggestions,
+    })
+}
+
+fn collect_history_suggestions(tabs: &[Tab]) -> Vec<OmniboxSuggestion> {
+    let mut suggestions = Vec::new();
+    let mut seen_urls = HashSet::new();
+    let mut next_id = 1;
+
+    for tab in tabs.iter().rev() {
+        for entry in tab.session.history.iter().rev() {
+            let url = entry.view.current_url.trim();
+            if url.is_empty() || !seen_urls.insert(url.to_string()) {
+                continue;
+            }
+            suggestions.push(OmniboxSuggestion {
+                id: next_id,
+                kind: OmniboxSuggestionKind::History,
+                title: visible_tab_title(&entry.view),
+                value: url.to_string(),
+                url: Some(url.to_string()),
+                detail: "Visited page from tab history".to_string(),
+            });
+            next_id += 1;
+        }
+    }
+
+    suggestions
+}
+
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1531,6 +1703,47 @@ mod tests {
             restored.get_navigation_state().current_url.as_deref(),
             Some("fixture://abehiroshi/index")
         );
+    }
+
+    #[test]
+    fn tab_operations_round_trip_pin_mute_duplicate_and_order() {
+        let mut app = SabaApp::default();
+        app.open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+        let second = app.new_tab();
+        assert_eq!(second.id, 2);
+
+        app.set_tab_pinned(2, true).expect("pin should succeed");
+        app.set_tab_muted(2, true).expect("mute should succeed");
+        let duplicate = app.duplicate_tab(2).expect("duplicate should succeed");
+        app.move_tab(duplicate.id, 0)
+            .expect("reorder should succeed");
+
+        let tabs = app.list_tabs();
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert!(tabs[0].is_pinned);
+        assert!(tabs[0].is_muted);
+        assert!(tabs[0].is_active);
+        assert!(tabs[1].is_pinned);
+        assert!(tabs[1].is_muted);
+
+        let snapshot = app.export_session_snapshot();
+        let mut restored = SabaApp::default();
+        restored
+            .import_session_snapshot(snapshot)
+            .expect("snapshot should restore");
+        let restored_tabs = restored.list_tabs();
+        assert_eq!(
+            restored_tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert!(restored_tabs[0].is_pinned);
+        assert!(restored_tabs[0].is_muted);
+        assert!(restored_tabs[1].is_pinned);
+        assert!(restored_tabs[1].is_muted);
     }
 
     fn sample_page(url: &str, diagnostics: Vec<&str>) -> PageViewModel {

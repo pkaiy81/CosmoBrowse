@@ -1,7 +1,7 @@
 use cosmo_runtime::{
     scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService,
-    FrameScrollPositionSnapshot, NavigationState, OrbitSnapshot, PaintCommand, SceneItem,
-    SearchResult, SessionSnapshot, StarshipApp, TabSummary,
+    FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet, OrbitSnapshot,
+    PaintCommand, SceneItem, SearchResult, SessionSnapshot, StarshipApp, TabSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -300,15 +300,34 @@ pub enum IpcRequestPayload {
     GetMetrics,
     GetLatestCrashReport,
     NewTab,
+    DuplicateTab {
+        id: u32,
+    },
     SwitchTab {
         id: u32,
     },
     CloseTab {
         id: u32,
     },
+    MoveTab {
+        id: u32,
+        target_index: usize,
+    },
+    SetTabPinned {
+        id: u32,
+        pinned: bool,
+    },
+    SetTabMuted {
+        id: u32,
+        muted: bool,
+    },
     ListTabs,
     Search {
         query: String,
+    },
+    OmniboxSuggestions {
+        query: String,
+        current_index: Option<usize>,
     },
     UpdateScrollPositions {
         positions: Vec<FrameScrollPositionSnapshot>,
@@ -328,6 +347,7 @@ pub enum IpcResponsePayload {
     Tab(TabSummary),
     Tabs(Vec<TabSummary>),
     SearchResults(Vec<SearchResult>),
+    OmniboxSuggestions(OmniboxSuggestionSet),
     Ack(bool),
 }
 
@@ -402,14 +422,32 @@ impl NativeAdapter {
                 self.get_latest_crash_report(),
             )),
             IpcRequestPayload::NewTab => self.new_tab().map(IpcResponsePayload::Tab),
+            IpcRequestPayload::DuplicateTab { id } => {
+                self.duplicate_tab(id).map(IpcResponsePayload::Tab)
+            }
             IpcRequestPayload::SwitchTab { id } => {
                 self.switch_tab(id).map(IpcResponsePayload::Page)
             }
             IpcRequestPayload::CloseTab { id } => self.close_tab(id).map(IpcResponsePayload::Tabs),
+            IpcRequestPayload::MoveTab { id, target_index } => self
+                .move_tab(id, target_index)
+                .map(IpcResponsePayload::Tabs),
+            IpcRequestPayload::SetTabPinned { id, pinned } => self
+                .set_tab_pinned(id, pinned)
+                .map(IpcResponsePayload::Tabs),
+            IpcRequestPayload::SetTabMuted { id, muted } => {
+                self.set_tab_muted(id, muted).map(IpcResponsePayload::Tabs)
+            }
             IpcRequestPayload::ListTabs => self.list_tabs().map(IpcResponsePayload::Tabs),
             IpcRequestPayload::Search { query } => {
                 self.search(&query).map(IpcResponsePayload::SearchResults)
             }
+            IpcRequestPayload::OmniboxSuggestions {
+                query,
+                current_index,
+            } => self
+                .omnibox_suggestions(&query, current_index)
+                .map(IpcResponsePayload::OmniboxSuggestions),
             IpcRequestPayload::UpdateScrollPositions { positions } => self
                 .update_scroll_positions(positions)
                 .map(|_| IpcResponsePayload::Ack(true)),
@@ -507,6 +545,14 @@ impl NativeAdapter {
         Ok(summary)
     }
 
+    pub fn duplicate_tab(&self, id: u32) -> Result<TabSummary, AppError> {
+        let mut app = self.lock_app()?;
+        let result = app.duplicate_tab(id);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
+    }
+
     pub fn switch_tab(&self, id: u32) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
         let result = app.switch_tab(id).map(BrowserPageDto::from);
@@ -523,6 +569,30 @@ impl NativeAdapter {
         result
     }
 
+    pub fn move_tab(&self, id: u32, target_index: usize) -> Result<Vec<TabSummary>, AppError> {
+        let mut app = self.lock_app()?;
+        let result = app.move_tab(id, target_index);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
+    }
+
+    pub fn set_tab_pinned(&self, id: u32, pinned: bool) -> Result<Vec<TabSummary>, AppError> {
+        let mut app = self.lock_app()?;
+        let result = app.set_tab_pinned(id, pinned);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
+    }
+
+    pub fn set_tab_muted(&self, id: u32, muted: bool) -> Result<Vec<TabSummary>, AppError> {
+        let mut app = self.lock_app()?;
+        let result = app.set_tab_muted(id, muted);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
+    }
+
     pub fn list_tabs(&self) -> Result<Vec<TabSummary>, AppError> {
         let app = self.lock_app()?;
         Ok(app.list_tabs())
@@ -531,6 +601,15 @@ impl NativeAdapter {
     pub fn search(&self, query: &str) -> Result<Vec<SearchResult>, AppError> {
         let app = self.lock_app()?;
         app.search(query)
+    }
+
+    pub fn omnibox_suggestions(
+        &self,
+        query: &str,
+        current_index: Option<usize>,
+    ) -> Result<OmniboxSuggestionSet, AppError> {
+        let app = self.lock_app()?;
+        app.omnibox_suggestions(query, current_index)
     }
 
     pub fn register_tls_exception(&self, url: &str) -> Result<(), AppError> {

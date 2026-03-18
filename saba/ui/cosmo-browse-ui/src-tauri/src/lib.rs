@@ -1,6 +1,7 @@
 use adapter_native::{BrowserPageDto, CrashReportDto, IpcRequest, IpcResponse, NativeAdapter};
 use cosmo_runtime::{
-    AppError, FrameScrollPositionSnapshot, NavigationState, SearchResult, TabSummary,
+    AppError, FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet, SearchResult,
+    TabSummary,
 };
 use serde::Serialize;
 use std::backtrace::Backtrace;
@@ -128,6 +129,11 @@ fn new_tab(state: tauri::State<'_, AppState>) -> Result<TabSummary, AppError> {
 }
 
 #[tauri::command]
+fn duplicate_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<TabSummary, AppError> {
+    state.adapter.duplicate_tab(id)
+}
+
+#[tauri::command]
 fn switch_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<BrowserPageDto, AppError> {
     state.adapter.switch_tab(id)
 }
@@ -138,6 +144,33 @@ fn close_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<Vec<TabSummar
 }
 
 #[tauri::command]
+fn move_tab(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    target_index: usize,
+) -> Result<Vec<TabSummary>, AppError> {
+    state.adapter.move_tab(id, target_index)
+}
+
+#[tauri::command]
+fn set_tab_pinned(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    pinned: bool,
+) -> Result<Vec<TabSummary>, AppError> {
+    state.adapter.set_tab_pinned(id, pinned)
+}
+
+#[tauri::command]
+fn set_tab_muted(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    muted: bool,
+) -> Result<Vec<TabSummary>, AppError> {
+    state.adapter.set_tab_muted(id, muted)
+}
+
+#[tauri::command]
 fn list_tabs(state: tauri::State<'_, AppState>) -> Result<Vec<TabSummary>, AppError> {
     state.adapter.list_tabs()
 }
@@ -145,6 +178,15 @@ fn list_tabs(state: tauri::State<'_, AppState>) -> Result<Vec<TabSummary>, AppEr
 #[tauri::command]
 fn search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, AppError> {
     state.adapter.search(&query)
+}
+
+#[tauri::command]
+fn omnibox_suggestions(
+    state: tauri::State<'_, AppState>,
+    query: String,
+    current_index: Option<usize>,
+) -> Result<OmniboxSuggestionSet, AppError> {
+    state.adapter.omnibox_suggestions(&query, current_index)
 }
 
 #[tauri::command]
@@ -266,10 +308,15 @@ pub fn run() {
             get_navigation_state,
             release_rollout_status,
             new_tab,
+            duplicate_tab,
             switch_tab,
             close_tab,
+            move_tab,
+            set_tab_pinned,
+            set_tab_muted,
             list_tabs,
             search,
+            omnibox_suggestions,
             update_scroll_positions
         ])
         .run(tauri::generate_context!())
