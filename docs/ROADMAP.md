@@ -251,12 +251,14 @@
   - 進捗メモ: TLS エラー分類、origin/TTL 付き例外登録、UI interstitial と再試行フローを `dispatch_ipc` 経路へ接続済み。
 
 ### Epic 6: UI/UX（タブ・アドレスバー・開発者体験）
-- [ ] **E6-T1 タブストリップ改善**
+- [x] **E6-T1 タブストリップ改善**
   - ピン留め、ミュート、複製、ドラッグ並べ替え。
   - **完了条件**: 20 タブ以上で操作遅延が許容値内。
-- [ ] **E6-T2 アドレスバー（Omnibox）**
+- 進捗メモ: タブごとの `pin/mute/duplicate/reorder` API と UI を接続し、session snapshot で pin/mute を保持、`scripts/benchmark_tab_strip.mjs` で 20 タブの軽量遅延計測を追加。
+- [x] **E6-T2 アドレスバー（Omnibox）**
   - URL/履歴/検索候補を統合し、キーボード操作を最適化。
   - **完了条件**: 主要ショートカットで遷移完了まで一貫動作。
+- 進捗メモ: `OmniboxSuggestionSet` DTO に履歴 + 既存検索候補 + active index を統合し、Enter / ArrowUp / ArrowDown / Escape / Ctrl(Cmd)+L / Alt+Left/Right を UI へ実装。
 - [ ] **E6-T3 ダウンロードマネージャ**
   - 進捗表示、一時停止/再開、保存先ポリシー。
   - **完了条件**: 大容量ファイルで再開可能ダウンロードが成功。
@@ -354,9 +356,10 @@
     - Cookie jar / local storage / 権限判断キャッシュを origin 単位で保存し、SameSite/Secure/HttpOnly 診断と接続する。
     - 進捗メモ: RFC 6454 origin key を使う in-memory 永続モデルと `localStorage` ランタイム同期、Cookie 診断/送信経路、永続化形式 ADR を追加。
     - セッション復元と干渉しないよう、永続化形式と消去ポリシーを ADR 化する。
-12. [ ] **NJ-T3 E6-T1/E6-T2 タブストリップ + Omnibox 改善**
+12. [x] **NJ-T3 E6-T1/E6-T2 タブストリップ + Omnibox 改善**
     - ピン留め/複製/並べ替えと URL・履歴・検索候補を統合した入力補完を導入する。
     - 20 タブ規模の UI 操作遅延と主要ショートカット回帰を Playwright か smoke harness で定量評価する。
+    - 進捗メモ: runtime 境界へ `OmniboxSuggestionSet` を追加し、タブストリップ操作とショートカットを `saba/ui/cosmo-browse-ui` に接続、`scripts/benchmark_tab_strip.mjs` で 20 タブ render p95 / interaction batch を smoke 計測可能にした。
 13. [ ] **NJ-T4 E7-T1/E7-T3 KPI ダッシュボード + クラッシュレポート強化**
     - 既存 `kpi_summary.json` を拡張して FCP 相当・メモリ使用量・クラッシュ分類を時系列可視化し、panic report を release artifacts と紐付ける。
     - minidump/symbol 管理までは到達していないため、まず nightly artifact 集約と再現テンプレート自動添付を完了条件にする。

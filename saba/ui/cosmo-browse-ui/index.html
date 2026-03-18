@@ -14,7 +14,7 @@
           <h1>CosmoBrowse</h1>
           <button id="new-tab-button" class="ghost-button" type="button">+ Tab</button>
         </div>
-        <ul id="tabs-list" class="tabs-list"></ul>
+        <ul id="tabs-list" class="tabs-list" aria-label="Open tabs"></ul>
       </section>
 
       <section class="browser-chrome">
@@ -27,7 +27,12 @@
           <input id="url-input" class="address-input" placeholder="URL or search query" />
           <button class="primary-button" type="submit">Open</button>
         </form>
-        <ul id="search-results" class="search-results hidden"></ul>
+        <ul
+          id="search-results"
+          class="search-results hidden"
+          role="listbox"
+          aria-label="Omnibox suggestions"
+        ></ul>
       </section>
 
       <section class="viewport-shell">

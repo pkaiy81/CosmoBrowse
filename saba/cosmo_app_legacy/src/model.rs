@@ -179,6 +179,8 @@ pub struct SessionSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TabSessionSnapshot {
     pub id: u32,
+    pub is_pinned: bool,
+    pub is_muted: bool,
     pub history: Vec<HistoryEntrySnapshot>,
     pub history_index: usize,
     pub viewport_width: i64,
@@ -470,6 +472,8 @@ pub struct TabSummary {
     pub title: String,
     pub url: Option<String>,
     pub is_active: bool,
+    pub is_pinned: bool,
+    pub is_muted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -478,6 +482,31 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OmniboxSuggestionKind {
+    History,
+    Search,
+    Url,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OmniboxSuggestion {
+    pub id: u32,
+    pub kind: OmniboxSuggestionKind,
+    pub title: String,
+    pub value: String,
+    pub url: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OmniboxSuggestionSet {
+    pub query: String,
+    pub active_index: Option<usize>,
+    pub suggestions: Vec<OmniboxSuggestion>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -523,10 +552,19 @@ pub trait AppService {
     fn get_navigation_state(&self) -> NavigationState;
     fn get_metrics(&self) -> AppMetricsSnapshot;
     fn new_tab(&mut self) -> TabSummary;
+    fn duplicate_tab(&mut self, id: u32) -> AppResult<TabSummary>;
     fn switch_tab(&mut self, id: u32) -> AppResult<PageViewModel>;
     fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>>;
+    fn move_tab(&mut self, id: u32, target_index: usize) -> AppResult<Vec<TabSummary>>;
+    fn set_tab_pinned(&mut self, id: u32, pinned: bool) -> AppResult<Vec<TabSummary>>;
+    fn set_tab_muted(&mut self, id: u32, muted: bool) -> AppResult<Vec<TabSummary>>;
     fn list_tabs(&self) -> Vec<TabSummary>;
     fn search(&self, query: &str) -> AppResult<Vec<SearchResult>>;
+    fn omnibox_suggestions(
+        &self,
+        query: &str,
+        current_index: Option<usize>,
+    ) -> AppResult<OmniboxSuggestionSet>;
     fn export_session_snapshot(&self) -> SessionSnapshot;
     fn import_session_snapshot(&mut self, snapshot: SessionSnapshot) -> AppResult<()>;
     fn update_scroll_positions(

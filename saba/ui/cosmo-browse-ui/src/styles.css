@@ -18,11 +18,20 @@ input { border: 1px solid #c7d2e9; border-radius: 14px; padding: 0.8rem 1rem; ba
 .tabs-panel, .browser-chrome { padding: 1rem 1.1rem; }
 .tabs-header, .page-meta { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .tabs-list { list-style: none; margin: 0; padding: 0; display: flex; gap: 0.6rem; flex-wrap: wrap; }
-.tab-item { align-items: center; background: #edf3ff; border: 1px solid transparent; border-radius: 999px; display: flex; overflow: hidden; }
+.tab-item { align-items: center; background: #edf3ff; border: 1px solid transparent; border-radius: 999px; display: flex; gap: 0.15rem; min-height: 44px; overflow: hidden; padding: 0.1rem 0.2rem; }
 .tab-item.active { background: #d7e5ff; border-color: #4878dd; }
-.tab-switch, .tab-close, .linklike { border: none; background: transparent; color: inherit; }
-.tab-switch { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0.55rem 0.9rem; }
-.tab-close { color: #7f1d33; font-weight: 700; padding: 0.55rem 0.75rem; }
+.tab-item.pinned { background: #e7eeff; }
+.tab-item.dragging { opacity: 0.6; }
+.tab-item.drop-target { border-color: #2b66de; box-shadow: 0 0 0 2px rgba(43, 102, 222, 0.15); }
+.tab-switch, .tab-close, .tab-action, .tab-drag-handle, .linklike { border: none; background: transparent; color: inherit; }
+.tab-switch { align-items: center; display: inline-flex; gap: 0.45rem; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0.55rem 0.55rem 0.55rem 0.4rem; }
+.tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-state-icons { color: #476287; display: inline-flex; gap: 0.2rem; font-size: 0.82rem; }
+.tab-action, .tab-drag-handle, .tab-close { border-radius: 999px; font-size: 0.9rem; padding: 0.45rem 0.5rem; }
+.tab-action:hover, .tab-drag-handle:hover, .tab-close:hover { background: rgba(43, 102, 222, 0.12); }
+.tab-close { color: #7f1d33; font-weight: 700; }
+.tab-drag-handle { cursor: grab; }
+.tab-drag-handle:active { cursor: grabbing; }
 .toolbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0.8rem; align-items: center; }
 .nav-group { display: flex; gap: 0.55rem; }
 .address-input { width: 100%; }
@@ -30,7 +39,12 @@ input { border: 1px solid #c7d2e9; border-radius: 14px; padding: 0.8rem 1rem; ba
 .ghost-button { background: #e7efff; }
 .search-results { list-style: none; margin: 0.8rem 0 0; padding: 0.4rem; border-radius: 16px; border: 1px solid #d8e1f4; background: #f8fbff; }
 .search-results.hidden { display: none; }
-.search-results li { padding: 0.45rem; }
+.search-results li { border-radius: 12px; padding: 0.45rem; }
+.search-results li.selected { background: #dfeaff; }
+.suggestion-button { align-items: flex-start; display: grid; gap: 0.15rem; text-align: left; text-decoration: none; width: 100%; }
+.suggestion-title { color: #16315d; font-weight: 600; }
+.suggestion-meta { color: #5a6a84; font-size: 0.82rem; }
+.suggestion-kind { color: #2151c4; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; }
 .linklike { border-radius: 0; padding: 0; color: #2151c4; text-decoration: underline; }
 .viewport-shell { min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .page-meta { padding: 1rem 1.1rem 0.8rem; border-bottom: 1px solid #e0e6f4; align-items: flex-start; }
