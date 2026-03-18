@@ -26,9 +26,65 @@ impl AppError {
         }
     }
 
+    pub fn network_timeout(message: impl Into<String>) -> Self {
+        Self {
+            code: "network_timeout".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn network_redirect_loop(message: impl Into<String>) -> Self {
+        Self {
+            code: "network_redirect_loop".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn network_content_decoding(message: impl Into<String>) -> Self {
+        Self {
+            code: "network_content_decoding".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn cors_blocked(message: impl Into<String>) -> Self {
+        Self {
+            code: "cors_blocked".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn cors_preflight_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "cors_preflight_failed".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
     pub fn tls(message: impl Into<String>) -> Self {
         Self {
             code: "tls_error".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn tls_certificate_expired(message: impl Into<String>) -> Self {
+        Self {
+            code: "tls_certificate_expired".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn tls_certificate_self_signed(message: impl Into<String>) -> Self {
+        Self {
+            code: "tls_certificate_self_signed".to_string(),
             message: message.into(),
             retryable: true,
         }

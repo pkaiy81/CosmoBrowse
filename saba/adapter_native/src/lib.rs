@@ -300,6 +300,9 @@ pub enum IpcRequestPayload {
     Search {
         query: String,
     },
+    RegisterTlsException {
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -312,6 +315,7 @@ pub enum IpcResponsePayload {
     Tab(TabSummary),
     Tabs(Vec<TabSummary>),
     SearchResults(Vec<SearchResult>),
+    Ack(bool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +397,9 @@ impl NativeAdapter {
             IpcRequestPayload::Search { query } => {
                 self.search(&query).map(IpcResponsePayload::SearchResults)
             }
+            IpcRequestPayload::RegisterTlsException { url } => self
+                .register_tls_exception(&url)
+                .map(|_| IpcResponsePayload::Ack(true)),
         }?;
 
         Ok(IpcResponse {
@@ -480,6 +487,11 @@ impl NativeAdapter {
     pub fn search(&self, query: &str) -> Result<Vec<SearchResult>, AppError> {
         let app = self.lock_app()?;
         app.search(query)
+    }
+
+    pub fn register_tls_exception(&self, url: &str) -> Result<(), AppError> {
+        let mut app = self.lock_app()?;
+        app.register_tls_exception(url)
     }
 
     fn lock_app(&self) -> Result<std::sync::MutexGuard<'_, StarshipApp>, AppError> {

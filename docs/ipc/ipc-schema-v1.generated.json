@@ -82,6 +82,19 @@
       },
       "response_type": "page"
     },
+    "register_tls_exception": {
+      "request_payload": {
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ]
+      },
+      "response_type": "ack"
+    },
     "reload": {
       "request_payload": null,
       "response_type": "page"
@@ -151,7 +164,8 @@
           "switch_tab",
           "close_tab",
           "list_tabs",
-          "search"
+          "search",
+          "register_tls_exception"
         ],
         "type": "string"
       },

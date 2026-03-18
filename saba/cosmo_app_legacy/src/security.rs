@@ -1,6 +1,12 @@
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN, SET_COOKIE};
-use std::sync::OnceLock;
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS,
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    SET_COOKIE,
+};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::model::{AppError, AppResult};
@@ -123,25 +129,186 @@ pub fn evaluate_sandbox_policy(initiator_url: &str, target_url: &str) -> Sandbox
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialsMode {
+    Omit,
+    Include,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorsPreflightResult {
+    pub status: u16,
+    pub headers: HeaderMap,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorsRequest<'a> {
+    pub initiator_url: &'a str,
+    pub target_url: &'a str,
+    pub method: &'a str,
+    pub request_headers: Vec<HeaderName>,
+    pub credentials_mode: CredentialsMode,
+}
+
 pub fn passes_cors(initiator_url: &str, target_url: &str, response_headers: &HeaderMap) -> bool {
-    if is_same_origin(initiator_url, target_url) {
+    let request = CorsRequest {
+        initiator_url,
+        target_url,
+        method: "GET",
+        request_headers: Vec::new(),
+        credentials_mode: CredentialsMode::Omit,
+    };
+    evaluate_cors_request(&request, response_headers, None).is_ok()
+}
+
+// Spec: Fetch Standard CORS-preflight fetch and CORS check algorithm.
+// https://fetch.spec.whatwg.org/#cors-preflight-fetch
+// https://fetch.spec.whatwg.org/#cors-check
+pub fn evaluate_cors_request(
+    request: &CorsRequest<'_>,
+    response_headers: &HeaderMap,
+    preflight: Option<&CorsPreflightResult>,
+) -> AppResult<()> {
+    if is_same_origin(request.initiator_url, request.target_url) {
+        return Ok(());
+    }
+
+    let initiator = Url::parse(request.initiator_url)
+        .map_err(|error| AppError::validation(format!("Invalid initiator URL: {error}")))?;
+    let initiator_origin = Origin::from_url(&initiator)
+        .ok_or_else(|| AppError::validation("Initiator URL has opaque origin"))?
+        .serialize();
+
+    if requires_preflight(request.method, &request.request_headers) {
+        let Some(preflight) = preflight else {
+            return Err(AppError::cors_preflight_failed(
+                "CORS preflight required but no preflight response was provided",
+            ));
+        };
+        validate_preflight(preflight, request, &initiator_origin)?;
+    }
+
+    let allowed_origin = response_headers
+        .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            AppError::cors_blocked("Missing Access-Control-Allow-Origin in cross-origin response")
+        })?;
+
+    match request.credentials_mode {
+        // Spec: Fetch forbids `*` with credentials mode include.
+        // https://fetch.spec.whatwg.org/#http-new-header-syntax
+        CredentialsMode::Include => {
+            if allowed_origin != initiator_origin {
+                return Err(AppError::cors_blocked(format!(
+                    "Credentials mode include requires exact Access-Control-Allow-Origin match (expected {initiator_origin}, got {allowed_origin})"
+                )));
+            }
+            let allows_credentials = response_headers
+                .get(ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+            if !allows_credentials {
+                return Err(AppError::cors_blocked(
+                    "Credentials mode include requires Access-Control-Allow-Credentials: true",
+                ));
+            }
+        }
+        CredentialsMode::Omit => {
+            if allowed_origin != "*" && allowed_origin != initiator_origin {
+                return Err(AppError::cors_blocked(format!(
+                    "Access-Control-Allow-Origin does not allow initiator origin {initiator_origin}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn requires_preflight(method: &str, request_headers: &[HeaderName]) -> bool {
+    let method = method.to_ascii_uppercase();
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
         return true;
     }
 
-    let Some(initiator) = Url::parse(initiator_url).ok() else {
-        return false;
-    };
-    let Some(initiator_origin) = Origin::from_url(&initiator).map(|origin| origin.serialize())
-    else {
-        return false;
-    };
-    let Some(value) = response_headers.get(ACCESS_CONTROL_ALLOW_ORIGIN) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    value == "*" || value == initiator_origin
+    request_headers
+        .iter()
+        .any(|name| !is_cors_safelisted_header(name.as_str()))
+}
+
+fn validate_preflight(
+    preflight: &CorsPreflightResult,
+    request: &CorsRequest<'_>,
+    initiator_origin: &str,
+) -> AppResult<()> {
+    if !(200..300).contains(&preflight.status) {
+        return Err(AppError::cors_preflight_failed(format!(
+            "Preflight failed with HTTP status {}",
+            preflight.status
+        )));
+    }
+
+    let allow_origin = preflight
+        .headers
+        .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            AppError::cors_preflight_failed(
+                "Preflight response missing Access-Control-Allow-Origin",
+            )
+        })?;
+    if allow_origin != "*" && allow_origin != initiator_origin {
+        return Err(AppError::cors_preflight_failed(format!(
+            "Preflight origin mismatch: expected {initiator_origin}, got {allow_origin}"
+        )));
+    }
+
+    let requested_method = request.method.to_ascii_uppercase();
+    let methods = preflight
+        .headers
+        .get(ACCESS_CONTROL_ALLOW_METHODS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !header_csv_contains_token(methods, &requested_method) {
+        return Err(AppError::cors_preflight_failed(format!(
+            "Preflight denied method {}",
+            request.method
+        )));
+    }
+
+    let allow_headers = preflight
+        .headers
+        .get(ACCESS_CONTROL_ALLOW_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    for name in &request.request_headers {
+        if !is_cors_safelisted_header(name.as_str())
+            && !header_csv_contains_token(allow_headers, name.as_str())
+        {
+            return Err(AppError::cors_preflight_failed(format!(
+                "Preflight denied header {}",
+                name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn header_csv_contains_token(csv: &str, token: &str) -> bool {
+    csv.split(',')
+        .map(str::trim)
+        .any(|entry| entry.eq_ignore_ascii_case(token))
+}
+
+// Spec: Fetch CORS-safelisted request-header names.
+// https://fetch.spec.whatwg.org/#cors-safelisted-request-header
+fn is_cors_safelisted_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "accept" | "accept-language" | "content-language" | "content-type"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,11 +444,83 @@ pub fn collect_cookie_diagnostics(headers: &HeaderMap, response_url: &str) -> Ve
         .collect()
 }
 
+fn tls_exception_store() -> &'static Mutex<HashMap<String, Instant>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Spec: certificate override decisions should be explicit and scoped per-origin,
+// with expiration to avoid permanent weakening of transport guarantees.
+// Ref: RFC 5280 path validation + browser interstitial UX practice.
+// https://www.rfc-editor.org/rfc/rfc5280
+pub fn register_tls_exception(url: &str, ttl: Duration) -> AppResult<String> {
+    let parsed = Url::parse(url)
+        .map_err(|error| AppError::validation(format!("Invalid URL for TLS exception: {error}")))?;
+    if parsed.scheme() != "https" {
+        return Err(AppError::validation(
+            "TLS exceptions are only valid for https origins",
+        ));
+    }
+    let origin = Origin::from_url(&parsed)
+        .ok_or_else(|| AppError::validation("TLS exception requires host-based origin"))?
+        .serialize();
+
+    let mut store = tls_exception_store()
+        .lock()
+        .map_err(|_| AppError::state("TLS exception store lock poisoned"))?;
+    store.insert(origin.clone(), Instant::now() + ttl);
+    Ok(origin)
+}
+
+#[cfg(test)]
+fn clear_tls_exceptions_for_tests() {
+    if let Ok(mut store) = tls_exception_store().lock() {
+        store.clear();
+    }
+}
+
+pub fn has_tls_exception(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(origin) = Origin::from_url(&parsed).map(|origin| origin.serialize()) else {
+        return false;
+    };
+
+    let Ok(mut store) = tls_exception_store().lock() else {
+        return false;
+    };
+
+    store.retain(|_, expires_at| *expires_at > Instant::now());
+    store.contains_key(&origin)
+}
+
 pub fn classify_tls_policy_error(message: &str) -> AppError {
     let lower = message.to_ascii_lowercase();
+    if lower.contains("certificate has expired") || lower.contains("expired") {
+        return AppError::tls_certificate_expired(format!(
+            "Certificate validation failed (expired): {message}"
+        ));
+    }
+    if lower.contains("self signed") {
+        return AppError::tls_certificate_self_signed(format!(
+            "Certificate validation failed (self-signed): {message}"
+        ));
+    }
     if lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl") {
         return AppError::tls(format!(
             "Certificate/TLS policy blocked secure connection: {message}"
+        ));
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return AppError::network_timeout(format!("Network timeout: {message}"));
+    }
+    if lower.contains("decode") || lower.contains("decompress") {
+        return AppError::network_content_decoding(format!(
+            "Response content decoding failed: {message}"
         ));
     }
     AppError::network(message.to_string())
@@ -362,5 +601,78 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("mixed-content"))
         );
+    }
+    #[test]
+    fn cors_requires_preflight_for_non_simple_method() {
+        let request_headers = vec![HeaderName::from_static("x-request-id")];
+        assert!(requires_preflight("PUT", &request_headers));
+        assert!(!requires_preflight("GET", &[]));
+    }
+
+    #[test]
+    fn cors_blocks_wildcard_with_credentials() {
+        let request = CorsRequest {
+            initiator_url: "https://app.example.com/page",
+            target_url: "https://api.example.net/data",
+            method: "GET",
+            request_headers: Vec::new(),
+            credentials_mode: CredentialsMode::Include,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        headers.insert(
+            ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+
+        let error = evaluate_cors_request(&request, &headers, None).expect_err("must block");
+        assert_eq!(error.code, "cors_blocked");
+    }
+
+    #[test]
+    fn cors_preflight_fails_when_header_not_allowed() {
+        let request = CorsRequest {
+            initiator_url: "https://app.example.com/page",
+            target_url: "https://api.example.net/data",
+            method: "PUT",
+            request_headers: vec![HeaderName::from_static("x-token")],
+            credentials_mode: CredentialsMode::Omit,
+        };
+
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://app.example.com:443"),
+        );
+
+        let mut preflight_headers = HeaderMap::new();
+        preflight_headers.insert(
+            ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://app.example.com:443"),
+        );
+        preflight_headers.insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("PUT"));
+        preflight_headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+        let preflight = CorsPreflightResult {
+            status: 204,
+            headers: preflight_headers,
+        };
+
+        let error = evaluate_cors_request(&request, &response_headers, Some(&preflight))
+            .expect_err("preflight should fail");
+        assert_eq!(error.code, "cors_preflight_failed");
+    }
+
+    #[test]
+    fn tls_exception_is_origin_scoped_and_expires() {
+        clear_tls_exceptions_for_tests();
+
+        let origin = register_tls_exception("https://example.com/path", Duration::from_millis(25))
+            .expect("register tls exception");
+        assert_eq!(origin, "https://example.com:443");
+        assert!(has_tls_exception("https://example.com/other"));
+        assert!(!has_tls_exception("https://example.org/other"));
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!has_tls_exception("https://example.com/other"));
     }
 }
