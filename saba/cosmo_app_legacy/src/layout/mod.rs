@@ -2,6 +2,7 @@ use crate::model::{
     ContentSize, FrameRect, RenderBox, RenderNode, RenderNodeKind, RenderTreeSnapshot,
     ResolvedStyle, SceneItem,
 };
+use crate::security::{local_storage_snapshot, replace_local_storage};
 use cosmo_core::js_runtime::JsDomRuntimeBridge;
 use cosmo_core::nebula_renderer::css::cssom::CssParser;
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
@@ -105,19 +106,25 @@ pub fn diff_scene_items(previous: &[SceneItem], next: &[SceneItem]) -> SceneDiff
     }
 }
 
-pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> ScriptLayoutResult {
+pub fn build_layout_scene_with_script_runtime(
+    document_url: &str,
+    html: &str,
+    rect: &FrameRect,
+) -> ScriptLayoutResult {
     let tokenizer = HtmlTokenizer::new(html.to_string());
     let window = HtmlParser::new(tokenizer).construct_tree();
     let dom = window.borrow().document();
 
     let script = get_js_content(dom.clone());
     let mut runtime = JsRuntime::new(dom.clone());
+    runtime.replace_local_storage_entries(local_storage_snapshot(document_url));
     if !script.trim().is_empty() {
         let lexer = JsLexer::new(script);
         let mut parser = JsParser::new(lexer);
         let program = parser.parse_ast();
         runtime.execute(&program);
     }
+    replace_local_storage(document_url, &runtime.local_storage_entries());
 
     let style = get_style_content(dom.clone());
     let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
@@ -139,7 +146,7 @@ pub fn build_layout_scene_with_script_runtime(html: &str, rect: &FrameRect) -> S
 }
 
 pub fn build_layout_scene(html: &str, rect: &FrameRect) -> LayoutScene {
-    build_layout_scene_with_script_runtime(html, rect).layout_scene
+    build_layout_scene_with_script_runtime("about:blank", html, rect).layout_scene
 }
 
 fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> LayoutScene {

@@ -1,15 +1,15 @@
 use crate::model::{AppError, AppResult, FrameRect};
 use crate::security::{
-    classify_tls_policy_error, collect_cookie_diagnostics, evaluate_cors_request,
-    evaluate_sandbox_policy, has_tls_exception, register_tls_exception, CorsRequest,
-    CredentialsMode,
+    apply_set_cookie_headers, attach_cookie_header, cache_permission_decision,
+    classify_tls_policy_error, evaluate_cors_request, evaluate_sandbox_policy, has_tls_exception,
+    register_tls_exception, CorsRequest, CredentialsMode,
 };
 use encoding_rs::{Encoding, SHIFT_JIS, UTF_8};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{
-    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, HeaderMap,
-    HeaderValue,
+    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+    LOCATION,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -98,7 +98,12 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     // https://www.rfc-editor.org/rfc/rfc9111
     let response = fetch_with_pipeline(&request, &mut diagnostics)?;
 
-    validate_response_security(url, &response.final_url, &response.headers, &mut diagnostics);
+    validate_response_security(
+        url,
+        &response.final_url,
+        &response.headers,
+        &mut diagnostics,
+    );
 
     let decoded = decode_html_bytes(&response.body, response.content_type.as_deref());
     store_cache_entry(url, &response, &decoded.html);
@@ -112,7 +117,6 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
         diagnostics,
     })
 }
-
 
 // Spec: certificate exception is a user-explicit, origin-scoped temporary override.
 // Ref: RFC 5280 validation and browser interstitial exception UX constraints.
@@ -180,18 +184,26 @@ fn fetch_with_pipeline(
         let cached = lookup_cache_entry(&current_url);
         let client = select_http_client(&current_url, diagnostics);
         let mut builder = client.get(&current_url);
+        let mut request_headers = HeaderMap::new();
+        if attach_cookie_header(&mut request_headers, &current_url, &current_url) {
+            diagnostics.push(format!("attached Cookie header for {}", current_url));
+        }
         if let Some(entry) = &cached {
             if let Some(etag) = &entry.etag {
                 if let Ok(value) = HeaderValue::from_str(etag) {
-                    builder = builder.header(IF_NONE_MATCH, value);
-                    diagnostics.push(format!("cache revalidation with If-None-Match for {current_url}"));
+                    request_headers.insert(IF_NONE_MATCH, value);
+                    diagnostics.push(format!(
+                        "cache revalidation with If-None-Match for {current_url}"
+                    ));
                 }
             }
         }
+        builder = builder.headers(request_headers);
 
         let response = builder.send().map_err(classify_request_error)?;
         let status = response.status();
         let headers = response.headers().clone();
+        diagnostics.extend(apply_set_cookie_headers(&headers, &current_url));
         diagnostics.push(format!("HTTP GET {} -> {}", current_url, status));
 
         if status.is_redirection() {
@@ -208,7 +220,10 @@ fn fetch_with_pipeline(
                 )));
             };
             let next_url = resolve_url(&current_url, location)?;
-            diagnostics.push(format!("redirect followed: {} -> {}", current_url, next_url));
+            diagnostics.push(format!(
+                "redirect followed: {} -> {}",
+                current_url, next_url
+            ));
             current_url = next_url;
             redirect_count += 1;
             continue;
@@ -216,7 +231,10 @@ fn fetch_with_pipeline(
 
         if status.as_u16() == 304 {
             if let Some(entry) = cached {
-                diagnostics.push(format!("cache hit with 304 Not Modified for {}", current_url));
+                diagnostics.push(format!(
+                    "cache hit with 304 Not Modified for {}",
+                    current_url
+                ));
                 return Ok(FetchResponse {
                     final_url: entry.final_url,
                     content_type: entry.content_type,
@@ -238,10 +256,7 @@ fn fetch_with_pipeline(
         {
             diagnostics.push(format!("content-encoding negotiated: {content_encoding}"));
         }
-        let body = response
-            .bytes()
-            .map_err(classify_request_error)?
-            .to_vec();
+        let body = response.bytes().map_err(classify_request_error)?.to_vec();
 
         return Ok(FetchResponse {
             final_url,
@@ -339,9 +354,8 @@ fn validate_response_security(
         ));
     }
 
-    diagnostics.extend(collect_cookie_diagnostics(headers, final_url));
-
     let sandbox = evaluate_sandbox_policy(initiator_url, final_url);
+    cache_permission_decision(initiator_url, final_url, sandbox.allowed);
     diagnostics.extend(sandbox.diagnostics);
 }
 

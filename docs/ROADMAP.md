@@ -231,8 +231,9 @@
   - microtask/macrotask の実行順序を定義し、タイマー API を追加。
   - **完了条件**: Promise/timeout を使うページでハングしない。
   - 進捗メモ: `setTimeout` / `queueMicrotask` / `Promise.then` と guard 付き event loop を実装し、`adapter_cli verify-event-loop` と単体テストで順序とハング検知を検証可能にした。
-- [ ] **E4-T3 ストレージ/クッキー/権限モデル**
+- [x] **E4-T3 ストレージ/クッキー/権限モデル**
   - origin 単位で cookie/local storage を管理。
+  - 進捗メモ: `PersistentSecurityState` を導入し、`Set-Cookie` 適用・`Cookie` header 送信・`localStorage` JS 連携・権限判断キャッシュ・ADR 追記まで接続済み。
   - **完了条件**: ログイン状態を持つサイトで再訪時セッション維持。
 
 ### Epic 5: ネットワーク/セキュリティ
@@ -349,8 +350,9 @@
     - タブ一覧・履歴スタック・スクロール位置をクラッシュセーフなスナップショットへ保存し、起動時に restore する。
     - 完了時には `renderer_recovered` 後の再起動経路でも、最後の active tab が自動復元されることをスモークで保証する。
     - 進捗メモ: `cosmo_app_legacy` / `adapter_native` / UI 間で session snapshot restore を実装し、session round-trip test と startup restore smoke で active tab・history_index・frame scroll の復元を検証済み。
-11. [ ] **NJ-T2 E4-T3 origin 単位ストレージ/クッキー永続化**
+11. [x] **NJ-T2 E4-T3 origin 単位ストレージ/クッキー永続化**
     - Cookie jar / local storage / 権限判断キャッシュを origin 単位で保存し、SameSite/Secure/HttpOnly 診断と接続する。
+    - 進捗メモ: RFC 6454 origin key を使う in-memory 永続モデルと `localStorage` ランタイム同期、Cookie 診断/送信経路、永続化形式 ADR を追加。
     - セッション復元と干渉しないよう、永続化形式と消去ポリシーを ADR 化する。
 12. [ ] **NJ-T3 E6-T1/E6-T2 タブストリップ + Omnibox 改善**
     - ピン留め/複製/並べ替えと URL・履歴・検索候補を統合した入力補完を導入する。
