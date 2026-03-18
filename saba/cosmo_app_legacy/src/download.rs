@@ -129,7 +129,11 @@ impl DownloadManager {
                 entry.state,
                 DownloadState::Downloading | DownloadState::Queued
             ) {
-                entry.state = DownloadState::Paused;
+                // Implementation note: pausing a streaming download is cooperative.
+                // We only transition to `Paused` once the worker reaches its next
+                // chunk boundary, closes the response body, and leaves the partial
+                // file in a resumable state. Until then the command is treated as a
+                // pause request rather than an already-completed pause.
                 entry.status_message =
                     Some("Pause requested; stopping after current chunk".to_string());
                 entry.updated_at_ms = unix_timestamp_ms();
@@ -614,8 +618,12 @@ mod tests {
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 let range_header = request
                     .lines()
-                    .find(|line| line.starts_with("Range: bytes="))
-                    .and_then(|line| line.strip_prefix("Range: bytes="))
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .starts_with("range: bytes=")
+                            .then(|| line.split_once(": ").map(|(_, value)| value).unwrap_or(""))
+                    })
                     .and_then(|line| line.split('-').next())
                     .and_then(|value| value.parse::<usize>().ok());
                 let start = if range_enabled {
@@ -671,6 +679,22 @@ mod tests {
         (format!("http://{addr}/fixture.bin"), handle)
     }
 
+    fn wait_for_state(
+        manager: &DownloadManager,
+        id: u64,
+        expected: DownloadState,
+        attempts: usize,
+    ) -> Option<DownloadEntry> {
+        for _ in 0..attempts {
+            let current = manager.progress(id).expect("progress current");
+            if current.state == expected {
+                return Some(current);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        None
+    }
+
     #[test]
     fn pause_and_resume_uses_range_when_server_supports_it() {
         let temp_dir =
@@ -682,9 +706,8 @@ mod tests {
         let entry = manager.enqueue(&url).expect("enqueue");
         thread::sleep(Duration::from_millis(60));
         let _ = manager.pause(entry.id).expect("pause");
-        thread::sleep(Duration::from_millis(50));
-        let paused = manager.progress(entry.id).expect("progress paused");
-        assert_eq!(paused.state, DownloadState::Paused);
+        let paused = wait_for_state(&manager, entry.id, DownloadState::Paused, 40)
+            .expect("pause should settle");
         assert!(paused.downloaded_bytes > 0);
         let _ = manager.resume(entry.id).expect("resume");
         for _ in 0..80 {
@@ -711,7 +734,9 @@ mod tests {
         let entry = manager.enqueue(&url).expect("enqueue");
         thread::sleep(Duration::from_millis(60));
         let _ = manager.pause(entry.id).expect("pause");
-        thread::sleep(Duration::from_millis(50));
+        let paused = wait_for_state(&manager, entry.id, DownloadState::Paused, 40)
+            .expect("pause should settle");
+        assert!(paused.downloaded_bytes > 0);
         let _ = manager.resume(entry.id).expect("resume");
         for _ in 0..80 {
             let current = manager.progress(entry.id).expect("progress current");
