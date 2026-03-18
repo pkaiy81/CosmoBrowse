@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -159,6 +159,50 @@ impl std::error::Error for AppError {}
 pub struct ContentSize {
     pub width: i64,
     pub height: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ScrollPosition {
+    pub x: i64,
+    pub y: i64,
+}
+
+pub const SESSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub version: u32,
+    pub active_tab_id: u32,
+    pub tabs: Vec<TabSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TabSessionSnapshot {
+    pub id: u32,
+    pub history: Vec<HistoryEntrySnapshot>,
+    pub history_index: usize,
+    pub viewport_width: i64,
+    pub viewport_height: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntrySnapshot {
+    pub current_url: String,
+    pub navigation_type: NavigationType,
+    pub frame_url_overrides: Vec<FrameUrlOverrideSnapshot>,
+    pub scroll_positions: Vec<FrameScrollPositionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrameUrlOverrideSnapshot {
+    pub frame_id: String,
+    pub current_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrameScrollPositionSnapshot {
+    pub frame_id: String,
+    pub position: ScrollPosition,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -335,6 +379,7 @@ pub struct FrameViewModel {
     pub diagnostics: Vec<String>,
     pub rect: FrameRect,
     pub content_size: ContentSize,
+    pub scroll_position: ScrollPosition,
     // Rendering strategy hint for the UI layer.
     pub render_backend: RenderBackendKind,
     // Canonical document URL used as a base for resource/link resolution.
@@ -411,7 +456,7 @@ pub struct NavigationState {
     pub current_navigation_type: Option<NavigationType>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NavigationType {
     Document,
@@ -482,6 +527,12 @@ pub trait AppService {
     fn close_tab(&mut self, id: u32) -> AppResult<Vec<TabSummary>>;
     fn list_tabs(&self) -> Vec<TabSummary>;
     fn search(&self, query: &str) -> AppResult<Vec<SearchResult>>;
+    fn export_session_snapshot(&self) -> SessionSnapshot;
+    fn import_session_snapshot(&mut self, snapshot: SessionSnapshot) -> AppResult<()>;
+    fn update_scroll_positions(
+        &mut self,
+        positions: Vec<FrameScrollPositionSnapshot>,
+    ) -> AppResult<()>;
 
     fn render_backend(&self) -> Box<dyn RenderBackend> {
         Box::new(DefaultRenderBackend)

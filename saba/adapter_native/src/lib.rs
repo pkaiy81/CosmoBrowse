@@ -1,9 +1,11 @@
 use cosmo_runtime::{
-    scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService, NavigationState,
-    OrbitSnapshot, PaintCommand, SceneItem, SearchResult, StarshipApp, TabSummary,
+    scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService,
+    FrameScrollPositionSnapshot, NavigationState, OrbitSnapshot, PaintCommand, SceneItem,
+    SearchResult, SessionSnapshot, StarshipApp, TabSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -177,6 +179,7 @@ pub struct BrowserFrameDto {
     pub title: String,
     pub diagnostics: Vec<String>,
     pub rect: FrameRectDto,
+    pub scroll_position: ScrollPositionDto,
     pub render_backend: String,
     pub document_url: String,
     pub scene_items: Vec<SceneItem>,
@@ -200,6 +203,13 @@ pub struct FrameRectDto {
     pub y: i64,
     pub width: i64,
     pub height: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScrollPositionDto {
+    pub x: i64,
+    pub y: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +310,9 @@ pub enum IpcRequestPayload {
     Search {
         query: String,
     },
+    UpdateScrollPositions {
+        positions: Vec<FrameScrollPositionSnapshot>,
+    },
     RegisterTlsException {
         url: String,
     },
@@ -343,7 +356,7 @@ impl NativeAdapter {
         healthcheck_interval: Duration,
     ) -> Self {
         Self {
-            app: Mutex::new(StarshipApp::default()),
+            app: Mutex::new(load_startup_app()),
             renderer: Mutex::new(RendererProcessManager::new(
                 process_host,
                 healthcheck_interval,
@@ -397,6 +410,9 @@ impl NativeAdapter {
             IpcRequestPayload::Search { query } => {
                 self.search(&query).map(IpcResponsePayload::SearchResults)
             }
+            IpcRequestPayload::UpdateScrollPositions { positions } => self
+                .update_scroll_positions(positions)
+                .map(|_| IpcResponsePayload::Ack(true)),
             IpcRequestPayload::RegisterTlsException { url } => self
                 .register_tls_exception(&url)
                 .map(|_| IpcResponsePayload::Ack(true)),
@@ -410,7 +426,10 @@ impl NativeAdapter {
 
     pub fn open_url(&self, url: &str) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.open_url(url).map(BrowserPageDto::from)
+        let result = app.open_url(url).map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn activate_link(
@@ -420,8 +439,12 @@ impl NativeAdapter {
         target: Option<&str>,
     ) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.activate_link(frame_id, href, target)
-            .map(BrowserPageDto::from)
+        let result = app
+            .activate_link(frame_id, href, target)
+            .map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn get_page_view(&self) -> Result<BrowserPageDto, AppError> {
@@ -431,22 +454,34 @@ impl NativeAdapter {
 
     pub fn set_viewport(&self, width: i64, height: i64) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.set_viewport(width, height).map(BrowserPageDto::from)
+        let result = app.set_viewport(width, height).map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn reload(&self) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.reload().map(BrowserPageDto::from)
+        let result = app.reload().map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn back(&self) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.back().map(BrowserPageDto::from)
+        let result = app.back().map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn forward(&self) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.forward().map(BrowserPageDto::from)
+        let result = app.forward().map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn get_navigation_state(&self) -> Result<NavigationState, AppError> {
@@ -466,17 +501,26 @@ impl NativeAdapter {
 
     pub fn new_tab(&self) -> Result<TabSummary, AppError> {
         let mut app = self.lock_app()?;
-        Ok(app.new_tab())
+        let summary = app.new_tab();
+        drop(app);
+        self.persist_latest_session_snapshot(true);
+        Ok(summary)
     }
 
     pub fn switch_tab(&self, id: u32) -> Result<BrowserPageDto, AppError> {
         let mut app = self.lock_app()?;
-        app.switch_tab(id).map(BrowserPageDto::from)
+        let result = app.switch_tab(id).map(BrowserPageDto::from);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn close_tab(&self, id: u32) -> Result<Vec<TabSummary>, AppError> {
         let mut app = self.lock_app()?;
-        app.close_tab(id)
+        let result = app.close_tab(id);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
     }
 
     pub fn list_tabs(&self) -> Result<Vec<TabSummary>, AppError> {
@@ -491,7 +535,38 @@ impl NativeAdapter {
 
     pub fn register_tls_exception(&self, url: &str) -> Result<(), AppError> {
         let mut app = self.lock_app()?;
-        app.register_tls_exception(url)
+        let result = app.register_tls_exception(url);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
+    }
+
+    pub fn update_scroll_positions(
+        &self,
+        positions: Vec<FrameScrollPositionSnapshot>,
+    ) -> Result<(), AppError> {
+        let mut app = self.lock_app()?;
+        let result = app.update_scroll_positions(positions);
+        drop(app);
+        self.persist_latest_session_snapshot(result.is_ok());
+        result
+    }
+
+    pub fn restore_session_snapshot(&self) -> Result<bool, AppError> {
+        let Some(snapshot) = read_session_snapshot(session_snapshot_path())? else {
+            return Ok(false);
+        };
+        let mut app = self.lock_app()?;
+        app.import_session_snapshot(snapshot)?;
+        Ok(true)
+    }
+
+    pub fn save_session_snapshot(&self) -> Result<(), AppError> {
+        self.persist_session_snapshot(session_snapshot_path())
+    }
+
+    pub fn save_crash_snapshot(&self) -> Result<(), AppError> {
+        self.persist_session_snapshot(crash_session_snapshot_path())
     }
 
     fn lock_app(&self) -> Result<std::sync::MutexGuard<'_, StarshipApp>, AppError> {
@@ -506,6 +581,25 @@ impl NativeAdapter {
             .lock()
             .map_err(|_| AppError::state("Failed to lock renderer process state"))?;
         renderer.ensure_healthy()
+    }
+
+    fn persist_session_snapshot(&self, path: impl AsRef<Path>) -> Result<(), AppError> {
+        let app = self.lock_app()?;
+        let snapshot = app.export_session_snapshot();
+        drop(app);
+        write_session_snapshot(path.as_ref(), &snapshot)
+    }
+
+    fn persist_latest_session_snapshot(&self, should_save: bool) {
+        if !should_save {
+            return;
+        }
+        if let Err(error) = self.save_crash_snapshot() {
+            log_recovery_event("session_snapshot_save_failed", None, &error.message);
+        }
+        if let Err(error) = self.save_session_snapshot() {
+            log_recovery_event("session_snapshot_save_failed", None, &error.message);
+        }
     }
 }
 
@@ -524,6 +618,7 @@ impl Default for NativeAdapter {
 
 impl Drop for NativeAdapter {
     fn drop(&mut self) {
+        let _ = self.save_session_snapshot();
         if let Ok(mut renderer) = self.renderer.lock() {
             let _ = renderer.host.kill();
         }
@@ -576,6 +671,10 @@ impl From<cosmo_runtime::FrameViewModel> for BrowserFrameDto {
                 y: frame.rect.y,
                 width: frame.rect.width,
                 height: frame.rect.height,
+            },
+            scroll_position: ScrollPositionDto {
+                x: frame.scroll_position.x,
+                y: frame.scroll_position.y,
             },
             render_backend: {
                 #[allow(deprecated)]
@@ -682,8 +781,86 @@ fn is_console_log_entry(entry: &str) -> bool {
     lower.contains("script") || lower.contains("unsupported browser api") || lower.contains("dom")
 }
 
+fn load_startup_app() -> StarshipApp {
+    match read_session_snapshot(session_snapshot_path()) {
+        Ok(Some(snapshot)) => {
+            let mut app = StarshipApp::default();
+            match app.import_session_snapshot(snapshot) {
+                Ok(()) => app,
+                Err(error) => {
+                    log_recovery_event("session_snapshot_restore_failed", None, &error.message);
+                    StarshipApp::default()
+                }
+            }
+        }
+        Ok(None) => StarshipApp::default(),
+        Err(error) => {
+            log_recovery_event("session_snapshot_read_failed", None, &error.message);
+            StarshipApp::default()
+        }
+    }
+}
+
 fn crash_report_path() -> std::path::PathBuf {
     std::env::temp_dir().join("cosmobrowse-crash-report.json")
+}
+
+fn session_snapshot_path() -> std::path::PathBuf {
+    std::env::var("COSMO_SESSION_SNAPSHOT_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("cosmobrowse-session-snapshot.json"))
+}
+
+fn crash_session_snapshot_path() -> std::path::PathBuf {
+    std::env::var("COSMO_CRASH_SESSION_SNAPSHOT_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("cosmobrowse-session-snapshot-crash.json"))
+}
+
+fn read_session_snapshot(path: std::path::PathBuf) -> Result<Option<SessionSnapshot>, AppError> {
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::state(format!(
+                "Failed to read session snapshot {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    serde_json::from_str(&content).map(Some).map_err(|error| {
+        AppError::state(format!(
+            "Failed to parse session snapshot {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn write_session_snapshot(path: &Path, snapshot: &SessionSnapshot) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::state(format!(
+                "Failed to prepare session snapshot directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(snapshot).map_err(|error| {
+        AppError::state(format!("Failed to serialize session snapshot: {error}"))
+    })?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, payload).map_err(|error| {
+        AppError::state(format!(
+            "Failed to write session snapshot {}: {error}",
+            tmp_path.display()
+        ))
+    })?;
+    fs::rename(&tmp_path, path).map_err(|error| {
+        AppError::state(format!(
+            "Failed to finalize session snapshot {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn log_recovery_event(event: &str, pid: Option<u32>, detail: &str) {
@@ -720,7 +897,8 @@ fn log_recovery_event(event: &str, pid: Option<u32>, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use cosmo_runtime::ScrollPosition;
+    use std::sync::{Arc, OnceLock};
 
     #[derive(Default)]
     struct FakeProcessState {
@@ -778,6 +956,11 @@ mod tests {
         }
     }
 
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn forced_renderer_exit_triggers_restart_and_allows_retry_success() {
         let state = Arc::new(Mutex::new(FakeProcessState::default()));
@@ -816,8 +999,61 @@ mod tests {
             "retry should succeed after renderer recovery"
         );
     }
-}
 
+    #[test]
+    fn adapter_restores_saved_session_snapshot_on_startup() {
+        let _env_guard = env_lock().lock().expect("env lock");
+        let snapshot_dir =
+            std::env::temp_dir().join(format!("cosmobrowse-session-test-{}", unix_timestamp_ms()));
+        let session_path = snapshot_dir.join("session.json");
+        let crash_path = snapshot_dir.join("session-crash.json");
+        std::env::set_var("COSMO_SESSION_SNAPSHOT_PATH", &session_path);
+        std::env::set_var("COSMO_CRASH_SESSION_SNAPSHOT_PATH", &crash_path);
+
+        let mut app = StarshipApp::default();
+        let view = app
+            .open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+        let left_frame = view.root_frame.child_frames[0].id.clone();
+        app.activate_link(&left_frame, "fixture://abehiroshi/prof", Some("right"))
+            .expect("targeted navigation should work");
+        app.update_scroll_positions(vec![
+            FrameScrollPositionSnapshot {
+                frame_id: "root".to_string(),
+                position: ScrollPosition { x: 0, y: 48 },
+            },
+            FrameScrollPositionSnapshot {
+                frame_id: "root/right".to_string(),
+                position: ScrollPosition { x: 4, y: 96 },
+            },
+        ])
+        .expect("scroll positions should update");
+        write_session_snapshot(&session_path, &app.export_session_snapshot())
+            .expect("snapshot should persist");
+
+        let restored = NativeAdapter::with_process_host(
+            Box::new(FakeProcessHost::new(Arc::new(Mutex::new(
+                FakeProcessState::default(),
+            )))),
+            Duration::ZERO,
+        );
+        let page = restored.get_page_view().expect("restored page view");
+
+        assert_eq!(page.current_url, "fixture://abehiroshi/index");
+        assert_eq!(page.root_frame.scroll_position.y, 48);
+        assert_eq!(
+            page.root_frame.child_frames[1].current_url,
+            "fixture://abehiroshi/prof"
+        );
+        assert_eq!(page.root_frame.child_frames[1].scroll_position.y, 96);
+
+        std::env::remove_var("COSMO_SESSION_SNAPSHOT_PATH");
+        std::env::remove_var("COSMO_CRASH_SESSION_SNAPSHOT_PATH");
+        let _ = fs::remove_file(&session_path);
+        let _ = fs::remove_file(&crash_path);
+        let _ = fs::remove_dir_all(&snapshot_dir);
+    }
+}
 
 fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
     let mut items = Vec::new();

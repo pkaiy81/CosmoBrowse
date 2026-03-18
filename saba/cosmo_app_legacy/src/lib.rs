@@ -6,9 +6,11 @@ mod session;
 
 pub use model::{
     AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, DefaultRenderBackend,
-    DefaultScriptEngine, DefaultSecurityPolicy, ErrorMetric, FrameRect, FrameViewModel,
-    NavigationEvent, NavigationState, PageViewModel, RenderBackend, RenderBackendKind, RenderBox,
-    RenderNode, RenderNodeKind, RenderTreeSnapshot, ResolvedStyle, SceneItem, ScriptEngine,
-    SearchResult, SecurityPolicy, TabSummary,
+    DefaultScriptEngine, DefaultSecurityPolicy, ErrorMetric, FrameRect,
+    FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel, HistoryEntrySnapshot,
+    NavigationEvent, NavigationState, NavigationType, PageViewModel, RenderBackend,
+    RenderBackendKind, RenderBox, RenderNode, RenderNodeKind, RenderTreeSnapshot, ResolvedStyle,
+    SceneItem, ScriptEngine, ScrollPosition, SearchResult, SecurityPolicy, SessionSnapshot,
+    TabSessionSnapshot, TabSummary, SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use session::SabaApp;
