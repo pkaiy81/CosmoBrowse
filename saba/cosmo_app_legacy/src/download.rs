@@ -681,7 +681,7 @@ mod tests {
                         return;
                     }
                     let chunk_delay_ms = if !range_enabled && range_header.is_none() {
-                        50
+                        20
                     } else if slow {
                         15
                     } else {
@@ -729,6 +729,24 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         None
+    }
+
+    fn wait_for_terminal_state(
+        manager: &DownloadManager,
+        id: u64,
+        attempts: usize,
+    ) -> DownloadEntry {
+        for _ in 0..attempts {
+            let current = manager.progress(id).expect("progress current");
+            if matches!(
+                current.state,
+                DownloadState::Completed | DownloadState::Failed
+            ) {
+                return current;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("download did not reach a terminal state");
     }
 
     fn seed_paused_download(
@@ -808,17 +826,11 @@ mod tests {
             .expect("pause should settle");
         assert!(paused.downloaded_bytes > 0);
         let _ = manager.resume(entry.id).expect("resume");
-        for _ in 0..160 {
-            let current = manager.progress(entry.id).expect("progress current");
-            if current.state == DownloadState::Completed {
-                assert_eq!(current.supports_resume, Some(true));
-                assert!(Path::new(&current.save_path).exists());
-                server.join().expect("server join");
-                return;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-        panic!("download did not complete after resume");
+        let current = wait_for_terminal_state(&manager, entry.id, 240);
+        assert_eq!(current.state, DownloadState::Completed);
+        assert_eq!(current.supports_resume, Some(true));
+        assert!(Path::new(&current.save_path).exists());
+        server.join().expect("server join");
     }
 
     #[test]
@@ -838,16 +850,15 @@ mod tests {
         let mut manager = DownloadManager::default();
         let entry = seed_paused_download(&mut manager, &url, 64 * 1024);
         let _ = manager.resume(entry.id).expect("resume");
-        for _ in 0..160 {
-            let current = manager.progress(entry.id).expect("progress current");
-            if current.state == DownloadState::Completed {
-                assert_eq!(current.supports_resume, Some(false));
-                assert!(current.last_error.is_some());
-                server.join().expect("server join");
-                return;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-        panic!("download did not complete after restart fallback");
+        // Test note: a restarted full-body transfer can legitimately take longer
+        // than the resumed 206 path because the server ignores the RFC 9110
+        // Range request and retransmits the entire representation. Give the test
+        // a larger budget and surface terminal failures immediately so CI logs
+        // show the actual transport error instead of only a timeout.
+        let current = wait_for_terminal_state(&manager, entry.id, 320);
+        assert_eq!(current.state, DownloadState::Completed);
+        assert_eq!(current.supports_resume, Some(false));
+        assert!(current.last_error.is_some());
+        server.join().expect("server join");
     }
 }
