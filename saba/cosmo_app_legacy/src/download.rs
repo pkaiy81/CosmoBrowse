@@ -6,6 +6,7 @@ use reqwest::header::{
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -286,7 +287,7 @@ fn execute_download_worker(
         entry.updated_at_ms = unix_timestamp_ms();
     })?;
 
-    let client = download_http_client()?;
+    let client = download_http_client(&config.url)?;
     let mut request = client.get(&config.url);
 
     // Spec note: resumable retrieval uses RFC 9110 Range requests by asking for
@@ -569,17 +570,35 @@ fn default_save_policy() -> DownloadSavePolicy {
     }
 }
 
-fn download_http_client() -> AppResult<Client> {
+fn should_bypass_proxy(url: &str) -> bool {
+    let parsed = match Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    let host = match parsed.host_str() {
+        Some(host) => host,
+        None => return false,
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn download_http_client(url: &str) -> AppResult<Client> {
     let mut builder = Client::builder()
         .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .timeout(DOWNLOAD_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(10));
-    #[cfg(test)]
-    {
-        // Test-fixture note: CI/container environments may inject HTTP proxy
-        // settings that do not exempt loopback consistently across uppercase /
-        // lowercase NO_PROXY variants. Disable proxies in unit tests so local
-        // fixture downloads always hit the in-process TCP server directly.
+    if should_bypass_proxy(url) {
+        // Test/dev note: loopback downloads should connect directly instead of
+        // being routed through ambient HTTP proxies. Our download fixtures use
+        // `localhost` / loopback origins, and proxying those requests can yield
+        // synthetic 4xx responses before the request ever reaches the local
+        // server. Bypassing proxies for loopback keeps local download behavior
+        // aligned with the direct origin that generated the URL.
         builder = builder.no_proxy();
     }
     builder
@@ -712,7 +731,10 @@ mod tests {
                 connection_handle.join().expect("connection handle join");
             }
         });
-        (format!("http://{addr}/fixture.bin"), handle)
+        (
+            format!("http://localhost:{}/fixture.bin", addr.port()),
+            handle,
+        )
     }
 
     fn wait_for_state(
