@@ -731,10 +731,12 @@ mod tests {
                 connection_handle.join().expect("connection handle join");
             }
         });
-        (
-            format!("http://localhost:{}/fixture.bin", addr.port()),
-            handle,
-        )
+        // Test-fixture note: return the exact loopback address we bound rather
+        // than `localhost`. Some environments resolve `localhost` to `::1`
+        // first, which would fail against an IPv4-only `127.0.0.1` listener
+        // before the request ever reaches the fixture. The download client still
+        // bypasses proxies because `127.0.0.1` is recognized as a loopback IP.
+        (format!("http://{addr}/fixture.bin"), handle)
     }
 
     fn wait_for_state(
