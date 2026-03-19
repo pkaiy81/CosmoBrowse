@@ -650,6 +650,14 @@ mod tests {
                     let status_line = if range_enabled && range_header.is_some() {
                         "HTTP/1.1 206 Partial Content\r\n"
                     } else {
+                        // Spec note: when `range_enabled` is false we intentionally
+                        // ignore any incoming `Range` header and respond with `200 OK`
+                        // plus the full representation. RFC 9110 allows an origin to
+                        // ignore Range and serve the selected representation normally;
+                        // the download manager should then restart from byte 0 rather
+                        // than append incompatible data to the existing `.part` file.
+                        // https://www.rfc-editor.org/rfc/rfc9110.html#name-range
+                        // https://www.rfc-editor.org/rfc/rfc9110.html#name-ok-200
                         "HTTP/1.1 200 OK\r\n"
                     };
                     let payload = &body[start..];
@@ -819,6 +827,13 @@ mod tests {
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
         std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
+        // Spec note: seed a paused partial file, then resume against a server
+        // that ignores Range and answers with `200 OK`. This matches the RFC 9110
+        // case exercised above and verifies that the browser restarts the transfer
+        // from byte 0 instead of appending a full-body 200 response to stale
+        // partial bytes.
+        // https://www.rfc-editor.org/rfc/rfc9110.html#name-range
+        // https://www.rfc-editor.org/rfc/rfc9110.html#name-partial-content
         let (url, server) = spawn_fixture_server(false, true, 1);
         let mut manager = DownloadManager::default();
         let entry = seed_paused_download(&mut manager, &url, 64 * 1024);
