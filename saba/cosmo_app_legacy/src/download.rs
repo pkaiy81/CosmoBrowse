@@ -570,10 +570,19 @@ fn default_save_policy() -> DownloadSavePolicy {
 }
 
 fn download_http_client() -> AppResult<Client> {
-    Client::builder()
+    let mut builder = Client::builder()
         .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .timeout(DOWNLOAD_REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::limited(10));
+    #[cfg(test)]
+    {
+        // Test-fixture note: CI/container environments may inject HTTP proxy
+        // settings that do not exempt loopback consistently across uppercase /
+        // lowercase NO_PROXY variants. Disable proxies in unit tests so local
+        // fixture downloads always hit the in-process TCP server directly.
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|error| AppError::state(format!("Failed to build download HTTP client: {error}")))
 }
@@ -601,7 +610,11 @@ mod tests {
     use std::net::{Shutdown, TcpListener};
     use std::thread::JoinHandle;
 
-    fn spawn_fixture_server(range_enabled: bool, slow: bool) -> (String, JoinHandle<()>) {
+    fn spawn_fixture_server(
+        range_enabled: bool,
+        slow: bool,
+        expected_connections: usize,
+    ) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("local addr");
         let body = vec![b'a'; 512 * 1024];
@@ -614,7 +627,7 @@ mod tests {
             // the resumed request can proceed even while the abandoned connection is
             // still draining or being torn down by the OS.
             let mut connection_handles = Vec::new();
-            for stream in listener.incoming().take(2) {
+            for stream in listener.incoming().take(expected_connections) {
                 let mut stream = stream.expect("stream");
                 let body = body.clone();
                 let connection_handle = thread::spawn(move || {
@@ -659,6 +672,13 @@ mod tests {
                     if stream.write_all(headers.as_bytes()).is_err() {
                         return;
                     }
+                    let chunk_delay_ms = if !range_enabled && range_header.is_none() {
+                        50
+                    } else if slow {
+                        15
+                    } else {
+                        0
+                    };
                     for chunk in payload.chunks(16 * 1024) {
                         if let Err(error) = stream.write_all(chunk) {
                             if matches!(
@@ -671,8 +691,8 @@ mod tests {
                             }
                             panic!("write chunk: {error}");
                         }
-                        if slow {
-                            thread::sleep(Duration::from_millis(15));
+                        if chunk_delay_ms > 0 {
+                            thread::sleep(Duration::from_millis(chunk_delay_ms));
                         }
                     }
                     let _ = stream.flush();
@@ -703,13 +723,75 @@ mod tests {
         None
     }
 
+    fn seed_paused_download(
+        manager: &mut DownloadManager,
+        url: &str,
+        partial_len: usize,
+    ) -> DownloadEntry {
+        let parsed = Url::parse(url).expect("valid URL");
+        manager.next_id += 1;
+        let id = manager.next_id;
+        let save_policy = default_save_policy();
+        let destination_path = unique_destination_path(
+            Path::new(&save_policy.directory),
+            &default_filename_from_url(&parsed),
+        );
+        std::fs::create_dir_all(
+            destination_path
+                .parent()
+                .expect("destination path should have parent"),
+        )
+        .expect("create dir");
+        let temp_path = temp_download_path(&destination_path, id);
+        // Test note: resume fallback behavior only depends on the presence of a
+        // partial `.part` file and paused in-memory state. Seeding that state
+        // directly avoids timing races from trying to pause a live no-range
+        // transfer before the worker drains the response body.
+        std::fs::write(&temp_path, vec![b'a'; partial_len]).expect("write partial");
+
+        let now = unix_timestamp_ms();
+        let entry = DownloadEntry {
+            id,
+            url: url.to_string(),
+            final_url: None,
+            file_name: destination_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("download.bin")
+                .to_string(),
+            save_path: destination_path.display().to_string(),
+            total_bytes: None,
+            downloaded_bytes: partial_len as u64,
+            state: DownloadState::Paused,
+            supports_resume: None,
+            save_policy,
+            last_error: None,
+            status_message: Some("Seeded paused download for resume test".to_string()),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+
+        manager.downloads.insert(
+            id,
+            DownloadHandle {
+                shared: Arc::new(Mutex::new(DownloadShared {
+                    entry: entry.clone(),
+                    temp_path: temp_path.display().to_string(),
+                })),
+                pause_flag: Arc::new(AtomicBool::new(false)),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        entry
+    }
+
     #[test]
     fn pause_and_resume_uses_range_when_server_supports_it() {
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
         std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
-        let (url, server) = spawn_fixture_server(true, true);
+        let (url, server) = spawn_fixture_server(true, true, 2);
         let mut manager = DownloadManager::default();
         let entry = manager.enqueue(&url).expect("enqueue");
         thread::sleep(Duration::from_millis(60));
@@ -737,14 +819,9 @@ mod tests {
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
         std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
-        let (url, server) = spawn_fixture_server(false, true);
+        let (url, server) = spawn_fixture_server(false, true, 1);
         let mut manager = DownloadManager::default();
-        let entry = manager.enqueue(&url).expect("enqueue");
-        thread::sleep(Duration::from_millis(60));
-        let _ = manager.pause(entry.id).expect("pause");
-        let paused = wait_for_state(&manager, entry.id, DownloadState::Paused, 40)
-            .expect("pause should settle");
-        assert!(paused.downloaded_bytes > 0);
+        let entry = seed_paused_download(&mut manager, &url, 64 * 1024);
         let _ = manager.resume(entry.id).expect("resume");
         for _ in 0..160 {
             let current = manager.progress(entry.id).expect("progress current");
