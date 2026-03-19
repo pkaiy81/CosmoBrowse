@@ -610,68 +610,78 @@ mod tests {
             // connection during pause/resume. Browsers may abort an in-flight body
             // when a download is paused, so the fixture must treat BrokenPipe /
             // ConnectionReset as expected transport cancellation rather than a test
-            // failure.
+            // failure. We also serve each accepted connection on its own thread so
+            // the resumed request can proceed even while the abandoned connection is
+            // still draining or being torn down by the OS.
+            let mut connection_handles = Vec::new();
             for stream in listener.incoming().take(2) {
                 let mut stream = stream.expect("stream");
-                let mut buffer = [0u8; 4096];
-                let read = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..read]);
-                let range_header = request
-                    .lines()
-                    .find_map(|line| {
-                        let lower = line.trim().to_ascii_lowercase();
-                        lower.strip_prefix("range: bytes=").map(str::to_string)
-                    })
-                    .and_then(|line| line.split('-').next().map(str::to_string))
-                    .and_then(|value| value.parse::<usize>().ok());
-                let start = if range_enabled {
-                    range_header.unwrap_or(0)
-                } else {
-                    0
-                };
-                let status_line = if range_enabled && range_header.is_some() {
-                    "HTTP/1.1 206 Partial Content\r\n"
-                } else {
-                    "HTTP/1.1 200 OK\r\n"
-                };
-                let payload = &body[start..];
-                let mut headers = format!(
-                    "{status_line}Content-Length: {}\r\nContent-Disposition: attachment; filename=\"fixture.bin\"\r\n",
-                    payload.len()
-                );
-                if range_enabled {
-                    headers.push_str("Accept-Ranges: bytes\r\n");
-                }
-                if range_enabled && range_header.is_some() {
-                    headers.push_str(&format!(
-                        "Content-Range: bytes {}-{}/{}\r\n",
-                        start,
-                        body.len() - 1,
-                        body.len()
-                    ));
-                }
-                headers.push_str("\r\n");
-                if stream.write_all(headers.as_bytes()).is_err() {
-                    continue;
-                }
-                for chunk in payload.chunks(16 * 1024) {
-                    if let Err(error) = stream.write_all(chunk) {
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::BrokenPipe
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::UnexpectedEof
-                        ) {
-                            break;
+                let body = body.clone();
+                let connection_handle = thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).expect("read request");
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let range_header = request
+                        .lines()
+                        .find_map(|line| {
+                            let lower = line.trim().to_ascii_lowercase();
+                            lower.strip_prefix("range: bytes=").map(str::to_string)
+                        })
+                        .and_then(|line| line.split('-').next().map(str::to_string))
+                        .and_then(|value| value.parse::<usize>().ok());
+                    let start = if range_enabled {
+                        range_header.unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let status_line = if range_enabled && range_header.is_some() {
+                        "HTTP/1.1 206 Partial Content\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\n"
+                    };
+                    let payload = &body[start..];
+                    let mut headers = format!(
+                        "{status_line}Content-Length: {}\r\nContent-Disposition: attachment; filename=\"fixture.bin\"\r\n",
+                        payload.len()
+                    );
+                    if range_enabled {
+                        headers.push_str("Accept-Ranges: bytes\r\n");
+                    }
+                    if range_enabled && range_header.is_some() {
+                        headers.push_str(&format!(
+                            "Content-Range: bytes {}-{}/{}\r\n",
+                            start,
+                            body.len() - 1,
+                            body.len()
+                        ));
+                    }
+                    headers.push_str("\r\n");
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        return;
+                    }
+                    for chunk in payload.chunks(16 * 1024) {
+                        if let Err(error) = stream.write_all(chunk) {
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) {
+                                break;
+                            }
+                            panic!("write chunk: {error}");
                         }
-                        panic!("write chunk: {error}");
+                        if slow {
+                            thread::sleep(Duration::from_millis(15));
+                        }
                     }
-                    if slow {
-                        thread::sleep(Duration::from_millis(15));
-                    }
-                }
-                let _ = stream.flush();
-                let _ = stream.shutdown(Shutdown::Both);
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(Shutdown::Both);
+                });
+                connection_handles.push(connection_handle);
+            }
+            for connection_handle in connection_handles {
+                connection_handle.join().expect("connection handle join");
             }
         });
         (format!("http://{addr}/fixture.bin"), handle)
@@ -708,7 +718,7 @@ mod tests {
             .expect("pause should settle");
         assert!(paused.downloaded_bytes > 0);
         let _ = manager.resume(entry.id).expect("resume");
-        for _ in 0..80 {
+        for _ in 0..160 {
             let current = manager.progress(entry.id).expect("progress current");
             if current.state == DownloadState::Completed {
                 assert_eq!(current.supports_resume, Some(true));
@@ -736,7 +746,7 @@ mod tests {
             .expect("pause should settle");
         assert!(paused.downloaded_bytes > 0);
         let _ = manager.resume(entry.id).expect("resume");
-        for _ in 0..80 {
+        for _ in 0..160 {
             let current = manager.progress(entry.id).expect("progress current");
             if current.state == DownloadState::Completed {
                 assert_eq!(current.supports_resume, Some(false));
