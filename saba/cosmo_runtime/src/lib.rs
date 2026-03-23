@@ -1,12 +1,16 @@
 pub use cosmo_app_legacy::*;
-pub use cosmo_core::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList};
+pub use cosmo_core::paint_commands::{
+    DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList,
+};
 
 // Cosmic app-layer aliases.
 pub type StarshipApp = SabaApp;
 pub type OrbitSnapshot = PageViewModel;
 pub type GalaxyFrame = FrameViewModel;
 
-pub fn scene_items_to_paint_commands(scene_items: &[SceneItem]) -> (PaintCommandList, Vec<AppError>) {
+pub fn scene_items_to_paint_commands(
+    scene_items: &[SceneItem],
+) -> (PaintCommandList, Vec<AppError>) {
     let mut commands = Vec::with_capacity(scene_items.len());
     let mut diagnostics = Vec::new();
     let mut errors = Vec::new();
@@ -47,8 +51,11 @@ pub fn scene_items_to_paint_commands(scene_items: &[SceneItem]) -> (PaintCommand
                 clip_rect,
             } => {
                 let family = if font_family.trim().is_empty() {
-                    diagnostics.push("Paint fallback: missing font-family, using monospace".to_string());
-                    errors.push(AppError::state("font is unavailable; rendered with fallback monospace"));
+                    diagnostics
+                        .push("Paint fallback: missing font-family, using monospace".to_string());
+                    errors.push(AppError::state(
+                        "font is unavailable; rendered with fallback monospace",
+                    ));
                     "monospace".to_string()
                 } else {
                     font_family.clone()
@@ -85,8 +92,12 @@ pub fn scene_items_to_paint_commands(scene_items: &[SceneItem]) -> (PaintCommand
                 // We preserve accessibility intent by painting a neutral placeholder and `alt` text.
                 // Ref: HTML Living Standard, image fallback content and `alt` text behavior.
                 if src.trim().is_empty() {
-                    diagnostics.push("Paint fallback: image source missing, drawing placeholder".to_string());
-                    errors.push(AppError::state("image resource is unavailable; rendered placeholder"));
+                    diagnostics.push(
+                        "Paint fallback: image source missing, drawing placeholder".to_string(),
+                    );
+                    errors.push(AppError::state(
+                        "image resource is unavailable; rendered placeholder",
+                    ));
                     commands.push(PaintCommand::DrawRect(DrawRect {
                         x: *x,
                         y: *y,

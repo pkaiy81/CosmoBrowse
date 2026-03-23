@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub type AppResult<T> = Result<T, AppError>;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppError {
     pub code: String,
     pub message: String,
@@ -141,6 +141,38 @@ impl AppError {
     pub fn script_timeout(message: impl Into<String>) -> Self {
         Self {
             code: "script_timeout".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn download_required(message: impl Into<String>) -> Self {
+        Self {
+            code: "download_required".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn download_save_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "download_save_failed".to_string(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn download_permission_denied(message: impl Into<String>) -> Self {
+        Self {
+            code: "download_permission_denied".to_string(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn download_resume_unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: "download_resume_unsupported".to_string(),
             message: message.into(),
             retryable: true,
         }
@@ -525,6 +557,42 @@ pub struct NavigationEvent {
     pub recorded_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadState {
+    Queued,
+    Downloading,
+    Paused,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadSavePolicy {
+    pub directory: String,
+    pub conflict_policy: String,
+    pub requires_user_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadEntry {
+    pub id: u64,
+    pub url: String,
+    pub final_url: Option<String>,
+    pub file_name: String,
+    pub save_path: String,
+    pub total_bytes: Option<u64>,
+    pub downloaded_bytes: u64,
+    pub state: DownloadState,
+    pub supports_resume: Option<bool>,
+    pub save_policy: DownloadSavePolicy,
+    pub last_error: Option<AppError>,
+    pub status_message: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppMetricsSnapshot {
     pub total_navigations: u64,
@@ -571,6 +639,14 @@ pub trait AppService {
         &mut self,
         positions: Vec<FrameScrollPositionSnapshot>,
     ) -> AppResult<()>;
+    fn enqueue_download(&mut self, url: &str) -> AppResult<DownloadEntry>;
+    fn list_downloads(&self) -> Vec<DownloadEntry>;
+    fn get_download_progress(&self, id: u64) -> AppResult<DownloadEntry>;
+    fn pause_download(&mut self, id: u64) -> AppResult<DownloadEntry>;
+    fn resume_download(&mut self, id: u64) -> AppResult<DownloadEntry>;
+    fn cancel_download(&mut self, id: u64) -> AppResult<DownloadEntry>;
+    fn open_download(&self, id: u64) -> AppResult<DownloadEntry>;
+    fn reveal_download(&self, id: u64) -> AppResult<DownloadEntry>;
 
     fn render_backend(&self) -> Box<dyn RenderBackend> {
         Box::new(DefaultRenderBackend)

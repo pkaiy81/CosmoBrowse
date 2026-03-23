@@ -1,7 +1,7 @@
 use adapter_native::{BrowserPageDto, CrashReportDto, IpcRequest, IpcResponse, NativeAdapter};
 use cosmo_runtime::{
-    AppError, FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet, SearchResult,
-    TabSummary,
+    AppError, DownloadEntry, FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet,
+    SearchResult, TabSummary,
 };
 use serde::Serialize;
 use std::backtrace::Backtrace;
@@ -196,6 +196,52 @@ fn update_scroll_positions(
 ) -> Result<bool, AppError> {
     state.adapter.update_scroll_positions(positions)?;
     Ok(true)
+}
+
+#[tauri::command]
+fn enqueue_download(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<DownloadEntry, AppError> {
+    state.adapter.enqueue_download(&url)
+}
+
+#[tauri::command]
+fn list_downloads(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadEntry>, AppError> {
+    state.adapter.list_downloads()
+}
+
+#[tauri::command]
+fn get_download_progress(
+    state: tauri::State<'_, AppState>,
+    id: u64,
+) -> Result<DownloadEntry, AppError> {
+    state.adapter.get_download_progress(id)
+}
+
+#[tauri::command]
+fn pause_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    state.adapter.pause_download(id)
+}
+
+#[tauri::command]
+fn resume_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    state.adapter.resume_download(id)
+}
+
+#[tauri::command]
+fn cancel_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    state.adapter.cancel_download(id)
+}
+
+#[tauri::command]
+fn open_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    state.adapter.open_download(id)
+}
+
+#[tauri::command]
+fn reveal_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    state.adapter.reveal_download(id)
 }
 
 fn install_crash_hook() {

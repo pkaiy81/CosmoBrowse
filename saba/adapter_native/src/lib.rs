@@ -1,5 +1,5 @@
 use cosmo_runtime::{
-    scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService,
+    scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService, DownloadEntry,
     FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet, OrbitSnapshot,
     PaintCommand, SceneItem, SearchResult, SessionSnapshot, StarshipApp, TabSummary,
 };
@@ -335,6 +335,28 @@ pub enum IpcRequestPayload {
     RegisterTlsException {
         url: String,
     },
+    EnqueueDownload {
+        url: String,
+    },
+    ListDownloads,
+    GetDownloadProgress {
+        id: u64,
+    },
+    PauseDownload {
+        id: u64,
+    },
+    ResumeDownload {
+        id: u64,
+    },
+    CancelDownload {
+        id: u64,
+    },
+    OpenDownload {
+        id: u64,
+    },
+    RevealDownload {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -348,6 +370,8 @@ pub enum IpcResponsePayload {
     Tabs(Vec<TabSummary>),
     SearchResults(Vec<SearchResult>),
     OmniboxSuggestions(OmniboxSuggestionSet),
+    Download(DownloadEntry),
+    Downloads(Vec<DownloadEntry>),
     Ack(bool),
 }
 
@@ -454,6 +478,30 @@ impl NativeAdapter {
             IpcRequestPayload::RegisterTlsException { url } => self
                 .register_tls_exception(&url)
                 .map(|_| IpcResponsePayload::Ack(true)),
+            IpcRequestPayload::EnqueueDownload { url } => self
+                .enqueue_download(&url)
+                .map(IpcResponsePayload::Download),
+            IpcRequestPayload::ListDownloads => {
+                self.list_downloads().map(IpcResponsePayload::Downloads)
+            }
+            IpcRequestPayload::GetDownloadProgress { id } => self
+                .get_download_progress(id)
+                .map(IpcResponsePayload::Download),
+            IpcRequestPayload::PauseDownload { id } => {
+                self.pause_download(id).map(IpcResponsePayload::Download)
+            }
+            IpcRequestPayload::ResumeDownload { id } => {
+                self.resume_download(id).map(IpcResponsePayload::Download)
+            }
+            IpcRequestPayload::CancelDownload { id } => {
+                self.cancel_download(id).map(IpcResponsePayload::Download)
+            }
+            IpcRequestPayload::OpenDownload { id } => {
+                self.open_download(id).map(IpcResponsePayload::Download)
+            }
+            IpcRequestPayload::RevealDownload { id } => {
+                self.reveal_download(id).map(IpcResponsePayload::Download)
+            }
         }?;
 
         Ok(IpcResponse {
@@ -618,6 +666,46 @@ impl NativeAdapter {
         drop(app);
         self.persist_latest_session_snapshot(result.is_ok());
         result
+    }
+
+    pub fn enqueue_download(&self, url: &str) -> Result<DownloadEntry, AppError> {
+        let mut app = self.lock_app()?;
+        app.enqueue_download(url)
+    }
+
+    pub fn list_downloads(&self) -> Result<Vec<DownloadEntry>, AppError> {
+        let app = self.lock_app()?;
+        Ok(app.list_downloads())
+    }
+
+    pub fn get_download_progress(&self, id: u64) -> Result<DownloadEntry, AppError> {
+        let app = self.lock_app()?;
+        app.get_download_progress(id)
+    }
+
+    pub fn pause_download(&self, id: u64) -> Result<DownloadEntry, AppError> {
+        let mut app = self.lock_app()?;
+        app.pause_download(id)
+    }
+
+    pub fn resume_download(&self, id: u64) -> Result<DownloadEntry, AppError> {
+        let mut app = self.lock_app()?;
+        app.resume_download(id)
+    }
+
+    pub fn cancel_download(&self, id: u64) -> Result<DownloadEntry, AppError> {
+        let mut app = self.lock_app()?;
+        app.cancel_download(id)
+    }
+
+    pub fn open_download(&self, id: u64) -> Result<DownloadEntry, AppError> {
+        let app = self.lock_app()?;
+        app.open_download(id)
+    }
+
+    pub fn reveal_download(&self, id: u64) -> Result<DownloadEntry, AppError> {
+        let app = self.lock_app()?;
+        app.reveal_download(id)
     }
 
     pub fn update_scroll_positions(
