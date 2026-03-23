@@ -627,7 +627,20 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
+    use std::sync::Once;
     use std::thread::JoinHandle;
+
+    fn configure_loopback_proxy_bypass() {
+        static CONFIGURE_PROXY_BYPASS: Once = Once::new();
+        CONFIGURE_PROXY_BYPASS.call_once(|| {
+            // Test-fixture note: some CI/container environments inject ambient
+            // HTTP proxy variables that are consulted before the request reaches
+            // our loopback fixture. Explicitly mark the standard loopback hosts
+            // as non-proxy targets so the tests exercise direct local transport.
+            std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1");
+            std::env::set_var("no_proxy", "localhost,127.0.0.1,::1");
+        });
+    }
 
     fn spawn_fixture_server(
         range_enabled: bool,
@@ -840,6 +853,7 @@ mod tests {
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        configure_loopback_proxy_bypass();
         std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
         let (url, server) = spawn_fixture_server(true, true, 2);
         let mut manager = DownloadManager::default();
@@ -862,6 +876,7 @@ mod tests {
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        configure_loopback_proxy_bypass();
         std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
         // Spec note: seed a paused partial file, then resume against a server
         // that ignores Range and answers with `200 OK`. This matches the RFC 9110
