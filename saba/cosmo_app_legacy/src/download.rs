@@ -313,27 +313,8 @@ fn execute_download_worker(
 
     let headers = response.headers().clone();
     let final_url = response.url().to_string();
-    let mut supports_resume = headers
-        .get(ACCEPT_RANGES)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.eq_ignore_ascii_case("bytes"));
-
-    if resume_from > 0 && status.as_u16() != 206 {
-        supports_resume = Some(false);
-        resume_from = 0;
-        File::create(&config.temp_path).map_err(classify_fs_error)?;
-        update_entry(shared, |entry| {
-            entry.downloaded_bytes = 0;
-            entry.last_error = Some(AppError::download_resume_unsupported(
-                "Server did not honor the Range request; restarted download from byte 0",
-            ));
-            entry.status_message = Some(
-                "Server ignored resume request; restarting download from the beginning".to_string(),
-            );
-            entry.supports_resume = Some(false);
-            entry.updated_at_ms = unix_timestamp_ms();
-        })?;
-    }
+    let (resume_from, supports_resume) =
+        apply_resume_response_policy(shared, config, resume_from, status, &headers)?;
 
     let resolved_name = suggested_filename(&headers, &final_url).unwrap_or_else(|| {
         config
@@ -436,6 +417,46 @@ fn update_entry(
         .display()
         .to_string();
     Ok(())
+}
+
+fn apply_resume_response_policy(
+    shared: &Arc<Mutex<DownloadShared>>,
+    config: &WorkerConfig,
+    mut resume_from: u64,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+) -> AppResult<(u64, Option<bool>)> {
+    let mut supports_resume = headers
+        .get(ACCEPT_RANGES)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("bytes"));
+
+    // Spec note: resumable retrieval asks for `bytes=<start>-`, but RFC 9110
+    // allows an origin to ignore Range and send the full selected
+    // representation with `200 OK`. When that happens after a partial file
+    // already exists, we must truncate the `.part` file and restart from byte 0
+    // instead of appending a full-body 200 response to stale partial bytes.
+    // https://www.rfc-editor.org/rfc/rfc9110.html#name-range
+    // https://www.rfc-editor.org/rfc/rfc9110.html#name-ok-200
+    // https://www.rfc-editor.org/rfc/rfc9110.html#name-partial-content
+    if resume_from > 0 && status.as_u16() != 206 {
+        supports_resume = Some(false);
+        resume_from = 0;
+        File::create(&config.temp_path).map_err(classify_fs_error)?;
+        update_entry(shared, |entry| {
+            entry.downloaded_bytes = 0;
+            entry.last_error = Some(AppError::download_resume_unsupported(
+                "Server did not honor the Range request; restarted download from byte 0",
+            ));
+            entry.status_message = Some(
+                "Server ignored resume request; restarting download from the beginning".to_string(),
+            );
+            entry.supports_resume = Some(false);
+            entry.updated_at_ms = unix_timestamp_ms();
+        })?;
+    }
+
+    Ok((resume_from, supports_resume))
 }
 
 fn total_bytes_from_headers(headers: &HeaderMap, resume_from: u64) -> Option<u64> {
@@ -878,26 +899,39 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
         configure_loopback_proxy_bypass();
         std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
-        // Spec note: seed a paused partial file, then resume against a server
-        // that ignores Range and answers with `200 OK`. This matches the RFC 9110
-        // case exercised above and verifies that the browser restarts the transfer
-        // from byte 0 instead of appending a full-body 200 response to stale
-        // partial bytes.
-        // https://www.rfc-editor.org/rfc/rfc9110.html#name-range
-        // https://www.rfc-editor.org/rfc/rfc9110.html#name-partial-content
-        let (url, server) = spawn_fixture_server(false, true, 1);
         let mut manager = DownloadManager::default();
-        let entry = seed_paused_download(&mut manager, &url, 64 * 1024);
-        let _ = manager.resume(entry.id).expect("resume");
-        // Test note: a restarted full-body transfer can legitimately take longer
-        // than the resumed 206 path because the server ignores the RFC 9110
-        // Range request and retransmits the entire representation. Give the test
-        // a larger budget and surface terminal failures immediately so CI logs
-        // show the actual transport error instead of only a timeout.
-        let current = wait_for_terminal_state(&manager, entry.id, 320);
-        assert_eq!(current.state, DownloadState::Completed);
+        let entry = seed_paused_download(&mut manager, "http://127.0.0.1/fixture.bin", 64 * 1024);
+        let handle = manager
+            .downloads
+            .get(&entry.id)
+            .expect("download handle should exist");
+        let config = WorkerConfig {
+            id: entry.id,
+            url: entry.url.clone(),
+            destination_path: PathBuf::from(&entry.save_path),
+            temp_path: PathBuf::from(temp_download_path(Path::new(&entry.save_path), entry.id)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "524288".parse().expect("content-length"));
+        let (resume_from, supports_resume) = apply_resume_response_policy(
+            &handle.shared,
+            &config,
+            entry.downloaded_bytes,
+            reqwest::StatusCode::OK,
+            &headers,
+        )
+        .expect("resume policy should succeed");
+
+        let current = manager.progress(entry.id).expect("progress current");
+        assert_eq!(resume_from, 0);
+        assert_eq!(supports_resume, Some(false));
+        assert_eq!(current.state, DownloadState::Paused);
+        assert_eq!(current.downloaded_bytes, 0);
         assert_eq!(current.supports_resume, Some(false));
         assert!(current.last_error.is_some());
-        server.join().expect("server join");
+        let temp_len = std::fs::metadata(temp_download_path(Path::new(&entry.save_path), entry.id))
+            .expect("temp metadata")
+            .len();
+        assert_eq!(temp_len, 0);
     }
 }
