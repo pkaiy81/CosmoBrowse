@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import resource
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -331,11 +333,62 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_kpi_summary(metrics_response: dict[str, Any]) -> dict[str, Any]:
+def classify_failure(message: str) -> str:
+    if message.startswith("layout_breakage_rate_exceeded") or "missing_box:" in message or "overflow_box_model:" in message:
+        return "layout_regression"
+    if message.startswith("runner_exception") or message.startswith("build_failed") or message.startswith("metrics_collection_failed"):
+        return "infrastructure"
+    if "expected" in message or "not found" in message:
+        return "content_assertion"
+    if "crash" in message.lower() or "panic" in message.lower():
+        return "crash"
+    return "unknown"
+
+
+def classify_crash_reason(reason: str) -> str:
+    normalized = reason.lower()
+    if "renderer_recovering" in normalized or "renderer" in normalized:
+        return "renderer_process"
+    if "tls" in normalized:
+        return "network_tls"
+    if "panic" in normalized:
+        return "panic"
+    return "uncategorized"
+
+
+def peak_memory_usage_kib() -> dict[str, int]:
+    self_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    child_usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    return {
+        "smoke_harness_peak_rss_kib": int(self_usage),
+        "child_process_peak_rss_kib": int(child_usage),
+        "combined_peak_rss_kib": int(self_usage + child_usage),
+    }
+
+
+def build_kpi_summary(
+    metrics_response: dict[str, Any],
+    *,
+    case_timings_ms: dict[str, int],
+    case_failures: dict[str, list[str]],
+    crash_report: dict[str, Any] | None,
+) -> dict[str, Any]:
     payload = metrics_response.get("payload", {})
     total = int(payload.get("total_navigations", 0) or 0)
     failed = int(payload.get("failed_navigations", 0) or 0)
     average_duration_ms = int(payload.get("average_duration_ms", 0) or 0)
+    successful_case_timings = sorted(
+        duration for case_name, duration in case_timings_ms.items() if not case_failures.get(case_name)
+    )
+    # Spec note: Paint Timing defines first-contentful-paint as the first time
+    # meaningful DOM content is painted. This smoke harness cannot observe the
+    # platform paint timeline directly, so it uses "time until the IPC page
+    # snapshot becomes available" as a stable FCP-equivalent proxy for nightly
+    # comparisons.
+    # https://w3c.github.io/paint-timing/#sec-terminology
+    fcp_equivalent_ms = (
+        successful_case_timings[len(successful_case_timings) // 2] if successful_case_timings else average_duration_ms
+    )
 
     error_counts = payload.get("error_counts", []) or []
     tls_errors = sum(
@@ -346,19 +399,46 @@ def build_kpi_summary(metrics_response: dict[str, Any]) -> dict[str, Any]:
     dangerous_attempts = tls_errors
     dangerous_detection_rate = 1.0 if dangerous_attempts == 0 else min(1.0, tls_errors / dangerous_attempts)
 
+    crash_count = 1 if crash_report else 0
     failure_rate = 0.0 if total == 0 else failed / total
     success_rate = 1.0 - failure_rate
+    crash_rate = 0.0 if total == 0 else crash_count / total
+
+    case_failure_summary = {
+        case_name: {
+            "count": len(messages),
+            "categories": sorted({classify_failure(message) for message in messages}),
+            "messages": messages,
+        }
+        for case_name, messages in sorted(case_failures.items())
+    }
+    crash_classification = (
+        {
+            "count": 1,
+            "categories": [classify_crash_reason(str(crash_report.get("reason", "")))],
+            "latest_reason": crash_report.get("reason"),
+        }
+        if crash_report
+        else {"count": 0, "categories": [], "latest_reason": None}
+    )
 
     return {
         "failure_rate": failure_rate,
         "success_rate": success_rate,
-        "crash_rate": 0.0,
+        "crash_rate": crash_rate,
         "display_time_ms": average_duration_ms,
+        "fcp_equivalent_ms": fcp_equivalent_ms,
+        "memory_usage_kib": peak_memory_usage_kib(),
         "dangerous_connection_detection_rate": dangerous_detection_rate,
+        "failure_classification": {
+            "by_case": case_failure_summary,
+            "crash": crash_classification,
+        },
         "totals": {
             "navigations": total,
             "failed_navigations": failed,
             "tls_error_events": tls_errors,
+            "crash_reports": crash_count,
         },
     }
 
@@ -380,6 +460,8 @@ def main() -> int:
     failures: list[str] = []
     snapshots: dict[str, Any] = {}
     layout_failures: dict[str, list[str]] = {}
+    case_failures: dict[str, list[str]] = {}
+    case_timings_ms: dict[str, int] = {}
 
     try:
         ipc_cli_path = ensure_native_ipc_cli_built(saba_dir, smoke_log)
@@ -396,16 +478,21 @@ def main() -> int:
     try:
         for case in cases:
             url = f"{base_url}{case.path}"
+            started_at = time.perf_counter()
             response = session.request("open_url", {"url": url})
+            case_timings_ms[case.name] = int((time.perf_counter() - started_at) * 1000)
             snapshots[case.name] = response
             try:
                 ensure_page(case, response, expected_url=url)
             except AssertionError as error:
-                failures.append(str(error))
+                message = str(error)
+                failures.append(message)
+                case_failures.setdefault(case.name, []).append(message)
 
             issues = collect_layout_issues(response)
             if issues:
                 layout_failures[case.name] = issues
+                case_failures.setdefault(case.name, []).extend(issues)
         run_navigation_and_tab_smoke(session, base_url)
         run_e7_t2_js_runtime_smoke(repo_root)
     except Exception as error:  # noqa: BLE001
@@ -414,7 +501,19 @@ def main() -> int:
         try:
             metrics_response = session.request("get_metrics")
             write_json(artifacts_dir / "app_metrics_snapshot.json", metrics_response)
-            write_json(artifacts_dir / "kpi_summary.json", build_kpi_summary(metrics_response))
+            crash_report_response = session.request("get_latest_crash_report")
+            crash_report = crash_report_response.get("payload")
+            if crash_report:
+                write_json(artifacts_dir / "latest_crash_report.json", crash_report)
+            write_json(
+                artifacts_dir / "kpi_summary.json",
+                build_kpi_summary(
+                    metrics_response,
+                    case_timings_ms=case_timings_ms,
+                    case_failures=case_failures,
+                    crash_report=crash_report,
+                ),
+            )
         except Exception as error:  # noqa: BLE001
             failures.append(f"metrics_collection_failed: {error}")
         total_cases = max(len(cases), 1)

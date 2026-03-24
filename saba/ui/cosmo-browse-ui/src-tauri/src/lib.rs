@@ -6,15 +6,22 @@ use cosmo_runtime::{
 use serde::Serialize;
 use std::backtrace::Backtrace;
 use std::collections::hash_map::DefaultHasher;
-use std::fs::File;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 struct AppState {
     adapter: NativeAdapter,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CrashContext {
+    active_url: Option<String>,
+    last_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,12 +40,26 @@ fn dispatch_ipc(
     state: tauri::State<'_, AppState>,
     request: IpcRequest,
 ) -> Result<IpcResponse, AppError> {
-    state.adapter.dispatch(request)
+    record_last_command(format!("dispatch_ipc::{}", ipc_payload_label(&request)));
+    match &request.payload {
+        adapter_native::IpcRequestPayload::OpenUrl { url }
+        | adapter_native::IpcRequestPayload::RegisterTlsException { url }
+        | adapter_native::IpcRequestPayload::EnqueueDownload { url } => record_active_url(url),
+        _ => {}
+    }
+    let response = state.adapter.dispatch(request)?;
+    if let adapter_native::IpcResponsePayload::Page(page) = &response.payload {
+        record_active_url(&page.current_url);
+    }
+    Ok(response)
 }
 
 #[tauri::command]
 fn open_url(state: tauri::State<'_, AppState>, url: String) -> Result<BrowserPageDto, AppError> {
-    state.adapter.open_url(&url)
+    record_navigation_context("open_url", Some(&url));
+    let page = state.adapter.open_url(&url)?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
@@ -48,14 +69,19 @@ fn activate_link(
     href: String,
     target: Option<String>,
 ) -> Result<BrowserPageDto, AppError> {
+    record_last_command(format!("activate_link:{frame_id}"));
     state
         .adapter
         .activate_link(&frame_id, &href, target.as_deref())
+        .inspect(|page| record_active_url(&page.current_url))
 }
 
 #[tauri::command]
 fn get_page_view(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    state.adapter.get_page_view()
+    record_last_command("get_page_view");
+    let page = state.adapter.get_page_view()?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
@@ -64,26 +90,39 @@ fn set_viewport(
     width: i64,
     height: i64,
 ) -> Result<BrowserPageDto, AppError> {
-    state.adapter.set_viewport(width, height)
+    record_last_command(format!("set_viewport:{width}x{height}"));
+    let page = state.adapter.set_viewport(width, height)?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
 fn reload(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    state.adapter.reload()
+    record_last_command("reload");
+    let page = state.adapter.reload()?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
 fn back(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    state.adapter.back()
+    record_last_command("back");
+    let page = state.adapter.back()?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
 fn forward(state: tauri::State<'_, AppState>) -> Result<BrowserPageDto, AppError> {
-    state.adapter.forward()
+    record_last_command("forward");
+    let page = state.adapter.forward()?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
 fn get_navigation_state(state: tauri::State<'_, AppState>) -> Result<NavigationState, AppError> {
+    record_last_command("get_navigation_state");
     state.adapter.get_navigation_state()
 }
 
@@ -125,21 +164,27 @@ fn release_rollout_status() -> ReleaseRolloutStatus {
 
 #[tauri::command]
 fn new_tab(state: tauri::State<'_, AppState>) -> Result<TabSummary, AppError> {
+    record_last_command("new_tab");
     state.adapter.new_tab()
 }
 
 #[tauri::command]
 fn duplicate_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<TabSummary, AppError> {
+    record_last_command(format!("duplicate_tab:{id}"));
     state.adapter.duplicate_tab(id)
 }
 
 #[tauri::command]
 fn switch_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<BrowserPageDto, AppError> {
-    state.adapter.switch_tab(id)
+    record_last_command(format!("switch_tab:{id}"));
+    let page = state.adapter.switch_tab(id)?;
+    record_active_url(&page.current_url);
+    Ok(page)
 }
 
 #[tauri::command]
 fn close_tab(state: tauri::State<'_, AppState>, id: u32) -> Result<Vec<TabSummary>, AppError> {
+    record_last_command(format!("close_tab:{id}"));
     state.adapter.close_tab(id)
 }
 
@@ -149,6 +194,7 @@ fn move_tab(
     id: u32,
     target_index: usize,
 ) -> Result<Vec<TabSummary>, AppError> {
+    record_last_command(format!("move_tab:{id}->{target_index}"));
     state.adapter.move_tab(id, target_index)
 }
 
@@ -158,6 +204,7 @@ fn set_tab_pinned(
     id: u32,
     pinned: bool,
 ) -> Result<Vec<TabSummary>, AppError> {
+    record_last_command(format!("set_tab_pinned:{id}:{pinned}"));
     state.adapter.set_tab_pinned(id, pinned)
 }
 
@@ -167,16 +214,19 @@ fn set_tab_muted(
     id: u32,
     muted: bool,
 ) -> Result<Vec<TabSummary>, AppError> {
+    record_last_command(format!("set_tab_muted:{id}:{muted}"));
     state.adapter.set_tab_muted(id, muted)
 }
 
 #[tauri::command]
 fn list_tabs(state: tauri::State<'_, AppState>) -> Result<Vec<TabSummary>, AppError> {
+    record_last_command("list_tabs");
     state.adapter.list_tabs()
 }
 
 #[tauri::command]
 fn search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, AppError> {
+    record_last_command("search");
     state.adapter.search(&query)
 }
 
@@ -186,6 +236,7 @@ fn omnibox_suggestions(
     query: String,
     current_index: Option<usize>,
 ) -> Result<OmniboxSuggestionSet, AppError> {
+    record_last_command("omnibox_suggestions");
     state.adapter.omnibox_suggestions(&query, current_index)
 }
 
@@ -194,6 +245,7 @@ fn update_scroll_positions(
     state: tauri::State<'_, AppState>,
     positions: Vec<FrameScrollPositionSnapshot>,
 ) -> Result<bool, AppError> {
+    record_last_command(format!("update_scroll_positions:{}", positions.len()));
     state.adapter.update_scroll_positions(positions)?;
     Ok(true)
 }
@@ -203,11 +255,13 @@ fn enqueue_download(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<DownloadEntry, AppError> {
+    record_navigation_context("enqueue_download", Some(&url));
     state.adapter.enqueue_download(&url)
 }
 
 #[tauri::command]
 fn list_downloads(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadEntry>, AppError> {
+    record_last_command("list_downloads");
     state.adapter.list_downloads()
 }
 
@@ -216,31 +270,37 @@ fn get_download_progress(
     state: tauri::State<'_, AppState>,
     id: u64,
 ) -> Result<DownloadEntry, AppError> {
+    record_last_command(format!("get_download_progress:{id}"));
     state.adapter.get_download_progress(id)
 }
 
 #[tauri::command]
 fn pause_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    record_last_command(format!("pause_download:{id}"));
     state.adapter.pause_download(id)
 }
 
 #[tauri::command]
 fn resume_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    record_last_command(format!("resume_download:{id}"));
     state.adapter.resume_download(id)
 }
 
 #[tauri::command]
 fn cancel_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    record_last_command(format!("cancel_download:{id}"));
     state.adapter.cancel_download(id)
 }
 
 #[tauri::command]
 fn open_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    record_last_command(format!("open_download:{id}"));
     state.adapter.open_download(id)
 }
 
 #[tauri::command]
 fn reveal_download(state: tauri::State<'_, AppState>, id: u64) -> Result<DownloadEntry, AppError> {
+    record_last_command(format!("reveal_download:{id}"));
     state.adapter.reveal_download(id)
 }
 
@@ -258,19 +318,33 @@ fn install_crash_hook() {
             .location()
             .map(|loc| format!("{}:{}", loc.file(), loc.line()))
             .unwrap_or_else(|| "unknown".to_string());
+        let crash_report_path = persist_crash_report_path();
+        let crash_context = crash_context()
+            .lock()
+            .map(|context| context.clone())
+            .unwrap_or_default();
         let report = CrashReportDto {
-            path: crash_report_path().display().to_string(),
+            path: crash_report_path.display().to_string(),
             crashed_at_ms: unix_timestamp_ms(),
             reason: format!("{reason} @ {location}"),
+            build_id: build_id(),
+            commit_hash: commit_hash(),
+            transport: current_transport(),
+            active_url: crash_context.active_url.unwrap_or_default(),
+            last_command: crash_context.last_command.unwrap_or_default(),
             reproduction: vec![
-                "Capture URL and last user action before crash".to_string(),
+                "Record the sanitized active URL, transport, and last command from this report"
+                    .to_string(),
+                "Attach page diagnostics (network/dom/console) from the last successful render"
+                    .to_string(),
                 "Re-run with RUST_BACKTRACE=1 to include full stack traces".to_string(),
-                "Attach diagnostics panel output (network/dom/console)".to_string(),
+                "Describe the user-visible symptom and the exact rollout percentage/channel"
+                    .to_string(),
             ],
         };
 
         if let Ok(payload) = serde_json::to_string_pretty(&report) {
-            if let Ok(mut file) = File::create(crash_report_path()) {
+            if let Ok(mut file) = File::create(&crash_report_path) {
                 let _ = file.write_all(payload.as_bytes());
             }
             eprintln!("CosmoBrowse crash report saved: {}", report.path);
@@ -280,8 +354,111 @@ fn install_crash_hook() {
     }));
 }
 
-fn crash_report_path() -> PathBuf {
-    std::env::temp_dir().join("cosmobrowse-crash-report.json")
+fn crash_context() -> &'static Mutex<CrashContext> {
+    static CONTEXT: OnceLock<Mutex<CrashContext>> = OnceLock::new();
+    CONTEXT.get_or_init(|| Mutex::new(CrashContext::default()))
+}
+
+fn record_last_command(command: impl Into<String>) {
+    if let Ok(mut context) = crash_context().lock() {
+        context.last_command = Some(command.into());
+    }
+}
+
+fn record_active_url(url: &str) {
+    if let Ok(mut context) = crash_context().lock() {
+        context.active_url = Some(sanitize_url_for_crash_report(url));
+    }
+}
+
+fn record_navigation_context(command: &str, url: Option<&str>) {
+    record_last_command(command.to_string());
+    if let Some(url) = url {
+        record_active_url(url);
+    }
+}
+
+fn persist_crash_report_path() -> PathBuf {
+    let repo = crash_repository_dir();
+    let _ = fs::create_dir_all(&repo);
+    repo.join(format!("crash-{}.json", unix_timestamp_ms()))
+}
+
+fn crash_repository_dir() -> PathBuf {
+    std::env::var("COSMO_CRASH_REPOSITORY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("cosmobrowse-crash-reports"))
+}
+
+fn build_id() -> String {
+    option_env!("COSMO_BUILD_ID")
+        .map(str::to_string)
+        .or_else(|| std::env::var("COSMO_BUILD_ID").ok())
+        .or_else(|| option_env!("GITHUB_RUN_ID").map(str::to_string))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+fn commit_hash() -> String {
+    option_env!("COSMO_COMMIT_HASH")
+        .map(str::to_string)
+        .or_else(|| std::env::var("COSMO_COMMIT_HASH").ok())
+        .or_else(|| option_env!("GITHUB_SHA").map(str::to_string))
+        .map(|hash| hash.chars().take(12).collect())
+        .unwrap_or_default()
+}
+
+fn current_transport() -> String {
+    release_rollout_status().assigned_transport
+}
+
+fn ipc_payload_label(request: &IpcRequest) -> &'static str {
+    match &request.payload {
+        adapter_native::IpcRequestPayload::OpenUrl { .. } => "open_url",
+        adapter_native::IpcRequestPayload::GetPageView => "get_page_view",
+        adapter_native::IpcRequestPayload::SetViewport { .. } => "set_viewport",
+        adapter_native::IpcRequestPayload::Reload => "reload",
+        adapter_native::IpcRequestPayload::Back => "back",
+        adapter_native::IpcRequestPayload::Forward => "forward",
+        adapter_native::IpcRequestPayload::ActivateLink { .. } => "activate_link",
+        adapter_native::IpcRequestPayload::GetNavigationState => "get_navigation_state",
+        adapter_native::IpcRequestPayload::GetMetrics => "get_metrics",
+        adapter_native::IpcRequestPayload::GetLatestCrashReport => "get_latest_crash_report",
+        adapter_native::IpcRequestPayload::NewTab => "new_tab",
+        adapter_native::IpcRequestPayload::DuplicateTab { .. } => "duplicate_tab",
+        adapter_native::IpcRequestPayload::SwitchTab { .. } => "switch_tab",
+        adapter_native::IpcRequestPayload::CloseTab { .. } => "close_tab",
+        adapter_native::IpcRequestPayload::MoveTab { .. } => "move_tab",
+        adapter_native::IpcRequestPayload::SetTabPinned { .. } => "set_tab_pinned",
+        adapter_native::IpcRequestPayload::SetTabMuted { .. } => "set_tab_muted",
+        adapter_native::IpcRequestPayload::ListTabs => "list_tabs",
+        adapter_native::IpcRequestPayload::Search { .. } => "search",
+        adapter_native::IpcRequestPayload::OmniboxSuggestions { .. } => "omnibox_suggestions",
+        adapter_native::IpcRequestPayload::UpdateScrollPositions { .. } => {
+            "update_scroll_positions"
+        }
+        adapter_native::IpcRequestPayload::RegisterTlsException { .. } => "register_tls_exception",
+        adapter_native::IpcRequestPayload::EnqueueDownload { .. } => "enqueue_download",
+        adapter_native::IpcRequestPayload::ListDownloads => "list_downloads",
+        adapter_native::IpcRequestPayload::GetDownloadProgress { .. } => "get_download_progress",
+        adapter_native::IpcRequestPayload::PauseDownload { .. } => "pause_download",
+        adapter_native::IpcRequestPayload::ResumeDownload { .. } => "resume_download",
+        adapter_native::IpcRequestPayload::CancelDownload { .. } => "cancel_download",
+        adapter_native::IpcRequestPayload::OpenDownload { .. } => "open_download",
+        adapter_native::IpcRequestPayload::RevealDownload { .. } => "reveal_download",
+    }
+}
+
+fn sanitize_url_for_crash_report(url: &str) -> String {
+    // Spec note: RFC 3986 separates query (`?`) and fragment (`#`) components from
+    // the hierarchical part of a URI. Crash telemetry keeps only the stable
+    // navigation target and drops those components to avoid over-retaining user
+    // content such as search terms, tokens, or in-document state.
+    // https://www.rfc-editor.org/rfc/rfc3986#section-3
+    let without_fragment = url.split_once('#').map_or(url, |(prefix, _)| prefix);
+    let without_query = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(prefix, _)| prefix);
+    without_query.to_string()
 }
 
 fn session_snapshot_path() -> PathBuf {
