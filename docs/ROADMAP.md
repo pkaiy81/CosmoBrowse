@@ -260,8 +260,16 @@
   - **完了条件**: 主要ショートカットで遷移完了まで一貫動作。
 - 進捗メモ: `OmniboxSuggestionSet` DTO に履歴 + 既存検索候補 + active index を統合し、Enter / ArrowUp / ArrowDown / Escape / Ctrl(Cmd)+L / Alt+Left/Right を UI へ実装。
 - [ ] **E6-T3 ダウンロードマネージャ**
-  - 進捗表示、一時停止/再開、保存先ポリシー。
-  - **完了条件**: 大容量ファイルで再開可能ダウンロードが成功。
+  - 実装済み機能（2026-03-24 時点）:
+    - `enqueue/list/progress/pause/resume/cancel/open/reveal` の IPC 契約と UI 操作線を接続済み。
+    - `saba/cosmo_app_legacy/src/download.rs` で cooperative pause/resume（分割受信ループでの中断・再開）を実装済み。
+  - 残課題（未達）:
+    - HTTP Range ベースの厳密 resume 検証（`Accept-Ranges`/`Content-Range` 整合、ETag/Last-Modified 再検証を含む）。
+    - 保存先ポリシー（毎回確認/既定フォルダ/サイト別方針）の UI 設定導線。
+    - 大容量ファイル回帰スモーク（失敗時リトライ + 完了ファイル整合性検証）の定常運用化。
+  - **完了条件（DoD）**:
+    - 上記残課題を解消し、ダウンロード検証ポリシー文書（`docs/layout-regression-policy.md` と同等粒度）で測定方法を固定したうえで、
+      大容量ファイルの pause/resume/retry を含む CI スモークが連続成功すること。
 
 ### Epic 7: 観測性・品質保証
 - [x] **E7-T1 ブラウザ KPI ダッシュボード**
