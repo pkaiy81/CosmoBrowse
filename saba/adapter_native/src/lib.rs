@@ -1,7 +1,8 @@
 use cosmo_runtime::{
     scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService, DownloadEntry,
-    FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet, OrbitSnapshot,
-    PaintCommand, SceneItem, SearchResult, SessionSnapshot, StarshipApp, TabSummary,
+    DownloadPolicySettings, DownloadSavePolicy, FrameScrollPositionSnapshot, NavigationState,
+    OmniboxSuggestionSet, OrbitSnapshot, PaintCommand, SceneItem, SearchResult, SessionSnapshot,
+    StarshipApp, TabSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -367,6 +368,17 @@ pub enum IpcRequestPayload {
     RevealDownload {
         id: u64,
     },
+    GetDownloadPolicySettings,
+    SetDownloadDefaultPolicy {
+        policy: DownloadSavePolicy,
+    },
+    SetDownloadSitePolicy {
+        origin: String,
+        policy: DownloadSavePolicy,
+    },
+    ClearDownloadSitePolicy {
+        origin: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -382,6 +394,7 @@ pub enum IpcResponsePayload {
     OmniboxSuggestions(OmniboxSuggestionSet),
     Download(DownloadEntry),
     Downloads(Vec<DownloadEntry>),
+    DownloadPolicySettings(DownloadPolicySettings),
     Ack(bool),
 }
 
@@ -512,6 +525,18 @@ impl NativeAdapter {
             IpcRequestPayload::RevealDownload { id } => {
                 self.reveal_download(id).map(IpcResponsePayload::Download)
             }
+            IpcRequestPayload::GetDownloadPolicySettings => self
+                .get_download_policy_settings()
+                .map(IpcResponsePayload::DownloadPolicySettings),
+            IpcRequestPayload::SetDownloadDefaultPolicy { policy } => self
+                .set_download_default_policy(policy)
+                .map(IpcResponsePayload::DownloadPolicySettings),
+            IpcRequestPayload::SetDownloadSitePolicy { origin, policy } => self
+                .set_download_site_policy(&origin, policy)
+                .map(IpcResponsePayload::DownloadPolicySettings),
+            IpcRequestPayload::ClearDownloadSitePolicy { origin } => self
+                .clear_download_site_policy(&origin)
+                .map(IpcResponsePayload::DownloadPolicySettings),
         }?;
 
         Ok(IpcResponse {
@@ -721,6 +746,36 @@ impl NativeAdapter {
     pub fn reveal_download(&self, id: u64) -> Result<DownloadEntry, AppError> {
         let app = self.lock_app()?;
         app.reveal_download(id)
+    }
+
+    pub fn get_download_policy_settings(&self) -> Result<DownloadPolicySettings, AppError> {
+        let app = self.lock_app()?;
+        Ok(app.get_download_policy_settings())
+    }
+
+    pub fn set_download_default_policy(
+        &self,
+        policy: DownloadSavePolicy,
+    ) -> Result<DownloadPolicySettings, AppError> {
+        let mut app = self.lock_app()?;
+        app.set_download_default_policy(policy)
+    }
+
+    pub fn set_download_site_policy(
+        &self,
+        origin: &str,
+        policy: DownloadSavePolicy,
+    ) -> Result<DownloadPolicySettings, AppError> {
+        let mut app = self.lock_app()?;
+        app.set_download_site_policy(origin, policy)
+    }
+
+    pub fn clear_download_site_policy(
+        &self,
+        origin: &str,
+    ) -> Result<DownloadPolicySettings, AppError> {
+        let mut app = self.lock_app()?;
+        app.clear_download_site_policy(origin)
     }
 
     pub fn update_scroll_positions(

@@ -1,4 +1,7 @@
-use crate::model::{AppError, AppResult, DownloadEntry, DownloadSavePolicy, DownloadState};
+use crate::model::{
+    AppError, AppResult, DownloadEntry, DownloadPolicySettings, DownloadSavePolicy,
+    DownloadSitePolicy, DownloadState,
+};
 use reqwest::blocking::Client;
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
@@ -19,10 +22,11 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 15);
 const CHUNK_SIZE: usize = 16 * 1024;
 
-#[derive(Debug, Default)]
 pub struct DownloadManager {
     next_id: u64,
     downloads: BTreeMap<u64, DownloadHandle>,
+    default_policy: DownloadSavePolicy,
+    site_policies: BTreeMap<String, DownloadSavePolicy>,
 }
 
 #[derive(Debug)]
@@ -68,7 +72,7 @@ impl DownloadManager {
 
         self.next_id += 1;
         let id = self.next_id;
-        let save_policy = default_save_policy();
+        let save_policy = self.resolve_save_policy(&parsed);
         let base_name = default_filename_from_url(&parsed);
         let destination_path =
             unique_destination_path(Path::new(&save_policy.directory), &base_name);
@@ -115,6 +119,56 @@ impl DownloadManager {
         self.downloads.insert(id, handle);
         self.spawn_worker(id, config, false)?;
         self.download(id)
+    }
+
+    pub fn get_policy_settings(&self) -> DownloadPolicySettings {
+        DownloadPolicySettings {
+            default_policy: self.default_policy.clone(),
+            site_policies: self
+                .site_policies
+                .iter()
+                .map(|(origin, policy)| DownloadSitePolicy {
+                    origin: origin.clone(),
+                    policy: policy.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn set_default_policy(
+        &mut self,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings> {
+        self.default_policy = normalize_save_policy(policy)?;
+        Ok(self.get_policy_settings())
+    }
+
+    pub fn set_site_policy(
+        &mut self,
+        origin: &str,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings> {
+        let canonical_origin = canonicalize_origin(origin)?;
+        self.site_policies
+            .insert(canonical_origin, normalize_save_policy(policy)?);
+        Ok(self.get_policy_settings())
+    }
+
+    pub fn clear_site_policy(&mut self, origin: &str) -> AppResult<DownloadPolicySettings> {
+        let canonical_origin = canonicalize_origin(origin)?;
+        self.site_policies.remove(&canonical_origin);
+        Ok(self.get_policy_settings())
+    }
+
+    pub fn apply_policy_settings(&mut self, settings: DownloadPolicySettings) -> AppResult<()> {
+        self.default_policy = normalize_save_policy(settings.default_policy)?;
+        self.site_policies.clear();
+        for entry in settings.site_policies {
+            let canonical_origin = canonicalize_origin(&entry.origin)?;
+            self.site_policies
+                .insert(canonical_origin, normalize_save_policy(entry.policy)?);
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Vec<DownloadEntry> {
@@ -242,6 +296,25 @@ impl DownloadManager {
                 AppError::state(format!("Failed to spawn download worker: {error}"))
             })?;
         Ok(())
+    }
+
+    fn resolve_save_policy(&self, url: &Url) -> DownloadSavePolicy {
+        let origin = origin_key_from_url(url);
+        self.site_policies
+            .get(&origin)
+            .cloned()
+            .unwrap_or_else(|| self.default_policy.clone())
+    }
+}
+
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            downloads: BTreeMap::new(),
+            default_policy: default_save_policy(),
+            site_policies: BTreeMap::new(),
+        }
     }
 }
 
@@ -725,6 +798,51 @@ fn default_save_policy() -> DownloadSavePolicy {
     }
 }
 
+fn normalize_save_policy(mut policy: DownloadSavePolicy) -> AppResult<DownloadSavePolicy> {
+    // Spec note: UI file pickers may return leading/trailing whitespace and
+    // non-canonical path strings. We normalize and validate once at the adapter
+    // boundary so downstream file operations are deterministic and least-surprise.
+    let trimmed = policy.directory.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::validation(
+            "Download save directory must not be empty",
+        ));
+    }
+    policy.directory = PathBuf::from(trimmed).display().to_string();
+    if policy.conflict_policy.trim().is_empty() {
+        policy.conflict_policy = "uniquify".to_string();
+    }
+    Ok(policy)
+}
+
+fn origin_key_from_url(url: &Url) -> String {
+    if let Some(port) = url.port() {
+        return format!("{}://{}:{port}", url.scheme(), url.host_str().unwrap_or_default());
+    }
+    format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default())
+}
+
+fn canonicalize_origin(origin: &str) -> AppResult<String> {
+    // Spec note: Origin identity follows RFC 6454 tuple semantics
+    // (scheme/host/port). We parse and normalize the tuple so policy keys match
+    // exactly across commands and session restarts.
+    // https://www.rfc-editor.org/rfc/rfc6454#section-4
+    let parsed = Url::parse(origin)
+        .map_err(|error| AppError::validation(format!("Invalid origin URL: {error}")))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(AppError::validation(format!(
+            "Download site policy origin must be http/https: {origin}"
+        )));
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::validation(format!(
+            "Download site policy origin must not include path/query/fragment: {origin}"
+        )));
+    }
+    Ok(origin_key_from_url(&parsed))
+}
+
 fn should_bypass_proxy(url: &str) -> bool {
     let parsed = match Url::parse(url) {
         Ok(parsed) => parsed,
@@ -1170,5 +1288,42 @@ mod tests {
             .status_message
             .unwrap_or_default()
             .contains("validator mismatch"));
+    }
+
+    #[test]
+    fn site_policy_overrides_default_directory_for_matching_origin() {
+        let mut manager = DownloadManager::default();
+        let settings = manager
+            .set_default_policy(DownloadSavePolicy {
+                directory: "/tmp/default-downloads".to_string(),
+                conflict_policy: "uniquify".to_string(),
+                requires_user_confirmation: true,
+            })
+            .expect("set default policy");
+        assert_eq!(settings.default_policy.directory, "/tmp/default-downloads");
+        manager
+            .set_site_policy(
+                "https://example.com",
+                DownloadSavePolicy {
+                    directory: "/tmp/example-downloads".to_string(),
+                    conflict_policy: "uniquify".to_string(),
+                    requires_user_confirmation: false,
+                },
+            )
+            .expect("set site policy");
+
+        let resolved = manager.resolve_save_policy(&Url::parse("https://example.com/file.bin").expect("url"));
+        assert_eq!(resolved.directory, "/tmp/example-downloads");
+        assert!(!resolved.requires_user_confirmation);
+    }
+
+    #[test]
+    fn canonicalize_origin_rejects_non_origin_urls() {
+        let with_path = canonicalize_origin("https://example.com/downloads");
+        assert!(with_path.is_err());
+        let ftp = canonicalize_origin("ftp://example.com");
+        assert!(ftp.is_err());
+        let ok = canonicalize_origin("https://example.com");
+        assert_eq!(ok.expect("origin"), "https://example.com");
     }
 }

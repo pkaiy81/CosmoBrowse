@@ -52,6 +52,14 @@ input { border: 1px solid #c7d2e9; border-radius: 14px; padding: 0.8rem 1rem; ba
 .download-summary { margin: 0.2rem 0 0; color: #5a6a84; font-size: 0.86rem; }
 .downloads-toolbar { display: flex; gap: 0.6rem; flex-wrap: wrap; }
 .downloads-list { list-style: none; margin: 0.9rem 0 0; padding: 0; display: grid; gap: 0.75rem; }
+.download-policy-shell { margin-top: 0.85rem; padding: 0.75rem; border: 1px solid #d8e1f4; border-radius: 14px; background: #f8fbff; }
+.download-policy-shell h3 { margin: 0 0 0.55rem; font-size: 0.92rem; }
+.download-policy-grid { display: grid; gap: 0.45rem; margin-bottom: 0.55rem; }
+.download-policy-grid label { display: grid; gap: 0.25rem; font-size: 0.8rem; color: #41516d; }
+.download-policy-grid input[type="text"] { width: 100%; border: 1px solid #c7d3ec; border-radius: 10px; padding: 0.46rem 0.56rem; font: inherit; color: #22324c; background: #fff; }
+.download-policy-checkbox { display: flex !important; align-items: center; gap: 0.5rem; }
+.download-policy-actions { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+.download-policy-status { margin: 0.35rem 0 0; font-size: 0.78rem; color: #5a6a84; }
 .download-item { border: 1px solid #d8e1f4; border-radius: 16px; background: #f8fbff; padding: 0.85rem; display: grid; gap: 0.5rem; }
 .download-item-header { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; }
 .download-state-badge { text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.72rem; font-weight: 700; color: #2151c4; background: #e7efff; border-radius: 999px; padding: 0.25rem 0.5rem; }

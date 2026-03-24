@@ -41,8 +41,8 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 `docs/ROADMAP.md` のチェックリストを基準に確認した結果、**未完了は Epic 6 の E6-T3（ダウンロードマネージャ）と GA 判定の連続達成のみ**です。
 
 - 完了済み: E1〜E5, E7〜E8, および E6-T1/E6-T2 は完了。
-- 未完了: E6-T3（保存先ポリシー UI、大容量回帰スモーク運用）。
-- 2026-03-24 追記: HTTP Range resume の厳密検証（`Content-Range` オフセット一致 + `ETag`/`Last-Modified` 再検証不一致時の full restart）は実装済み。
+- 未完了: E6-T3（大容量回帰スモーク運用）。
+- 2026-03-24 追記: HTTP Range resume の厳密検証（`Content-Range` オフセット一致 + `ETag`/`Last-Modified` 再検証不一致時の full restart）と、保存先ポリシー UI + session restore 後の保持を実装済み。
 - 未判定: GA gate の `consecutive_pass_streak >= 3` を満たす連続 nightlies。
 
 ### 未完了に対する新規タスク（2026-03-24 作成）

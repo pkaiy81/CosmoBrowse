@@ -439,9 +439,10 @@
     - 仕様準拠メモ:
       - HTTP range request/resume は RFC 9110 Section 14（Range Requests）に準拠し、range satisfiable 条件をサーバー応答で検証する。
       - キャッシュ再検証は RFC 9111 Section 4.3（Validation）に合わせ、validator 不一致時の部分再利用を禁止する。
-18. [ ] **DL-T2 保存先ポリシー UI/永続化**
+18. [x] **DL-T2 保存先ポリシー UI/永続化**
     - 保存先ポリシー（毎回確認/既定フォルダ/サイト別）を UI 設定に追加。
     - policy は session restore 後も維持し、origin 単位の例外設定を監査ログに記録する。
+    - 進捗メモ（2026-03-24）: `get/set/clear_download_*policy` の IPC 契約と UI 設定フォームを追加し、`SessionSnapshot.download_policy_settings` を使って restore 後も default/site policy を復元するようにした。
 19. [ ] **DL-T3 大容量回帰スモーク定常化**
     - pause/resume/retry を含む大容量 fixture を nightly へ追加。
     - 完了ファイルは checksum（SHA-256）一致を必須判定にし、失敗時は crash report と同一 history_key に束ねる。

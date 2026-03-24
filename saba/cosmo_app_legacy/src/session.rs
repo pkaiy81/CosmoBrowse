@@ -5,12 +5,12 @@ use crate::loader::{
     register_tls_exception_for_url, resolve_url, FramesetChild, FramesetSpec, LoadedDocument,
 };
 use crate::model::{
-    AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, DownloadEntry, ErrorMetric,
-    FrameRect, FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel,
-    HistoryEntrySnapshot, NavigationEvent, NavigationState, NavigationType, OmniboxSuggestion,
-    OmniboxSuggestionKind, OmniboxSuggestionSet, PageViewModel, RenderBackendKind, ScriptEngine,
-    ScrollPosition, SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary,
-    SESSION_SNAPSHOT_SCHEMA_VERSION,
+    AppError, AppMetricsSnapshot, AppResult, AppService, ContentSize, DownloadEntry,
+    DownloadPolicySettings, DownloadSavePolicy, ErrorMetric, FrameRect,
+    FrameScrollPositionSnapshot, FrameUrlOverrideSnapshot, FrameViewModel, HistoryEntrySnapshot,
+    NavigationEvent, NavigationState, NavigationType, OmniboxSuggestion, OmniboxSuggestionKind,
+    OmniboxSuggestionSet, PageViewModel, RenderBackendKind, ScriptEngine, ScrollPosition,
+    SearchResult, SessionSnapshot, TabSessionSnapshot, TabSummary, SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::security::{apply_minimum_csp, enforce_mixed_content_policy, is_same_origin};
 use std::collections::{BTreeMap, HashSet};
@@ -291,6 +291,29 @@ impl AppService for SabaApp {
     fn reveal_download(&self, id: u64) -> AppResult<DownloadEntry> {
         self.downloads.reveal(id)
     }
+
+    fn get_download_policy_settings(&self) -> DownloadPolicySettings {
+        self.downloads.get_policy_settings()
+    }
+
+    fn set_download_default_policy(
+        &mut self,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings> {
+        self.downloads.set_default_policy(policy)
+    }
+
+    fn set_download_site_policy(
+        &mut self,
+        origin: &str,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings> {
+        self.downloads.set_site_policy(origin, policy)
+    }
+
+    fn clear_download_site_policy(&mut self, origin: &str) -> AppResult<DownloadPolicySettings> {
+        self.downloads.clear_site_policy(origin)
+    }
 }
 
 impl SabaApp {
@@ -304,6 +327,7 @@ impl SabaApp {
             version: SESSION_SNAPSHOT_SCHEMA_VERSION,
             active_tab_id: self.active_tab_id,
             tabs: self.tabs.iter().map(Tab::snapshot).collect(),
+            download_policy_settings: Some(self.downloads.get_policy_settings()),
         }
     }
 
@@ -312,6 +336,7 @@ impl SabaApp {
             version,
             active_tab_id,
             tabs: tab_snapshots,
+            download_policy_settings,
         } = snapshot;
 
         if version != SESSION_SNAPSHOT_SCHEMA_VERSION {
@@ -342,6 +367,9 @@ impl SabaApp {
                 .ok_or_else(|| AppError::state("Failed to resolve restored active tab"))?
         };
         self.next_tab_id = max_tab_id + 1;
+        if let Some(settings) = download_policy_settings {
+            self.downloads.apply_policy_settings(settings)?;
+        }
         Ok(())
     }
 
@@ -1780,6 +1808,41 @@ mod tests {
         assert!(restored_tabs[0].is_muted);
         assert!(restored_tabs[1].is_pinned);
         assert!(restored_tabs[1].is_muted);
+    }
+
+    #[test]
+    fn download_policy_settings_round_trip_in_session_snapshot() {
+        let mut app = SabaApp::default();
+        app.set_download_default_policy(DownloadSavePolicy {
+            directory: "/tmp/default-policy".to_string(),
+            conflict_policy: "uniquify".to_string(),
+            requires_user_confirmation: true,
+        })
+        .expect("set default policy");
+        app.set_download_site_policy(
+            "https://example.com",
+            DownloadSavePolicy {
+                directory: "/tmp/example-policy".to_string(),
+                conflict_policy: "uniquify".to_string(),
+                requires_user_confirmation: false,
+            },
+        )
+        .expect("set site policy");
+
+        let snapshot = app.export_session_snapshot();
+        let mut restored = SabaApp::default();
+        restored
+            .import_session_snapshot(snapshot)
+            .expect("snapshot should restore");
+        let settings = restored.get_download_policy_settings();
+        assert_eq!(settings.default_policy.directory, "/tmp/default-policy");
+        let site = settings
+            .site_policies
+            .iter()
+            .find(|entry| entry.origin == "https://example.com")
+            .expect("site policy should exist");
+        assert_eq!(site.policy.directory, "/tmp/example-policy");
+        assert!(!site.policy.requires_user_confirmation);
     }
 
     fn sample_page(url: &str, diagnostics: Vec<&str>) -> PageViewModel {
