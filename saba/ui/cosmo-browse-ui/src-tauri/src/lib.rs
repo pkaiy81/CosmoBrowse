@@ -1,7 +1,7 @@
 use adapter_native::{BrowserPageDto, CrashReportDto, IpcRequest, IpcResponse, NativeAdapter};
 use cosmo_runtime::{
-    AppError, DownloadEntry, FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet,
-    SearchResult, TabSummary,
+    AppError, DownloadEntry, DownloadPolicySettings, DownloadSavePolicy,
+    FrameScrollPositionSnapshot, NavigationState, OmniboxSuggestionSet, SearchResult, TabSummary,
 };
 use serde::Serialize;
 use std::backtrace::Backtrace;
@@ -304,6 +304,42 @@ fn reveal_download(state: tauri::State<'_, AppState>, id: u64) -> Result<Downloa
     state.adapter.reveal_download(id)
 }
 
+#[tauri::command]
+fn get_download_policy_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<DownloadPolicySettings, AppError> {
+    record_last_command("get_download_policy_settings");
+    state.adapter.get_download_policy_settings()
+}
+
+#[tauri::command]
+fn set_download_default_policy(
+    state: tauri::State<'_, AppState>,
+    policy: DownloadSavePolicy,
+) -> Result<DownloadPolicySettings, AppError> {
+    record_last_command("set_download_default_policy");
+    state.adapter.set_download_default_policy(policy)
+}
+
+#[tauri::command]
+fn set_download_site_policy(
+    state: tauri::State<'_, AppState>,
+    origin: String,
+    policy: DownloadSavePolicy,
+) -> Result<DownloadPolicySettings, AppError> {
+    record_last_command(format!("set_download_site_policy:{origin}"));
+    state.adapter.set_download_site_policy(&origin, policy)
+}
+
+#[tauri::command]
+fn clear_download_site_policy(
+    state: tauri::State<'_, AppState>,
+    origin: String,
+) -> Result<DownloadPolicySettings, AppError> {
+    record_last_command(format!("clear_download_site_policy:{origin}"));
+    state.adapter.clear_download_site_policy(&origin)
+}
+
 fn install_crash_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
         let _ = persist_pre_crash_snapshot();
@@ -445,6 +481,16 @@ fn ipc_payload_label(request: &IpcRequest) -> &'static str {
         adapter_native::IpcRequestPayload::CancelDownload { .. } => "cancel_download",
         adapter_native::IpcRequestPayload::OpenDownload { .. } => "open_download",
         adapter_native::IpcRequestPayload::RevealDownload { .. } => "reveal_download",
+        adapter_native::IpcRequestPayload::GetDownloadPolicySettings => {
+            "get_download_policy_settings"
+        }
+        adapter_native::IpcRequestPayload::SetDownloadDefaultPolicy { .. } => {
+            "set_download_default_policy"
+        }
+        adapter_native::IpcRequestPayload::SetDownloadSitePolicy { .. } => "set_download_site_policy",
+        adapter_native::IpcRequestPayload::ClearDownloadSitePolicy { .. } => {
+            "clear_download_site_policy"
+        }
     }
 }
 
@@ -540,7 +586,19 @@ pub fn run() {
             list_tabs,
             search,
             omnibox_suggestions,
-            update_scroll_positions
+            update_scroll_positions,
+            enqueue_download,
+            list_downloads,
+            get_download_progress,
+            pause_download,
+            resume_download,
+            cancel_download,
+            open_download,
+            reveal_download,
+            get_download_policy_settings,
+            set_download_default_policy,
+            set_download_site_policy,
+            clear_download_site_policy
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

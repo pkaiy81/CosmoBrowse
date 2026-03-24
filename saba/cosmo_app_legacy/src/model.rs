@@ -206,6 +206,8 @@ pub struct SessionSnapshot {
     pub version: u32,
     pub active_tab_id: u32,
     pub tabs: Vec<TabSessionSnapshot>,
+    #[serde(default)]
+    pub download_policy_settings: Option<DownloadPolicySettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -576,6 +578,18 @@ pub struct DownloadSavePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadSitePolicy {
+    pub origin: String,
+    pub policy: DownloadSavePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadPolicySettings {
+    pub default_policy: DownloadSavePolicy,
+    pub site_policies: Vec<DownloadSitePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DownloadEntry {
     pub id: u64,
     pub url: String,
@@ -647,6 +661,17 @@ pub trait AppService {
     fn cancel_download(&mut self, id: u64) -> AppResult<DownloadEntry>;
     fn open_download(&self, id: u64) -> AppResult<DownloadEntry>;
     fn reveal_download(&self, id: u64) -> AppResult<DownloadEntry>;
+    fn get_download_policy_settings(&self) -> DownloadPolicySettings;
+    fn set_download_default_policy(
+        &mut self,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings>;
+    fn set_download_site_policy(
+        &mut self,
+        origin: &str,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings>;
+    fn clear_download_site_policy(&mut self, origin: &str) -> AppResult<DownloadPolicySettings>;
 
     fn render_backend(&self) -> Box<dyn RenderBackend> {
         Box::new(DefaultRenderBackend)

@@ -1,7 +1,11 @@
-use crate::model::{AppError, AppResult, DownloadEntry, DownloadSavePolicy, DownloadState};
+use crate::model::{
+    AppError, AppResult, DownloadEntry, DownloadPolicySettings, DownloadSavePolicy,
+    DownloadSitePolicy, DownloadState,
+};
 use reqwest::blocking::Client;
 use reqwest::header::{
-    HeaderMap, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE,
+    HeaderMap, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+    ETAG, LAST_MODIFIED, RANGE,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -18,10 +22,12 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 15);
 const CHUNK_SIZE: usize = 16 * 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DownloadManager {
     next_id: u64,
     downloads: BTreeMap<u64, DownloadHandle>,
+    default_policy: DownloadSavePolicy,
+    site_policies: BTreeMap<String, DownloadSavePolicy>,
 }
 
 #[derive(Debug)]
@@ -35,6 +41,13 @@ struct DownloadHandle {
 struct DownloadShared {
     entry: DownloadEntry,
     temp_path: String,
+    resume_validator: ResumeValidator,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResumeValidator {
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +73,7 @@ impl DownloadManager {
 
         self.next_id += 1;
         let id = self.next_id;
-        let save_policy = default_save_policy();
+        let save_policy = self.resolve_save_policy(&parsed);
         let base_name = default_filename_from_url(&parsed);
         let destination_path =
             unique_destination_path(Path::new(&save_policy.directory), &base_name);
@@ -91,6 +104,7 @@ impl DownloadManager {
         let shared = Arc::new(Mutex::new(DownloadShared {
             entry: entry.clone(),
             temp_path: temp_path.display().to_string(),
+            resume_validator: ResumeValidator::default(),
         }));
         let handle = DownloadHandle {
             shared: Arc::clone(&shared),
@@ -106,6 +120,56 @@ impl DownloadManager {
         self.downloads.insert(id, handle);
         self.spawn_worker(id, config, false)?;
         self.download(id)
+    }
+
+    pub fn get_policy_settings(&self) -> DownloadPolicySettings {
+        DownloadPolicySettings {
+            default_policy: self.default_policy.clone(),
+            site_policies: self
+                .site_policies
+                .iter()
+                .map(|(origin, policy)| DownloadSitePolicy {
+                    origin: origin.clone(),
+                    policy: policy.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn set_default_policy(
+        &mut self,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings> {
+        self.default_policy = normalize_save_policy(policy)?;
+        Ok(self.get_policy_settings())
+    }
+
+    pub fn set_site_policy(
+        &mut self,
+        origin: &str,
+        policy: DownloadSavePolicy,
+    ) -> AppResult<DownloadPolicySettings> {
+        let canonical_origin = canonicalize_origin(origin)?;
+        self.site_policies
+            .insert(canonical_origin, normalize_save_policy(policy)?);
+        Ok(self.get_policy_settings())
+    }
+
+    pub fn clear_site_policy(&mut self, origin: &str) -> AppResult<DownloadPolicySettings> {
+        let canonical_origin = canonicalize_origin(origin)?;
+        self.site_policies.remove(&canonical_origin);
+        Ok(self.get_policy_settings())
+    }
+
+    pub fn apply_policy_settings(&mut self, settings: DownloadPolicySettings) -> AppResult<()> {
+        self.default_policy = normalize_save_policy(settings.default_policy)?;
+        self.site_policies.clear();
+        for entry in settings.site_policies {
+            let canonical_origin = canonicalize_origin(&entry.origin)?;
+            self.site_policies
+                .insert(canonical_origin, normalize_save_policy(entry.policy)?);
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Vec<DownloadEntry> {
@@ -234,6 +298,25 @@ impl DownloadManager {
             })?;
         Ok(())
     }
+
+    fn resolve_save_policy(&self, url: &Url) -> DownloadSavePolicy {
+        let origin = origin_key_from_url(url);
+        self.site_policies
+            .get(&origin)
+            .cloned()
+            .unwrap_or_else(|| self.default_policy.clone())
+    }
+}
+
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            downloads: BTreeMap::new(),
+            default_policy: default_save_policy(),
+            site_policies: BTreeMap::new(),
+        }
+    }
 }
 
 fn run_download_worker(
@@ -315,6 +398,8 @@ fn execute_download_worker(
     let final_url = response.url().to_string();
     let (resume_from, supports_resume) =
         apply_resume_response_policy(shared, config, resume_from, status, &headers)?;
+    let response_validator = ResumeValidator::from_headers(&headers);
+    set_resume_validator(shared, response_validator)?;
 
     let resolved_name = suggested_filename(&headers, &final_url).unwrap_or_else(|| {
         config
@@ -456,7 +541,130 @@ fn apply_resume_response_policy(
         })?;
     }
 
+    if resume_from > 0 && status.as_u16() == 206 {
+        // Spec note: RFC 9110 requires a valid `Content-Range` field in `206
+        // Partial Content` responses. We reject malformed/offset-mismatched
+        // ranges and restart from byte 0 to avoid appending bytes from a
+        // divergent representation to an existing `.part` file.
+        // https://www.rfc-editor.org/rfc/rfc9110.html#name-partial-content
+        // https://www.rfc-editor.org/rfc/rfc9110.html#name-content-range
+        if !content_range_matches_resume_offset(headers, resume_from) {
+            supports_resume = Some(false);
+            resume_from = 0;
+            File::create(&config.temp_path).map_err(classify_fs_error)?;
+            update_entry(shared, |entry| {
+                entry.downloaded_bytes = 0;
+                entry.last_error = Some(AppError::download_resume_unsupported(
+                    "Server returned an invalid Content-Range for resume; restarted from byte 0",
+                ));
+                entry.status_message = Some(
+                    "Resume response had invalid Content-Range; restarting download".to_string(),
+                );
+                entry.supports_resume = Some(false);
+                entry.updated_at_ms = unix_timestamp_ms();
+            })?;
+        } else if resume_validator_mismatch(shared, headers)? {
+            // Spec note: RFC 9111 validator rules require cached partial bytes to
+            // be reused only when validators still identify the same selected
+            // representation. If ETag/Last-Modified no longer match, we restart
+            // full-body download to preserve representation integrity.
+            // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3
+            supports_resume = Some(false);
+            resume_from = 0;
+            File::create(&config.temp_path).map_err(classify_fs_error)?;
+            update_entry(shared, |entry| {
+                entry.downloaded_bytes = 0;
+                entry.last_error = Some(AppError::download_resume_unsupported(
+                    "Stored validators did not match resume response; restarted from byte 0",
+                ));
+                entry.status_message = Some(
+                    "Resume validator mismatch (ETag/Last-Modified); restarting download"
+                        .to_string(),
+                );
+                entry.supports_resume = Some(false);
+                entry.updated_at_ms = unix_timestamp_ms();
+            })?;
+        }
+    }
+
     Ok((resume_from, supports_resume))
+}
+
+fn content_range_matches_resume_offset(headers: &HeaderMap, resume_from: u64) -> bool {
+    let Some(content_range) = headers.get(CONTENT_RANGE).and_then(header_value_to_string) else {
+        return false;
+    };
+    let Some(range_spec) = content_range.strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((range_part, _total_part)) = range_spec.split_once('/') else {
+        return false;
+    };
+    let Some((start_part, _end_part)) = range_part.split_once('-') else {
+        return false;
+    };
+    start_part.parse::<u64>().ok() == Some(resume_from)
+}
+
+fn resume_validator_mismatch(
+    shared: &Arc<Mutex<DownloadShared>>,
+    headers: &HeaderMap,
+) -> AppResult<bool> {
+    let stored = shared
+        .lock()
+        .map_err(|_| AppError::state("Download state lock poisoned"))?
+        .resume_validator
+        .clone();
+    Ok(stored.mismatches(headers))
+}
+
+fn set_resume_validator(
+    shared: &Arc<Mutex<DownloadShared>>,
+    validator: ResumeValidator,
+) -> AppResult<()> {
+    let mut shared = shared
+        .lock()
+        .map_err(|_| AppError::state("Download state lock poisoned"))?;
+    shared.resume_validator = validator;
+    Ok(())
+}
+
+fn header_value_to_string(value: &HeaderValue) -> Option<String> {
+    value.to_str().ok().map(str::to_string)
+}
+
+impl ResumeValidator {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            etag: headers.get(ETAG).and_then(header_value_to_string),
+            last_modified: headers.get(LAST_MODIFIED).and_then(header_value_to_string),
+        }
+    }
+
+    fn mismatches(&self, headers: &HeaderMap) -> bool {
+        if self.etag.is_none() && self.last_modified.is_none() {
+            return false;
+        }
+        if let Some(expected_etag) = &self.etag {
+            let Some(actual_etag) = headers.get(ETAG).and_then(header_value_to_string) else {
+                return true;
+            };
+            if &actual_etag != expected_etag {
+                return true;
+            }
+        }
+        if let Some(expected_last_modified) = &self.last_modified {
+            let Some(actual_last_modified) =
+                headers.get(LAST_MODIFIED).and_then(header_value_to_string)
+            else {
+                return true;
+            };
+            if &actual_last_modified != expected_last_modified {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn total_bytes_from_headers(headers: &HeaderMap, resume_from: u64) -> Option<u64> {
@@ -589,6 +797,51 @@ fn default_save_policy() -> DownloadSavePolicy {
         conflict_policy: "uniquify".to_string(),
         requires_user_confirmation: true,
     }
+}
+
+fn normalize_save_policy(mut policy: DownloadSavePolicy) -> AppResult<DownloadSavePolicy> {
+    // Spec note: UI file pickers may return leading/trailing whitespace and
+    // non-canonical path strings. We normalize and validate once at the adapter
+    // boundary so downstream file operations are deterministic and least-surprise.
+    let trimmed = policy.directory.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::validation(
+            "Download save directory must not be empty",
+        ));
+    }
+    policy.directory = PathBuf::from(trimmed).display().to_string();
+    if policy.conflict_policy.trim().is_empty() {
+        policy.conflict_policy = "uniquify".to_string();
+    }
+    Ok(policy)
+}
+
+fn origin_key_from_url(url: &Url) -> String {
+    if let Some(port) = url.port() {
+        return format!("{}://{}:{port}", url.scheme(), url.host_str().unwrap_or_default());
+    }
+    format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default())
+}
+
+fn canonicalize_origin(origin: &str) -> AppResult<String> {
+    // Spec note: Origin identity follows RFC 6454 tuple semantics
+    // (scheme/host/port). We parse and normalize the tuple so policy keys match
+    // exactly across commands and session restarts.
+    // https://www.rfc-editor.org/rfc/rfc6454#section-4
+    let parsed = Url::parse(origin)
+        .map_err(|error| AppError::validation(format!("Invalid origin URL: {error}")))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(AppError::validation(format!(
+            "Download site policy origin must be http/https: {origin}"
+        )));
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::validation(format!(
+            "Download site policy origin must not include path/query/fragment: {origin}"
+        )));
+    }
+    Ok(origin_key_from_url(&parsed))
 }
 
 fn should_bypass_proxy(url: &str) -> bool {
@@ -861,6 +1114,7 @@ mod tests {
                 shared: Arc::new(Mutex::new(DownloadShared {
                     entry: entry.clone(),
                     temp_path: temp_path.display().to_string(),
+                    resume_validator: ResumeValidator::default(),
                 })),
                 pause_flag: Arc::new(AtomicBool::new(false)),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -933,5 +1187,144 @@ mod tests {
             .expect("temp metadata")
             .len();
         assert_eq!(temp_len, 0);
+    }
+
+    #[test]
+    fn resume_falls_back_when_content_range_offset_is_invalid() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
+        let mut manager = DownloadManager::default();
+        let entry = seed_paused_download(&mut manager, "http://127.0.0.1/fixture.bin", 64 * 1024);
+        let handle = manager
+            .downloads
+            .get(&entry.id)
+            .expect("download handle should exist");
+        let config = WorkerConfig {
+            id: entry.id,
+            url: entry.url.clone(),
+            destination_path: PathBuf::from(&entry.save_path),
+            temp_path: PathBuf::from(temp_download_path(Path::new(&entry.save_path), entry.id)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_RANGES, "bytes".parse().expect("accept-ranges"));
+        headers.insert(
+            CONTENT_RANGE,
+            "bytes 1024-524287/524288"
+                .parse()
+                .expect("content-range"),
+        );
+
+        let (resume_from, supports_resume) = apply_resume_response_policy(
+            &handle.shared,
+            &config,
+            entry.downloaded_bytes,
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            &headers,
+        )
+        .expect("resume policy should succeed");
+
+        let current = manager.progress(entry.id).expect("progress current");
+        assert_eq!(resume_from, 0);
+        assert_eq!(supports_resume, Some(false));
+        assert_eq!(current.downloaded_bytes, 0);
+        assert_eq!(current.supports_resume, Some(false));
+        assert!(current
+            .status_message
+            .unwrap_or_default()
+            .contains("Content-Range"));
+    }
+
+    #[test]
+    fn resume_falls_back_when_etag_does_not_match_previous_partial() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
+        let mut manager = DownloadManager::default();
+        let entry = seed_paused_download(&mut manager, "http://127.0.0.1/fixture.bin", 64 * 1024);
+        let handle = manager
+            .downloads
+            .get(&entry.id)
+            .expect("download handle should exist");
+        {
+            let mut shared = handle.shared.lock().expect("lock");
+            shared.resume_validator = ResumeValidator {
+                etag: Some("\"previous\"".to_string()),
+                last_modified: None,
+            };
+        }
+        let config = WorkerConfig {
+            id: entry.id,
+            url: entry.url.clone(),
+            destination_path: PathBuf::from(&entry.save_path),
+            temp_path: PathBuf::from(temp_download_path(Path::new(&entry.save_path), entry.id)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_RANGES, "bytes".parse().expect("accept-ranges"));
+        headers.insert(
+            CONTENT_RANGE,
+            format!("bytes {}-{}/{}", entry.downloaded_bytes, 524287, 524288)
+                .parse()
+                .expect("content-range"),
+        );
+        headers.insert(ETAG, "\"changed\"".parse().expect("etag"));
+
+        let (resume_from, supports_resume) = apply_resume_response_policy(
+            &handle.shared,
+            &config,
+            entry.downloaded_bytes,
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            &headers,
+        )
+        .expect("resume policy should succeed");
+
+        let current = manager.progress(entry.id).expect("progress current");
+        assert_eq!(resume_from, 0);
+        assert_eq!(supports_resume, Some(false));
+        assert_eq!(current.downloaded_bytes, 0);
+        assert_eq!(current.supports_resume, Some(false));
+        assert!(current
+            .status_message
+            .unwrap_or_default()
+            .contains("validator mismatch"));
+    }
+
+    #[test]
+    fn site_policy_overrides_default_directory_for_matching_origin() {
+        let mut manager = DownloadManager::default();
+        let settings = manager
+            .set_default_policy(DownloadSavePolicy {
+                directory: "/tmp/default-downloads".to_string(),
+                conflict_policy: "uniquify".to_string(),
+                requires_user_confirmation: true,
+            })
+            .expect("set default policy");
+        assert_eq!(settings.default_policy.directory, "/tmp/default-downloads");
+        manager
+            .set_site_policy(
+                "https://example.com",
+                DownloadSavePolicy {
+                    directory: "/tmp/example-downloads".to_string(),
+                    conflict_policy: "uniquify".to_string(),
+                    requires_user_confirmation: false,
+                },
+            )
+            .expect("set site policy");
+
+        let resolved = manager.resolve_save_policy(&Url::parse("https://example.com/file.bin").expect("url"));
+        assert_eq!(resolved.directory, "/tmp/example-downloads");
+        assert!(!resolved.requires_user_confirmation);
+    }
+
+    #[test]
+    fn canonicalize_origin_rejects_non_origin_urls() {
+        let with_path = canonicalize_origin("https://example.com/downloads");
+        assert!(with_path.is_err());
+        let ftp = canonicalize_origin("ftp://example.com");
+        assert!(ftp.is_err());
+        let ok = canonicalize_origin("https://example.com");
+        assert_eq!(ok.expect("origin"), "https://example.com");
     }
 }

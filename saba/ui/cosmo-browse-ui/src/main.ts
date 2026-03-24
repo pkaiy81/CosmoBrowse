@@ -161,6 +161,14 @@ type DownloadSavePolicy = {
   conflict_policy: string;
   requires_user_confirmation: boolean;
 };
+type DownloadSitePolicy = {
+  origin: string;
+  policy: DownloadSavePolicy;
+};
+type DownloadPolicySettings = {
+  default_policy: DownloadSavePolicy;
+  site_policies: DownloadSitePolicy[];
+};
 type DownloadEntry = {
   id: number;
   url: string;
@@ -286,6 +294,17 @@ const legacyTransportHandlers: Record<string, (payload?: Record<string, unknown>
   cancel_download: (payload) => legacyInvoke<DownloadEntry>("cancel_download", { id: Number(payload?.id ?? 0) }),
   open_download: (payload) => legacyInvoke<DownloadEntry>("open_download", { id: Number(payload?.id ?? 0) }),
   reveal_download: (payload) => legacyInvoke<DownloadEntry>("reveal_download", { id: Number(payload?.id ?? 0) }),
+  get_download_policy_settings: () => legacyInvoke<DownloadPolicySettings>("get_download_policy_settings"),
+  set_download_default_policy: (payload) => legacyInvoke<DownloadPolicySettings>("set_download_default_policy", {
+    policy: payload?.policy,
+  }),
+  set_download_site_policy: (payload) => legacyInvoke<DownloadPolicySettings>("set_download_site_policy", {
+    origin: `${payload?.origin ?? ""}`,
+    policy: payload?.policy,
+  }),
+  clear_download_site_policy: (payload) => legacyInvoke<DownloadPolicySettings>("clear_download_site_policy", {
+    origin: `${payload?.origin ?? ""}`,
+  }),
 };
 
 const nativeTransport: AppTransport = {
@@ -407,6 +426,15 @@ let downloadsListEl: HTMLUListElement | null;
 let downloadSummaryEl: HTMLElement | null;
 let downloadCurrentButtonEl: HTMLButtonElement | null;
 let refreshDownloadsButtonEl: HTMLButtonElement | null;
+let downloadDefaultDirInputEl: HTMLInputElement | null;
+let downloadDefaultConfirmEl: HTMLInputElement | null;
+let downloadDefaultApplyButtonEl: HTMLButtonElement | null;
+let downloadSiteOriginInputEl: HTMLInputElement | null;
+let downloadSiteDirInputEl: HTMLInputElement | null;
+let downloadSiteConfirmEl: HTMLInputElement | null;
+let downloadSiteApplyButtonEl: HTMLButtonElement | null;
+let downloadSiteClearButtonEl: HTMLButtonElement | null;
+let downloadPolicyStatusEl: HTMLElement | null;
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: number | null = null;
 let scrollSyncTimer: number | null = null;
@@ -414,6 +442,7 @@ let pageEpoch = 0;
 let latestOmniboxSuggestions: OmniboxSuggestionSet = { query: "", active_index: null, suggestions: [] };
 let draggedTabId: number | null = null;
 let downloadPollTimer: number | null = null;
+let latestDownloadPolicySettings: DownloadPolicySettings | null = null;
 
 type RenderBackend = {
   kind: "native_scene";
@@ -1117,6 +1146,121 @@ async function refreshDownloads(silent = false) {
   }
 }
 
+function currentDownloadSiteOriginCandidate(): string | null {
+  const raw = (downloadSiteOriginInputEl?.value ?? urlInputEl?.value ?? "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function applyDownloadPolicyInputs(settings: DownloadPolicySettings) {
+  if (downloadDefaultDirInputEl) downloadDefaultDirInputEl.value = settings.default_policy.directory;
+  if (downloadDefaultConfirmEl) downloadDefaultConfirmEl.checked = settings.default_policy.requires_user_confirmation;
+
+  const origin = currentDownloadSiteOriginCandidate();
+  if (origin && downloadSiteOriginInputEl) downloadSiteOriginInputEl.value = origin;
+  const sitePolicy = origin
+    ? settings.site_policies.find((entry) => entry.origin === origin)
+    : null;
+  if (downloadSiteDirInputEl) {
+    downloadSiteDirInputEl.value = sitePolicy?.policy.directory ?? settings.default_policy.directory;
+  }
+  if (downloadSiteConfirmEl) {
+    downloadSiteConfirmEl.checked = sitePolicy?.policy.requires_user_confirmation ?? settings.default_policy.requires_user_confirmation;
+  }
+  if (downloadPolicyStatusEl) {
+    downloadPolicyStatusEl.textContent = origin
+      ? sitePolicy
+        ? `Site policy active for ${origin}.`
+        : `No site override for ${origin}; default policy applies.`
+      : "Enter an http(s) origin to edit site-specific policy.";
+  }
+}
+
+async function refreshDownloadPolicySettings(silent = false) {
+  try {
+    const settings = await requestAppCommand<DownloadPolicySettings>({ type: "get_download_policy_settings" });
+    latestDownloadPolicySettings = settings;
+    applyDownloadPolicyInputs(settings);
+  } catch (errorValue) {
+    if (!silent) handleCommandError(errorValue);
+  }
+}
+
+async function applyDefaultDownloadPolicy() {
+  const directory = downloadDefaultDirInputEl?.value.trim() ?? "";
+  const requiresUserConfirmation = Boolean(downloadDefaultConfirmEl?.checked);
+  try {
+    const settings = await requestAppCommand<DownloadPolicySettings>({
+      type: "set_download_default_policy",
+      payload: {
+        policy: {
+          directory,
+          conflict_policy: "uniquify",
+          requires_user_confirmation: requiresUserConfirmation,
+        },
+      },
+    });
+    latestDownloadPolicySettings = settings;
+    applyDownloadPolicyInputs(settings);
+    setStatus("Updated default download policy.");
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function applySiteDownloadPolicy() {
+  const origin = currentDownloadSiteOriginCandidate();
+  if (!origin) {
+    setStatus("Site policy requires a valid http(s) origin.", "error");
+    return;
+  }
+  const directory = downloadSiteDirInputEl?.value.trim() ?? "";
+  const requiresUserConfirmation = Boolean(downloadSiteConfirmEl?.checked);
+  try {
+    const settings = await requestAppCommand<DownloadPolicySettings>({
+      type: "set_download_site_policy",
+      payload: {
+        origin,
+        policy: {
+          directory,
+          conflict_policy: "uniquify",
+          requires_user_confirmation: requiresUserConfirmation,
+        },
+      },
+    });
+    latestDownloadPolicySettings = settings;
+    applyDownloadPolicyInputs(settings);
+    setStatus(`Updated site policy: ${origin}`);
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
+async function clearSiteDownloadPolicy() {
+  const origin = currentDownloadSiteOriginCandidate();
+  if (!origin) {
+    setStatus("Site policy clear requires a valid http(s) origin.", "error");
+    return;
+  }
+  try {
+    const settings = await requestAppCommand<DownloadPolicySettings>({
+      type: "clear_download_site_policy",
+      payload: { origin },
+    });
+    latestDownloadPolicySettings = settings;
+    applyDownloadPolicyInputs(settings);
+    setStatus(`Cleared site policy: ${origin}`);
+  } catch (errorValue) {
+    handleCommandError(errorValue);
+  }
+}
+
 async function enqueueCurrentUrlDownload() {
   const candidate = urlInputEl?.value.trim() ?? "";
   if (!candidate) {
@@ -1563,6 +1707,15 @@ window.addEventListener("DOMContentLoaded", () => {
   downloadSummaryEl = document.querySelector("#download-summary");
   downloadCurrentButtonEl = document.querySelector("#download-current-button");
   refreshDownloadsButtonEl = document.querySelector("#refresh-downloads-button");
+  downloadDefaultDirInputEl = document.querySelector("#download-default-dir");
+  downloadDefaultConfirmEl = document.querySelector("#download-default-confirm");
+  downloadDefaultApplyButtonEl = document.querySelector("#download-default-apply");
+  downloadSiteOriginInputEl = document.querySelector("#download-site-origin");
+  downloadSiteDirInputEl = document.querySelector("#download-site-dir");
+  downloadSiteConfirmEl = document.querySelector("#download-site-confirm");
+  downloadSiteApplyButtonEl = document.querySelector("#download-site-apply");
+  downloadSiteClearButtonEl = document.querySelector("#download-site-clear");
+  downloadPolicyStatusEl = document.querySelector("#download-policy-status");
 
   document.querySelector("#url-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1574,6 +1727,12 @@ window.addEventListener("DOMContentLoaded", () => {
   newTabButtonEl?.addEventListener("click", () => void createTab());
   downloadCurrentButtonEl?.addEventListener("click", () => void enqueueCurrentUrlDownload());
   refreshDownloadsButtonEl?.addEventListener("click", () => void refreshDownloads());
+  downloadDefaultApplyButtonEl?.addEventListener("click", () => void applyDefaultDownloadPolicy());
+  downloadSiteApplyButtonEl?.addEventListener("click", () => void applySiteDownloadPolicy());
+  downloadSiteClearButtonEl?.addEventListener("click", () => void clearSiteDownloadPolicy());
+  downloadSiteOriginInputEl?.addEventListener("change", () => {
+    if (latestDownloadPolicySettings) applyDownloadPolicyInputs(latestDownloadPolicySettings);
+  });
   installKeyboardHandlers();
 
   if (viewportEl) {
@@ -1589,5 +1748,6 @@ window.addEventListener("DOMContentLoaded", () => {
   downloadPollTimer = window.setInterval(() => void refreshDownloads(true), 1000);
   void refreshCrashReport();
   void refreshDownloads(true);
+  void refreshDownloadPolicySettings(true);
   void loadInitialPageView();
 });

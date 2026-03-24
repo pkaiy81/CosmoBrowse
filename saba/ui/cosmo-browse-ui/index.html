@@ -46,6 +46,39 @@
             <button id="refresh-downloads-button" class="ghost-button" type="button">Refresh</button>
           </div>
         </div>
+        <section class="download-policy-shell" aria-label="Download policy settings">
+          <h3>Save policy</h3>
+          <div class="download-policy-grid">
+            <label>
+              Default directory
+              <input id="download-default-dir" type="text" placeholder="/path/to/downloads" />
+            </label>
+            <label class="download-policy-checkbox">
+              <input id="download-default-confirm" type="checkbox" />
+              Ask user confirmation before save (default policy)
+            </label>
+            <button id="download-default-apply" class="ghost-button" type="button">Apply default</button>
+          </div>
+          <div class="download-policy-grid">
+            <label>
+              Site origin
+              <input id="download-site-origin" type="text" placeholder="https://example.com" />
+            </label>
+            <label>
+              Site directory
+              <input id="download-site-dir" type="text" placeholder="/path/to/site-downloads" />
+            </label>
+            <label class="download-policy-checkbox">
+              <input id="download-site-confirm" type="checkbox" />
+              Ask confirmation for this site
+            </label>
+            <div class="download-policy-actions">
+              <button id="download-site-apply" class="ghost-button" type="button">Apply site policy</button>
+              <button id="download-site-clear" class="ghost-button" type="button">Clear site policy</button>
+            </div>
+          </div>
+          <p id="download-policy-status" class="download-policy-status">Loading download policy…</p>
+        </section>
         <ul id="downloads-list" class="downloads-list" aria-label="Downloads"></ul>
       </section>
 

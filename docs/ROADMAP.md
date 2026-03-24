@@ -420,3 +420,35 @@
     - 例外的に `count == 1` の場合は `latest_crash_report.json` に `transport` / `active_url` / `last_command` / `build_id` / `commit_hash` が揃い、単発で再現手順付きであること
     - 同一 `failure_classification.crash.categories[*]` が 2 nightlies 連続した場合は未達（ロールバック判定）
 - [ ] `adapter_tauri` は互換層として最小維持され、コア機能追加は `adapter_native` のみで成立する。
+
+
+## 11. 進捗棚卸し（2026-03-24）と追加タスク
+
+### 11.1 棚卸し結果
+- [x] Epic 1〜5 は完了。
+- [x] Epic 6 は E6-T1/E6-T2 完了。
+- [ ] Epic 6 の E6-T3（ダウンロードマネージャ最終化）は未完了。
+- [x] Epic 7〜8 は実装完了（運用は継続監視中）。
+- [ ] GA 完成判定は `consecutive_pass_streak >= 3` の連続達成が未確認。
+
+### 11.2 E6-T3 完了に向けた追加タスク（DL series）
+17. [x] **DL-T1 HTTP Range strict resume 検証**
+    - 206 応答時の `Content-Range` と保存済みオフセットの一致を必須化する。
+    - `ETag` / `Last-Modified` 再検証不一致時は resume せず full restart へフォールバックする。
+    - 進捗メモ（2026-03-24）: `saba/cosmo_app_legacy/src/download.rs` で `Content-Range` 開始オフセット検証と validator mismatch fallback を実装し、回帰テストを追加済み。
+    - 仕様準拠メモ:
+      - HTTP range request/resume は RFC 9110 Section 14（Range Requests）に準拠し、range satisfiable 条件をサーバー応答で検証する。
+      - キャッシュ再検証は RFC 9111 Section 4.3（Validation）に合わせ、validator 不一致時の部分再利用を禁止する。
+18. [x] **DL-T2 保存先ポリシー UI/永続化**
+    - 保存先ポリシー（毎回確認/既定フォルダ/サイト別）を UI 設定に追加。
+    - policy は session restore 後も維持し、origin 単位の例外設定を監査ログに記録する。
+    - 進捗メモ（2026-03-24）: `get/set/clear_download_*policy` の IPC 契約と UI 設定フォームを追加し、`SessionSnapshot.download_policy_settings` を使って restore 後も default/site policy を復元するようにした。
+19. [ ] **DL-T3 大容量回帰スモーク定常化**
+    - pause/resume/retry を含む大容量 fixture を nightly へ追加。
+    - 完了ファイルは checksum（SHA-256）一致を必須判定にし、失敗時は crash report と同一 history_key に束ねる。
+
+### 11.3 GA 判定運用タスク（連続達成の最終化）
+20. [ ] **GA-T1 3連続 pass の自動証跡化**
+    - `ga-gate-report.json.consecutive_pass_streak` と `required_consecutive_passes` を nightly ごとに保存し、3連続達成時に release unblock を自動判定する。
+21. [ ] **GA-T2 crash 単発例外の運用ルール固定**
+    - `crash.count == 1` を許容する際の再現テンプレート必須項目（transport/active_url/last_command/build_id/commit_hash）をチェックリスト化し、CI で欠落を fail にする。
