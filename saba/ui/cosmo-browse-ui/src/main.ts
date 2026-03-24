@@ -1002,10 +1002,20 @@ function renderDiagnostics(view: PageViewModel) {
 
 async function refreshCrashReport() {
   try {
-    const report = await invokeNativeIpc<{ path: string; reason: string; crashed_at_ms: number; reproduction: string[] } | null>({ type: "get_latest_crash_report" });
+    const report = await invokeNativeIpc<{
+      path: string;
+      reason: string;
+      crashed_at_ms: number;
+      build_id: string;
+      commit_hash: string;
+      transport: string;
+      active_url: string;
+      last_command: string;
+      reproduction: string[];
+    } | null>({ type: "get_latest_crash_report" });
     if (!crashReportEl) return;
     crashReportEl.textContent = report
-      ? `Crash report: ${report.reason} @ ${new Date(report.crashed_at_ms).toISOString()} (${report.path})`
+      ? `Crash report: ${report.reason} @ ${new Date(report.crashed_at_ms).toISOString()} (${report.transport || "unknown transport"}, ${report.active_url || "no url"}, ${report.last_command || "no command"})`
       : "Crash report: none";
   } catch {
     if (crashReportEl) crashReportEl.textContent = "Crash report: unavailable";

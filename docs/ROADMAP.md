@@ -264,16 +264,18 @@
   - **完了条件**: 大容量ファイルで再開可能ダウンロードが成功。
 
 ### Epic 7: 観測性・品質保証
-- [ ] **E7-T1 ブラウザ KPI ダッシュボード**
+- [x] **E7-T1 ブラウザ KPI ダッシュボード**
   - 成功率、クラッシュ率、FCP 相当、メモリ使用量を定期収集。
   - **完了条件**: CI/ nightly で時系列比較が可能。
+  - 進捗メモ: `kpi_summary.json` を拡張し、`fcp_equivalent_ms` / `memory_usage_kib` / ケース別失敗分類を nightly artifact の `history/<history_key>/` に集約、`evaluate_release_gate.py` / `check_release_streak.py` へ履歴キーを付与して時系列比較しやすくした。
 - [x] **E7-T2 Web 互換スモークスイート**
   - 代表サイト群のナビゲーション/描画/入力を自動検証。
   - **完了条件**: リグレッションを PR 時点で検知。
   - 進捗メモ: PR 軽量版 + nightly 拡張版の二段構成で導入し、失敗時ログを artifact 保存。
-- [ ] **E7-T3 クラッシュレポート基盤**
+- [x] **E7-T3 クラッシュレポート基盤**
   - panic/minidump 収集、シンボル管理、再現手順テンプレート化。
-  - **完了条件**: 上位クラッシュ原因の特定時間を短縮。
+  - **完了条件**: まず nightly artifact 集約・再現手順テンプレート自動添付・クラッシュ分類ダッシュボードを完了し、その後 minidump/symbol 管理へ段階拡張する。
+  - 進捗メモ: panic report に build id / commit hash / transport / active URL / last command を保存し、履歴付き crash repository から最新 report を取得、nightly artifact へ `latest_crash_report.json` を添付して crash 分類を KPI ダッシュボードへ反映した。
 
 ### Epic 8: リリース/移行完遂（WebView-free デフォルト化）
 - [x] **E8-T1 `adapter_native` をデフォルト起動へ切替**
@@ -360,9 +362,10 @@
     - ピン留め/複製/並べ替えと URL・履歴・検索候補を統合した入力補完を導入する。
     - 20 タブ規模の UI 操作遅延と主要ショートカット回帰を Playwright か smoke harness で定量評価する。
     - 進捗メモ: runtime 境界へ `OmniboxSuggestionSet` を追加し、タブストリップ操作とショートカットを `saba/ui/cosmo-browse-ui` に接続、`scripts/benchmark_tab_strip.mjs` で 20 タブ render p95 / interaction batch を smoke 計測可能にした。
-13. [ ] **NJ-T4 E7-T1/E7-T3 KPI ダッシュボード + クラッシュレポート強化**
+13. [x] **NJ-T4 E7-T1/E7-T3 KPI ダッシュボード + クラッシュレポート強化**
     - 既存 `kpi_summary.json` を拡張して FCP 相当・メモリ使用量・クラッシュ分類を時系列可視化し、panic report を release artifacts と紐付ける。
     - minidump/symbol 管理までは到達していないため、まず nightly artifact 集約と再現テンプレート自動添付を完了条件にする。
+    - 進捗メモ: nightly workflow が `smoke-kpi-history-nightly` artifact を生成し、`ga-gate-report.json` / `kpi_summary.json` / `latest_crash_report.json` を同じ `history_key` で束ねるようにした。
 
 ### Sprint I（GA前）: デフォルト切替・運用完成
 14. [x] **NI-T1 E8-T1 native デフォルト起動の段階ロールアウト**
@@ -374,5 +377,5 @@
 
 ### 完了基準（更新）
 - [ ] WebView なし既定起動で、主要シナリオ（遷移/戻る進む/検索/タブ/軽量SPA）が連続成功する。
-- [ ] KPI（成功率・クラッシュ率・平均表示時間）が GA しきい値を連続で満たす。
+- [ ] KPI（成功率・クラッシュ率・平均表示時間・FCP 相当・メモリ使用量）が GA しきい値を連続で満たす。
 - [ ] `adapter_tauri` は互換層として最小維持され、コア機能追加は `adapter_native` のみで成立する。

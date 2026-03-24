@@ -5,7 +5,7 @@ use cosmo_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -265,6 +265,16 @@ pub struct CrashReportDto {
     pub path: String,
     pub crashed_at_ms: u64,
     pub reason: String,
+    #[serde(default)]
+    pub build_id: String,
+    #[serde(default)]
+    pub commit_hash: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub active_url: String,
+    #[serde(default)]
+    pub last_command: String,
     pub reproduction: Vec<String>,
 }
 
@@ -581,8 +591,13 @@ impl NativeAdapter {
     }
 
     pub fn get_latest_crash_report(&self) -> Option<CrashReportDto> {
-        let content = fs::read_to_string(crash_report_path()).ok()?;
-        serde_json::from_str::<CrashReportDto>(&content).ok()
+        let path = latest_crash_report_path()?;
+        let content = fs::read_to_string(&path).ok()?;
+        let mut report = serde_json::from_str::<CrashReportDto>(&content).ok()?;
+        if report.path.is_empty() {
+            report.path = path.display().to_string();
+        }
+        Some(report)
     }
 
     pub fn new_tab(&self) -> Result<TabSummary, AppError> {
@@ -968,8 +983,28 @@ fn load_startup_app() -> StarshipApp {
     }
 }
 
-fn crash_report_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("cosmobrowse-crash-report.json")
+fn crash_repository_dir() -> PathBuf {
+    std::env::var("COSMO_CRASH_REPOSITORY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("cosmobrowse-crash-reports"))
+}
+
+fn latest_crash_report_path() -> Option<PathBuf> {
+    let repo = crash_repository_dir();
+    // Privacy note: consumers only read the newest crash report from the
+    // repository instead of bulk-loading every historical entry into memory.
+    // This keeps diagnostics focused on the latest failure while avoiding
+    // unnecessary propagation of older user-adjacent crash metadata.
+    let mut entries = fs::read_dir(&repo)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.pop().or_else(|| {
+        let legacy = std::env::temp_dir().join("cosmobrowse-crash-report.json");
+        legacy.exists().then_some(legacy)
+    })
 }
 
 fn session_snapshot_path() -> std::path::PathBuf {
@@ -1219,6 +1254,62 @@ mod tests {
         let _ = fs::remove_file(&session_path);
         let _ = fs::remove_file(&crash_path);
         let _ = fs::remove_dir_all(&snapshot_dir);
+    }
+
+    #[test]
+    fn get_latest_crash_report_reads_newest_entry_from_repository() {
+        let _env_guard = env_lock().lock().expect("env lock");
+        let repo_dir =
+            std::env::temp_dir().join(format!("cosmobrowse-crash-test-{}", unix_timestamp_ms()));
+        std::env::set_var("COSMO_CRASH_REPOSITORY_DIR", &repo_dir);
+        fs::create_dir_all(&repo_dir).expect("repo dir");
+
+        let older = CrashReportDto {
+            path: repo_dir.join("crash-1.json").display().to_string(),
+            crashed_at_ms: 1,
+            reason: "older".to_string(),
+            build_id: "build-a".to_string(),
+            commit_hash: "aaaa".to_string(),
+            transport: "adapter_native".to_string(),
+            active_url: "fixture://older".to_string(),
+            last_command: "open_url".to_string(),
+            reproduction: vec!["step".to_string()],
+        };
+        let newer = CrashReportDto {
+            path: repo_dir.join("crash-2.json").display().to_string(),
+            crashed_at_ms: 2,
+            reason: "newer".to_string(),
+            build_id: "build-b".to_string(),
+            commit_hash: "bbbb".to_string(),
+            transport: "adapter_native".to_string(),
+            active_url: "fixture://newer".to_string(),
+            last_command: "reload".to_string(),
+            reproduction: vec!["step".to_string()],
+        };
+
+        fs::write(
+            repo_dir.join("crash-1.json"),
+            serde_json::to_string_pretty(&older).expect("serialize older"),
+        )
+        .expect("write older");
+        fs::write(
+            repo_dir.join("crash-2.json"),
+            serde_json::to_string_pretty(&newer).expect("serialize newer"),
+        )
+        .expect("write newer");
+
+        let adapter = NativeAdapter::with_process_host(
+            Box::new(FakeProcessHost::new(Arc::new(Mutex::new(
+                FakeProcessState::default(),
+            )))),
+            Duration::ZERO,
+        );
+        let report = adapter.get_latest_crash_report().expect("latest report");
+        assert_eq!(report.reason, "newer");
+        assert_eq!(report.active_url, "fixture://newer");
+
+        std::env::remove_var("COSMO_CRASH_REPOSITORY_DIR");
+        let _ = fs::remove_dir_all(&repo_dir);
     }
 }
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-summary", required=True)
     parser.add_argument("--legacy-usage-summary", required=True)
     parser.add_argument("--history-dir")
+    parser.add_argument("--history-series", default="webview-free-ga-gate")
+    parser.add_argument("--history-key")
     parser.add_argument("--report-out", required=True)
     parser.add_argument("--min-success-rate", type=float, default=0.99)
     parser.add_argument("--max-crash-rate", type=float, default=0.005)
@@ -55,6 +58,15 @@ def consecutive_passes(reports: list[dict[str, Any]]) -> int:
     return streak
 
 
+def build_history_key(explicit_key: str | None, evaluated_at: str) -> str:
+    if explicit_key:
+        return explicit_key
+    compact_timestamp = evaluated_at.replace("-", "").replace(":", "").replace("+00:00", "Z")
+    commit = os.environ.get("GITHUB_SHA", "local")[:12]
+    run_id = os.environ.get("GITHUB_RUN_ID", "manual")
+    return f"{compact_timestamp}--{run_id}--{commit}"
+
+
 def main() -> int:
     args = parse_args()
     kpi_summary = load_json(args.kpi_summary)
@@ -67,6 +79,8 @@ def main() -> int:
     layout_pass = bool(layout_summary.get("pass", False))
     unused_legacy_commands = list(legacy_usage_summary.get("unused_legacy_commands", []))
     used_legacy_commands = list(legacy_usage_summary.get("used_legacy_commands", []))
+    evaluated_at = datetime.now(tz=timezone.utc).isoformat()
+    history_key = build_history_key(args.history_key, evaluated_at)
 
     checks = [
         {
@@ -109,7 +123,9 @@ def main() -> int:
     gate_passed = all(item["passed"] for item in checks[:4])
     history_reports = load_history_reports(args.history_dir)
     current_report = {
-        "evaluated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "evaluated_at": evaluated_at,
+        "history_series": args.history_series,
+        "history_key": history_key,
         "gate_passed": gate_passed,
         "required_consecutive_passes": args.required_consecutive_passes,
         "checks": checks,
@@ -117,6 +133,8 @@ def main() -> int:
             "success_rate": success_rate,
             "crash_rate": crash_rate,
             "display_time_ms": display_time_ms,
+            "fcp_equivalent_ms": int(kpi_summary.get("fcp_equivalent_ms", 0) or 0),
+            "memory_usage_kib": kpi_summary.get("memory_usage_kib", {}),
         },
         "layout": layout_summary,
         "legacy_usage": {

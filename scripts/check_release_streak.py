@@ -34,10 +34,13 @@ def main() -> int:
 
     result = {
         "reports_found": len(reports),
+        "history_series": "webview-free-ga-gate",
+        "history_keys": [report.get("history_key", "") for report in reports],
         "required_consecutive_passes": args.required_consecutive_passes,
         "consecutive_pass_streak": streak,
         "release_blocked": streak < args.required_consecutive_passes,
         "report_paths": [report["source_path"] for report in reports],
+        "latest_history_key": reports[-1].get("history_key", "") if reports else "",
     }
     out_path = Path(args.report_out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
