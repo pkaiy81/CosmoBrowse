@@ -18,6 +18,23 @@ CosmoBrowse は Rust + Tauri で実装している実験的ブラウザです。
 
 詳細は `docs/ROADMAP.md` と `docs/architecture/runtime-topology.md` を参照してください。
 
+## 現時点の完成判定ステータス（ローカル実行前の確認用）
+
+GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果物を基準に確認します。
+ローカル実行前に、次の「既知ギャップ」を先に把握してください。
+
+- **連続達成の確認が未実施だと完成判定できない**
+  - 確認キー: `ga-gate-report.json.consecutive_pass_streak` / `required_consecutive_passes`
+  - 判定条件: `consecutive_pass_streak >= 3` かつ `release_blocked == false`
+- **GA gate の pass 結果が未取得だと完成判定できない**
+  - 確認キー: `ga-gate-report.json.gate_passed` と `checks[*].passed`
+  - 判定条件: `gate_passed == true` かつ mandatory gate（success/crash/display/layout）がすべて `true`
+- **重大クラッシュ情報がないと安全判定ができない**
+  - 確認キー: `kpi_summary.json.failure_classification.crash` と `latest_crash_report.json`
+  - 判定条件: 原則 `crash.count == 0`。`count == 1` の場合は crash report に再現/切り分け情報（`transport` / `active_url` / `last_command` / `build_id` / `commit_hash`）が揃っていること
+
+ローカルで smoke を実行して成果物を作るまでは、上記 3 点は **未判定（known gap）** として扱ってください。
+
 ## HTTPS ページ表示の現状
 
 - `reqwest` ベースのローダーで `https://` URL を取得します。

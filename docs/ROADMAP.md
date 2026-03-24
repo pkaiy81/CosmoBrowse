@@ -398,4 +398,25 @@
 ### 完了基準（更新）
 - [ ] WebView なし既定起動で、主要シナリオ（遷移/戻る進む/検索/タブ/軽量SPA）が連続成功する。
 - [ ] KPI（成功率・クラッシュ率・平均表示時間・FCP 相当・メモリ使用量）が GA しきい値を連続で満たす。
+  - 判定成果物キー（`history/<history_key>/kpi_summary.json`）:
+    - `success_rate >= 0.99`（= `failure_rate <= 0.01`）
+    - `crash_rate <= 0.005`
+    - `display_time_ms <= 1500`
+    - `fcp_equivalent_ms` が直近 3 回中央値比 `+10%` 以内
+    - `memory_usage_kib.combined_peak_rss_kib` が直近 3 回中央値比 `+15%` 以内
+  - 連続達成条件:
+    - `history/<history_key>/ga-gate-report.json` の `consecutive_pass_streak >= 3`
+    - 同ファイルの `required_consecutive_passes == 3` と整合し、`release_blocked == false`
+- [ ] `ga-gate-report.json` の mandatory gate が pass している。
+  - 判定成果物キー（`history/<history_key>/ga-gate-report.json`）:
+    - `gate_passed == true`
+    - `checks[name=success_rate].passed == true`
+    - `checks[name=crash_rate].passed == true`
+    - `checks[name=display_time_ms].passed == true`
+    - `checks[name=layout_regression].passed == true`
+- [ ] 重大クラッシュ閾値を下回っている。
+  - 判定成果物キー（`history/<history_key>/latest_crash_report.json` + `history/<history_key>/kpi_summary.json`）:
+    - `kpi_summary.json.failure_classification.crash.count == 0` を原則条件とする
+    - 例外的に `count == 1` の場合は `latest_crash_report.json` に `transport` / `active_url` / `last_command` / `build_id` / `commit_hash` が揃い、単発で再現手順付きであること
+    - 同一 `failure_classification.crash.categories[*]` が 2 nightlies 連続した場合は未達（ロールバック判定）
 - [ ] `adapter_tauri` は互換層として最小維持され、コア機能追加は `adapter_native` のみで成立する。
