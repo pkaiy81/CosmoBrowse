@@ -45,14 +45,21 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 - 2026-03-24 追記: HTTP Range resume の厳密検証（`Content-Range` オフセット一致 + `ETag`/`Last-Modified` 再検証不一致時の full restart）と、保存先ポリシー UI + session restore 後の保持を実装済み。
 - 未判定: GA gate の `consecutive_pass_streak >= 3` を満たす連続 nightlies。
 
-### 未完了に対する新規タスク（2026-03-24 作成）
+### 未完了に対する新規タスク（2026-03-24 更新）
 
-1. **DL-T1: HTTP Range resume strict validation**
-   - `Accept-Ranges` / `Content-Range` / `ETag` / `Last-Modified` の整合チェックを実装し、resume 可否を deterministic に判定する。
-2. **DL-T2: 保存先ポリシー UI と設定永続化**
-   - 「毎回確認 / 既定フォルダ / サイト別ポリシー」を選べる設定導線を UI に追加し、session restore 後も保持する。
-3. **DL-T3: 大容量ダウンロード回帰スモークの定常化**
+1. **DL-T3: 大容量ダウンロード回帰スモークの定常化**
    - pause/resume/retry を含む 1GB 級の検証ケースを nightly に追加し、完了ファイルの checksum 検証まで自動化する。
+2. **DL-T4: ダウンロード検証ポリシー文書化**
+   - 失敗分類・判定閾値・nightly/PR 軽量版の差分（fixture サイズ/再試行/timeout）を文書で固定する。
+3. **GA-T1〜T3: GA 判定証跡の運用固定**
+   - `consecutive_pass_streak >= 3` の自動証跡化、crash 単発例外時の必須項目チェック、README から最終 artifact を辿れる導線整備を完了する。
+
+### ローカル実行の最新確認結果（2026-03-24）
+
+- 実行コマンド: `python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr`
+- 結果: `native_ipc_cli` の build で失敗（`rustup` が `https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256` を取得できず中断）。
+- 解釈: 実装の論理不整合というより、検証環境側のネットワーク制約で toolchain 更新ができない状態。
+- 対処: ネットワーク到達可能な開発環境、または事前に Rust stable toolchain を導入済みの環境で同コマンドを再実行してください。
 
 ### 実装完了後に行うローカル確認・配布物生成
 
