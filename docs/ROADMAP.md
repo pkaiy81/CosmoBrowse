@@ -314,8 +314,8 @@
    - DOM 読み取り・イベント dispatch を最小接続し、軽量 SPA 初期描画を成立。
 5. [x] **NG-T2 E4-T2 イベントループ/タスクキュー実装**
    - microtask/macrotask の順序を仕様化し、Promise/timeout のハングを解消。
-6. [ ] **NG-T3 E4-T3 ストレージ/クッキー基盤**
-   - origin 単位の cookie/local storage 管理と永続化ポリシーを実装。
+6. [x] **NG-T3 E4-T3 ストレージ/クッキー基盤（Sprint J の NJ-T2 へ統合済み）**
+   - 同一成果物のため完了履歴は NJ-T2 に集約（重複管理を解消）。
 
 ### Sprint H1（2週間）: HTTP 信頼性基盤 + 失敗理由統一
 7. [x] **NH1-T1 E5-T1 HTTP スタック統合フェーズ 1**
@@ -356,6 +356,18 @@
     - 進捗メモ: `cosmo_app_legacy` / `adapter_native` / UI 間で session snapshot restore を実装し、session round-trip test と startup restore smoke で active tab・history_index・frame scroll の復元を検証済み。
 11. [x] **NJ-T2 E4-T3 origin 単位ストレージ/クッキー永続化**
     - Cookie jar / local storage / 権限判断キャッシュを origin 単位で保存し、SameSite/Secure/HttpOnly 診断と接続する。
+    - 完了日: **2026-03-17**（E4-T3 完了履歴の単一記録点）。
+    - 実装参照:
+      - 画面/セッション経路: `saba/cosmo_app_legacy/src/session.rs`
+      - ダウンロード機能との整合確認: `saba/cosmo_app_legacy/src/download.rs`
+      - 永続化実体（`PersistentSecurityState`）: `saba/cosmo_app_legacy/src/security.rs`
+      - Cookie 入出力配線: `saba/cosmo_app_legacy/src/loader.rs`
+      - `localStorage` ランタイム同期: `saba/cosmo_app_legacy/src/layout/mod.rs`
+      - 永続化方針 ADR: `docs/architecture/adr-0002-origin-storage-persistence.md`
+    - 検証経路（集約）:
+      - unit test: `cargo test -p cosmo_app_legacy security::tests::set_cookie_updates_origin_scoped_jar_and_request_header`
+      - unit test: `cargo test -p cosmo_app_legacy security::tests::insecure_same_site_none_cookie_is_rejected_and_not_stored`
+      - unit test: `cargo test -p cosmo_app_legacy security::tests::local_storage_snapshots_are_origin_scoped`
     - 進捗メモ: RFC 6454 origin key を使う in-memory 永続モデルと `localStorage` ランタイム同期、Cookie 診断/送信経路、永続化形式 ADR を追加。
     - セッション復元と干渉しないよう、永続化形式と消去ポリシーを ADR 化する。
 12. [x] **NJ-T3 E6-T1/E6-T2 タブストリップ + Omnibox 改善**
