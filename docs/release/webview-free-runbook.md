@@ -70,7 +70,7 @@ Epic 8 (`E8-T1`〜`E8-T3`) の運用手順をまとめ、`adapter_native` を正
 | Display time | `<= 1500 ms` |
 | Layout regression summary | `pass == true` |
 
-`smoke-nightly` は `kpi_summary.json` / `layout_regression_summary.json` / `legacy-command-usage.json` から `ga-gate-report.json` を生成する。
+`smoke-nightly` は `kpi_summary.json` / `layout_regression_summary.json` / `legacy-command-usage.json` から `ga-gate-report.json` を生成する。nightly artifact には `history/<history_key>/` 配下で KPI history bundle も保存され、`fcp_equivalent_ms`、`memory_usage_kib`、ケース別失敗分類、最新 crash report を時系列比較できる。
 
 ## 6. Consecutive-pass release blocking rule
 
@@ -83,8 +83,40 @@ Epic 8 (`E8-T1`〜`E8-T3`) の運用手順をまとめ、`adapter_native` を正
 ### Before raising rollout percentage
 
 - `smoke-nightly` の `ga-gate-report.json` が pass。
+- `history/<history_key>/kpi_summary.json` の `fcp_equivalent_ms` が直近 3 回で悪化トレンドに入っていない。
+- `history/<history_key>/kpi_summary.json` の `memory_usage_kib.combined_peak_rss_kib` が直近中央値から `+15%` 以内。
+- `history/<history_key>/kpi_summary.json` の `failure_classification.by_case` に同一ケースの `content_assertion` / `layout_regression` が連続増加していない。
 - `legacy-command-usage.json` で新しい direct command が増えていない。
 - 障害端末の rollback override 件数が増えていない。
+
+### Rollout up/down decision graph
+
+1. **Raise rollout (`+10%` ずつ)**
+   次の 4 条件をすべて満たしたときだけ `COSMO_NATIVE_DEFAULT_ROLLOUT_PERCENT` を引き上げる。
+   - `ga-gate-report.json.checks[*].passed` がすべて `true`。
+   - `success_rate >= 99%` が 3 連続。
+   - `fcp_equivalent_ms` と `display_time_ms` がともに直近 3 回中央値の `+10%` 以内。
+   - `failure_classification.crash.count == 0`、またはクラッシュ分類が単発で再現手順付き。
+
+2. **Hold rollout (据え置き)**
+   次のいずれかが成立したら割合は据え置き、追加の nightly 1〜2 回で様子を見る。
+   - `fcp_equivalent_ms` が `+10%` を超えるが `+20%` 未満。
+   - `memory_usage_kib.combined_peak_rss_kib` が直近中央値比 `+15%` 以上 `+25%` 未満。
+   - 同一ケース失敗分類が 1 回だけ増えたが、`ga-gate-report.json` 自体は pass。
+
+3. **Lower rollout / rollback (`-10%` または `0%`)**
+   次のいずれかを検知したら割合を下げ、必要に応じて `adapter_tauri` を強制する。
+   - `ga-gate-report.json.gate_passed == false`。
+   - `crash_rate > 0.5%`、または `failure_classification.crash.categories` に同じ分類が 2 回以上続く。
+   - `fcp_equivalent_ms` か `display_time_ms` が直近中央値比 `+20%` 超。
+   - `memory_usage_kib.combined_peak_rss_kib` が直近中央値比 `+25%` 超。
+   - `failure_classification.by_case` に同一ケースの `layout_regression` が 2 nightlies 連続で残る。
+
+4. **Crash triage dashboard usage**
+   `latest_crash_report.json` と `kpi_summary.json.failure_classification.crash` を並べて確認する。
+   - `transport` / `active_url` / `last_command` が同一なら rollout を下げて再現優先。
+   - `build_id` / `commit_hash` が単一 commit に集中していれば、その commit を hotfix 対象にする。
+   - 再現テンプレートが埋まっていない crash は「要追記」で据え置きにし、上げない。
 
 ### Before GA declaration
 
