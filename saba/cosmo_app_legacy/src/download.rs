@@ -22,6 +22,7 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 15);
 const CHUNK_SIZE: usize = 16 * 1024;
 
+#[derive(Debug)]
 pub struct DownloadManager {
     next_id: u64,
     downloads: BTreeMap<u64, DownloadHandle>,
