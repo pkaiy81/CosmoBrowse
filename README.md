@@ -35,6 +35,36 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 
 ローカルで smoke を実行して成果物を作るまでは、上記 3 点は **未判定（known gap）** として扱ってください。
 
+
+## 進捗確認（2026-03-24）
+
+`docs/ROADMAP.md` のチェックリストを基準に確認した結果、**未完了は Epic 6 の E6-T3（ダウンロードマネージャ）と GA 判定の連続達成のみ**です。
+
+- 完了済み: E1〜E5, E7〜E8, および E6-T1/E6-T2 は完了。
+- 未完了: E6-T3（保存先ポリシー UI、大容量回帰スモーク運用）。
+- 2026-03-24 追記: HTTP Range resume の厳密検証（`Content-Range` オフセット一致 + `ETag`/`Last-Modified` 再検証不一致時の full restart）は実装済み。
+- 未判定: GA gate の `consecutive_pass_streak >= 3` を満たす連続 nightlies。
+
+### 未完了に対する新規タスク（2026-03-24 作成）
+
+1. **DL-T1: HTTP Range resume strict validation**
+   - `Accept-Ranges` / `Content-Range` / `ETag` / `Last-Modified` の整合チェックを実装し、resume 可否を deterministic に判定する。
+2. **DL-T2: 保存先ポリシー UI と設定永続化**
+   - 「毎回確認 / 既定フォルダ / サイト別ポリシー」を選べる設定導線を UI に追加し、session restore 後も保持する。
+3. **DL-T3: 大容量ダウンロード回帰スモークの定常化**
+   - pause/resume/retry を含む 1GB 級の検証ケースを nightly に追加し、完了ファイルの checksum 検証まで自動化する。
+
+### 実装完了後に行うローカル確認・配布物生成
+
+未完了タスクを解消した後は、次の手順で完成確認と配布物生成を実施してください。
+
+- ローカル smoke: `python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly`
+- GA gate 判定: `python3 scripts/evaluate_release_gate.py --history-root smoke-artifacts/nightly/history --output smoke-artifacts/nightly/ga-gate-report.json`
+- 連続達成確認: `python3 scripts/check_release_streak.py --history-root smoke-artifacts/nightly/history --report smoke-artifacts/nightly/ga-gate-report.json`
+- Windows portable 配布物作成（Rust/Node が無い実行環境向け）: `pwsh -File scripts/build-cosmobrowse-portable.ps1 -Version <version> -OutDir <out_dir>`
+
+配布物の利用者は zip を展開して `cosmo-browse-ui.exe` を起動するだけで試せます（実行端末に Rust/Node は不要）。
+
 ## HTTPS ページ表示の現状
 
 - `reqwest` ベースのローダーで `https://` URL を取得します。

@@ -1,7 +1,8 @@
 use crate::model::{AppError, AppResult, DownloadEntry, DownloadSavePolicy, DownloadState};
 use reqwest::blocking::Client;
 use reqwest::header::{
-    HeaderMap, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE,
+    HeaderMap, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+    ETAG, LAST_MODIFIED, RANGE,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -35,6 +36,13 @@ struct DownloadHandle {
 struct DownloadShared {
     entry: DownloadEntry,
     temp_path: String,
+    resume_validator: ResumeValidator,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResumeValidator {
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +99,7 @@ impl DownloadManager {
         let shared = Arc::new(Mutex::new(DownloadShared {
             entry: entry.clone(),
             temp_path: temp_path.display().to_string(),
+            resume_validator: ResumeValidator::default(),
         }));
         let handle = DownloadHandle {
             shared: Arc::clone(&shared),
@@ -315,6 +324,8 @@ fn execute_download_worker(
     let final_url = response.url().to_string();
     let (resume_from, supports_resume) =
         apply_resume_response_policy(shared, config, resume_from, status, &headers)?;
+    let response_validator = ResumeValidator::from_headers(&headers);
+    set_resume_validator(shared, response_validator)?;
 
     let resolved_name = suggested_filename(&headers, &final_url).unwrap_or_else(|| {
         config
@@ -456,7 +467,130 @@ fn apply_resume_response_policy(
         })?;
     }
 
+    if resume_from > 0 && status.as_u16() == 206 {
+        // Spec note: RFC 9110 requires a valid `Content-Range` field in `206
+        // Partial Content` responses. We reject malformed/offset-mismatched
+        // ranges and restart from byte 0 to avoid appending bytes from a
+        // divergent representation to an existing `.part` file.
+        // https://www.rfc-editor.org/rfc/rfc9110.html#name-partial-content
+        // https://www.rfc-editor.org/rfc/rfc9110.html#name-content-range
+        if !content_range_matches_resume_offset(headers, resume_from) {
+            supports_resume = Some(false);
+            resume_from = 0;
+            File::create(&config.temp_path).map_err(classify_fs_error)?;
+            update_entry(shared, |entry| {
+                entry.downloaded_bytes = 0;
+                entry.last_error = Some(AppError::download_resume_unsupported(
+                    "Server returned an invalid Content-Range for resume; restarted from byte 0",
+                ));
+                entry.status_message = Some(
+                    "Resume response had invalid Content-Range; restarting download".to_string(),
+                );
+                entry.supports_resume = Some(false);
+                entry.updated_at_ms = unix_timestamp_ms();
+            })?;
+        } else if resume_validator_mismatch(shared, headers)? {
+            // Spec note: RFC 9111 validator rules require cached partial bytes to
+            // be reused only when validators still identify the same selected
+            // representation. If ETag/Last-Modified no longer match, we restart
+            // full-body download to preserve representation integrity.
+            // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3
+            supports_resume = Some(false);
+            resume_from = 0;
+            File::create(&config.temp_path).map_err(classify_fs_error)?;
+            update_entry(shared, |entry| {
+                entry.downloaded_bytes = 0;
+                entry.last_error = Some(AppError::download_resume_unsupported(
+                    "Stored validators did not match resume response; restarted from byte 0",
+                ));
+                entry.status_message = Some(
+                    "Resume validator mismatch (ETag/Last-Modified); restarting download"
+                        .to_string(),
+                );
+                entry.supports_resume = Some(false);
+                entry.updated_at_ms = unix_timestamp_ms();
+            })?;
+        }
+    }
+
     Ok((resume_from, supports_resume))
+}
+
+fn content_range_matches_resume_offset(headers: &HeaderMap, resume_from: u64) -> bool {
+    let Some(content_range) = headers.get(CONTENT_RANGE).and_then(header_value_to_string) else {
+        return false;
+    };
+    let Some(range_spec) = content_range.strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((range_part, _total_part)) = range_spec.split_once('/') else {
+        return false;
+    };
+    let Some((start_part, _end_part)) = range_part.split_once('-') else {
+        return false;
+    };
+    start_part.parse::<u64>().ok() == Some(resume_from)
+}
+
+fn resume_validator_mismatch(
+    shared: &Arc<Mutex<DownloadShared>>,
+    headers: &HeaderMap,
+) -> AppResult<bool> {
+    let stored = shared
+        .lock()
+        .map_err(|_| AppError::state("Download state lock poisoned"))?
+        .resume_validator
+        .clone();
+    Ok(stored.mismatches(headers))
+}
+
+fn set_resume_validator(
+    shared: &Arc<Mutex<DownloadShared>>,
+    validator: ResumeValidator,
+) -> AppResult<()> {
+    let mut shared = shared
+        .lock()
+        .map_err(|_| AppError::state("Download state lock poisoned"))?;
+    shared.resume_validator = validator;
+    Ok(())
+}
+
+fn header_value_to_string(value: &HeaderValue) -> Option<String> {
+    value.to_str().ok().map(str::to_string)
+}
+
+impl ResumeValidator {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            etag: headers.get(ETAG).and_then(header_value_to_string),
+            last_modified: headers.get(LAST_MODIFIED).and_then(header_value_to_string),
+        }
+    }
+
+    fn mismatches(&self, headers: &HeaderMap) -> bool {
+        if self.etag.is_none() && self.last_modified.is_none() {
+            return false;
+        }
+        if let Some(expected_etag) = &self.etag {
+            let Some(actual_etag) = headers.get(ETAG).and_then(header_value_to_string) else {
+                return true;
+            };
+            if &actual_etag != expected_etag {
+                return true;
+            }
+        }
+        if let Some(expected_last_modified) = &self.last_modified {
+            let Some(actual_last_modified) =
+                headers.get(LAST_MODIFIED).and_then(header_value_to_string)
+            else {
+                return true;
+            };
+            if &actual_last_modified != expected_last_modified {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn total_bytes_from_headers(headers: &HeaderMap, resume_from: u64) -> Option<u64> {
@@ -861,6 +995,7 @@ mod tests {
                 shared: Arc::new(Mutex::new(DownloadShared {
                     entry: entry.clone(),
                     temp_path: temp_path.display().to_string(),
+                    resume_validator: ResumeValidator::default(),
                 })),
                 pause_flag: Arc::new(AtomicBool::new(false)),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -933,5 +1068,107 @@ mod tests {
             .expect("temp metadata")
             .len();
         assert_eq!(temp_len, 0);
+    }
+
+    #[test]
+    fn resume_falls_back_when_content_range_offset_is_invalid() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
+        let mut manager = DownloadManager::default();
+        let entry = seed_paused_download(&mut manager, "http://127.0.0.1/fixture.bin", 64 * 1024);
+        let handle = manager
+            .downloads
+            .get(&entry.id)
+            .expect("download handle should exist");
+        let config = WorkerConfig {
+            id: entry.id,
+            url: entry.url.clone(),
+            destination_path: PathBuf::from(&entry.save_path),
+            temp_path: PathBuf::from(temp_download_path(Path::new(&entry.save_path), entry.id)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_RANGES, "bytes".parse().expect("accept-ranges"));
+        headers.insert(
+            CONTENT_RANGE,
+            "bytes 1024-524287/524288"
+                .parse()
+                .expect("content-range"),
+        );
+
+        let (resume_from, supports_resume) = apply_resume_response_policy(
+            &handle.shared,
+            &config,
+            entry.downloaded_bytes,
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            &headers,
+        )
+        .expect("resume policy should succeed");
+
+        let current = manager.progress(entry.id).expect("progress current");
+        assert_eq!(resume_from, 0);
+        assert_eq!(supports_resume, Some(false));
+        assert_eq!(current.downloaded_bytes, 0);
+        assert_eq!(current.supports_resume, Some(false));
+        assert!(current
+            .status_message
+            .unwrap_or_default()
+            .contains("Content-Range"));
+    }
+
+    #[test]
+    fn resume_falls_back_when_etag_does_not_match_previous_partial() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::env::set_var("COSMO_DOWNLOAD_DIR", &temp_dir);
+        let mut manager = DownloadManager::default();
+        let entry = seed_paused_download(&mut manager, "http://127.0.0.1/fixture.bin", 64 * 1024);
+        let handle = manager
+            .downloads
+            .get(&entry.id)
+            .expect("download handle should exist");
+        {
+            let mut shared = handle.shared.lock().expect("lock");
+            shared.resume_validator = ResumeValidator {
+                etag: Some("\"previous\"".to_string()),
+                last_modified: None,
+            };
+        }
+        let config = WorkerConfig {
+            id: entry.id,
+            url: entry.url.clone(),
+            destination_path: PathBuf::from(&entry.save_path),
+            temp_path: PathBuf::from(temp_download_path(Path::new(&entry.save_path), entry.id)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_RANGES, "bytes".parse().expect("accept-ranges"));
+        headers.insert(
+            CONTENT_RANGE,
+            format!("bytes {}-{}/{}", entry.downloaded_bytes, 524287, 524288)
+                .parse()
+                .expect("content-range"),
+        );
+        headers.insert(ETAG, "\"changed\"".parse().expect("etag"));
+
+        let (resume_from, supports_resume) = apply_resume_response_policy(
+            &handle.shared,
+            &config,
+            entry.downloaded_bytes,
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            &headers,
+        )
+        .expect("resume policy should succeed");
+
+        let current = manager.progress(entry.id).expect("progress current");
+        assert_eq!(resume_from, 0);
+        assert_eq!(supports_resume, Some(false));
+        assert_eq!(current.downloaded_bytes, 0);
+        assert_eq!(current.supports_resume, Some(false));
+        assert!(current
+            .status_message
+            .unwrap_or_default()
+            .contains("validator mismatch"));
     }
 }
