@@ -48,9 +48,9 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 ### 未完了に対する新規タスク（2026-03-24 更新）
 
 1. **DL-T3: 大容量ダウンロード回帰スモークの定常化**
-   - pause/resume/retry を含む 1GB 級の検証ケースを nightly に追加し、完了ファイルの checksum 検証まで自動化する。
+   - pause/resume/retry を含む大容量検証ケースを nightly に追加し、完了ファイルの checksum 検証まで自動化する。
 2. **DL-T4: ダウンロード検証ポリシー文書化**
-   - 失敗分類・判定閾値・nightly/PR 軽量版の差分（fixture サイズ/再試行/timeout）を文書で固定する。
+   - 失敗分類・判定閾値・nightly/PR 軽量版の差分（fixture サイズ/再試行/timeout）を文書で固定する。→ `docs/download-regression-policy.md`
 3. **GA-T1〜T3: GA 判定証跡の運用固定**
    - `consecutive_pass_streak >= 3` の自動証跡化、crash 単発例外時の必須項目チェック、README から最終 artifact を辿れる導線整備を完了する。
 
@@ -66,11 +66,23 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 未完了タスクを解消した後は、次の手順で完成確認と配布物生成を実施してください。
 
 - ローカル smoke: `python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly`
-- GA gate 判定: `python3 scripts/evaluate_release_gate.py --history-root smoke-artifacts/nightly/history --output smoke-artifacts/nightly/ga-gate-report.json`
+- ダウンロード回帰: `python3 scripts/run_download_regression.py --artifacts-dir smoke-artifacts/nightly --fixture-size-mib 64 --timeout-sec 240`
+- legacy command 利用集計: `python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/nightly/legacy-command-usage.json`
+- GA gate 判定: `python3 scripts/evaluate_release_gate.py --kpi-summary smoke-artifacts/nightly/kpi_summary.json --layout-summary smoke-artifacts/nightly/layout_regression_summary.json --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json --download-summary smoke-artifacts/nightly/download_regression_summary.json --report-out smoke-artifacts/nightly/ga-gate-report.json`
 - 連続達成確認: `python3 scripts/check_release_streak.py --history-root smoke-artifacts/nightly/history --report smoke-artifacts/nightly/ga-gate-report.json`
 - Windows portable 配布物作成（Rust/Node が無い実行環境向け）: `pwsh -File scripts/build-cosmobrowse-portable.ps1 -Version <version> -OutDir <out_dir>`
 
 配布物の利用者は zip を展開して `cosmo-browse-ui.exe` を起動するだけで試せます（実行端末に Rust/Node は不要）。
+
+### GA 証跡の参照導線（GA-T3）
+
+nightly 実行後は GitHub Actions artifact `smoke-kpi-history-nightly` の
+`history/<history_key>/` 配下を確認してください。完成判定に使う主要ファイルは次のとおりです。
+
+- `ga-gate-report.json`（`gate_passed`, `consecutive_pass_streak`, `release_blocked`）
+- `kpi_summary.json`（`failure_rate`, `crash_rate`, `fcp_equivalent_ms`, memory）
+- `download_regression_summary.json`（`pass`, `cases[*].passed`, checksum 検証結果）
+- `latest_crash_report.json`（クラッシュ例外時の再現情報）
 
 ## HTTPS ページ表示の現状
 

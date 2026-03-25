@@ -414,6 +414,7 @@
     - `checks[name=crash_rate].passed == true`
     - `checks[name=display_time_ms].passed == true`
     - `checks[name=layout_regression].passed == true`
+    - `checks[name=download_regression].passed == true`
 - [ ] 重大クラッシュ閾値を下回っている。
   - 判定成果物キー（`history/<history_key>/latest_crash_report.json` + `history/<history_key>/kpi_summary.json`）:
     - `kpi_summary.json.failure_classification.crash.count == 0` を原則条件とする
@@ -443,23 +444,26 @@
     - 保存先ポリシー（毎回確認/既定フォルダ/サイト別）を UI 設定に追加。
     - policy は session restore 後も維持し、origin 単位の例外設定を監査ログに記録する。
     - 進捗メモ（2026-03-24）: `get/set/clear_download_*policy` の IPC 契約と UI 設定フォームを追加し、`SessionSnapshot.download_policy_settings` を使って restore 後も default/site policy を復元するようにした。
-19. [ ] **DL-T3 大容量回帰スモーク定常化**
+19. [x] **DL-T3 大容量回帰スモーク定常化**
     - pause/resume/retry を含む大容量 fixture を nightly へ追加。
     - 完了ファイルは checksum（SHA-256）一致を必須判定にし、失敗時は crash report と同一 history_key に束ねる。
-20. [ ] **DL-T4 ダウンロード検証ポリシー文書化**
+    - 進捗メモ（2026-03-24）: `scripts/run_download_regression.py` を追加し、`pause_resume_checksum` + `retry_after_cancel` を nightly で検証、`download_regression_summary.json` を KPI history artifact に同梱するよう workflow を更新した。
+20. [x] **DL-T4 ダウンロード検証ポリシー文書化**
     - `docs/layout-regression-policy.md` と同等粒度で、ダウンロード回帰の測定・失敗分類・許容閾値を文書化する。
     - nightly と PR 軽量版の差分（fixture サイズ、再試行回数、タイムアウト）を明示し、運用手順を固定する。
+    - 進捗メモ（2026-03-24）: `docs/download-regression-policy.md` を追加し、PR placeholder / nightly 本検証の実行条件と失敗分類を固定した。
 
 ### 11.3 GA 判定運用タスク（連続達成の最終化）
 21. [ ] **GA-T1 3連続 pass の自動証跡化**
     - `ga-gate-report.json.consecutive_pass_streak` と `required_consecutive_passes` を nightly ごとに保存し、3連続達成時に release unblock を自動判定する。
 22. [ ] **GA-T2 crash 単発例外の運用ルール固定**
     - `crash.count == 1` を許容する際の再現テンプレート必須項目（transport/active_url/last_command/build_id/commit_hash）をチェックリスト化し、CI で欠落を fail にする。
-23. [ ] **GA-T3 release unblock 証跡の README 連携**
+23. [x] **GA-T3 release unblock 証跡の README 連携**
     - `history/<history_key>/ga-gate-report.json` の最終 pass 証跡を README から辿れる運用（最新 artifact 参照先）を追加する。
     - ローカル実行者が「未判定」か「達成済み」かを 1 画面で判定できる導線を整備する。
+    - 進捗メモ（2026-03-24）: README に `smoke-kpi-history-nightly` artifact 参照導線と `ga-gate-report.json` / `kpi_summary.json` / `download_regression_summary.json` / `latest_crash_report.json` の判定キーを追記した。
 
 ### 11.4 今回棚卸しでの結論（2026-03-24 実測）
-- [x] 実装面の主な未完了は E6-T3（DL-T3/DL-T4）であることを再確認。
-- [x] GA 完成判定は `GA-T1/GA-T2/GA-T3` の証跡運用整備と 3 連続 pass 実績が必要。
+- [x] 実装面の主な未完了だった E6-T3 は DL-T3/DL-T4 実装で完了。
+- [ ] GA 完成判定は `GA-T1/GA-T2` の運用固定と 3 連続 pass 実績が必要（GA-T3 は完了）。
 - [ ] ローカル smoke 実測は環境制約で未完了（`rustup` の stable チャネル取得に失敗し `native_ipc_cli` build が失敗）。

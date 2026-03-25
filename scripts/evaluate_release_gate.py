@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kpi-summary", required=True)
     parser.add_argument("--layout-summary", required=True)
     parser.add_argument("--legacy-usage-summary", required=True)
+    parser.add_argument("--download-summary")
     parser.add_argument("--history-dir")
     parser.add_argument("--history-series", default="webview-free-ga-gate")
     parser.add_argument("--history-key")
@@ -72,6 +73,7 @@ def main() -> int:
     kpi_summary = load_json(args.kpi_summary)
     layout_summary = load_json(args.layout_summary)
     legacy_usage_summary = load_json(args.legacy_usage_summary)
+    download_summary = load_json(args.download_summary) if args.download_summary else {}
 
     success_rate = 1.0 - float(kpi_summary.get("failure_rate", 0.0) or 0.0)
     crash_rate = float(kpi_summary.get("crash_rate", 0.0) or 0.0)
@@ -118,9 +120,16 @@ def main() -> int:
             "operator": "informational",
             "passed": len(unused_legacy_commands) > 0,
         },
+        {
+            "name": "download_regression",
+            "actual": bool(download_summary.get("pass", False)),
+            "expected": True,
+            "operator": "==",
+            "passed": bool(download_summary.get("pass", False)),
+        },
     ]
 
-    gate_passed = all(item["passed"] for item in checks[:4])
+    gate_passed = all(item["passed"] for item in checks[:5])
     history_reports = load_history_reports(args.history_dir)
     current_report = {
         "evaluated_at": evaluated_at,
@@ -141,6 +150,7 @@ def main() -> int:
             "used_legacy_commands": used_legacy_commands,
             "unused_legacy_commands": unused_legacy_commands,
         },
+        "download_regression": download_summary,
     }
     streak = consecutive_passes(history_reports + [current_report])
     current_report["consecutive_pass_streak"] = streak

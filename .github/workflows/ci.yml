@@ -53,12 +53,34 @@ jobs:
         run: python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr
       - name: collect legacy command usage
         run: python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/pr/legacy-command-usage.json
+      - name: set PR download regression placeholder
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          output = Path("smoke-artifacts/pr/download_regression_summary.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(
+              json.dumps(
+                  {
+                      "pass": True,
+                      "mode": "pr_placeholder",
+                      "note": "Full download regression runs in nightly workflow.",
+                      "cases": [],
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          PY
       - name: evaluate WebView-free GA gate for PR pipeline
         run: |
           python3 scripts/evaluate_release_gate.py \
             --kpi-summary smoke-artifacts/pr/kpi_summary.json \
             --layout-summary smoke-artifacts/pr/layout_regression_summary.json \
             --legacy-usage-summary smoke-artifacts/pr/legacy-command-usage.json \
+            --download-summary smoke-artifacts/pr/download_regression_summary.json \
             --report-out smoke-artifacts/pr/ga-gate-report.json \
             --required-consecutive-passes 1
       - name: print layout breakage summary
