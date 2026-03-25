@@ -1,0 +1,29 @@
+<html>
+  <head>
+    <script>
+      var field = document.getElementById("field");
+      var target = document.getElementById("target");
+
+      function onInput() {
+        target.textContent = "input";
+      }
+
+      function onChange() {
+        target.textContent = "change";
+      }
+
+      function onClick() {
+        target.textContent = "click";
+      }
+
+      field.addEventListener("input", onInput);
+      field.addEventListener("change", onChange);
+      field.addEventListener("click", onClick);
+      field.onchange = onChange;
+    </script>
+  </head>
+  <body>
+    <input id="field" value="seed" />
+    <p id="target">init</p>
+  </body>
+</html>

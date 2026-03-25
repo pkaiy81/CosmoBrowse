@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>CosmoBrowse</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <main class="browser-shell">
+      <section class="tabs-panel">
+        <div class="tabs-header">
+          <h1>CosmoBrowse</h1>
+          <button id="new-tab-button" class="ghost-button" type="button">+ Tab</button>
+        </div>
+        <ul id="tabs-list" class="tabs-list" aria-label="Open tabs"></ul>
+      </section>
+
+      <section class="browser-chrome">
+        <form id="url-form" class="toolbar">
+          <div class="nav-group">
+            <button id="back-button" type="button">Back</button>
+            <button id="forward-button" type="button">Forward</button>
+            <button id="reload-button" type="button">Reload</button>
+          </div>
+          <input id="url-input" class="address-input" placeholder="URL or search query" />
+          <button class="primary-button" type="submit">Open</button>
+        </form>
+        <ul
+          id="search-results"
+          class="search-results hidden"
+          role="listbox"
+          aria-label="Omnibox suggestions"
+        ></ul>
+      </section>
+
+      <section class="downloads-shell">
+        <div class="downloads-header">
+          <div>
+            <h2>Downloads</h2>
+            <p id="download-summary" class="download-summary">No downloads yet.</p>
+          </div>
+          <div class="downloads-toolbar">
+            <button id="download-current-button" class="primary-button" type="button">Download current URL</button>
+            <button id="refresh-downloads-button" class="ghost-button" type="button">Refresh</button>
+          </div>
+        </div>
+        <section class="download-policy-shell" aria-label="Download policy settings">
+          <h3>Save policy</h3>
+          <div class="download-policy-grid">
+            <label>
+              Default directory
+              <input id="download-default-dir" type="text" placeholder="/path/to/downloads" />
+            </label>
+            <label class="download-policy-checkbox">
+              <input id="download-default-confirm" type="checkbox" />
+              Ask user confirmation before save (default policy)
+            </label>
+            <button id="download-default-apply" class="ghost-button" type="button">Apply default</button>
+          </div>
+          <div class="download-policy-grid">
+            <label>
+              Site origin
+              <input id="download-site-origin" type="text" placeholder="https://example.com" />
+            </label>
+            <label>
+              Site directory
+              <input id="download-site-dir" type="text" placeholder="/path/to/site-downloads" />
+            </label>
+            <label class="download-policy-checkbox">
+              <input id="download-site-confirm" type="checkbox" />
+              Ask confirmation for this site
+            </label>
+            <div class="download-policy-actions">
+              <button id="download-site-apply" class="ghost-button" type="button">Apply site policy</button>
+              <button id="download-site-clear" class="ghost-button" type="button">Clear site policy</button>
+            </div>
+          </div>
+          <p id="download-policy-status" class="download-policy-status">Loading download policy…</p>
+        </section>
+        <ul id="downloads-list" class="downloads-list" aria-label="Downloads"></ul>
+      </section>
+
+      <section class="viewport-shell">
+        <header class="page-meta">
+          <div>
+            <p id="page-title" class="page-title">New Tab</p>
+            <p id="current-url" class="current-url">URL: (none)</p>
+          </div>
+          <p id="status" class="status">Ready.</p>
+        </header>
+
+        <div id="viewport" class="viewport">
+          <div id="scene-root" class="scene-root"></div>
+          <section id="security-interstitial" class="security-interstitial hidden" aria-live="polite"></section>
+        </div>
+
+        <section class="diagnostics-shell">
+          <h2>Developer Diagnostics</h2>
+          <p id="crash-report" class="diagnostic-summary">Crash report: none</p>
+          <div class="diagnostics-grid">
+            <article>
+              <h3>Network log</h3>
+              <pre id="network-log" class="diagnostic-log"></pre>
+            </article>
+            <article>
+              <h3>Console</h3>
+              <pre id="console-log" class="diagnostic-log"></pre>
+            </article>
+            <article>
+              <h3>DOM snapshot</h3>
+              <pre id="dom-snapshot" class="diagnostic-log"></pre>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

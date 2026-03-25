@@ -1,0 +1,65 @@
+name: develop-distribution
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  ga_readiness:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: download recent nightly GA history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/download_ga_history.py \
+            --output-dir release-artifacts/ga-history \
+            --limit 3
+      - name: require consecutive GA passes before distribution build
+        run: |
+          python3 scripts/check_release_streak.py \
+            --history-dir release-artifacts/ga-history \
+            --report-out release-artifacts/release-streak-report.json \
+            --required-consecutive-passes 3
+      - name: upload GA readiness report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-ga-readiness-report
+          path: release-artifacts/release-streak-report.json
+          if-no-files-found: warn
+
+  build_windows_portable:
+    needs: ga_readiness
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: npm ci
+        working-directory: saba/ui/cosmo-browse-ui
+        run: npm ci
+      - name: build Windows portable package
+        shell: pwsh
+        run: |
+          ./scripts/build-cosmobrowse-portable.ps1
+      - name: upload Windows portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmobrowse-windows-portable-zip
+          path: artifacts/cosmo-browse-ui/*.zip
+          if-no-files-found: error
+      - name: upload Windows portable expanded directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmobrowse-windows-portable-dir
+          path: artifacts/cosmo-browse-ui/windows-portable
+          if-no-files-found: error

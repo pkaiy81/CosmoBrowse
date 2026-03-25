@@ -1,0 +1,100 @@
+name: smoke-nightly
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  smoke_regression_nightly:
+    runs-on: ubuntu-latest
+    env:
+      KPI_HISTORY_KEY: nightly-${{ github.run_id }}-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: run nightly smoke regression
+        run: python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly
+      - name: run nightly download regression
+        run: |
+          python3 scripts/run_download_regression.py \
+            --artifacts-dir smoke-artifacts/nightly \
+            --fixture-size-mib 64 \
+            --timeout-sec 240
+      - name: collect legacy command usage
+        run: python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/nightly/legacy-command-usage.json
+      - name: evaluate nightly GA gate snapshot
+        run: |
+          python3 scripts/evaluate_release_gate.py \
+            --kpi-summary smoke-artifacts/nightly/kpi_summary.json \
+            --layout-summary smoke-artifacts/nightly/layout_regression_summary.json \
+            --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json \
+            --download-summary smoke-artifacts/nightly/download_regression_summary.json \
+            --crash-report smoke-artifacts/nightly/latest_crash_report.json \
+            --report-out smoke-artifacts/nightly/ga-gate-report.json \
+            --history-key "${KPI_HISTORY_KEY}" \
+            --required-consecutive-passes 1
+      - name: build nightly KPI history artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          export HISTORY_KEY="${KPI_HISTORY_KEY}"
+          export HISTORY_ROOT="smoke-artifacts/nightly/history/${HISTORY_KEY}"
+          mkdir -p "${HISTORY_ROOT}"
+          for file in kpi_summary.json layout_regression_summary.json legacy-command-usage.json download_regression_summary.json ga-gate-report.json latest_crash_report.json; do
+            if [ -f "smoke-artifacts/nightly/${file}" ]; then
+              cp "smoke-artifacts/nightly/${file}" "${HISTORY_ROOT}/${file}"
+            fi
+          done
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          history_root = Path(os.environ["HISTORY_ROOT"])
+          manifest = {
+              "history_series": "webview-free-kpi-nightly",
+              "history_key": os.environ["HISTORY_KEY"],
+              "generated_from": "smoke-nightly",
+              "files": sorted(path.name for path in history_root.iterdir() if path.is_file()),
+          }
+          (history_root / "history_manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          PY
+      - name: upload nightly smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-regression-nightly
+          path: smoke-artifacts/nightly
+          if-no-files-found: warn
+      - name: upload GA gate history artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ga-gate-nightly
+          path: smoke-artifacts/nightly/ga-gate-report.json
+          if-no-files-found: warn
+      - name: upload KPI history artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-kpi-history-nightly
+          path: smoke-artifacts/nightly/history
+          if-no-files-found: warn
+      - name: evaluate release streak evidence (3 passes)
+        if: always()
+        run: |
+          python3 scripts/check_release_streak.py \
+            --history-dir smoke-artifacts/nightly/history \
+            --required-consecutive-passes 3 \
+            --report-out smoke-artifacts/nightly/release-streak-report.json || true
+      - name: upload release streak evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ga-release-streak-nightly
+          path: smoke-artifacts/nightly/release-streak-report.json
+          if-no-files-found: warn

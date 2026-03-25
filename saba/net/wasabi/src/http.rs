@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 use noli::net::lookup_host;
 use noli::net::SocketAddr;
 use noli::net::TcpStream;
-use saba_core::error::Error;
-use saba_core::http::HttpResponse;
+use cosmo_core::error::Error;
+use cosmo_core::http::HttpResponse;
 
 //  Define the HttpClient struct
 //  This struct will be used to control the HTTP Requests/Responses

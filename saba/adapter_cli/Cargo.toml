@@ -1,0 +1,10 @@
+[package]
+name = "adapter_cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+cosmo_runtime = { path = "../cosmo_runtime" }
+cosmo_core = { path = "../cosmo_core" }
+serde_json = "1"
