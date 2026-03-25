@@ -468,5 +468,6 @@
 ### 11.4 今回棚卸しでの結論（2026-03-25 更新）
 - [x] 実装面の主な未完了だった E6-T3 は DL-T3/DL-T4 実装で完了。
 - [x] GA 判定運用タスク（GA-T1/GA-T2/GA-T3）は実装完了。
+- [x] `develop` マージ時の Windows portable 配布物自動生成を workflow 化（GA readiness pass 時のみ）。
 - [ ] 残課題は「3 連続 pass 実績を artifact 上で満たすこと」のみ。
 - [x] ローカル download regression（軽量設定: 2 MiB）は実測 pass。

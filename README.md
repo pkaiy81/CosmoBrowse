@@ -67,6 +67,8 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 - Windows portable 配布物作成（Rust/Node が無い実行環境向け）: `pwsh -File scripts/build-cosmobrowse-portable.ps1 -Version <version> -OutDir <out_dir>`
 
 配布物の利用者は zip を展開して `cosmo-browse-ui.exe` を起動するだけで試せます（実行端末に Rust/Node は不要）。
+また、`develop` へのマージ時には `.github/workflows/develop-distribution.yml` により、
+GA readiness（3連続 pass）を満たした場合のみ Windows portable 配布物が自動生成・artifact 化されます。
 
 ### GA 証跡の参照導線（GA-T3）
 
