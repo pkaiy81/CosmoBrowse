@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 import os
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any
 
 
 API_ROOT = "https://api.github.com"
+MAX_API_PAGE_SIZE = 100
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +60,32 @@ def download_bytes(url: str, token: str) -> bytes:
     )
     with urllib.request.urlopen(request) as response:
         return response.read()
+
+
+def list_artifacts_by_name(repo: str, token: str, artifact_name: str, limit: int) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    page = 1
+    while len(found) < limit:
+        # GitHub Actions Artifacts API supports filtering by `name`.
+        # Using the API-side filter keeps behavior compliant with GitHub REST API pagination
+        # semantics and avoids missing matching artifacts when the global artifact list exceeds 100.
+        # Ref: GitHub REST API docs (actions/artifacts list endpoint).
+        query = urllib.parse.urlencode(
+            {"name": artifact_name, "per_page": MAX_API_PAGE_SIZE, "page": page}
+        )
+        payload = api_get(f"{API_ROOT}/repos/{repo}/actions/artifacts?{query}", token)
+        artifacts = payload.get("artifacts", [])
+        if not artifacts:
+            break
+        for artifact in artifacts:
+            if not artifact.get("expired", True):
+                found.append(artifact)
+                if len(found) >= limit:
+                    break
+        if len(artifacts) < MAX_API_PAGE_SIZE:
+            break
+        page += 1
+    return found
 
 
 def main() -> int:
