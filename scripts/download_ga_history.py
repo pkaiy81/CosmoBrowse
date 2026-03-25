@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 import os
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -14,13 +15,22 @@ from typing import Any
 
 
 API_ROOT = "https://api.github.com"
+MAX_API_PAGE_SIZE = 100
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
-    parser.add_argument("--artifact-name", default="ga-gate-nightly")
+    parser.add_argument(
+        "--artifact-name",
+        action="append",
+        dest="artifact_names",
+        help=(
+            "Artifact name to download. Can be specified multiple times. "
+            "Defaults to trying smoke-kpi-history-nightly, then ga-gate-nightly."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
@@ -52,6 +62,32 @@ def download_bytes(url: str, token: str) -> bytes:
         return response.read()
 
 
+def list_artifacts_by_name(repo: str, token: str, artifact_name: str, limit: int) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    page = 1
+    while len(found) < limit:
+        # GitHub Actions Artifacts API supports filtering by `name`.
+        # Using the API-side filter keeps behavior compliant with GitHub REST API pagination
+        # semantics and avoids missing matching artifacts when the global artifact list exceeds 100.
+        # Ref: GitHub REST API docs (actions/artifacts list endpoint).
+        query = urllib.parse.urlencode(
+            {"name": artifact_name, "per_page": MAX_API_PAGE_SIZE, "page": page}
+        )
+        payload = api_get(f"{API_ROOT}/repos/{repo}/actions/artifacts?{query}", token)
+        artifacts = payload.get("artifacts", [])
+        if not artifacts:
+            break
+        for artifact in artifacts:
+            if not artifact.get("expired", True):
+                found.append(artifact)
+                if len(found) >= limit:
+                    break
+        if len(artifacts) < MAX_API_PAGE_SIZE:
+            break
+        page += 1
+    return found
+
+
 def main() -> int:
     args = parse_args()
     if not args.repo or not args.token:
@@ -60,12 +96,19 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    artifacts = api_get(f"{API_ROOT}/repos/{args.repo}/actions/artifacts?per_page=100", args.token)
-    matches = [
-        artifact
-        for artifact in artifacts.get("artifacts", [])
-        if artifact.get("name") == args.artifact_name and not artifact.get("expired", True)
-    ]
+    artifact_names = args.artifact_names or ["smoke-kpi-history-nightly", "ga-gate-nightly"]
+    matches: list[dict[str, Any]] = []
+    for artifact_name in artifact_names:
+        matches.extend(
+            list_artifacts_by_name(
+                repo=args.repo,
+                token=args.token,
+                artifact_name=artifact_name,
+                limit=args.limit,
+            )
+        )
+    deduped_matches_by_id = {str(artifact.get("id", "")): artifact for artifact in matches}
+    matches = list(deduped_matches_by_id.values())
     matches.sort(key=lambda artifact: artifact.get("created_at", ""), reverse=True)
 
     extracted = 0
@@ -77,7 +120,16 @@ def main() -> int:
             zf.extractall(artifact_dir)
         extracted += 1
 
-    print(json.dumps({"downloaded_artifacts": extracted, "output_dir": output_dir.as_posix()}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "downloaded_artifacts": extracted,
+                "output_dir": output_dir.as_posix(),
+                "artifact_names": artifact_names,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
