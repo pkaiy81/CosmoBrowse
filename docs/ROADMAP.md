@@ -424,12 +424,11 @@
 - [ ] `adapter_tauri` は互換層として最小維持され、コア機能追加は `adapter_native` のみで成立する。
 
 
-## 11. 進捗棚卸し（2026-03-24）と追加タスク
+## 11. 進捗棚卸し（2026-03-25）と追加タスク
 
 ### 11.1 棚卸し結果
 - [x] Epic 1〜5 は完了。
-- [x] Epic 6 は E6-T1/E6-T2 完了。
-- [ ] Epic 6 の E6-T3（ダウンロードマネージャ最終化）は未完了。
+- [x] Epic 6 は E6-T1/E6-T2/E6-T3 完了。
 - [x] Epic 7〜8 は実装完了（運用は継続監視中）。
 - [ ] GA 完成判定は `consecutive_pass_streak >= 3` の連続達成が未確認。
 
@@ -470,4 +469,4 @@
 - [x] 実装面の主な未完了だった E6-T3 は DL-T3/DL-T4 実装で完了。
 - [x] GA 判定運用タスク（GA-T1/GA-T2/GA-T3）は実装完了。
 - [ ] 残課題は「3 連続 pass 実績を artifact 上で満たすこと」のみ。
-- [ ] ローカル smoke 実測は環境制約で未完了（`rustup` の stable チャネル取得に失敗し `native_ipc_cli` build が失敗）。
+- [x] ローカル download regression（軽量設定: 2 MiB）は実測 pass。

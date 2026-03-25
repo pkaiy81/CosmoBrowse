@@ -36,30 +36,24 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 ローカルで smoke を実行して成果物を作るまでは、上記 3 点は **未判定（known gap）** として扱ってください。
 
 
-## 進捗確認（2026-03-24）
+## 進捗確認（2026-03-25）
 
-`docs/ROADMAP.md` のチェックリストを基準に確認した結果、**未完了は Epic 6 の E6-T3（ダウンロードマネージャ）と GA 判定の連続達成のみ**です。
+`docs/ROADMAP.md` のチェックリストを基準に確認した結果、**実装タスクは完了し、未完了は GA の 3 連続 pass 実績のみ**です。
 
-- 完了済み: E1〜E5, E7〜E8, および E6-T1/E6-T2 は完了。
-- 未完了: E6-T3（大容量回帰スモーク運用）。
-- 2026-03-24 追記: HTTP Range resume の厳密検証（`Content-Range` オフセット一致 + `ETag`/`Last-Modified` 再検証不一致時の full restart）と、保存先ポリシー UI + session restore 後の保持を実装済み。
-- 未判定: GA gate の `consecutive_pass_streak >= 3` を満たす連続 nightlies。
+- 完了済み: E1〜E8（E6-T3 を含む）および GA 運用実装タスク（GA-T1〜T3）。
+- 未完了: `history/<history_key>/` の時系列で `consecutive_pass_streak >= 3` の実績を蓄積して release unblock を確認すること。
 
-### 未完了に対する新規タスク（2026-03-24 更新）
+### 残タスク（2026-03-25 更新）
 
-1. **DL-T3: 大容量ダウンロード回帰スモークの定常化**
-   - pause/resume/retry を含む大容量検証ケースを nightly に追加し、完了ファイルの checksum 検証まで自動化する。
-2. **DL-T4: ダウンロード検証ポリシー文書化**
-   - 失敗分類・判定閾値・nightly/PR 軽量版の差分（fixture サイズ/再試行/timeout）を文書で固定する。→ `docs/download-regression-policy.md`
-3. **GA-T1〜T3: GA 判定証跡の運用固定**
-   - `consecutive_pass_streak >= 3` の自動証跡化、crash 単発例外時の必須項目チェック、README から最終 artifact を辿れる導線整備を完了する。
+1. **GA-R1: 3 連続 pass 実績の達成**
+   - nightly artifact を 3 回以上蓄積し、`release-streak-report.json.consecutive_pass_streak >= 3` を満たす。
+2. **GA-R2: release unblock の最終確認**
+   - `ga-gate-report.json.release_blocked == false` と `release-streak-report.json.release_blocked == false` を同一履歴系列で確認する。
 
-### ローカル実行の最新確認結果（2026-03-24）
+### ローカル実行の最新確認結果（2026-03-25）
 
-- 実行コマンド: `python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr`
-- 結果: `native_ipc_cli` の build で失敗（`rustup` が `https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256` を取得できず中断）。
-- 解釈: 実装の論理不整合というより、検証環境側のネットワーク制約で toolchain 更新ができない状態。
-- 対処: ネットワーク到達可能な開発環境、または事前に Rust stable toolchain を導入済みの環境で同コマンドを再実行してください。
+- 実行コマンド: `python3 scripts/run_download_regression.py --artifacts-dir smoke-artifacts/nightly --fixture-size-mib 2 --timeout-sec 30`
+- 結果: pass（`Download regression checks passed.` を確認）。
 
 ### 実装完了後に行うローカル確認・配布物生成
 
@@ -68,7 +62,7 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 - ローカル smoke: `python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly`
 - ダウンロード回帰: `python3 scripts/run_download_regression.py --artifacts-dir smoke-artifacts/nightly --fixture-size-mib 64 --timeout-sec 240`
 - legacy command 利用集計: `python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/nightly/legacy-command-usage.json`
-- GA gate 判定: `python3 scripts/evaluate_release_gate.py --kpi-summary smoke-artifacts/nightly/kpi_summary.json --layout-summary smoke-artifacts/nightly/layout_regression_summary.json --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json --download-summary smoke-artifacts/nightly/download_regression_summary.json --report-out smoke-artifacts/nightly/ga-gate-report.json`
+- GA gate 判定: `python3 scripts/evaluate_release_gate.py --kpi-summary smoke-artifacts/nightly/kpi_summary.json --layout-summary smoke-artifacts/nightly/layout_regression_summary.json --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json --download-summary smoke-artifacts/nightly/download_regression_summary.json --crash-report smoke-artifacts/nightly/latest_crash_report.json --report-out smoke-artifacts/nightly/ga-gate-report.json`
 - 連続達成確認: `python3 scripts/check_release_streak.py --history-dir smoke-artifacts/nightly/history --required-consecutive-passes 3 --report-out smoke-artifacts/nightly/release-streak-report.json`
 - Windows portable 配布物作成（Rust/Node が無い実行環境向け）: `pwsh -File scripts/build-cosmobrowse-portable.ps1 -Version <version> -OutDir <out_dir>`
 
