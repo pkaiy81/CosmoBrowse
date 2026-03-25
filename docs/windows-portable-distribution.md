@@ -44,3 +44,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-cosmobrowse-portable.ps
 - This artifact is intended for quick trial distribution.
 - It is not yet a signed installer and does not yet create Start Menu or Add/Remove Programs entries.
 - If installer-grade distribution is required later, add a second path based on `tauri build` bundle outputs.
+
+## CI Automation on `develop` Merge
+- Workflow: `.github/workflows/develop-distribution.yml`
+- Trigger: `push` to `develop` (including merge commits).
+- Flow:
+  1. Validate GA readiness using `scripts/download_ga_history.py` + `scripts/check_release_streak.py` (`required_consecutive_passes = 3`).
+  2. If GA readiness passes, run Windows build on `windows-latest`.
+  3. Execute `scripts/build-cosmobrowse-portable.ps1` and upload artifacts.
+- Uploaded artifacts:
+  - `cosmobrowse-windows-portable-zip`
+  - `cosmobrowse-windows-portable-dir`
+
+This means portable binaries are generated automatically at develop-merge timing only after GA streak conditions are satisfied.

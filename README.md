@@ -28,7 +28,7 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
   - 判定条件: `consecutive_pass_streak >= 3` かつ `release_blocked == false`
 - **GA gate の pass 結果が未取得だと完成判定できない**
   - 確認キー: `ga-gate-report.json.gate_passed` と `checks[*].passed`
-  - 判定条件: `gate_passed == true` かつ mandatory gate（success/crash/display/layout）がすべて `true`
+  - 判定条件: `gate_passed == true` かつ mandatory gate（`success_rate` / `crash_rate` / `display_time_ms` / `layout_regression` / `download_regression` / `crash_exception_metadata`）がすべて `true`
 - **重大クラッシュ情報がないと安全判定ができない**
   - 確認キー: `kpi_summary.json.failure_classification.crash` と `latest_crash_report.json`
   - 判定条件: 原則 `crash.count == 0`。`count == 1` の場合は crash report に再現/切り分け情報（`transport` / `active_url` / `last_command` / `build_id` / `commit_hash`）が揃っていること
@@ -36,34 +36,50 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 ローカルで smoke を実行して成果物を作るまでは、上記 3 点は **未判定（known gap）** として扱ってください。
 
 
-## 進捗確認（2026-03-24）
+## 進捗確認（2026-03-25）
 
-`docs/ROADMAP.md` のチェックリストを基準に確認した結果、**未完了は Epic 6 の E6-T3（ダウンロードマネージャ）と GA 判定の連続達成のみ**です。
+`docs/ROADMAP.md` のチェックリストを基準に確認した結果、**実装タスクは完了し、未完了は GA の 3 連続 pass 実績のみ**です。
 
-- 完了済み: E1〜E5, E7〜E8, および E6-T1/E6-T2 は完了。
-- 未完了: E6-T3（大容量回帰スモーク運用）。
-- 2026-03-24 追記: HTTP Range resume の厳密検証（`Content-Range` オフセット一致 + `ETag`/`Last-Modified` 再検証不一致時の full restart）と、保存先ポリシー UI + session restore 後の保持を実装済み。
-- 未判定: GA gate の `consecutive_pass_streak >= 3` を満たす連続 nightlies。
+- 完了済み: E1〜E8（E6-T3 を含む）および GA 運用実装タスク（GA-T1〜T3）。
+- 未完了: `history/<history_key>/` の時系列で `consecutive_pass_streak >= 3` の実績を蓄積して release unblock を確認すること。
 
-### 未完了に対する新規タスク（2026-03-24 作成）
+### 残タスク（2026-03-25 更新）
 
-1. **DL-T1: HTTP Range resume strict validation**
-   - `Accept-Ranges` / `Content-Range` / `ETag` / `Last-Modified` の整合チェックを実装し、resume 可否を deterministic に判定する。
-2. **DL-T2: 保存先ポリシー UI と設定永続化**
-   - 「毎回確認 / 既定フォルダ / サイト別ポリシー」を選べる設定導線を UI に追加し、session restore 後も保持する。
-3. **DL-T3: 大容量ダウンロード回帰スモークの定常化**
-   - pause/resume/retry を含む 1GB 級の検証ケースを nightly に追加し、完了ファイルの checksum 検証まで自動化する。
+1. **GA-R1: 3 連続 pass 実績の達成**
+   - nightly artifact を 3 回以上蓄積し、`release-streak-report.json.consecutive_pass_streak >= 3` を満たす。
+2. **GA-R2: release unblock の最終確認**
+   - `ga-gate-report.json.release_blocked == false` と `release-streak-report.json.release_blocked == false` を同一履歴系列で確認する。
+
+### ローカル実行の最新確認結果（2026-03-25）
+
+- 実行コマンド: `python3 scripts/run_download_regression.py --artifacts-dir smoke-artifacts/nightly --fixture-size-mib 2 --timeout-sec 30`
+- 結果: pass（`Download regression checks passed.` を確認）。
 
 ### 実装完了後に行うローカル確認・配布物生成
 
 未完了タスクを解消した後は、次の手順で完成確認と配布物生成を実施してください。
 
 - ローカル smoke: `python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/nightly`
-- GA gate 判定: `python3 scripts/evaluate_release_gate.py --history-root smoke-artifacts/nightly/history --output smoke-artifacts/nightly/ga-gate-report.json`
-- 連続達成確認: `python3 scripts/check_release_streak.py --history-root smoke-artifacts/nightly/history --report smoke-artifacts/nightly/ga-gate-report.json`
+- ダウンロード回帰: `python3 scripts/run_download_regression.py --artifacts-dir smoke-artifacts/nightly --fixture-size-mib 64 --timeout-sec 240`
+- legacy command 利用集計: `python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/nightly/legacy-command-usage.json`
+- GA gate 判定: `python3 scripts/evaluate_release_gate.py --kpi-summary smoke-artifacts/nightly/kpi_summary.json --layout-summary smoke-artifacts/nightly/layout_regression_summary.json --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json --download-summary smoke-artifacts/nightly/download_regression_summary.json --crash-report smoke-artifacts/nightly/latest_crash_report.json --report-out smoke-artifacts/nightly/ga-gate-report.json`
+- 連続達成確認: `python3 scripts/check_release_streak.py --history-dir smoke-artifacts/nightly/history --required-consecutive-passes 3 --report-out smoke-artifacts/nightly/release-streak-report.json`
 - Windows portable 配布物作成（Rust/Node が無い実行環境向け）: `pwsh -File scripts/build-cosmobrowse-portable.ps1 -Version <version> -OutDir <out_dir>`
 
 配布物の利用者は zip を展開して `cosmo-browse-ui.exe` を起動するだけで試せます（実行端末に Rust/Node は不要）。
+また、`develop` へのマージ時には `.github/workflows/develop-distribution.yml` により、
+GA readiness（3連続 pass）を満たした場合のみ Windows portable 配布物が自動生成・artifact 化されます。
+
+### GA 証跡の参照導線（GA-T3）
+
+nightly 実行後は GitHub Actions artifact `smoke-kpi-history-nightly` の
+`history/<history_key>/` 配下を確認してください。完成判定に使う主要ファイルは次のとおりです。
+
+- `ga-gate-report.json`（`gate_passed`, `consecutive_pass_streak`, `release_blocked`）
+- `release-streak-report.json`（3 連続 pass 判定の証跡）
+- `kpi_summary.json`（`failure_rate`, `crash_rate`, `fcp_equivalent_ms`, memory）
+- `download_regression_summary.json`（`pass`, `cases[*].passed`, checksum 検証結果）
+- `latest_crash_report.json`（クラッシュ例外時の再現情報）
 
 ## HTTPS ページ表示の現状
 
