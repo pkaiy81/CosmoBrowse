@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 
@@ -24,7 +25,19 @@ def main() -> int:
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["source_path"] = path.as_posix()
         reports.append(payload)
-    reports.sort(key=lambda item: str(item.get("evaluated_at", "")))
+    def evaluated_at_key(report: dict) -> tuple[int, datetime]:
+        raw = str(report.get("evaluated_at", "")).strip()
+        if not raw:
+            return (1, datetime.min)
+        # RFC 3339 allows the UTC designator "Z". Python's fromisoformat expects "+00:00",
+        # so we normalize it before parsing to keep chronological ordering spec-compliant.
+        normalized = raw.replace("Z", "+00:00")
+        try:
+            return (0, datetime.fromisoformat(normalized))
+        except ValueError:
+            return (1, datetime.min)
+
+    reports.sort(key=evaluated_at_key)
 
     streak = 0
     for report in reversed(reports):
@@ -41,6 +54,13 @@ def main() -> int:
         "release_blocked": streak < args.required_consecutive_passes,
         "report_paths": [report["source_path"] for report in reports],
         "latest_history_key": reports[-1].get("history_key", "") if reports else "",
+        "blocking_reason": (
+            "no ga-gate-report.json was found under --history-dir"
+            if not reports
+            else "consecutive pass streak is below required threshold"
+            if streak < args.required_consecutive_passes
+            else ""
+        ),
     }
     out_path = Path(args.report_out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

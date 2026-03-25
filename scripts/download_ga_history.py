@@ -20,7 +20,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
-    parser.add_argument("--artifact-name", default="ga-gate-nightly")
+    parser.add_argument(
+        "--artifact-name",
+        action="append",
+        dest="artifact_names",
+        help=(
+            "Artifact name to download. Can be specified multiple times. "
+            "Defaults to trying smoke-kpi-history-nightly, then ga-gate-nightly."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
@@ -61,10 +69,11 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts = api_get(f"{API_ROOT}/repos/{args.repo}/actions/artifacts?per_page=100", args.token)
+    artifact_names = args.artifact_names or ["smoke-kpi-history-nightly", "ga-gate-nightly"]
     matches = [
         artifact
         for artifact in artifacts.get("artifacts", [])
-        if artifact.get("name") == args.artifact_name and not artifact.get("expired", True)
+        if artifact.get("name") in artifact_names and not artifact.get("expired", True)
     ]
     matches.sort(key=lambda artifact: artifact.get("created_at", ""), reverse=True)
 
@@ -77,7 +86,16 @@ def main() -> int:
             zf.extractall(artifact_dir)
         extracted += 1
 
-    print(json.dumps({"downloaded_artifacts": extracted, "output_dir": output_dir.as_posix()}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "downloaded_artifacts": extracted,
+                "output_dir": output_dir.as_posix(),
+                "artifact_names": artifact_names,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
