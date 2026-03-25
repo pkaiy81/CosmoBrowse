@@ -28,7 +28,7 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
   - 判定条件: `consecutive_pass_streak >= 3` かつ `release_blocked == false`
 - **GA gate の pass 結果が未取得だと完成判定できない**
   - 確認キー: `ga-gate-report.json.gate_passed` と `checks[*].passed`
-  - 判定条件: `gate_passed == true` かつ mandatory gate（success/crash/display/layout）がすべて `true`
+  - 判定条件: `gate_passed == true` かつ mandatory gate（`success_rate` / `crash_rate` / `display_time_ms` / `layout_regression` / `download_regression` / `crash_exception_metadata`）がすべて `true`
 - **重大クラッシュ情報がないと安全判定ができない**
   - 確認キー: `kpi_summary.json.failure_classification.crash` と `latest_crash_report.json`
   - 判定条件: 原則 `crash.count == 0`。`count == 1` の場合は crash report に再現/切り分け情報（`transport` / `active_url` / `last_command` / `build_id` / `commit_hash`）が揃っていること
@@ -69,7 +69,7 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 - ダウンロード回帰: `python3 scripts/run_download_regression.py --artifacts-dir smoke-artifacts/nightly --fixture-size-mib 64 --timeout-sec 240`
 - legacy command 利用集計: `python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/nightly/legacy-command-usage.json`
 - GA gate 判定: `python3 scripts/evaluate_release_gate.py --kpi-summary smoke-artifacts/nightly/kpi_summary.json --layout-summary smoke-artifacts/nightly/layout_regression_summary.json --legacy-usage-summary smoke-artifacts/nightly/legacy-command-usage.json --download-summary smoke-artifacts/nightly/download_regression_summary.json --report-out smoke-artifacts/nightly/ga-gate-report.json`
-- 連続達成確認: `python3 scripts/check_release_streak.py --history-root smoke-artifacts/nightly/history --report smoke-artifacts/nightly/ga-gate-report.json`
+- 連続達成確認: `python3 scripts/check_release_streak.py --history-dir smoke-artifacts/nightly/history --required-consecutive-passes 3 --report-out smoke-artifacts/nightly/release-streak-report.json`
 - Windows portable 配布物作成（Rust/Node が無い実行環境向け）: `pwsh -File scripts/build-cosmobrowse-portable.ps1 -Version <version> -OutDir <out_dir>`
 
 配布物の利用者は zip を展開して `cosmo-browse-ui.exe` を起動するだけで試せます（実行端末に Rust/Node は不要）。
@@ -80,6 +80,7 @@ nightly 実行後は GitHub Actions artifact `smoke-kpi-history-nightly` の
 `history/<history_key>/` 配下を確認してください。完成判定に使う主要ファイルは次のとおりです。
 
 - `ga-gate-report.json`（`gate_passed`, `consecutive_pass_streak`, `release_blocked`）
+- `release-streak-report.json`（3 連続 pass 判定の証跡）
 - `kpi_summary.json`（`failure_rate`, `crash_rate`, `fcp_equivalent_ms`, memory）
 - `download_regression_summary.json`（`pass`, `cases[*].passed`, checksum 検証結果）
 - `latest_crash_report.json`（クラッシュ例外時の再現情報）

@@ -415,6 +415,7 @@
     - `checks[name=display_time_ms].passed == true`
     - `checks[name=layout_regression].passed == true`
     - `checks[name=download_regression].passed == true`
+    - `checks[name=crash_exception_metadata].passed == true`
 - [ ] 重大クラッシュ閾値を下回っている。
   - 判定成果物キー（`history/<history_key>/latest_crash_report.json` + `history/<history_key>/kpi_summary.json`）:
     - `kpi_summary.json.failure_classification.crash.count == 0` を原則条件とする
@@ -454,16 +455,19 @@
     - 進捗メモ（2026-03-24）: `docs/download-regression-policy.md` を追加し、PR placeholder / nightly 本検証の実行条件と失敗分類を固定した。
 
 ### 11.3 GA 判定運用タスク（連続達成の最終化）
-21. [ ] **GA-T1 3連続 pass の自動証跡化**
+21. [x] **GA-T1 3連続 pass の自動証跡化**
     - `ga-gate-report.json.consecutive_pass_streak` と `required_consecutive_passes` を nightly ごとに保存し、3連続達成時に release unblock を自動判定する。
-22. [ ] **GA-T2 crash 単発例外の運用ルール固定**
+    - 進捗メモ（2026-03-25）: nightly workflow に `check_release_streak.py` を追加し、`release-streak-report.json` を artifact 化して 3 連続判定の証跡を自動生成するようにした。
+22. [x] **GA-T2 crash 単発例外の運用ルール固定**
     - `crash.count == 1` を許容する際の再現テンプレート必須項目（transport/active_url/last_command/build_id/commit_hash）をチェックリスト化し、CI で欠落を fail にする。
+    - 進捗メモ（2026-03-25）: `evaluate_release_gate.py` に `crash_exception_metadata` mandatory check を追加し、`latest_crash_report.json` 欠落項目（transport/active_url/last_command/build_id/commit_hash）を fail-fast するようにした。
 23. [x] **GA-T3 release unblock 証跡の README 連携**
     - `history/<history_key>/ga-gate-report.json` の最終 pass 証跡を README から辿れる運用（最新 artifact 参照先）を追加する。
     - ローカル実行者が「未判定」か「達成済み」かを 1 画面で判定できる導線を整備する。
     - 進捗メモ（2026-03-24）: README に `smoke-kpi-history-nightly` artifact 参照導線と `ga-gate-report.json` / `kpi_summary.json` / `download_regression_summary.json` / `latest_crash_report.json` の判定キーを追記した。
 
-### 11.4 今回棚卸しでの結論（2026-03-24 実測）
+### 11.4 今回棚卸しでの結論（2026-03-25 更新）
 - [x] 実装面の主な未完了だった E6-T3 は DL-T3/DL-T4 実装で完了。
-- [ ] GA 完成判定は `GA-T1/GA-T2` の運用固定と 3 連続 pass 実績が必要（GA-T3 は完了）。
+- [x] GA 判定運用タスク（GA-T1/GA-T2/GA-T3）は実装完了。
+- [ ] 残課題は「3 連続 pass 実績を artifact 上で満たすこと」のみ。
 - [ ] ローカル smoke 実測は環境制約で未完了（`rustup` の stable チャネル取得に失敗し `native_ipc_cli` build が失敗）。

@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-summary", required=True)
     parser.add_argument("--legacy-usage-summary", required=True)
     parser.add_argument("--download-summary")
+    parser.add_argument("--crash-report")
     parser.add_argument("--history-dir")
     parser.add_argument("--history-series", default="webview-free-ga-gate")
     parser.add_argument("--history-key")
@@ -30,6 +31,15 @@ def parse_args() -> argparse.Namespace:
 
 def load_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_optional_json(path: str | None) -> Any:
+    if not path:
+        return {}
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    return load_json(file_path)
 
 
 def load_history_reports(history_dir: str | None) -> list[dict[str, Any]]:
@@ -74,6 +84,7 @@ def main() -> int:
     layout_summary = load_json(args.layout_summary)
     legacy_usage_summary = load_json(args.legacy_usage_summary)
     download_summary = load_json(args.download_summary) if args.download_summary else {}
+    crash_report = load_optional_json(args.crash_report)
 
     success_rate = 1.0 - float(kpi_summary.get("failure_rate", 0.0) or 0.0)
     crash_rate = float(kpi_summary.get("crash_rate", 0.0) or 0.0)
@@ -81,6 +92,10 @@ def main() -> int:
     layout_pass = bool(layout_summary.get("pass", False))
     unused_legacy_commands = list(legacy_usage_summary.get("unused_legacy_commands", []))
     used_legacy_commands = list(legacy_usage_summary.get("used_legacy_commands", []))
+    crash_count = int(((kpi_summary.get("failure_classification", {}) or {}).get("crash", {}) or {}).get("count", 0) or 0)
+    crash_required_fields = ["transport", "active_url", "last_command", "build_id", "commit_hash"]
+    missing_crash_fields = [field for field in crash_required_fields if not str(crash_report.get(field, "")).strip()]
+    crash_metadata_passed = crash_count == 0 or (crash_count == 1 and not missing_crash_fields)
     evaluated_at = datetime.now(tz=timezone.utc).isoformat()
     history_key = build_history_key(args.history_key, evaluated_at)
 
@@ -127,9 +142,29 @@ def main() -> int:
             "operator": "==",
             "passed": bool(download_summary.get("pass", False)),
         },
+        {
+            "name": "crash_exception_metadata",
+            "actual": {
+                "crash_count": crash_count,
+                "missing_fields": missing_crash_fields,
+            },
+            "expected": "crash_count == 0 OR (crash_count == 1 and required metadata fields are present)",
+            "operator": "policy",
+            "passed": crash_metadata_passed,
+        },
     ]
 
-    gate_passed = all(item["passed"] for item in checks[:5])
+    mandatory_check_names = {
+        "success_rate",
+        "crash_rate",
+        "display_time_ms",
+        "layout_regression",
+        "download_regression",
+        "crash_exception_metadata",
+    }
+    gate_passed = all(
+        item["passed"] for item in checks if str(item.get("name", "")) in mandatory_check_names
+    )
     history_reports = load_history_reports(args.history_dir)
     current_report = {
         "evaluated_at": evaluated_at,
@@ -151,6 +186,12 @@ def main() -> int:
             "unused_legacy_commands": unused_legacy_commands,
         },
         "download_regression": download_summary,
+        "crash_exception_policy": {
+            "crash_count": crash_count,
+            "required_fields": crash_required_fields,
+            "missing_fields": missing_crash_fields,
+            "report_present": bool(crash_report),
+        },
     }
     streak = consecutive_passes(history_reports + [current_report])
     current_report["consecutive_pass_streak"] = streak

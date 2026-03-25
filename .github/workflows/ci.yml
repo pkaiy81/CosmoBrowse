@@ -81,6 +81,7 @@ jobs:
             --layout-summary smoke-artifacts/pr/layout_regression_summary.json \
             --legacy-usage-summary smoke-artifacts/pr/legacy-command-usage.json \
             --download-summary smoke-artifacts/pr/download_regression_summary.json \
+            --crash-report smoke-artifacts/pr/latest_crash_report.json \
             --report-out smoke-artifacts/pr/ga-gate-report.json \
             --required-consecutive-passes 1
       - name: print layout breakage summary
