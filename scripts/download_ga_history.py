@@ -96,13 +96,31 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    artifacts = api_get(f"{API_ROOT}/repos/{args.repo}/actions/artifacts?per_page=100", args.token)
     artifact_names = args.artifact_names or ["smoke-kpi-history-nightly", "ga-gate-nightly"]
-    matches = [
-        artifact
-        for artifact in artifacts.get("artifacts", [])
-        if artifact.get("name") in artifact_names and not artifact.get("expired", True)
-    ]
+
+    matches: list[dict[str, Any]] = []
+    for artifact_name in artifact_names:
+        matches.extend(
+            list_artifacts_by_name(
+                repo=args.repo,
+                token=args.token,
+                artifact_name=artifact_name,
+                limit=args.limit,
+            )
+        )
+
+    # GitHub REST API can return overlapping entries across per-name lookups.
+    # Keep the newest instance for each artifact id before applying the global
+    # "latest N" selection.
+    deduped: dict[int, dict[str, Any]] = {}
+    for artifact in matches:
+        artifact_id = int(artifact.get("id", 0) or 0)
+        if artifact_id <= 0:
+            continue
+        current = deduped.get(artifact_id)
+        if current is None or str(artifact.get("created_at", "")) > str(current.get("created_at", "")):
+            deduped[artifact_id] = artifact
+    matches = list(deduped.values())
     matches.sort(key=lambda artifact: artifact.get("created_at", ""), reverse=True)
 
     extracted = 0
