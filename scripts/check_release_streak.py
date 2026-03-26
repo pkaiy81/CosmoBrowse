@@ -12,6 +12,7 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history-dir", required=True)
+    parser.add_argument("--history-series", default="webview-free-ga-gate")
     parser.add_argument("--required-consecutive-passes", type=int, default=3)
     parser.add_argument("--report-out", required=True)
     return parser.parse_args()
@@ -21,8 +22,21 @@ def main() -> int:
     args = parse_args()
     history_dir = Path(args.history_dir)
     reports = []
-    for path in sorted(history_dir.rglob("ga-gate-report.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
+    for path in sorted(history_dir.rglob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        # JSON history artifacts follow RFC 8259. We only treat top-level objects
+        # with a GA decision key (`gate_passed`) as streak inputs so that unrelated
+        # JSON files (e.g., KPI snapshots, manifests) do not skew release gating.
+        if not isinstance(payload, dict):
+            continue
+        if "gate_passed" not in payload:
+            continue
+        series = str(payload.get("history_series", "")).strip()
+        if series and series != args.history_series:
+            continue
         payload["source_path"] = path.as_posix()
         reports.append(payload)
     def evaluated_at_key(report: dict) -> tuple[int, datetime]:
@@ -47,7 +61,7 @@ def main() -> int:
 
     result = {
         "reports_found": len(reports),
-        "history_series": "webview-free-ga-gate",
+        "history_series": args.history_series,
         "history_keys": [report.get("history_key", "") for report in reports],
         "required_consecutive_passes": args.required_consecutive_passes,
         "consecutive_pass_streak": streak,
@@ -55,7 +69,7 @@ def main() -> int:
         "report_paths": [report["source_path"] for report in reports],
         "latest_history_key": reports[-1].get("history_key", "") if reports else "",
         "blocking_reason": (
-            "no ga-gate-report.json was found under --history-dir"
+            "no GA gate report JSON (gate_passed field) was found under --history-dir"
             if not reports
             else "consecutive pass streak is below required threshold"
             if streak < args.required_consecutive_passes
