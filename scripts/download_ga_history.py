@@ -78,6 +78,13 @@ def list_artifacts_by_name(repo: str, token: str, artifact_name: str, limit: int
         if not artifacts:
             break
         for artifact in artifacts:
+            # GitHub REST API (Actions Artifacts: list repository artifacts) defines
+            # `name` as an optional query filter. Some proxies/GHES versions can return
+            # broader result sets, so we defensively enforce exact-name matching here.
+            # This keeps release-history selection aligned with the API contract even
+            # when upstream filtering is not strictly applied.
+            if str(artifact.get("name", "")) != artifact_name:
+                continue
             if not artifact.get("expired", True):
                 found.append(artifact)
                 if len(found) >= limit:
