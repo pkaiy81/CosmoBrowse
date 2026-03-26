@@ -110,8 +110,7 @@ def main() -> int:
         )
 
     # GitHub REST API can return overlapping entries across per-name lookups.
-    # Keep the newest instance for each artifact id before applying the global
-    # "latest N" selection.
+    # Keep only the newest instance for each artifact id before extraction.
     deduped: dict[int, dict[str, Any]] = {}
     for artifact in matches:
         artifact_id = int(artifact.get("id", 0) or 0)
@@ -124,7 +123,11 @@ def main() -> int:
     matches.sort(key=lambda artifact: artifact.get("created_at", ""), reverse=True)
 
     extracted = 0
-    for artifact in matches[: args.limit]:
+    # `--limit` is applied per artifact name during lookup (`list_artifacts_by_name`),
+    # so we intentionally extract every deduplicated match here. This keeps the release
+    # history complete across both artifact streams (e.g. smoke-kpi-history-nightly and
+    # ga-gate-nightly) in line with GitHub Actions artifact list/filter semantics.
+    for artifact in matches:
         artifact_dir = output_dir / f"{artifact['id']}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         archive = download_bytes(artifact["archive_download_url"], args.token)
