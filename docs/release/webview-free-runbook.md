@@ -80,6 +80,33 @@ Epic 8 (`E8-T1`〜`E8-T3`) の運用手順をまとめ、`adapter_native` を正
 
 ## 7. Operational checklist
 
+### CI preflight before pushing fixes
+
+CI での手戻りを減らすため、PR 前にローカルで GitHub Actions 相当のチェックをまとめて実行する。
+
+```bash
+python3 scripts/run_ci_preflight.py
+```
+
+release-gate（連続 3 pass 判定）まで事前確認したい場合は、GitHub API トークンを設定して追加実行する。
+
+```bash
+export GITHUB_REPOSITORY="<owner>/<repo>"
+export GITHUB_TOKEN="<token with actions:read>"
+python3 scripts/run_ci_preflight.py --with-release-gate --history-limit 3
+```
+
+`--with-release-gate` は `download_ga_history.py` と `check_release_streak.py` を連続実行し、CI と同じく `gate_passed` を持つ JSON が history 配下に存在しない場合は失敗させる（`reports_found == 0` を即時検知する）。
+
+GitHub API に接続できない環境では、既存の history ディレクトリを直接指定して同じ判定だけを再実行できる。
+
+```bash
+python3 scripts/run_ci_preflight.py \
+  --skip-rust --skip-frontend --skip-smoke \
+  --with-release-gate \
+  --release-history-dir smoke-artifacts/nightly/history
+```
+
 ### Before raising rollout percentage
 
 - `smoke-nightly` の `ga-gate-report.json` が pass。
