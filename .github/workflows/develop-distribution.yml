@@ -89,9 +89,13 @@ jobs:
           fi
           echo "ready=${ready}" >> "$GITHUB_OUTPUT"
           if [ "${ready}" != "true" ] && [ ! -f release-artifacts/release-streak-report.json ]; then
-            cat > release-artifacts/release-streak-report.json <<'JSON'
-            {"status":"skipped","reason":"ga-history-report-not-found"}
-            JSON
+            # Keep JSON generation single-line to avoid heredoc delimiter parsing
+            # pitfalls when workflow YAML indentation introduces leading spaces in
+            # the runner-generated shell script. `printf` + redirection is defined
+            # by POSIX Shell Command Language and writes deterministic bytes.
+            # Ref: POSIX.1-2017 Shell Command Language (`printf`, redirection).
+            printf '%s\n' '{"status":"skipped","reason":"ga-history-report-not-found"}' \
+              > release-artifacts/release-streak-report.json
           fi
       - name: upload GA readiness report
         if: always()
