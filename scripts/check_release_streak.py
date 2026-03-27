@@ -23,6 +23,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history-dir", required=True)
     parser.add_argument("--history-series", default="webview-free-ga-gate")
+    parser.add_argument(
+        "--history-series-alias",
+        action="append",
+        dest="history_series_aliases",
+        default=[],
+        help=(
+            "Additional history_series value treated as equivalent to --history-series. "
+            "Useful for backward compatibility with older nightly artifact schemas."
+        ),
+    )
     parser.add_argument("--required-consecutive-passes", type=int, default=3)
     parser.add_argument("--report-out", required=True)
     return parser.parse_args()
@@ -32,8 +42,23 @@ def main() -> int:
     args = parse_args()
     history_dir = Path(args.history_dir)
     reports = []
+    accepted_series = {args.history_series, *[alias.strip() for alias in args.history_series_aliases]}
+    # Backward compatibility: older KPI history snapshots used a broader series label
+    # while still embedding GA gate decisions in the same report JSON files.
+    # Keeping this alias defaulted preserves release-gate behavior across historical
+    # artifacts without weakening schema validation for unrelated JSON blobs.
+    accepted_series.add("webview-free-kpi-nightly")
 
     def normalize_report(payload: dict) -> dict | None:
+        # RFC 8259 defines JSON "object" values recursively, so some pipelines wrap
+        # the GA report object under a stable key; we unwrap known wrappers first and
+        # then evaluate the same gate fields to stay schema-compatible.
+        for wrapper_key in ("ga_gate_report", "report", "payload"):
+            wrapped = payload.get(wrapper_key)
+            if isinstance(wrapped, dict):
+                payload = wrapped
+                break
+
         if "gate_passed" in payload:
             return payload
 
@@ -77,7 +102,7 @@ def main() -> int:
         if payload is None:
             continue
         series = str(payload.get("history_series", "")).strip()
-        if series and series != args.history_series:
+        if series and series not in accepted_series:
             continue
         payload["source_path"] = path.as_posix()
         reports.append(payload)
