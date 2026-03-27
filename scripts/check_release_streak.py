@@ -9,6 +9,16 @@ from datetime import datetime
 from pathlib import Path
 
 
+MANDATORY_CHECK_NAMES = {
+    "success_rate",
+    "crash_rate",
+    "display_time_ms",
+    "layout_regression",
+    "download_regression",
+    "crash_exception_metadata",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history-dir", required=True)
@@ -22,6 +32,37 @@ def main() -> int:
     args = parse_args()
     history_dir = Path(args.history_dir)
     reports = []
+
+    def normalize_report(payload: dict) -> dict | None:
+        if "gate_passed" in payload:
+            return payload
+
+        # Backward compatibility for older GA gate snapshots that predate explicit
+        # `gate_passed`. JSON payloads are still RFC 8259 objects, and we infer
+        # gate status from stable fields only.
+        release_blocked = payload.get("release_blocked")
+        if isinstance(release_blocked, bool):
+            hydrated = dict(payload)
+            hydrated["gate_passed"] = not release_blocked
+            return hydrated
+
+        checks = payload.get("checks")
+        if isinstance(checks, list):
+            check_map: dict[str, bool] = {}
+            for item in checks:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                check_map[name] = bool(item.get("passed"))
+            if MANDATORY_CHECK_NAMES.issubset(check_map.keys()):
+                hydrated = dict(payload)
+                hydrated["gate_passed"] = all(check_map[name] for name in MANDATORY_CHECK_NAMES)
+                return hydrated
+
+        return None
+
     for path in sorted(history_dir.rglob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -32,7 +73,8 @@ def main() -> int:
         # JSON files (e.g., KPI snapshots, manifests) do not skew release gating.
         if not isinstance(payload, dict):
             continue
-        if "gate_passed" not in payload:
+        payload = normalize_report(payload)
+        if payload is None:
             continue
         series = str(payload.get("history_series", "")).strip()
         if series and series != args.history_series:
@@ -69,7 +111,7 @@ def main() -> int:
         "report_paths": [report["source_path"] for report in reports],
         "latest_history_key": reports[-1].get("history_key", "") if reports else "",
         "blocking_reason": (
-            "no GA gate report JSON (gate_passed field) was found under --history-dir"
+            "no GA gate report JSON (or compatible fields) was found under --history-dir"
             if not reports
             else "consecutive pass streak is below required threshold"
             if streak < args.required_consecutive_passes
