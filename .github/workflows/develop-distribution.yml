@@ -32,13 +32,18 @@ jobs:
           ls -R release-artifacts/ga-history || true
       - name: verify GA history contains reports
         run: |
-          test -d release-artifacts/ga-history
+          # Keep this step idempotent even when it is re-run in isolation.
+          # Ref: POSIX.1-2017 `mkdir` utility (`-p`).
+          mkdir -p release-artifacts/ga-history
           # POSIX shell pathname expansion leaves an unmatched pattern unchanged,
           # causing `ls release-artifacts/ga-history/*.json` to fail with a less
           # actionable error. Use `find` to test existence explicitly.
           # Ref: POSIX.1-2017 Shell Command Language, 2.13 Pathname Expansion.
           json_count="$(find release-artifacts/ga-history -type f -name '*.json' | wc -l)"
-          test "${json_count}" -gt 0
+          if [ "${json_count}" -eq 0 ]; then
+            echo "::error::release-artifacts/ga-history に GA レポート JSON が見つかりませんでした。download_ga_history.py の実行結果を確認してください。"
+            exit 1
+          fi
       - name: require consecutive GA passes before distribution build
         run: |
           python3 scripts/check_release_streak.py \
