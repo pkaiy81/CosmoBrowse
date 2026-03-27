@@ -31,6 +31,9 @@ jobs:
         run: |
           ls -R release-artifacts/ga-history || true
       - name: verify GA history contains reports
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           # Keep this step idempotent even when it is re-run in isolation.
           # Ref: POSIX.1-2017 `mkdir` utility (`-p`).
@@ -40,6 +43,17 @@ jobs:
           # actionable error. Use `find` to test existence explicitly.
           # Ref: POSIX.1-2017 Shell Command Language, 2.13 Pathname Expansion.
           json_count="$(find release-artifacts/ga-history -type f -name '*.json' | wc -l)"
+          if [ "${json_count}" -eq 0 ]; then
+            # When this step is re-run in isolation, prior download outputs may
+            # be absent. Re-running download_ga_history.py is safe because it only
+            # performs idempotent GET requests and writes artifacts under the same
+            # directory deterministically.
+            # Ref: RFC 9110 Section 9.2.2 (GET is idempotent).
+            python3 scripts/download_ga_history.py \
+              --output-dir release-artifacts/ga-history \
+              --limit 3
+            json_count="$(find release-artifacts/ga-history -type f -name '*.json' | wc -l)"
+          fi
           if [ "${json_count}" -eq 0 ]; then
             echo "::error::release-artifacts/ga-history に GA レポート JSON が見つかりませんでした。download_ga_history.py の実行結果を確認してください。"
             exit 1
