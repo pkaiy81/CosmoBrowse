@@ -18,6 +18,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
+          # Ensure the history directory exists even if artifact download returns
+          # zero files. `mkdir -p` is idempotent per POSIX and keeps the
+          # subsequent `test -d` check aligned with Shell Command Language
+          # pathname handling expectations.
+          # Ref: POSIX.1-2017 `mkdir` utility (`-p`) and Shell Command Language.
+          mkdir -p release-artifacts/ga-history
           python3 scripts/download_ga_history.py \
             --output-dir release-artifacts/ga-history \
             --limit 3
