@@ -8,6 +8,8 @@ on:
 jobs:
   ga_readiness:
     runs-on: ubuntu-latest
+    outputs:
+      ga_ready: ${{ steps.set_ga_ready.outputs.ready }}
     permissions:
       actions: read
       contents: read
@@ -31,6 +33,7 @@ jobs:
         run: |
           ls -R release-artifacts/ga-history || true
       - name: verify GA history contains reports
+        id: verify_ga_history
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -55,15 +58,41 @@ jobs:
             json_count="$(find release-artifacts/ga-history -type f -name '*.json' | wc -l)"
           fi
           if [ "${json_count}" -eq 0 ]; then
-            echo "::error::release-artifacts/ga-history に GA レポート JSON が見つかりませんでした。download_ga_history.py の実行結果を確認してください。"
-            exit 1
+            echo "::warning::release-artifacts/ga-history に GA レポート JSON が見つかりませんでした。nightly artifact 未生成時は GA gate をスキップします。"
+            echo "reports_found=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "reports_found=1" >> "$GITHUB_OUTPUT"
       - name: require consecutive GA passes before distribution build
+        id: check_release_streak
+        if: steps.verify_ga_history.outputs.reports_found == '1'
         run: |
           python3 scripts/check_release_streak.py \
             --history-dir release-artifacts/ga-history \
             --report-out release-artifacts/release-streak-report.json \
             --required-consecutive-passes 3
+      - name: set GA readiness output
+        id: set_ga_ready
+        if: always()
+        run: |
+          # Job outputs are read via the `jobs.<job_id>.outputs` mapping.
+          # We normalize readiness to a string boolean so downstream `if:`
+          # expression checks remain deterministic per GitHub Actions
+          # expressions/output semantics.
+          # Ref: GitHub Actions docs:
+          # - Workflow syntax (`jobs.<job_id>.outputs`)
+          # - Expressions (string comparison in `if`).
+          ready="false"
+          if [ "${{ steps.verify_ga_history.outputs.reports_found }}" = "1" ] && \
+             [ "${{ steps.check_release_streak.outcome }}" = "success" ]; then
+            ready="true"
+          fi
+          echo "ready=${ready}" >> "$GITHUB_OUTPUT"
+          if [ "${ready}" != "true" ] && [ ! -f release-artifacts/release-streak-report.json ]; then
+            cat > release-artifacts/release-streak-report.json <<'JSON'
+            {"status":"skipped","reason":"ga-history-report-not-found"}
+            JSON
+          fi
       - name: upload GA readiness report
         if: always()
         uses: actions/upload-artifact@v4
@@ -74,6 +103,7 @@ jobs:
 
   build_windows_portable:
     needs: ga_readiness
+    if: needs.ga_readiness.outputs.ga_ready == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
