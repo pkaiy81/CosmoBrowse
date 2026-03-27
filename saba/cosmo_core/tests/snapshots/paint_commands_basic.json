@@ -1,0 +1,31 @@
+{
+  "commands": [
+    {
+      "kind": "draw_rect",
+      "x": 14,
+      "y": 26,
+      "width": 80,
+      "height": 20,
+      "background_color": "#eeeeee",
+      "opacity": 1.0,
+      "z_index": 0,
+      "clip_rect": null
+    },
+    {
+      "kind": "draw_text",
+      "x": 18,
+      "y": 30,
+      "text": "hello",
+      "color": "#111111",
+      "font_px": 16,
+      "font_family": "serif",
+      "underline": true,
+      "opacity": 0.9,
+      "href": "https://example.com",
+      "target": null,
+      "z_index": 1,
+      "clip_rect": null
+    }
+  ],
+  "diagnostics": []
+}

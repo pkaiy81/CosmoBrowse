@@ -1,0 +1,136 @@
+name: develop-distribution
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  ga_readiness:
+    runs-on: ubuntu-latest
+    outputs:
+      ga_ready: ${{ steps.set_ga_ready.outputs.ready }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: download recent nightly GA history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          # Ensure the history directory exists even if artifact download returns
+          # zero files. `mkdir -p` is idempotent per POSIX and keeps the
+          # subsequent `test -d` check aligned with Shell Command Language
+          # pathname handling expectations.
+          # Ref: POSIX.1-2017 `mkdir` utility (`-p`) and Shell Command Language.
+          mkdir -p release-artifacts/ga-history
+          python3 scripts/download_ga_history.py \
+            --output-dir release-artifacts/ga-history \
+            --limit 3
+      - name: debug GA history directory
+        run: |
+          ls -R release-artifacts/ga-history || true
+      - name: verify GA history contains reports
+        id: verify_ga_history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          # Keep this step idempotent even when it is re-run in isolation.
+          # Ref: POSIX.1-2017 `mkdir` utility (`-p`).
+          mkdir -p release-artifacts/ga-history
+          # POSIX shell pathname expansion leaves an unmatched pattern unchanged,
+          # causing `ls release-artifacts/ga-history/*.json` to fail with a less
+          # actionable error. Use `find` to test existence explicitly.
+          # Ref: POSIX.1-2017 Shell Command Language, 2.13 Pathname Expansion.
+          json_count="$(find release-artifacts/ga-history -type f -name '*.json' | wc -l)"
+          if [ "${json_count}" -eq 0 ]; then
+            # When this step is re-run in isolation, prior download outputs may
+            # be absent. Re-running download_ga_history.py is safe because it only
+            # performs idempotent GET requests and writes artifacts under the same
+            # directory deterministically.
+            # Ref: RFC 9110 Section 9.2.2 (GET is idempotent).
+            python3 scripts/download_ga_history.py \
+              --output-dir release-artifacts/ga-history \
+              --limit 3
+            json_count="$(find release-artifacts/ga-history -type f -name '*.json' | wc -l)"
+          fi
+          if [ "${json_count}" -eq 0 ]; then
+            echo "::warning::release-artifacts/ga-history に GA レポート JSON が見つかりませんでした。nightly artifact 未生成時は GA gate をスキップします。"
+            echo "reports_found=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "reports_found=1" >> "$GITHUB_OUTPUT"
+      - name: require consecutive GA passes before distribution build
+        id: check_release_streak
+        if: steps.verify_ga_history.outputs.reports_found == '1'
+        run: |
+          python3 scripts/check_release_streak.py \
+            --history-dir release-artifacts/ga-history \
+            --report-out release-artifacts/release-streak-report.json \
+            --required-consecutive-passes 3
+      - name: set GA readiness output
+        id: set_ga_ready
+        if: always()
+        run: |
+          # Job outputs are read via the `jobs.<job_id>.outputs` mapping.
+          # We normalize readiness to a string boolean so downstream `if:`
+          # expression checks remain deterministic per GitHub Actions
+          # expressions/output semantics.
+          # Ref: GitHub Actions docs:
+          # - Workflow syntax (`jobs.<job_id>.outputs`)
+          # - Expressions (string comparison in `if`).
+          ready="false"
+          if [ "${{ steps.verify_ga_history.outputs.reports_found }}" = "1" ] && \
+             [ "${{ steps.check_release_streak.outcome }}" = "success" ]; then
+            ready="true"
+          fi
+          echo "ready=${ready}" >> "$GITHUB_OUTPUT"
+          if [ "${ready}" != "true" ] && [ ! -f release-artifacts/release-streak-report.json ]; then
+            # Keep JSON generation single-line to avoid heredoc delimiter parsing
+            # pitfalls when workflow YAML indentation introduces leading spaces in
+            # the runner-generated shell script. `printf` + redirection is defined
+            # by POSIX Shell Command Language and writes deterministic bytes.
+            # Ref: POSIX.1-2017 Shell Command Language (`printf`, redirection).
+            printf '%s\n' '{"status":"skipped","reason":"ga-history-report-not-found"}' \
+              > release-artifacts/release-streak-report.json
+          fi
+      - name: upload GA readiness report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-ga-readiness-report
+          path: release-artifacts/release-streak-report.json
+          if-no-files-found: warn
+
+  build_windows_portable:
+    needs: ga_readiness
+    if: needs.ga_readiness.outputs.ga_ready == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: npm ci
+        working-directory: saba/ui/cosmo-browse-ui
+        run: npm ci
+      - name: build Windows portable package
+        shell: pwsh
+        run: |
+          ./scripts/build-cosmobrowse-portable.ps1
+      - name: upload Windows portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmobrowse-windows-portable-zip
+          path: artifacts/cosmo-browse-ui/*.zip
+          if-no-files-found: error
+      - name: upload Windows portable expanded directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmobrowse-windows-portable-dir
+          path: artifacts/cosmo-browse-ui/windows-portable
+          if-no-files-found: error

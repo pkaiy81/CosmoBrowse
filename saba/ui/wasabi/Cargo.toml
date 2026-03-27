@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-saba_core = { path = "../../saba_core" }
+cosmo_core = { path = "../../cosmo_core" }
 noli = { git = "https://github.com/hikalium/wasabi.git", branch = "for_saba" }

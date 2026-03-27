@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: saba
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: forbid direct saba_ imports outside compatibility layers
+        run: |
+          set -euo pipefail
+          if rg -n "\bsaba_(app|core)\b" \
+            --glob '!cosmo_app_legacy/**' \
+            --glob '!cosmo_core_legacy/**' \
+            --glob '!docs/**' \
+            --glob '!**/*.md' \
+            .; then
+            echo "Direct saba_ references remain outside compatibility layers."
+            exit 1
+          fi
+      - name: cargo check stable-target crates
+        run: cargo check -p cosmo_core_legacy -p cosmo_app_legacy -p adapter_cli
+      - name: cargo test stable-target crates
+        run: cargo test -p cosmo_core_legacy -p cosmo_app_legacy -p adapter_cli
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: saba/ui/cosmo-browse-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: npm install
+        run: npm install
+      - name: npm run build
+        run: npm run build
+
+  smoke_regression_pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: run PR smoke regression (light)
+        run: python3 scripts/run_smoke_regression.py --mode pr --artifacts-dir smoke-artifacts/pr
+      - name: collect legacy command usage
+        run: python3 scripts/collect_legacy_command_usage.py --output smoke-artifacts/pr/legacy-command-usage.json
+      - name: set PR download regression placeholder
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          output = Path("smoke-artifacts/pr/download_regression_summary.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(
+              json.dumps(
+                  {
+                      "pass": True,
+                      "mode": "pr_placeholder",
+                      "note": "Full download regression runs in nightly workflow.",
+                      "cases": [],
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          PY
+      - name: evaluate WebView-free GA gate for PR pipeline
+        run: |
+          python3 scripts/evaluate_release_gate.py \
+            --kpi-summary smoke-artifacts/pr/kpi_summary.json \
+            --layout-summary smoke-artifacts/pr/layout_regression_summary.json \
+            --legacy-usage-summary smoke-artifacts/pr/legacy-command-usage.json \
+            --download-summary smoke-artifacts/pr/download_regression_summary.json \
+            --crash-report smoke-artifacts/pr/latest_crash_report.json \
+            --report-out smoke-artifacts/pr/ga-gate-report.json \
+            --required-consecutive-passes 1
+      - name: print layout breakage summary
+        run: cat smoke-artifacts/pr/layout_regression_summary.json
+      - name: print GA gate report
+        run: cat smoke-artifacts/pr/ga-gate-report.json
+      - name: upload smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-regression-pr-failure
+          path: smoke-artifacts/pr
+          if-no-files-found: warn
+
+  ipc_contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate IPC schema snapshot
+        run: python scripts/generate_ipc_schema.py
+      - name: check backward compatibility
+        run: |
+          python scripts/check_ipc_compat.py \
+            docs/ipc/ipc-schema-v1.json \
+            docs/ipc/ipc-schema-v1.generated.json
+      - name: upload IPC schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipc-schema-v1
+          path: docs/ipc/ipc-schema-v1.generated.json
