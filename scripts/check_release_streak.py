@@ -7,6 +7,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 MANDATORY_CHECK_NAMES = {
@@ -17,6 +18,63 @@ MANDATORY_CHECK_NAMES = {
     "download_regression",
     "crash_exception_metadata",
 }
+
+
+def load_json_if_exists(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def synthesize_report_from_history_bundle(kpi_path: Path) -> dict[str, Any] | None:
+    if kpi_path.name != "kpi_summary.json":
+        return None
+    bundle_dir = kpi_path.parent
+
+    # Nightly history bundles are JSON objects (RFC 8259) grouped under one history key.
+    # We reconstruct a GA gate decision from the same stable fields used by
+    # `evaluate_release_gate.py` so release-streak evaluation stays schema-compatible
+    # even when ga-gate-report.json is missing from downloaded artifacts.
+    kpi_summary = load_json_if_exists(kpi_path)
+    layout_summary = load_json_if_exists(bundle_dir / "layout_regression_summary.json") or {}
+    download_summary = load_json_if_exists(bundle_dir / "download_regression_summary.json") or {}
+    crash_report = load_json_if_exists(bundle_dir / "latest_crash_report.json") or {}
+    if not isinstance(kpi_summary, dict):
+        return None
+
+    success_rate = 1.0 - float(kpi_summary.get("failure_rate", 0.0) or 0.0)
+    crash_rate = float(kpi_summary.get("crash_rate", 0.0) or 0.0)
+    display_time_ms = int(kpi_summary.get("display_time_ms", 0) or 0)
+    layout_pass = bool(layout_summary.get("pass", False))
+    download_pass = bool(download_summary.get("pass", False))
+    crash_count = int(
+        (((kpi_summary.get("failure_classification", {}) or {}).get("crash", {}) or {}).get("count", 0) or 0)
+    )
+    crash_required_fields = ("transport", "active_url", "last_command", "build_id", "commit_hash")
+    missing_crash_fields = [field for field in crash_required_fields if not str(crash_report.get(field, "")).strip()]
+    crash_metadata_passed = crash_count == 0 or (crash_count == 1 and not missing_crash_fields)
+
+    checks = {
+        "success_rate": success_rate >= 0.99,
+        "crash_rate": crash_rate <= 0.005,
+        "display_time_ms": display_time_ms <= 1500,
+        "layout_regression": layout_pass,
+        "download_regression": download_pass,
+        "crash_exception_metadata": crash_metadata_passed,
+    }
+    gate_passed = all(checks.values())
+
+    return {
+        "history_series": "webview-free-kpi-nightly",
+        "history_key": bundle_dir.name,
+        "evaluated_at": datetime.fromtimestamp(kpi_path.stat().st_mtime).isoformat(),
+        "checks": [{"name": name, "passed": passed} for name, passed in checks.items()],
+        "gate_passed": gate_passed,
+        "source_path": kpi_path.as_posix(),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +100,7 @@ def main() -> int:
     args = parse_args()
     history_dir = Path(args.history_dir)
     reports = []
+    synthesized_keys: set[str] = set()
     accepted_series = {args.history_series, *[alias.strip() for alias in args.history_series_aliases]}
     # Backward compatibility: older KPI history snapshots used a broader series label
     # while still embedding GA gate decisions in the same report JSON files.
@@ -100,11 +159,19 @@ def main() -> int:
             continue
         payload = normalize_report(payload)
         if payload is None:
-            continue
+            synthesized = synthesize_report_from_history_bundle(path)
+            if synthesized is None:
+                continue
+            dedupe_key = str(synthesized.get("history_key", "")).strip()
+            if dedupe_key and dedupe_key in synthesized_keys:
+                continue
+            if dedupe_key:
+                synthesized_keys.add(dedupe_key)
+            payload = synthesized
         series = str(payload.get("history_series", "")).strip()
         if series and series not in accepted_series:
             continue
-        payload["source_path"] = path.as_posix()
+        payload["source_path"] = payload.get("source_path", path.as_posix())
         reports.append(payload)
     def evaluated_at_key(report: dict) -> tuple[int, datetime]:
         raw = str(report.get("evaluated_at", "")).strip()
