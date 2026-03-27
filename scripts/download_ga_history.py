@@ -29,7 +29,8 @@ def parse_args() -> argparse.Namespace:
         dest="artifact_names",
         help=(
             "Artifact name to download. Can be specified multiple times. "
-            "Defaults to trying smoke-kpi-history-nightly, then ga-gate-nightly."
+            "Defaults to trying smoke-kpi-history-nightly, then ga-gate-nightly, "
+            "then smoke-regression-nightly."
         ),
     )
     parser.add_argument("--limit", type=int, default=3)
@@ -127,7 +128,17 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    artifact_names = args.artifact_names or ["smoke-kpi-history-nightly", "ga-gate-nightly"]
+    # Download order is most-specific -> broad fallback. The first two artifacts
+    # are curated GA-history bundles; `smoke-regression-nightly` is a compatibility
+    # fallback that still contains ga-gate-report.json in the uploaded directory.
+    # This aligns with GitHub Actions artifact packaging semantics where uploaded
+    # directories retain nested paths during download/extract.
+    # Ref: GitHub Actions docs, "Store and share data with workflow artifacts".
+    artifact_names = args.artifact_names or [
+        "smoke-kpi-history-nightly",
+        "ga-gate-nightly",
+        "smoke-regression-nightly",
+    ]
 
     matches: list[dict[str, Any]] = []
     for artifact_name in artifact_names:
