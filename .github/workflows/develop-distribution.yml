@@ -21,6 +21,13 @@ jobs:
           python3 scripts/download_ga_history.py \
             --output-dir release-artifacts/ga-history \
             --limit 3
+      - name: debug GA history directory
+        run: |
+          ls -R release-artifacts/ga-history || true
+      - name: verify GA history contains reports
+        run: |
+          test -d release-artifacts/ga-history
+          ls release-artifacts/ga-history/*.json
       - name: require consecutive GA passes before distribution build
         run: |
           python3 scripts/check_release_streak.py \

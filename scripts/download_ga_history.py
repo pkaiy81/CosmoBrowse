@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import urllib.parse
 import urllib.request
 import zipfile
@@ -60,6 +61,29 @@ def download_bytes(url: str, token: str) -> bytes:
     )
     with urllib.request.urlopen(request) as response:
         return response.read()
+
+
+def load_json_if_exists(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def is_ga_report_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for wrapper_key in ("ga_gate_report", "report", "payload"):
+        wrapped = payload.get(wrapper_key)
+        if isinstance(wrapped, dict):
+            payload = wrapped
+            break
+    if "gate_passed" in payload:
+        return True
+    if isinstance(payload.get("release_blocked"), bool):
+        return True
+    checks = payload.get("checks")
+    return isinstance(checks, list)
 
 
 def list_artifacts_by_name(repo: str, token: str, artifact_name: str, limit: int) -> list[dict[str, Any]]:
@@ -130,6 +154,7 @@ def main() -> int:
     matches.sort(key=lambda artifact: artifact.get("created_at", ""), reverse=True)
 
     extracted = 0
+    flattened_reports = 0
     # `--limit` is applied per artifact name during lookup (`list_artifacts_by_name`),
     # so we intentionally extract every deduplicated match here. This keeps the release
     # history complete across both artifact streams (e.g. smoke-kpi-history-nightly and
@@ -140,12 +165,29 @@ def main() -> int:
         archive = download_bytes(artifact["archive_download_url"], args.token)
         with zipfile.ZipFile(io.BytesIO(archive)) as zf:
             zf.extractall(artifact_dir)
+        # GitHub Actions upload-artifact wraps paths with directories derived from
+        # the uploaded path. We keep the full extraction tree for traceability and
+        # also flatten GA report JSON files into --output-dir so downstream
+        # check_release_streak.py can consume a stable location regardless of nesting.
+        # Ref: GitHub Actions "Store and share data with workflow artifacts" behavior.
+        for json_path in artifact_dir.rglob("*.json"):
+            payload = load_json_if_exists(json_path)
+            if not is_ga_report_payload(payload):
+                continue
+            flat_name = (
+                f"ga-gate-report-{artifact['id']}-"
+                f"{flattened_reports + 1:03d}.json"
+            )
+            flat_path = output_dir / flat_name
+            shutil.copyfile(json_path, flat_path)
+            flattened_reports += 1
         extracted += 1
 
     print(
         json.dumps(
             {
                 "downloaded_artifacts": extracted,
+                "flattened_ga_reports": flattened_reports,
                 "output_dir": output_dir.as_posix(),
                 "artifact_names": artifact_names,
             },
