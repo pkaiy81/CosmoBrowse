@@ -147,7 +147,12 @@ def main() -> int:
 
         return None
 
+    scanned_json_files = 0
+    inspected_paths: list[str] = []
     for path in sorted(history_dir.rglob("*.json")):
+        scanned_json_files += 1
+        if len(inspected_paths) < 20:
+            inspected_paths.append(path.as_posix())
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -195,7 +200,11 @@ def main() -> int:
 
     result = {
         "reports_found": len(reports),
+        "history_dir": history_dir.as_posix(),
         "history_series": args.history_series,
+        "accepted_history_series": sorted(series for series in accepted_series if series),
+        "scanned_json_files": scanned_json_files,
+        "inspected_paths_sample": inspected_paths,
         "history_keys": [report.get("history_key", "") for report in reports],
         "required_consecutive_passes": args.required_consecutive_passes,
         "consecutive_pass_streak": streak,
