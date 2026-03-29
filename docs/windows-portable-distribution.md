@@ -50,10 +50,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-cosmobrowse-portable.ps
 - Trigger: `push` to `develop` (including merge commits).
 - Flow:
   1. Validate GA readiness using `scripts/download_ga_history.py` + `scripts/check_release_streak.py` (`required_consecutive_passes = 3`).
-  2. If GA readiness passes, run Windows build on `windows-latest`.
-  3. Execute `scripts/build-cosmobrowse-portable.ps1` and upload artifacts.
+  2. If GA history is not available, run fallback GA snapshot checks in the same workflow (`run_smoke_regression.py`, `run_download_regression.py`, `collect_legacy_command_usage.py`, `evaluate_release_gate.py --required-consecutive-passes 1`).
+  3. If either GA readiness path passes, run Windows build on `windows-latest`.
+  4. Execute `scripts/build-cosmobrowse-portable.ps1` and upload artifacts.
 - Uploaded artifacts:
   - `cosmobrowse-windows-portable-zip`
   - `cosmobrowse-windows-portable-dir`
 
-This means portable binaries are generated automatically at develop-merge timing only after GA streak conditions are satisfied.
+This means portable binaries are generated automatically at develop-merge timing after GA gating passes (nightly streak path or merge-time fallback path).
