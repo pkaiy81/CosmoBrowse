@@ -68,7 +68,9 @@ GA 判定は nightly artifact の `history/<history_key>/` 配下にある成果
 
 配布物の利用者は zip を展開して `cosmo-browse-ui.exe` を起動するだけで試せます（実行端末に Rust/Node は不要）。
 また、`develop` へのマージ時には `.github/workflows/develop-distribution.yml` により、
-GA readiness（3連続 pass）を満たした場合のみ Windows portable 配布物が自動生成・artifact 化されます。
+GA readiness（通常は nightly の 3連続 pass）を満たした場合に Windows portable 配布物が自動生成・artifact 化されます。
+nightly GA history artifact が未生成の場合は、同 workflow 内で smoke/download/GA gate を実行した
+fallback 判定（required consecutive passes = 1）に成功したときも生成されます。
 
 ### GA 証跡の参照導線（GA-T3）
 

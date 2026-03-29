@@ -170,7 +170,19 @@ def run_pause_resume_checksum_case(
 ) -> DownloadCaseResult:
     enqueue = session.request("enqueue_download", {"url": f"{base_url}/attachment.bin"})
     entry = enqueue.get("payload", {})
-    download_id = int(entry["id"])
+    raw_id = entry.get("id")
+    if raw_id is None:
+        # Keep CI diagnostics actionable when IPC payload contracts drift.
+        # The request/response exchange uses JSON object member lookup semantics;
+        # missing members should be handled defensively instead of crashing with
+        # KeyError so callers receive structured regression results.
+        # Ref: RFC 8259, Section 4 (Objects are unordered name/value pairs).
+        return DownloadCaseResult(
+            "pause_resume_checksum",
+            False,
+            f"enqueue_download payload missing id: {json.dumps(entry, ensure_ascii=False)}",
+        )
+    download_id = int(raw_id)
 
     # RFC 9110 §9.2.2 allows retrying idempotent methods such as GET.
     # We pause after measurable progress and then resume the same GET transfer.
@@ -213,14 +225,30 @@ def run_pause_resume_checksum_case(
 
 def run_retry_case(session: IpcSession, *, base_url: str, timeout_sec: int) -> DownloadCaseResult:
     first = session.request("enqueue_download", {"url": f"{base_url}/attachment.bin"})
-    first_id = int(first.get("payload", {}).get("id"))
+    first_payload = first.get("payload", {})
+    first_raw_id = first_payload.get("id")
+    if first_raw_id is None:
+        return DownloadCaseResult(
+            "retry_after_cancel",
+            False,
+            f"first enqueue_download payload missing id: {json.dumps(first_payload, ensure_ascii=False)}",
+        )
+    first_id = int(first_raw_id)
     session.request("cancel_download", {"id": first_id})
     cancelled, _ = wait_for_terminal_state(session, first_id, timeout_sec)
     if cancelled.get("state") != "cancelled":
         return DownloadCaseResult("retry_after_cancel", False, "cancel did not settle to cancelled")
 
     retried = session.request("enqueue_download", {"url": f"{base_url}/attachment.bin"})
-    retry_id = int(retried.get("payload", {}).get("id"))
+    retry_payload = retried.get("payload", {})
+    retry_raw_id = retry_payload.get("id")
+    if retry_raw_id is None:
+        return DownloadCaseResult(
+            "retry_after_cancel",
+            False,
+            f"retry enqueue_download payload missing id: {json.dumps(retry_payload, ensure_ascii=False)}",
+        )
+    retry_id = int(retry_raw_id)
     terminal, _ = wait_for_terminal_state(session, retry_id, timeout_sec)
     if terminal.get("state") != "completed":
         return DownloadCaseResult("retry_after_cancel", False, f"retry did not complete: {terminal.get('state')}")

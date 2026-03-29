@@ -71,6 +71,29 @@ jobs:
             --history-dir release-artifacts/ga-history \
             --report-out release-artifacts/release-streak-report.json \
             --required-consecutive-passes 3
+      - name: fallback GA snapshot on develop push when history is unavailable
+        id: fallback_ga_snapshot
+        if: steps.verify_ga_history.outputs.reports_found != '1'
+        run: |
+          # When nightly history is unavailable (e.g. first-day setup), run the
+          # same GA checks in this workflow so `develop` merges can still produce
+          # a portable build after passing mandatory gates.
+          # Ref: GitHub Actions workflow syntax (`if:` and step outcomes).
+          python3 scripts/run_smoke_regression.py --mode nightly --artifacts-dir smoke-artifacts/develop-distribution
+          python3 scripts/run_download_regression.py \
+            --artifacts-dir smoke-artifacts/develop-distribution \
+            --fixture-size-mib 64 \
+            --timeout-sec 240
+          python3 scripts/collect_legacy_command_usage.py \
+            --output smoke-artifacts/develop-distribution/legacy-command-usage.json
+          python3 scripts/evaluate_release_gate.py \
+            --kpi-summary smoke-artifacts/develop-distribution/kpi_summary.json \
+            --layout-summary smoke-artifacts/develop-distribution/layout_regression_summary.json \
+            --legacy-usage-summary smoke-artifacts/develop-distribution/legacy-command-usage.json \
+            --download-summary smoke-artifacts/develop-distribution/download_regression_summary.json \
+            --crash-report smoke-artifacts/develop-distribution/latest_crash_report.json \
+            --report-out release-artifacts/release-streak-report.json \
+            --required-consecutive-passes 1
       - name: set GA readiness output
         id: set_ga_ready
         if: always()
@@ -85,6 +108,9 @@ jobs:
           ready="false"
           if [ "${{ steps.verify_ga_history.outputs.reports_found }}" = "1" ] && \
              [ "${{ steps.check_release_streak.outcome }}" = "success" ]; then
+            ready="true"
+          elif [ "${{ steps.verify_ga_history.outputs.reports_found }}" != "1" ] && \
+               [ "${{ steps.fallback_ga_snapshot.outcome }}" = "success" ]; then
             ready="true"
           fi
           echo "ready=${ready}" >> "$GITHUB_OUTPUT"
