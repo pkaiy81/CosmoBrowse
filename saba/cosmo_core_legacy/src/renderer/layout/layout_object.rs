@@ -1,3 +1,11 @@
+// Spec: CSS Box Model — margin/border/padding/content areas and box sizing.
+// https://www.w3.org/TR/css-box-4/
+// Spec: CSS Display — outer/inner display types and block/inline formatting contexts.
+// https://www.w3.org/TR/css-display-3/
+// Spec: CSS Cascade — specificity, origin, and inheritance resolution order.
+// https://www.w3.org/TR/css-cascade-5/
+// Spec: CSS Values and Units — length units (px, em, rem, vh, vw) and numeric types.
+// https://www.w3.org/TR/css-values-4/
 use crate::constants::CHAR_HEIGHT_WITH_PADDING;
 use crate::constants::CHAR_WIDTH;
 use crate::display_item::ClipRect;

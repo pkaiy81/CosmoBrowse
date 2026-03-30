@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Spec: JSON Schema draft 2020-12 — $schema, type, enum, const, required, properties keywords.
+# https://json-schema.org/draft/2020-12/json-schema-core
 import json
 from pathlib import Path
 
