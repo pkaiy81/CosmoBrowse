@@ -55,11 +55,12 @@ def api_get(url: str, token: str) -> Any:
 def download_bytes(url: str, token: str) -> bytes:
     headers = {
         "Authorization": f"Bearer {token}",
-        # GitHub Actions artifact download endpoints return ZIP payloads.
-        # RFC 9110 (HTTP Semantics), Section 12.5.1 (Accept), allows clients
-        # to explicitly express representation preferences; we request binary
-        # content here instead of GitHub API JSON media types.
-        "Accept": "application/octet-stream",
+        # GitHub Actions artifact archive_download_url is an API endpoint that
+        # returns a 302 redirect to blob storage. The API itself requires the
+        # standard GitHub JSON media type; sending application/octet-stream
+        # causes a 415 (Unsupported Media Type) rejection.
+        # Ref: GitHub REST API docs (actions/artifacts download endpoint).
+        "Accept": "application/vnd.github+json",
         "User-Agent": "CosmoBrowse-GA-History-Downloader",
     }
     request = urllib.request.Request(url, headers=headers)
@@ -69,10 +70,11 @@ def download_bytes(url: str, token: str) -> bytes:
     except urllib.error.HTTPError as exc:
         # GitHub may redirect archive downloads to storage backends on a
         # different host. In that case, forwarding an OAuth bearer token can be
-        # rejected by the backend (401). RFC 9110, Section 15.4 (Redirection 3xx),
-        # permits user agents to reissue redirected requests; we conservatively
-        # retry once without Authorization only for 401 responses.
-        if exc.code != 401:
+        # rejected by the backend (401). The redirect target may also reject
+        # the GitHub-specific Accept header (415). RFC 9110, Section 15.4
+        # (Redirection 3xx), permits user agents to reissue redirected requests;
+        # we conservatively retry once without Authorization for 401/415.
+        if exc.code not in (401, 415):
             raise
         unauth_headers = {
             "Accept": "application/octet-stream",
