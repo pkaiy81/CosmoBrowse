@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -52,16 +53,33 @@ def api_get(url: str, token: str) -> Any:
 
 
 def download_bytes(url: str, token: str) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
+    headers = {
+        "Authorization": f"Bearer {token}",
+        # GitHub Actions artifact download endpoints return ZIP payloads.
+        # RFC 9110 (HTTP Semantics), Section 12.5.1 (Accept), allows clients
+        # to explicitly express representation preferences; we request binary
+        # content here instead of GitHub API JSON media types.
+        "Accept": "application/octet-stream",
+        "User-Agent": "CosmoBrowse-GA-History-Downloader",
+    }
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        # GitHub may redirect archive downloads to storage backends on a
+        # different host. In that case, forwarding an OAuth bearer token can be
+        # rejected by the backend (401). RFC 9110, Section 15.4 (Redirection 3xx),
+        # permits user agents to reissue redirected requests; we conservatively
+        # retry once without Authorization only for 401 responses.
+        if exc.code != 401:
+            raise
+        unauth_headers = {
+            "Accept": "application/octet-stream",
             "User-Agent": "CosmoBrowse-GA-History-Downloader",
-        },
-    )
-    with urllib.request.urlopen(request) as response:
-        return response.read()
+        }
+        with urllib.request.urlopen(urllib.request.Request(url, headers=unauth_headers)) as response:
+            return response.read()
 
 
 def load_json_if_exists(path: Path) -> Any:
