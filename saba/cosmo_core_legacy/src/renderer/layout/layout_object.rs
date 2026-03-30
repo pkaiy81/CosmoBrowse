@@ -154,26 +154,37 @@ fn parse_dimension_attr(value: Option<String>) -> Option<i64> {
 fn measure_text_width(text: &str, font_size: FontSize) -> i64 {
     text.len() as i64 * CHAR_WIDTH * font_ratio(font_size)
 }
-fn find_index_for_line_break(line: String, max_index: usize) -> usize {
-    let chars = line.chars().collect::<Vec<char>>();
-    let upper = max_index.min(chars.len().saturating_sub(1));
+/// Find a byte index suitable for line breaking at or before `max_char_index`
+/// characters. Returns a byte offset safe for `str::split_at`.
+fn find_byte_index_for_line_break(line: &str, max_char_index: usize) -> usize {
+    let char_indices: Vec<(usize, char)> = line.char_indices().collect();
+    let upper = max_char_index.min(char_indices.len().saturating_sub(1));
+    // Prefer breaking at a space.
     for i in (0..=upper).rev() {
-        if chars[i] == ' ' {
-            return i;
+        if char_indices[i].1 == ' ' || char_indices[i].1 == '\u{3000}' {
+            return char_indices[i].0;
         }
     }
-    max_index
+    // No space found; break at the character boundary.
+    if upper + 1 < char_indices.len() {
+        char_indices[upper + 1].0
+    } else {
+        line.len()
+    }
 }
 
 fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
     let mut result: Vec<String> = vec![];
     let safe_width = max_width.max(char_width).max(1);
-    if line.len() as i64 * char_width > safe_width {
-        let split_index =
-            find_index_for_line_break(line.clone(), (safe_width / char_width).max(1) as usize);
-        let s = line.split_at(split_index.min(line.len()));
-        result.push(s.0.to_string());
-        result.extend(split_text(s.1.trim().to_string(), char_width, safe_width));
+    let char_count = line.chars().count();
+    if char_count as i64 * char_width > safe_width {
+        let max_chars = (safe_width / char_width).max(1) as usize;
+        let split_byte =
+            find_byte_index_for_line_break(&line, max_chars);
+        let split_byte = split_byte.min(line.len());
+        let (left, right) = line.split_at(split_byte);
+        result.push(left.to_string());
+        result.extend(split_text(right.trim().to_string(), char_width, safe_width));
     } else if !line.is_empty() {
         result.push(line);
     }
