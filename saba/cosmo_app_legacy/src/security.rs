@@ -56,6 +56,8 @@ pub fn is_same_origin(source: &str, target: &str) -> bool {
     source_origin == target_origin
 }
 
+// Spec: Mixed Content W3C — blocking optionally-blockable mixed content from HTTPS contexts.
+// https://www.w3.org/TR/mixed-content/
 pub fn enforce_mixed_content_policy(initiator_url: &str, target_url: &str) -> AppResult<()> {
     let initiator = Url::parse(initiator_url)
         .map_err(|error| AppError::validation(format!("Invalid initiator URL: {error}")))?;

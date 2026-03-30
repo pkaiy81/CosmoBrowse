@@ -4,4 +4,6 @@ build
 artifacts/
 Makefile
 Cargo.lock
+smoke-artifacts/
+release-artifacts/
 

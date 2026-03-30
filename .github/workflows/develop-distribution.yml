@@ -15,6 +15,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: download recent nightly GA history
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
