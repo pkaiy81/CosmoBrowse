@@ -52,36 +52,54 @@ def api_get(url: str, token: str) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Suppress automatic redirect following so we can strip Authorization."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 def download_bytes(url: str, token: str) -> bytes:
-    headers = {
+    # GitHub Actions artifact archive_download_url returns a 302 redirect to
+    # blob storage. urllib's default redirect handler forwards all headers
+    # (including Authorization) to the redirect target, which rejects the
+    # GitHub bearer token with 401. We disable auto-redirect, extract the
+    # Location header, and fetch the blob URL without Authorization.
+    # Ref: GitHub REST API docs (actions/artifacts download endpoint);
+    #      RFC 9110, Section 15.4 (Redirection 3xx).
+    opener = urllib.request.build_opener(_NoRedirect)
+    api_headers = {
         "Authorization": f"Bearer {token}",
-        # GitHub Actions artifact archive_download_url is an API endpoint that
-        # returns a 302 redirect to blob storage. The API itself requires the
-        # standard GitHub JSON media type; sending application/octet-stream
-        # causes a 415 (Unsupported Media Type) rejection.
-        # Ref: GitHub REST API docs (actions/artifacts download endpoint).
         "Accept": "application/vnd.github+json",
         "User-Agent": "CosmoBrowse-GA-History-Downloader",
     }
-    request = urllib.request.Request(url, headers=headers)
+    request = urllib.request.Request(url, headers=api_headers)
     try:
-        with urllib.request.urlopen(request) as response:
-            return response.read()
+        response = opener.open(request)
+        # If the API returned content directly (no redirect), use it.
+        return response.read()
     except urllib.error.HTTPError as exc:
-        # GitHub may redirect archive downloads to storage backends on a
-        # different host. In that case, forwarding an OAuth bearer token can be
-        # rejected by the backend (401). The redirect target may also reject
-        # the GitHub-specific Accept header (415). RFC 9110, Section 15.4
-        # (Redirection 3xx), permits user agents to reissue redirected requests;
-        # we conservatively retry once without Authorization for 401/415.
-        if exc.code not in (401, 415):
+        if exc.code not in (301, 302, 303, 307, 308):
             raise
-        unauth_headers = {
-            "Accept": "application/octet-stream",
-            "User-Agent": "CosmoBrowse-GA-History-Downloader",
-        }
-        with urllib.request.urlopen(urllib.request.Request(url, headers=unauth_headers)) as response:
-            return response.read()
+        redirect_url = exc.headers.get("Location")
+        if not redirect_url:
+            raise
+    # Fetch the blob storage URL without Authorization.
+    blob_headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "CosmoBrowse-GA-History-Downloader",
+    }
+    blob_request = urllib.request.Request(redirect_url, headers=blob_headers)
+    with urllib.request.urlopen(blob_request) as response:
+        return response.read()
 
 
 def load_json_if_exists(path: Path) -> Any:
