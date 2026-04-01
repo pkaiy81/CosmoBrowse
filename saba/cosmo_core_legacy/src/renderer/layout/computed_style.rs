@@ -67,6 +67,7 @@ impl EdgeSize {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     background_color: Option<Color>,
+    background_image: Option<String>,
     color: Option<Color>,
     display: Option<DisplayType>,
     font_family: Option<String>,
@@ -85,6 +86,7 @@ pub struct ComputedStyle {
     position: Option<PositionType>,
     offset_top: Option<f64>,
     offset_left: Option<f64>,
+    text_align: Option<TextAlign>,
     z_index: Option<i32>,
     overflow_clip: Option<bool>,
 }
@@ -93,6 +95,7 @@ impl ComputedStyle {
     pub fn new() -> Self {
         Self {
             background_color: None,
+            background_image: None,
             color: None,
             display: None,
             font_family: None,
@@ -111,6 +114,7 @@ impl ComputedStyle {
             position: None,
             offset_top: None,
             offset_left: None,
+            text_align: None,
             z_index: None,
             overflow_clip: None,
         }
@@ -136,6 +140,10 @@ impl ComputedStyle {
             {
                 self.text_decoration = Some(parent_style.text_decoration());
             }
+            // text-align is inherited.
+            if self.text_align.is_none() && parent_style.text_align != Some(TextAlign::Left) {
+                self.text_align = parent_style.text_align;
+            }
             let parent_opacity = parent_style.opacity();
             if let Some(opacity) = self.opacity {
                 self.opacity = Some((opacity * parent_opacity).clamp(0.0, 1.0));
@@ -144,12 +152,42 @@ impl ComputedStyle {
             }
         }
 
+        // Handle HTML bgcolor and text attributes (presentational hints).
+        if self.background_color.is_none() {
+            if let Some(bgcolor) = get_element_attribute(node, "bgcolor") {
+                if let Some(color) = parse_html_color(&bgcolor) {
+                    self.background_color = Some(color);
+                }
+            }
+        }
+        // Handle HTML <body background="..."> attribute for tiled background image.
+        if self.background_image.is_none() {
+            if let Some(bg) = get_element_attribute(node, "background") {
+                if !bg.is_empty() {
+                    self.background_image = Some(bg);
+                }
+            }
+        }
+
+        if self.color.is_none() {
+            // <body text="..."> or <font color="...">
+            let color_attr = get_element_attribute(node, "text")
+                .or_else(|| get_element_attribute(node, "color"));
+            if let Some(color_val) = color_attr {
+                if let Some(color) = parse_html_color(&color_val) {
+                    self.color = Some(color);
+                }
+            }
+        }
+
         if self.background_color.is_none() {
             self.background_color = Some(match node.borrow().element_kind() {
                 Some(ElementKind::Button) | Some(ElementKind::Img) | Some(ElementKind::Input) => {
                     Color::lightgray()
                 }
-                _ => Color::white(),
+                Some(ElementKind::Body) => Color::white(),
+                // Use transparent default so parent backgrounds (e.g. body bgcolor) show through.
+                _ => Color::transparent(),
             });
         }
         if self.color.is_none() {
@@ -176,11 +214,52 @@ impl ComputedStyle {
         if self.width.is_none() {
             self.width = Some(0.0);
         }
+        // Handle HTML align attribute (presentational hint).
+        if let Some(align) = get_element_attribute(node, "align") {
+            if align.eq_ignore_ascii_case("center") {
+                self.margin_left_auto = true;
+                self.margin_right_auto = true;
+                if self.text_align.is_none() {
+                    self.text_align = Some(TextAlign::Center);
+                }
+            } else if align.eq_ignore_ascii_case("right") {
+                if self.text_align.is_none() {
+                    self.text_align = Some(TextAlign::Right);
+                }
+            }
+        }
+        // <center> tag implies text-align: center for children.
+        if node.borrow().element_kind() == Some(ElementKind::Center) && self.text_align.is_none() {
+            self.text_align = Some(TextAlign::Center);
+        }
+        // Block children of <center> should be horizontally centered (margin auto).
+        {
+            let parent_is_center = node
+                .borrow()
+                .parent()
+                .upgrade()
+                .map(|p| p.borrow().element_kind() == Some(ElementKind::Center))
+                .unwrap_or(false);
+            if parent_is_center {
+                if let NodeKind::Element(ref e) = node.borrow().kind() {
+                    if e.is_block_element() {
+                        self.margin_left_auto = true;
+                        self.margin_right_auto = true;
+                    }
+                }
+            }
+        }
+
         if self.margin.is_none() {
             self.margin = Some(EdgeSize::zero());
         }
         if self.padding.is_none() {
-            self.padding = Some(EdgeSize::zero());
+            // Default padding-left for list containers (UA stylesheet).
+            if node.borrow().element_kind() == Some(ElementKind::Ul) {
+                self.padding = Some(EdgeSize::from_values(0.0, 0.0, 0.0, 40.0));
+            } else {
+                self.padding = Some(EdgeSize::zero());
+            }
         }
         if self.position.is_none() {
             self.position = Some(PositionType::Static);
@@ -193,6 +272,9 @@ impl ComputedStyle {
         }
         if self.offset_left.is_none() {
             self.offset_left = Some(0.0);
+        }
+        if self.text_align.is_none() {
+            self.text_align = Some(TextAlign::Left);
         }
         if self.z_index.is_none() {
             self.z_index = Some(0);
@@ -210,6 +292,18 @@ impl ComputedStyle {
         self.background_color
             .clone()
             .expect("failed to access CSS property: background-color")
+    }
+
+    pub fn background_image(&self) -> Option<&str> {
+        self.background_image.as_deref()
+    }
+
+    pub fn text_align(&self) -> TextAlign {
+        self.text_align.unwrap_or(TextAlign::Left)
+    }
+
+    pub fn set_text_align(&mut self, text_align: TextAlign) {
+        self.text_align = Some(text_align);
     }
 
     pub fn set_color(&mut self, color: Color) {
@@ -443,6 +537,7 @@ impl Color {
             "aqua" => "#00ffff".to_string(),
             "orange" => "#ffa500".to_string(),
             "lightgray" => "#d3d3d3".to_string(),
+            "transparent" => "#00000000".to_string(),
             _ => {
                 return Err(Error::UnexpectedInput(format!(
                     "color name {:?} is not supported yet",
@@ -525,6 +620,13 @@ impl Color {
         }
     }
 
+    pub fn transparent() -> Self {
+        Self {
+            name: Some("transparent".to_string()),
+            code: "#00000000".to_string(),
+        }
+    }
+
     pub fn black() -> Self {
         Self {
             name: Some("black".to_string()),
@@ -561,6 +663,7 @@ impl FontSize {
             NodeKind::Element(element) => match element.kind() {
                 ElementKind::H1 => FontSize::XXLarge,
                 ElementKind::H2 => FontSize::XLarge,
+                ElementKind::H3 => FontSize::XLarge,
                 _ => FontSize::Medium,
             },
             _ => FontSize::Medium,
@@ -680,5 +783,35 @@ impl TextDecoration {
                 value
             ))),
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+fn get_element_attribute(node: &Rc<RefCell<Node>>, name: &str) -> Option<String> {
+    match node.borrow().kind() {
+        NodeKind::Element(ref element) => element.get_attribute(name),
+        _ => None,
+    }
+}
+
+fn parse_html_color(value: &str) -> Option<Color> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('#') {
+        Color::from_code(trimmed).ok()
+    } else {
+        Color::from_name(trimmed).ok().or_else(|| {
+            // Try as bare hex code (e.g., "d2b48c" without #).
+            if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                Color::from_code(&format!("#{}", trimmed)).ok()
+            } else {
+                None
+            }
+        })
     }
 }

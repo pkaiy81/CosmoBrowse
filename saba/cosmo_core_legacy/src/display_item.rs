@@ -47,4 +47,14 @@ pub enum DisplayItem {
         paint_order: PaintOrder,
         clip_rect: Option<ClipRect>,
     },
+    Image {
+        src: String,
+        alt: String,
+        layout_point: LayoutPoint,
+        layout_size: LayoutSize,
+        style: ComputedStyle,
+        href: Option<String>,
+        paint_order: PaintOrder,
+        clip_rect: Option<ClipRect>,
+    },
 }

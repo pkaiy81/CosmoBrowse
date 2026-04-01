@@ -258,6 +258,7 @@ pub enum SceneItem {
         width: i64,
         height: i64,
         background_color: String,
+        background_image: Option<String>,
         opacity: f64,
         z_index: i32,
         clip_rect: Option<(i64, i64, i64, i64)>,

@@ -52,6 +52,7 @@ pub struct DrawRect {
     pub width: i64,
     pub height: i64,
     pub background_color: String,
+    pub background_image: Option<String>,
     pub opacity: f64,
     pub z_index: i32,
     pub clip_rect: Option<(i64, i64, i64, i64)>,

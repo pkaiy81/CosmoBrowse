@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use app_bridge::AppBridge;
 use hit_test::hit_test;
-use painter::render_commands;
+use painter::{render_commands, ImageCache};
 use text_render::TextRenderer;
 use ui_chrome::{ChromeAction, ChromeState, CHROME_HEIGHT};
 use winit::{
@@ -35,6 +35,7 @@ struct WindowState {
 struct App {
     window_state: Option<WindowState>,
     text_renderer: TextRenderer,
+    image_cache: ImageCache,
     bridge: AppBridge,
     chrome: ChromeState,
     scroll_y: i64,
@@ -52,6 +53,7 @@ impl App {
         Self {
             window_state: None,
             text_renderer: TextRenderer::new(),
+            image_cache: ImageCache::new(),
             bridge: AppBridge::new(),
             chrome: ChromeState::new(),
             scroll_y: 0,
@@ -72,12 +74,14 @@ impl App {
     }
 
     fn navigate(&mut self, url: &str) {
+
         self.status_message = format!("Loading {}...", url);
         self.needs_redraw = true;
         self.redraw();
 
         match self.bridge.navigate(url) {
             Ok(()) => {
+
                 self.chrome.set_url(&self.bridge.current_url());
                 self.scroll_y = 0;
                 self.status_message.clear();
@@ -92,10 +96,12 @@ impl App {
                 }
             }
             Err(e) => {
+
                 self.status_message = format!("Error: {}", e);
             }
         }
         self.needs_redraw = true;
+        self.request_redraw();
     }
 
     fn redraw(&mut self) {
@@ -128,12 +134,15 @@ impl App {
 
         // Draw page content.
         let mut all_hit_regions = Vec::new();
+        let base_url = self.bridge.current_url();
         let frame_commands = self.bridge.collect_paint_commands();
         for (frame_id, commands) in &frame_commands {
             let regions = render_commands(
                 &mut pixmap,
                 commands,
                 &mut self.text_renderer,
+                &mut self.image_cache,
+                &base_url,
                 self.scroll_y,
                 CHROME_HEIGHT,
                 frame_id,

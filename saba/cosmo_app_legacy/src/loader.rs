@@ -213,7 +213,7 @@ fn fetch_with_pipeline(
         diagnostics.extend(apply_set_cookie_headers(&headers, &current_url));
         diagnostics.push(format!("HTTP GET {} -> {}", current_url, status));
 
-        if status.is_redirection() {
+        if status.is_redirection() && status.as_u16() != 304 {
             if redirect_count >= MAX_REDIRECTS {
                 return Err(AppError::network_redirect_loop(format!(
                     "Redirect limit exceeded while fetching {}",
@@ -242,9 +242,11 @@ fn fetch_with_pipeline(
                     "cache hit with 304 Not Modified for {}",
                     current_url
                 ));
+                // Cached HTML is already decoded to UTF-8, so force charset=utf-8
+                // to prevent double-decoding (e.g. Shift_JIS → UTF-8 → Shift_JIS mojibake).
                 return Ok(FetchResponse {
                     final_url: entry.final_url,
-                    content_type: entry.content_type,
+                    content_type: Some("text/html; charset=utf-8".to_string()),
                     body: entry.html.into_bytes(),
                     diagnostics: diagnostics.clone(),
                     headers,

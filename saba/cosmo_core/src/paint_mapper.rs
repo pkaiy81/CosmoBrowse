@@ -1,6 +1,6 @@
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use crate::paint_commands::{DrawRect, DrawText, PaintCommand, PaintCommandList};
+use crate::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList};
 
 use crate::nebula_renderer::layout::computed_style::TextDecoration;
 use crate::stardust_display::DisplayItem;
@@ -34,6 +34,7 @@ pub fn map_display_items_to_paint_commands(
                     width: layout_size.width(),
                     height: layout_size.height(),
                     background_color: style.background_color().code().to_string(),
+                    background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
@@ -78,6 +79,30 @@ pub fn map_display_items_to_paint_commands(
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 }));
             }
+            DisplayItem::Image {
+                src,
+                alt,
+                layout_point,
+                layout_size,
+                style,
+                href,
+                paint_order,
+                clip_rect,
+            } => {
+                commands.push(PaintCommand::DrawImage(DrawImage {
+                    x: origin_x + layout_point.x(),
+                    y: origin_y + layout_point.y(),
+                    width: layout_size.width(),
+                    height: layout_size.height(),
+                    src: src.clone(),
+                    alt: alt.clone(),
+                    opacity: style.opacity(),
+                    href: href.clone(),
+                    target: None,
+                    z_index: paint_order.z_index,
+                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                }));
+            }
         }
     }
 
@@ -90,6 +115,7 @@ pub fn map_display_items_to_paint_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use crate::nebula_renderer::layout::computed_style::{Color, ComputedStyle, FontSize, TextDecoration};
     use crate::nebula_renderer::layout::layout_object::{LayoutPoint, LayoutSize};
     use crate::stardust_display::PaintOrder;

@@ -162,6 +162,14 @@ impl Page {
                     width = width.max(layout_point.x() + text_width);
                     height = height.max(layout_point.y() + style.font_size().px() + 4);
                 }
+                DisplayItem::Image {
+                    layout_point,
+                    layout_size,
+                    ..
+                } => {
+                    width = width.max(layout_point.x() + layout_size.width());
+                    height = height.max(layout_point.y() + layout_size.height());
+                }
             }
         }
         LayoutSize::new(width, height)

@@ -1,17 +1,12 @@
-/// Minimal text rasterizer using fontdue with a bundled monospace font.
+/// Text rasterizer using fontdue with font fallback chain.
 
 use fontdue::{Font, FontSettings};
 use tiny_skia::Pixmap;
 
-// Embed a minimal monospace font. We use the SIL Open Font License "DejaVu Sans Mono"
-// subset or any freely redistributable TTF. For bootstrap, use the built-in fontdue
-// rasterizer with whatever system font we can find, falling back to a hardcoded glyph set.
-//
-// For the initial implementation we generate glyphs on the fly and cache them.
 use std::collections::HashMap;
 
 pub struct TextRenderer {
-    font: Font,
+    fonts: Vec<Font>,
     glyph_cache: HashMap<(char, u32), GlyphBitmap>,
 }
 
@@ -26,15 +21,9 @@ struct GlyphBitmap {
 
 impl TextRenderer {
     pub fn new() -> Self {
-        // Try to load a system font; fall back to a built-in minimal font.
-        let font_data = find_system_font();
-        let font = Font::from_bytes(
-            font_data.as_slice(),
-            FontSettings::default(),
-        )
-        .expect("Failed to load font");
+        let fonts = load_font_chain();
         Self {
-            font,
+            fonts,
             glyph_cache: HashMap::new(),
         }
     }
@@ -93,7 +82,31 @@ impl TextRenderer {
         let key = (ch, font_px);
         if !self.glyph_cache.contains_key(&key) {
             let px = font_px as f32;
-            let (metrics, bitmap) = self.font.rasterize(ch, px);
+
+            // Try each font in the chain; use the first one that produces a real glyph.
+            let mut best_metrics = None;
+            let mut best_bitmap = None;
+            for font in &self.fonts {
+                // Check if this font has the glyph (not .notdef).
+                let glyph_index = font.lookup_glyph_index(ch);
+                if glyph_index == 0 && ch != '\0' {
+                    continue; // .notdef — try next font
+                }
+                let (metrics, bitmap) = font.rasterize(ch, px);
+                // Accept if it has actual pixels or if it's a space-like character.
+                if metrics.width > 0 || ch.is_whitespace() || metrics.advance_width > 0.0 {
+                    best_metrics = Some(metrics);
+                    best_bitmap = Some(bitmap);
+                    break;
+                }
+            }
+
+            // Final fallback: rasterize from first font even if .notdef.
+            let (metrics, bitmap) = match (best_metrics, best_bitmap) {
+                (Some(m), Some(b)) => (m, b),
+                _ => self.fonts[0].rasterize(ch, px),
+            };
+
             self.glyph_cache.insert(key, GlyphBitmap {
                 width: metrics.width as u32,
                 height: metrics.height as u32,
@@ -122,7 +135,6 @@ fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) 
         data[idx + 2] = b;
         data[idx + 3] = 255;
     } else {
-        // Alpha compositing (src over dst), premultiplied.
         let sa = a as u32;
         let da = 255 - sa;
         data[idx] = ((r as u32 * sa + data[idx] as u32 * da) / 255) as u8;
@@ -132,52 +144,107 @@ fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) 
     }
 }
 
-fn find_system_font() -> Vec<u8> {
-    // Try common system font paths.
-    let candidates = [
-        // Linux
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-        // macOS
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/System/Library/Fonts/SFMono-Regular.otf",
-        // Windows
-        "C:\\Windows\\Fonts\\consola.ttf",
-        "C:\\Windows\\Fonts\\cour.ttf",
-        "C:\\Windows\\Fonts\\lucon.ttf",
-    ];
+fn load_font_chain() -> Vec<Font> {
+    let mut fonts = Vec::new();
 
-    for path in &candidates {
-        if let Ok(data) = std::fs::read(path) {
-            if !data.is_empty() {
-                return data;
+    // Latin/symbol font (primary).
+    let latin_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Monaco.ttf",
+        "C:\\Windows\\Fonts\\consola.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ];
+    if let Some(font) = try_load_font(&latin_candidates) {
+        eprintln!("[FONT] Primary (Latin) loaded");
+        fonts.push(font);
+    }
+
+    // CJK font (fallback for Japanese/Chinese/Korean).
+    let cjk_candidates = [
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
+        "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
+        "/usr/share/fonts/truetype/ipa/ipag.ttf",
+        "/usr/share/fonts/truetype/ipa/ipagp.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\YuGothR.ttc",
+    ];
+    if let Some(font) = try_load_font(&cjk_candidates) {
+        eprintln!("[FONT] Fallback (CJK) loaded");
+        fonts.push(font);
+    }
+
+    if fonts.is_empty() {
+        // Absolute fallback: try any .ttf in font directories.
+        for dir in &["/usr/share/fonts/truetype", "C:\\Windows\\Fonts", "/System/Library/Fonts"] {
+            if let Some(font) = find_any_ttf_in_dir(dir) {
+                eprintln!("[FONT] Emergency fallback loaded from {}", dir);
+                fonts.push(font);
+                break;
             }
         }
     }
 
-    // Absolute fallback: use any .ttf we can find in common font directories.
-    for dir in &[
-        "/usr/share/fonts",
-        "C:\\Windows\\Fonts",
-        "/System/Library/Fonts",
-    ] {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "ttf") {
-                    if let Ok(data) = std::fs::read(&path) {
-                        if !data.is_empty() {
-                            return data;
-                        }
+    if fonts.is_empty() {
+        panic!("No system font found. Please install DejaVu Sans or any TTF font.");
+    }
+
+    fonts
+}
+
+fn try_load_font(candidates: &[&str]) -> Option<Font> {
+    for path in candidates {
+        if let Ok(data) = std::fs::read(path) {
+            if data.is_empty() {
+                continue;
+            }
+            // Try default collection index first, then index 0 explicitly.
+            for idx in [0u32, 1, 2, 3] {
+                let settings = FontSettings {
+                    collection_index: idx,
+                    scale: 40.0,
+                    load_substitutions: false,
+                };
+                if let Ok(font) = Font::from_bytes(data.as_slice(), settings) {
+                    // Verify the font can actually rasterize a basic character.
+                    let (metrics, _) = font.rasterize('A', 16.0);
+                    if metrics.advance_width > 0.0 {
+                        eprintln!("[FONT]   {} (index {})", path, idx);
+                        return Some(font);
                     }
                 }
             }
         }
     }
+    None
+}
 
-    panic!("No system font found. Please install DejaVu Sans Mono or any TTF font.");
+fn find_any_ttf_in_dir(dir: &str) -> Option<Font> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(font) = find_any_ttf_in_dir(&path.to_string_lossy()) {
+                return Some(font);
+            }
+            continue;
+        }
+        if path.extension().is_some_and(|ext| ext == "ttf") {
+            if let Ok(data) = std::fs::read(&path) {
+                if let Ok(font) = Font::from_bytes(data.as_slice(), FontSettings::default()) {
+                    let (metrics, _) = font.rasterize('A', 16.0);
+                    if metrics.advance_width > 0.0 {
+                        return Some(font);
+                    }
+                }
+            }
+        }
+    }
+    None
 }

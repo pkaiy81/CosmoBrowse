@@ -71,8 +71,7 @@ impl AppBridge {
             .unwrap_or_default()
     }
 
-    /// Collect all paint commands from all frames (root + children), with
-    /// frame offsets applied.
+    /// Collect all paint commands from all frames (root + children).
     pub fn collect_paint_commands(&self) -> Vec<(String, Vec<PaintCommand>)> {
         let Some(page) = &self.current_page else {
             return Vec::new();
@@ -87,61 +86,12 @@ fn collect_frame_commands(
     frame: &BrowserFrameDto,
     out: &mut Vec<(String, Vec<PaintCommand>)>,
 ) {
-    // Apply frame rect offset to each paint command.
-    let offset_x = frame.rect.x;
-    let offset_y = frame.rect.y;
-
-    let adjusted: Vec<PaintCommand> = frame
-        .paint_commands
-        .iter()
-        .map(|cmd| offset_command(cmd, offset_x, offset_y))
-        .collect();
-
-    out.push((frame.id.clone(), adjusted));
+    // Paint commands already have frame-absolute coordinates applied by
+    // display_items_to_scene(), so no additional offset is needed here.
+    out.push((frame.id.clone(), frame.paint_commands.clone()));
 
     for child in &frame.child_frames {
         collect_frame_commands(child, out);
     }
 }
 
-fn offset_command(cmd: &PaintCommand, dx: i64, dy: i64) -> PaintCommand {
-    match cmd {
-        PaintCommand::DrawRect(r) => PaintCommand::DrawRect(cosmo_core::paint_commands::DrawRect {
-            x: r.x + dx,
-            y: r.y + dy,
-            width: r.width,
-            height: r.height,
-            background_color: r.background_color.clone(),
-            opacity: r.opacity,
-            z_index: r.z_index,
-            clip_rect: r.clip_rect.map(|(cx, cy, cw, ch)| (cx + dx, cy + dy, cw, ch)),
-        }),
-        PaintCommand::DrawText(t) => PaintCommand::DrawText(cosmo_core::paint_commands::DrawText {
-            x: t.x + dx,
-            y: t.y + dy,
-            text: t.text.clone(),
-            color: t.color.clone(),
-            font_px: t.font_px,
-            font_family: t.font_family.clone(),
-            underline: t.underline,
-            opacity: t.opacity,
-            href: t.href.clone(),
-            target: t.target.clone(),
-            z_index: t.z_index,
-            clip_rect: t.clip_rect.map(|(cx, cy, cw, ch)| (cx + dx, cy + dy, cw, ch)),
-        }),
-        PaintCommand::DrawImage(img) => PaintCommand::DrawImage(cosmo_core::paint_commands::DrawImage {
-            x: img.x + dx,
-            y: img.y + dy,
-            width: img.width,
-            height: img.height,
-            src: img.src.clone(),
-            alt: img.alt.clone(),
-            opacity: img.opacity,
-            href: img.href.clone(),
-            target: img.target.clone(),
-            z_index: img.z_index,
-            clip_rect: img.clip_rect.map(|(cx, cy, cw, ch)| (cx + dx, cy + dy, cw, ch)),
-        }),
-    }
-}

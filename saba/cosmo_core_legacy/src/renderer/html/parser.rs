@@ -79,6 +79,51 @@ impl HtmlParser {
         }
     }
 
+    /// Implicitly close elements that should be closed when a new element
+    /// of the same kind (or an element that implies closing) is opened.
+    /// Ref: HTML spec — optional end tags for td, th, tr, li, p, dt, dd.
+    fn close_implicit(&mut self, new_tag: &str) {
+        match new_tag {
+            "td" | "th" => {
+                // Close any open td/th (and intervening inline elements like <font>).
+                if self.contain_in_stack(ElementKind::Td) {
+                    self.pop_until(ElementKind::Td);
+                } else if self.contain_in_stack(ElementKind::Th) {
+                    self.pop_until(ElementKind::Th);
+                }
+            }
+            "tr" => {
+                // Close any open td/th first, then any open tr.
+                if self.contain_in_stack(ElementKind::Td) {
+                    self.pop_until(ElementKind::Td);
+                } else if self.contain_in_stack(ElementKind::Th) {
+                    self.pop_until(ElementKind::Th);
+                }
+                if self.contain_in_stack(ElementKind::Tr) {
+                    self.pop_until(ElementKind::Tr);
+                }
+            }
+            "li" => {
+                if self.contain_in_stack(ElementKind::Li) {
+                    self.pop_until(ElementKind::Li);
+                }
+            }
+            "p" => {
+                if self.contain_in_stack(ElementKind::P) {
+                    self.pop_until(ElementKind::P);
+                }
+            }
+            "dt" | "dd" => {
+                if self.contain_in_stack(ElementKind::Dt) {
+                    self.pop_until(ElementKind::Dt);
+                } else if self.contain_in_stack(ElementKind::Dd) {
+                    self.pop_until(ElementKind::Dd);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn pop_current_node(&mut self, element_kind: ElementKind) -> bool {
         let current = match self.stack_of_open_elements.last() {
             Some(n) => n,
@@ -134,22 +179,33 @@ impl HtmlParser {
         let node = Rc::new(RefCell::new(self.create_char(c))); // 4
 
         if current.borrow().first_child().is_some() {
-            // 5
-            current
-                .borrow()
-                .first_child()
-                .unwrap()
-                .borrow_mut()
-                .set_next_sibling(Some(node.clone())); // 6
+            // Traverse to the last sibling, then append the new text node.
+            let mut last_sibling = current.borrow().first_child();
+            loop {
+                last_sibling = match last_sibling {
+                    Some(ref n) => {
+                        if n.borrow().next_sibling().is_some() {
+                            n.borrow().next_sibling()
+                        } else {
+                            break;
+                        }
+                    }
+                    None => break,
+                };
+            }
+            if let Some(ref last) = last_sibling {
+                last.borrow_mut().set_next_sibling(Some(node.clone()));
+                node.borrow_mut()
+                    .set_previous_sibling(Rc::downgrade(last));
+            }
         } else {
-            // 7
-            current.borrow_mut().set_first_child(Some(node.clone())); // 8
+            current.borrow_mut().set_first_child(Some(node.clone()));
         }
 
-        current.borrow_mut().set_last_child(Rc::downgrade(&node)); // 9
-        node.borrow_mut().set_parent(Rc::downgrade(&current)); // 10
+        current.borrow_mut().set_last_child(Rc::downgrade(&node));
+        node.borrow_mut().set_parent(Rc::downgrade(&current));
 
-        self.stack_of_open_elements.push(node); // 11
+        self.stack_of_open_elements.push(node);
     }
 
     fn create_element(&self, tag: &str, attributes: Vec<Attribute>) -> Node {
@@ -168,6 +224,14 @@ impl HtmlParser {
     // 11. Lastly, push the new node to the stack of open elements.
     // ref. https://html.spec.whatwg.org/multipage/parsing.html#insert-a-foreign-element
     fn insert_element(&mut self, tag: &str, attributes: Vec<Attribute>) {
+        // If the current node is a Text node, pop it first so that the new element
+        // becomes a sibling of the text rather than a child of it.
+        if let Some(top) = self.stack_of_open_elements.last() {
+            if matches!(top.borrow().kind(), NodeKind::Text(_)) {
+                self.stack_of_open_elements.pop();
+            }
+        }
+
         let window = self.window.borrow();
         let current = match self.stack_of_open_elements.last() {
             // 1
@@ -419,13 +483,17 @@ impl HtmlParser {
                             self_closing: _,
                             ref attributes,
                         }) => match tag.as_str() {
-                            "a" | "button" | "div" | "form" | "h1" | "h2" | "header" | "li"
-                            | "main" | "p" | "section" | "span" | "ul" => {
+                            "a" | "button" | "div" | "form" | "h1" | "h2" | "h3"
+                            | "header" | "li" | "main" | "p" | "section" | "span"
+                            | "ul" | "center" | "table" | "tr" | "td" | "th"
+                            | "font" | "b" | "i" | "strong" | "em" | "pre"
+                            | "blockquote" | "dl" | "dt" | "dd" => {
+                                self.close_implicit(tag);
                                 self.insert_element(tag, attributes.to_vec());
                                 token = self.t.next();
                                 continue;
                             }
-                            "img" | "input" => {
+                            "img" | "input" | "br" | "hr" => {
                                 self.insert_element(tag, attributes.to_vec());
                                 let element_kind = ElementKind::from_str(tag)
                                     .expect("failed to convert string to ElementKind");
@@ -457,8 +525,11 @@ impl HtmlParser {
                                     }
                                     continue;
                                 }
-                                "a" | "button" | "div" | "form" | "h1" | "h2" | "header" | "li"
-                                | "main" | "p" | "section" | "span" | "ul" => {
+                                "a" | "button" | "div" | "form" | "h1" | "h2" | "h3"
+                                | "header" | "li" | "main" | "p" | "section" | "span"
+                                | "ul" | "center" | "table" | "tr" | "td" | "th"
+                                | "font" | "b" | "i" | "strong" | "em" | "pre"
+                                | "blockquote" | "dl" | "dt" | "dd" => {
                                     let element_kind = ElementKind::from_str(tag)
                                         .expect("failed to convert string to ElementKind");
                                     token = self.t.next();

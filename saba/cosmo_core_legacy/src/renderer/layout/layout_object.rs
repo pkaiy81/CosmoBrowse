@@ -23,6 +23,7 @@ use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::PositionType;
+use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::computed_style::TextDecoration;
 use alloc::format;
 use alloc::rc::Rc;
@@ -151,8 +152,24 @@ fn parse_dimension_attr(value: Option<String>) -> Option<i64> {
     }
 }
 
+fn is_wide_char(c: char) -> bool {
+    let cp = c as u32;
+    // CJK Unified Ideographs, Hiragana, Katakana, Fullwidth forms, CJK symbols
+    (0x3000..=0x9FFF).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFF01..=0xFF60).contains(&cp)
+        || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0x20000..=0x2FA1F).contains(&cp)
+        || (0xAC00..=0xD7AF).contains(&cp) // Hangul
+}
+
+fn estimate_text_width_chars(text: &str) -> i64 {
+    // Count width units: wide (CJK) chars = 2, narrow chars = 1
+    text.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum::<i64>()
+}
+
 fn measure_text_width(text: &str, font_size: FontSize) -> i64 {
-    text.len() as i64 * CHAR_WIDTH * font_ratio(font_size)
+    estimate_text_width_chars(text) * CHAR_WIDTH * font_ratio(font_size)
 }
 /// Find a byte index suitable for line breaking at or before `max_char_index`
 /// characters. Returns a byte offset safe for `str::split_at`.
@@ -176,11 +193,22 @@ fn find_byte_index_for_line_break(line: &str, max_char_index: usize) -> usize {
 fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
     let mut result: Vec<String> = vec![];
     let safe_width = max_width.max(char_width).max(1);
-    let char_count = line.chars().count();
-    if char_count as i64 * char_width > safe_width {
-        let max_chars = (safe_width / char_width).max(1) as usize;
-        let split_byte =
-            find_byte_index_for_line_break(&line, max_chars);
+    let text_width = estimate_text_width_chars(&line) * char_width;
+    if text_width > safe_width {
+        // Find how many characters fit within safe_width, accounting for wide chars.
+        let max_width_units = (safe_width / char_width).max(1);
+        let mut units = 0i64;
+        let mut max_chars = 0usize;
+        for c in line.chars() {
+            let w = if is_wide_char(c) { 2 } else { 1 };
+            if units + w > max_width_units {
+                break;
+            }
+            units += w;
+            max_chars += 1;
+        }
+        max_chars = max_chars.max(1);
+        let split_byte = find_byte_index_for_line_break(&line, max_chars);
         let split_byte = split_byte.min(line.len());
         let (left, right) = line.split_at(split_byte);
         result.push(left.to_string());
@@ -382,11 +410,164 @@ impl LayoutObject {
         self.node.borrow().element_kind()
     }
 
+    fn is_table_cell(&self) -> bool {
+        matches!(self.element_kind(), Some(ElementKind::Td) | Some(ElementKind::Th))
+    }
+
+    fn is_table_row(&self) -> bool {
+        matches!(self.element_kind(), Some(ElementKind::Tr))
+    }
+
+    fn parent_element_kind(&self) -> Option<ElementKind> {
+        self.parent.upgrade()?.borrow().element_kind()
+    }
+
+    /// Compute the width this cell should use, accounting for sibling cells
+    /// that have explicit HTML width attributes, and rowspan cells from
+    /// previous rows that reduce the available width.
+    /// Returns the remaining width divided among cells without explicit widths.
+    fn table_cell_auto_width(&self, available_width: i64) -> i64 {
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return available_width,
+        };
+        // Reduce available width by rowspan columns from previous rows.
+        let rowspan_offset = parent.borrow().rowspan_column_offset();
+        let effective_width = (available_width - rowspan_offset).max(0);
+
+        let mut total_explicit: i64 = 0;
+        let mut auto_count: usize = 0;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            match c.try_borrow() {
+                Ok(borrowed) => {
+                    if borrowed.is_table_cell() {
+                        if let Some(w) = parse_dimension_attr(borrowed.element_attribute("width")) {
+                            total_explicit += w;
+                        } else {
+                            auto_count += 1;
+                        }
+                    }
+                    let next = borrowed.next_sibling();
+                    drop(borrowed);
+                    child = next;
+                }
+                Err(_) => {
+                    // This is self — it has no explicit width (caller already checked).
+                    auto_count += 1;
+                    let next = c.as_ptr();
+                    child = unsafe { (*next).next_sibling() };
+                }
+            }
+        }
+        let remaining = (effective_width - total_explicit).max(0);
+        if auto_count > 0 {
+            remaining / auto_count as i64
+        } else {
+            effective_width
+        }
+    }
+
+    /// Sum of all explicit HTML width attributes among sibling table cells.
+    fn total_sibling_explicit_widths(&self) -> i64 {
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return 0,
+        };
+        let mut total: i64 = 0;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            match c.try_borrow() {
+                Ok(borrowed) => {
+                    if borrowed.is_table_cell() {
+                        if let Some(w) = parse_dimension_attr(borrowed.element_attribute("width")) {
+                            total += w;
+                        }
+                    }
+                    let next = borrowed.next_sibling();
+                    drop(borrowed);
+                    child = next;
+                }
+                Err(_) => {
+                    // This is self — check our own width attribute.
+                    if let Some(w) = parse_dimension_attr(self.element_attribute("width")) {
+                        total += w;
+                    }
+                    let next = c.as_ptr();
+                    child = unsafe { (*next).next_sibling() };
+                }
+            }
+        }
+        total
+    }
+
     fn element_attribute(&self, name: &str) -> Option<String> {
         match self.node.borrow().kind() {
             NodeKind::Element(ref element) => element.get_attribute(name),
             _ => None,
         }
+    }
+
+    /// Compute the x-offset for cells in this row due to rowspan cells from
+    /// previous sibling rows.  Returns the total width that is "occupied" by
+    /// spanning cells, so the first real cell in this row should start at
+    /// parent_x + offset.
+    fn rowspan_column_offset(&self) -> i64 {
+        if !self.is_table_row() {
+            return 0;
+        }
+        // Walk backwards through previous sibling rows.
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return 0,
+        };
+        // Determine our row index among siblings.
+        let mut row_index: usize = 0;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            let is_self = Rc::ptr_eq(&self.node, &c.borrow().node);
+            if is_self {
+                break;
+            }
+            if c.borrow().is_table_row() {
+                row_index += 1;
+            }
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
+        if row_index == 0 {
+            return 0;
+        }
+        // Now scan previous rows for cells with rowspan > 1 that extend into us.
+        let mut offset: i64 = 0;
+        let mut prev_row_index: usize = 0;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            if c.borrow().is_table_row() {
+                if prev_row_index >= row_index {
+                    break;
+                }
+                // Scan cells in this row.
+                let mut cell = c.borrow().first_child();
+                while let Some(cell_rc) = cell {
+                    let cell_borrowed = cell_rc.borrow();
+                    if cell_borrowed.is_table_cell() {
+                        let rowspan = parse_dimension_attr(cell_borrowed.element_attribute("rowspan"))
+                            .unwrap_or(1);
+                        if rowspan > 1 && prev_row_index + rowspan as usize > row_index {
+                            offset += cell_borrowed.size.width();
+                        }
+                    }
+                    let next = cell_borrowed.next_sibling();
+                    drop(cell_borrowed);
+                    cell = next;
+                }
+                prev_row_index += 1;
+            }
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
+        offset
     }
 
     fn placeholder_text(&self) -> Option<String> {
@@ -520,7 +701,36 @@ impl LayoutObject {
                         });
                     }
 
-                    if let Some(text) = self.placeholder_text() {
+                    if self.element_kind() == Some(ElementKind::Img) {
+                        let src = self.element_attribute("src").unwrap_or_default();
+                        let alt = self.element_attribute("alt").unwrap_or_default();
+                        items.push(DisplayItem::Image {
+                            src,
+                            alt,
+                            layout_point: self.point(),
+                            layout_size: self.size(),
+                            style: self.style(),
+                            href: self.link_href(),
+                            paint_order: PaintOrder {
+                                stacking_context: if self.style.position() != PositionType::Static {
+                                    1
+                                } else {
+                                    0
+                                },
+                                z_index: self.style.z_index(),
+                            },
+                            clip_rect: if self.style.overflow_clip() {
+                                Some(ClipRect {
+                                    x: self.point().x(),
+                                    y: self.point().y(),
+                                    width: self.size().width(),
+                                    height: self.size().height(),
+                                })
+                            } else {
+                                None
+                            },
+                        });
+                    } else if let Some(text) = self.placeholder_text() {
                         items.push(DisplayItem::Text {
                             text,
                             style: self.style(),
@@ -566,7 +776,7 @@ impl LayoutObject {
                             style: self.style(),
                             layout_point: LayoutPoint::new(
                                 self.point().x(),
-                                self.point().y() + CHAR_HEIGHT_WITH_PADDING * i as i64,
+                                self.point().y() + CHAR_HEIGHT_WITH_PADDING * ratio * i as i64,
                             ),
                             href: href.clone(),
                             paint_order: PaintOrder {
@@ -598,19 +808,53 @@ impl LayoutObject {
             LayoutObjectKind::Block => {
                 let available_width = (parent_size.width() - metrics.outer_horizontal()).max(0);
                 let explicit_width = self.resolved_width(parent_size);
-                let content_width = if explicit_width > 0 {
+                // Also check HTML width attribute for block elements (tables, etc.).
+                let html_width = parse_dimension_attr(self.element_attribute("width"));
+
+                // Table cells: use width attribute, or allocate remaining width
+                // after subtracting explicitly-sized sibling cells.
+                // When total explicit widths exceed available space, scale
+                // proportionally to fit.
+                let content_width = if self.is_table_cell() {
+                    let attr_width = parse_dimension_attr(self.element_attribute("width"));
+                    if let Some(w) = attr_width {
+                        let rowspan_offset = self
+                            .parent
+                            .upgrade()
+                            .map(|p| p.borrow().rowspan_column_offset())
+                            .unwrap_or(0);
+                        let effective = (available_width - rowspan_offset).max(0);
+                        let total_explicit = self.total_sibling_explicit_widths();
+                        if total_explicit > effective && total_explicit > 0 {
+                            // Scale down proportionally.
+                            (w * effective / total_explicit).max(0)
+                        } else {
+                            w.min(effective)
+                        }
+                    } else if explicit_width > 0 {
+                        explicit_width.min(available_width)
+                    } else {
+                        self.table_cell_auto_width(available_width)
+                    }
+                } else if explicit_width > 0 {
                     explicit_width.min(available_width)
+                } else if let Some(w) = html_width {
+                    w.min(available_width)
                 } else {
                     available_width
                 };
 
                 let mut content_height = 0;
                 let mut child = self.first_child();
+                let is_row = self.is_table_row();
                 let mut previous_child_kind = LayoutObjectKind::Block;
                 while child.is_some() {
                     let c = child.expect("first child should exist");
                     let c_kind = c.borrow().kind();
-                    if previous_child_kind.normal_flow_spec().stacks_vertically
+                    if is_row {
+                        // Table row: height = max of cell heights.
+                        content_height = content_height.max(c.borrow().size.height());
+                    } else if previous_child_kind.normal_flow_spec().stacks_vertically
                         || c_kind.normal_flow_spec().stacks_vertically
                     {
                         content_height += c.borrow().size.height();
@@ -621,11 +865,17 @@ impl LayoutObject {
                     child = c.borrow().next_sibling();
                 }
 
-                let explicit_height = self.resolved_height(parent_size);
-                let content_height = if explicit_height > 0 {
-                    explicit_height
+                // <br> elements produce exactly one line break even with no children.
+                let content_height = if self.element_kind() == Some(ElementKind::Br) {
+                    let ratio = font_ratio(self.style.font_size());
+                    CHAR_HEIGHT_WITH_PADDING * ratio
                 } else {
-                    content_height.max(0)
+                    let explicit_height = self.resolved_height(parent_size);
+                    if explicit_height > 0 {
+                        explicit_height
+                    } else {
+                        content_height.max(0)
+                    }
                 };
                 size.set_width((content_width + metrics.inner_horizontal()).max(0));
                 size.set_height((content_height + metrics.inner_vertical()).max(0));
@@ -663,7 +913,7 @@ impl LayoutObject {
                     let lines = split_text(plain_text.clone(), CHAR_WIDTH * ratio, max_width);
                     let width = lines
                         .iter()
-                        .map(|line| line.len() as i64 * CHAR_WIDTH * ratio)
+                        .map(|line| estimate_text_width_chars(line) * CHAR_WIDTH * ratio)
                         .max()
                         .unwrap_or(0);
                     let height = if lines.is_empty() {
@@ -691,6 +941,22 @@ impl LayoutObject {
         let mut point = LayoutPoint::new(0, 0);
         let metrics = compute_box_model_metrics(&self.style);
 
+        // Table cells: position horizontally within the row.
+        if self.is_table_cell() {
+            if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
+                point.set_x(pos.x() + size.width() + metrics.margin.left);
+                point.set_y(parent_point.y() + metrics.margin.top);
+            } else {
+                // First cell in row: apply rowspan offset from previous rows.
+                let rowspan_offset = self
+                    .parent
+                    .upgrade()
+                    .map(|p| p.borrow().rowspan_column_offset())
+                    .unwrap_or(0);
+                point.set_x(parent_point.x() + rowspan_offset + metrics.margin.left);
+                point.set_y(parent_point.y() + metrics.margin.top);
+            }
+        } else {
         match (
             self.kind().normal_flow_spec().flow,
             previous_sibling_kind.normal_flow_spec().flow,
@@ -709,6 +975,12 @@ impl LayoutObject {
                     point.set_x(parent_point.x() + available_width / 2);
                 } else if self.style.margin_left_auto() && available_width > metrics.margin.right {
                     point.set_x(parent_point.x() + available_width - metrics.margin.right);
+                } else if !self.kind().normal_flow_spec().stacks_vertically
+                    && self.style.text_align() == TextAlign::Center
+                    && available_width > 0
+                {
+                    // Inline/text node after a block: apply text-align centering.
+                    point.set_x(parent_point.x() + available_width / 2);
                 } else {
                     point.set_x(parent_point.x() + metrics.margin.left);
                 }
@@ -718,11 +990,33 @@ impl LayoutObject {
                     point.set_x(pos.x() + size.width() + metrics.margin.left);
                     point.set_y(pos.y() + metrics.margin.top);
                 } else {
-                    point.set_x(parent_point.x() + metrics.margin.left);
+                    // First inline child: apply text-align centering if set.
+                    match self.style.text_align() {
+                        TextAlign::Center => {
+                            let available = parent_size.width() - self.size.width();
+                            if available > 0 {
+                                point.set_x(parent_point.x() + available / 2);
+                            } else {
+                                point.set_x(parent_point.x() + metrics.margin.left);
+                            }
+                        }
+                        TextAlign::Right => {
+                            let available = parent_size.width() - self.size.width();
+                            if available > 0 {
+                                point.set_x(parent_point.x() + available);
+                            } else {
+                                point.set_x(parent_point.x() + metrics.margin.left);
+                            }
+                        }
+                        TextAlign::Left => {
+                            point.set_x(parent_point.x() + metrics.margin.left);
+                        }
+                    }
                     point.set_y(parent_point.y() + metrics.margin.top);
                 }
             }
         }
+        } // end if !table_cell
 
         match self.style.position() {
             PositionType::Static => {}
@@ -926,6 +1220,16 @@ impl LayoutObject {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         if let Ok(decoration) = TextDecoration::from_str(value) {
                             self.style.set_text_decoration(decoration);
+                        }
+                    }
+                }
+                "text-align" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        match value.as_str() {
+                            "center" => self.style.set_text_align(TextAlign::Center),
+                            "right" => self.style.set_text_align(TextAlign::Right),
+                            "left" => self.style.set_text_align(TextAlign::Left),
+                            _ => {}
                         }
                     }
                 }

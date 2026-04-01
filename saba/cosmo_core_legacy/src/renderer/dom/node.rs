@@ -173,12 +173,25 @@ impl Element {
                 | ElementKind::Form
                 | ElementKind::H1
                 | ElementKind::H2
+                | ElementKind::H3
                 | ElementKind::Header
                 | ElementKind::Li
                 | ElementKind::Main
                 | ElementKind::P
                 | ElementKind::Section
                 | ElementKind::Ul
+                | ElementKind::Center
+                | ElementKind::Table
+                | ElementKind::Tr
+                | ElementKind::Hr
+                | ElementKind::Pre
+                | ElementKind::Blockquote
+                | ElementKind::Br
+                | ElementKind::Td
+                | ElementKind::Th
+                | ElementKind::Dl
+                | ElementKind::Dt
+                | ElementKind::Dd
         )
     }
 
@@ -220,6 +233,24 @@ pub enum ElementKind {
     Header,
     Main,
     Section,
+    Br,
+    Center,
+    Table,
+    Tr,
+    Td,
+    Th,
+    Font,
+    B,
+    I,
+    Strong,
+    Em,
+    Hr,
+    Pre,
+    Blockquote,
+    Dl,
+    Dt,
+    Dd,
+    H3,
 }
 
 impl Display for ElementKind {
@@ -247,6 +278,24 @@ impl Display for ElementKind {
             ElementKind::Header => "header",
             ElementKind::Main => "main",
             ElementKind::Section => "section",
+            ElementKind::Br => "br",
+            ElementKind::Center => "center",
+            ElementKind::Table => "table",
+            ElementKind::Tr => "tr",
+            ElementKind::Td => "td",
+            ElementKind::Th => "th",
+            ElementKind::Font => "font",
+            ElementKind::B => "b",
+            ElementKind::I => "i",
+            ElementKind::Strong => "strong",
+            ElementKind::Em => "em",
+            ElementKind::Hr => "hr",
+            ElementKind::Pre => "pre",
+            ElementKind::Blockquote => "blockquote",
+            ElementKind::Dl => "dl",
+            ElementKind::Dt => "dt",
+            ElementKind::Dd => "dd",
+            ElementKind::H3 => "h3",
         };
         write!(f, "{}", s)
     }
@@ -279,6 +328,24 @@ impl FromStr for ElementKind {
             "header" => Ok(ElementKind::Header),
             "main" => Ok(ElementKind::Main),
             "section" => Ok(ElementKind::Section),
+            "br" => Ok(ElementKind::Br),
+            "center" => Ok(ElementKind::Center),
+            "table" => Ok(ElementKind::Table),
+            "tr" => Ok(ElementKind::Tr),
+            "td" => Ok(ElementKind::Td),
+            "th" => Ok(ElementKind::Th),
+            "font" => Ok(ElementKind::Font),
+            "b" => Ok(ElementKind::B),
+            "i" => Ok(ElementKind::I),
+            "strong" => Ok(ElementKind::Strong),
+            "em" => Ok(ElementKind::Em),
+            "hr" => Ok(ElementKind::Hr),
+            "pre" => Ok(ElementKind::Pre),
+            "blockquote" => Ok(ElementKind::Blockquote),
+            "dl" => Ok(ElementKind::Dl),
+            "dt" => Ok(ElementKind::Dt),
+            "dd" => Ok(ElementKind::Dd),
+            "h3" => Ok(ElementKind::H3),
             _ => Err(format!("unimplemented element name {:?}", s)),
         }
     }

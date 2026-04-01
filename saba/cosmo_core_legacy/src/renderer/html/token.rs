@@ -1,5 +1,6 @@
 use crate::renderer::html::attribute::Attribute;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +73,8 @@ pub struct HtmlTokenizer {
     latest_token: Option<HtmlToken>,
     input: Vec<char>,
     buf: String,
+    /// Queue for characters produced by entity decoding (returned one at a time).
+    pending_chars: Vec<char>,
 }
 
 impl HtmlTokenizer {
@@ -83,6 +86,62 @@ impl HtmlTokenizer {
             latest_token: None,
             input: html.chars().collect(),
             buf: String::new(),
+            pending_chars: Vec::new(),
+        }
+    }
+
+    /// Try to decode a character reference starting after '&'.
+    /// Returns decoded char(s) or the raw '&' + consumed chars if not a valid reference.
+    fn try_decode_entity(&mut self) -> Vec<char> {
+        let start = self.pos;
+
+        // Collect chars until ';' or a non-entity char (max 32 chars to avoid runaway).
+        let mut entity = String::new();
+        let mut found_semicolon = false;
+        while self.pos < self.input.len() && entity.len() < 32 {
+            let ch = self.input[self.pos];
+            self.pos += 1;
+            if ch == ';' {
+                found_semicolon = true;
+                break;
+            }
+            if !ch.is_ascii_alphanumeric() && ch != '#' {
+                // Not a valid entity character — rewind and return '&' as-is.
+                self.pos = start;
+                return vec!['&'];
+            }
+            entity.push(ch);
+        }
+
+        if !found_semicolon {
+            self.pos = start;
+            return vec!['&'];
+        }
+
+        // Numeric reference: &#123; or &#xAB;
+        if entity.starts_with('#') {
+            let num_part = &entity[1..];
+            let code_point = if num_part.starts_with('x') || num_part.starts_with('X') {
+                u32::from_str_radix(&num_part[1..], 16).ok()
+            } else {
+                num_part.parse::<u32>().ok()
+            };
+            if let Some(cp) = code_point {
+                if let Some(ch) = char::from_u32(cp) {
+                    return vec![ch];
+                }
+            }
+            // Invalid numeric reference — return raw text.
+            self.pos = start;
+            return vec!['&'];
+        }
+
+        // Named entity lookup.
+        if let Some(decoded) = decode_named_entity(&entity) {
+            decoded.chars().collect()
+        } else {
+            self.pos = start;
+            vec!['&']
         }
     }
 
@@ -211,6 +270,12 @@ impl Iterator for HtmlTokenizer {
     type Item = HtmlToken;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Return queued characters from entity decoding first.
+        if !self.pending_chars.is_empty() {
+            let ch = self.pending_chars.remove(0);
+            return Some(HtmlToken::Char(ch));
+        }
+
         if self.pos >= self.input.len() {
             return None;
         }
@@ -236,6 +301,16 @@ impl Iterator for HtmlTokenizer {
                         return Some(HtmlToken::Eof);
                     }
 
+                    // Character reference (entity) decoding.
+                    if c == '&' {
+                        let decoded = self.try_decode_entity();
+                        let first = decoded[0];
+                        for ch in decoded.into_iter().skip(1) {
+                            self.pending_chars.push(ch);
+                        }
+                        return Some(HtmlToken::Char(first));
+                    }
+
                     return Some(HtmlToken::Char(c));
                 }
 
@@ -245,6 +320,48 @@ impl Iterator for HtmlTokenizer {
                     // Otherwise, return Char token
                     if c == '/' {
                         self.state = State::EndTagOpen;
+                        continue;
+                    }
+
+                    // Handle markup declarations: comments (<!--) and DOCTYPE (<!DOCTYPE).
+                    if c == '!' {
+                        // Peek ahead for comment start "--".
+                        if self.pos + 1 < self.input.len()
+                            && self.input[self.pos] == '-'
+                            && self.input[self.pos + 1] == '-'
+                        {
+                            // Skip the two dashes.
+                            self.pos += 2;
+                            // Consume until "-->" or EOF.
+                            loop {
+                                if self.pos + 2 < self.input.len()
+                                    && self.input[self.pos] == '-'
+                                    && self.input[self.pos + 1] == '-'
+                                    && self.input[self.pos + 2] == '>'
+                                {
+                                    self.pos += 3;
+                                    break;
+                                }
+                                if self.pos >= self.input.len() {
+                                    break;
+                                }
+                                self.pos += 1;
+                            }
+                            self.state = State::Data;
+                            continue;
+                        }
+                        // Skip <!DOCTYPE ...> or other <! declarations.
+                        loop {
+                            if self.pos >= self.input.len() {
+                                break;
+                            }
+                            if self.input[self.pos] == '>' {
+                                self.pos += 1;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                        self.state = State::Data;
                         continue;
                     }
 
@@ -429,6 +546,14 @@ impl Iterator for HtmlTokenizer {
                         return Some(HtmlToken::Eof);
                     }
 
+                    if c == '&' {
+                        let decoded = self.try_decode_entity();
+                        for ch in decoded {
+                            self.append_attribute(ch, false);
+                        }
+                        continue;
+                    }
+
                     self.append_attribute(c, /* is_name = */ false);
                 }
 
@@ -444,6 +569,14 @@ impl Iterator for HtmlTokenizer {
 
                     if self.is_eof() {
                         return Some(HtmlToken::Eof);
+                    }
+
+                    if c == '&' {
+                        let decoded = self.try_decode_entity();
+                        for ch in decoded {
+                            self.append_attribute(ch, false);
+                        }
+                        continue;
                     }
 
                     self.append_attribute(c, /* is_name = */ false);
@@ -616,6 +749,62 @@ impl Iterator for HtmlTokenizer {
                 }
             }
         }
+    }
+}
+
+fn decode_named_entity(name: &str) -> Option<&'static str> {
+    match name {
+        "amp" => Some("&"),
+        "lt" => Some("<"),
+        "gt" => Some(">"),
+        "quot" => Some("\""),
+        "apos" => Some("'"),
+        "nbsp" => Some("\u{00A0}"),
+        "copy" => Some("\u{00A9}"),
+        "reg" => Some("\u{00AE}"),
+        "trade" => Some("\u{2122}"),
+        "mdash" => Some("\u{2014}"),
+        "ndash" => Some("\u{2013}"),
+        "laquo" => Some("\u{00AB}"),
+        "raquo" => Some("\u{00BB}"),
+        "bull" => Some("\u{2022}"),
+        "hellip" => Some("\u{2026}"),
+        "prime" => Some("\u{2032}"),
+        "Prime" => Some("\u{2033}"),
+        "lsquo" => Some("\u{2018}"),
+        "rsquo" => Some("\u{2019}"),
+        "ldquo" => Some("\u{201C}"),
+        "rdquo" => Some("\u{201D}"),
+        "ensp" => Some("\u{2002}"),
+        "emsp" => Some("\u{2003}"),
+        "thinsp" => Some("\u{2009}"),
+        "times" => Some("\u{00D7}"),
+        "divide" => Some("\u{00F7}"),
+        "minus" => Some("\u{2212}"),
+        "plusmn" => Some("\u{00B1}"),
+        "deg" => Some("\u{00B0}"),
+        "micro" => Some("\u{00B5}"),
+        "para" => Some("\u{00B6}"),
+        "middot" => Some("\u{00B7}"),
+        "frac12" => Some("\u{00BD}"),
+        "frac14" => Some("\u{00BC}"),
+        "frac34" => Some("\u{00BE}"),
+        "iexcl" => Some("\u{00A1}"),
+        "iquest" => Some("\u{00BF}"),
+        "cent" => Some("\u{00A2}"),
+        "pound" => Some("\u{00A3}"),
+        "yen" => Some("\u{00A5}"),
+        "euro" => Some("\u{20AC}"),
+        "sect" => Some("\u{00A7}"),
+        "larr" => Some("\u{2190}"),
+        "uarr" => Some("\u{2191}"),
+        "rarr" => Some("\u{2192}"),
+        "darr" => Some("\u{2193}"),
+        "hearts" => Some("\u{2665}"),
+        "diams" => Some("\u{2666}"),
+        "clubs" => Some("\u{2663}"),
+        "spades" => Some("\u{2660}"),
+        _ => None,
     }
 }
 

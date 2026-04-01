@@ -173,6 +173,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     width: layout_size.width(),
                     height: layout_size.height(),
                     background_color: style.background_color().code().to_string(),
+                    background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
@@ -200,6 +201,34 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     font_px: style.font_size().px(),
                     font_family: style.font_family(),
                     underline: style.text_decoration() == TextDecoration::Underline,
+                    opacity: style.opacity(),
+                    href,
+                    target: None,
+                    z_index: paint_order.z_index,
+                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                });
+            }
+            DisplayItem::Image {
+                src,
+                alt,
+                layout_point,
+                layout_size,
+                style,
+                href,
+                paint_order,
+                clip_rect,
+            } => {
+                let x = rect.x + layout_point.x();
+                let y = rect.y + layout_point.y();
+                max_width = max_width.max(layout_point.x() + layout_size.width());
+                max_height = max_height.max(layout_point.y() + layout_size.height());
+                scene_items.push(SceneItem::Image {
+                    x,
+                    y,
+                    width: layout_size.width(),
+                    height: layout_size.height(),
+                    src,
+                    alt,
                     opacity: style.opacity(),
                     href,
                     target: None,
@@ -354,6 +383,7 @@ mod diff_tests {
             width: 10,
             height: 10,
             background_color: "#fff".to_string(),
+            background_image: None,
             opacity: 1.0,
             z_index: 0,
             clip_rect: None,
@@ -364,6 +394,7 @@ mod diff_tests {
             width: 20,
             height: 10,
             background_color: "#fff".to_string(),
+            background_image: None,
             opacity: 1.0,
             z_index: 1,
             clip_rect: None,

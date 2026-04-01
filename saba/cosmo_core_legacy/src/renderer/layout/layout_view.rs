@@ -37,7 +37,8 @@ fn build_layout_tree(
         let original_first_child = n.borrow().first_child();
         let original_next_sibling = n.borrow().next_sibling();
         let mut first_child = build_layout_tree(&original_first_child, &layout_object, cssom);
-        let mut next_sibling = build_layout_tree(&original_next_sibling, &None, cssom);
+        // Siblings share the same parent as the current node.
+        let mut next_sibling = build_layout_tree(&original_next_sibling, parent_obj, cssom);
 
         if first_child.is_none() && original_first_child.is_some() {
             let mut original_dom_node = original_first_child
@@ -67,7 +68,7 @@ fn build_layout_tree(
                 .next_sibling();
 
             loop {
-                next_sibling = build_layout_tree(&original_dom_node, &None, cssom);
+                next_sibling = build_layout_tree(&original_dom_node, parent_obj, cssom);
 
                 if next_sibling.is_none() && original_dom_node.is_some() {
                     original_dom_node = original_dom_node
@@ -207,12 +208,12 @@ impl LayoutView {
         // Positioned/stacking descendants are painted by stacking context and z-index.
         display_items.sort_by(|a, b| {
             let (a_context, a_z) = match a {
-                DisplayItem::Rect { paint_order, .. } | DisplayItem::Text { paint_order, .. } => {
+                DisplayItem::Rect { paint_order, .. } | DisplayItem::Text { paint_order, .. } | DisplayItem::Image { paint_order, .. } => {
                     (paint_order.stacking_context, paint_order.z_index)
                 }
             };
             let (b_context, b_z) = match b {
-                DisplayItem::Rect { paint_order, .. } | DisplayItem::Text { paint_order, .. } => {
+                DisplayItem::Rect { paint_order, .. } | DisplayItem::Text { paint_order, .. } | DisplayItem::Image { paint_order, .. } => {
                     (paint_order.stacking_context, paint_order.z_index)
                 }
             };
@@ -415,5 +416,199 @@ mod tests {
             item,
             DisplayItem::Text { text, .. } if text == "Email" || text == "Hero"
         )));
+    }
+
+    #[test]
+    fn test_br_creates_vertical_separation() {
+        let html = "<html><head></head><body>Line1<br>Line2<br>Line3</body></html>".to_string();
+        let layout_view = create_layout_view(html, 600);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<_> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.clone(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        assert!(text_items.len() >= 3, "expected 3 text items, got {:?}", text_items);
+        // Each line should have a distinct Y coordinate (increasing).
+        let ys: Vec<i64> = text_items.iter().map(|(_, y)| *y).collect();
+        for i in 1..ys.len() {
+            assert!(
+                ys[i] > ys[i - 1],
+                "line {} (y={}) should be below line {} (y={})",
+                i, ys[i], i - 1, ys[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_center_tag_centers_text() {
+        let html =
+            "<html><head></head><body><center>Centered</center></body></html>".to_string();
+        let layout_view = create_layout_view(html, 600);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<_> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.clone(), layout_point.x())),
+                _ => None,
+            })
+            .collect();
+
+        assert!(!text_items.is_empty(), "should have text items");
+        let (_, x) = &text_items[0];
+        // Text should be noticeably offset from left (centered in 600px viewport).
+        assert!(*x > 100, "centered text x={} should be > 100", x);
+    }
+
+    #[test]
+    fn test_table_cells_horizontal() {
+        let html = "<html><head></head><body><table><tr><td>Cell1</td><td>Cell2</td></tr></table></body></html>".to_string();
+        let layout_view = create_layout_view(html, 600);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<_> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.clone(), layout_point.x(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        assert!(text_items.len() >= 2, "expected 2 text items, got {:?}", text_items);
+        // Cell2 should be to the right of Cell1.
+        let cell1 = text_items.iter().find(|(t, _, _)| t == "Cell1").unwrap();
+        let cell2 = text_items.iter().find(|(t, _, _)| t == "Cell2").unwrap();
+        assert!(
+            cell2.1 > cell1.1,
+            "Cell2 x={} should be right of Cell1 x={}",
+            cell2.1, cell1.1
+        );
+        // Same row: Y should be similar.
+        assert!(
+            (cell2.2 - cell1.2).abs() < 5,
+            "cells should be on same row: y1={}, y2={}",
+            cell1.2, cell2.2
+        );
+    }
+
+    #[test]
+    fn test_table_cell_explicit_width_leaves_remaining_for_auto() {
+        // First cell has explicit width=200, second cell should get remaining space.
+        let html = r#"<html><head></head><body><table><tr><td width="200">Left</td><td>Right</td></tr></table></body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 600);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<_> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. }
+                    => Some((text.clone(), layout_point.x())),
+                _ => None,
+            })
+            .collect();
+
+        let _left = text_items.iter().find(|(t, _)| t == "Left").unwrap();
+        let right = text_items.iter().find(|(t, _)| t == "Right").unwrap();
+        // Right cell should start at x=200 (left cell width).
+        assert!(
+            right.1 >= 200,
+            "Right cell x={} should be >= 200",
+            right.1
+        );
+        // Right cell should NOT be pushed off a 600px viewport.
+        assert!(
+            right.1 < 500,
+            "Right cell x={} should be well within viewport",
+            right.1
+        );
+    }
+
+    #[test]
+    fn test_table_nested_content_all_rendered() {
+        let html = r#"<html><head></head><body><table><tr><td>Col1</td><td><center>Header</center>More text<br>Final line</td></tr></table></body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<_> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(text_items.iter().any(|t| t == "Col1"), "Col1 missing, got: {:?}", text_items);
+        assert!(text_items.iter().any(|t| t == "Header"), "Header missing, got: {:?}", text_items);
+        assert!(text_items.iter().any(|t| t.contains("More text")), "More text missing, got: {:?}", text_items);
+        assert!(text_items.iter().any(|t| t.contains("Final line")), "Final line missing, got: {:?}", text_items);
+    }
+
+    #[test]
+    fn test_table_rowspan_offsets_second_row() {
+        // Row 1: cell with rowspan=2 (width=200) + cell B
+        // Row 2: cell C (should be shifted right by ~200)
+        let html = r#"<html><head></head><body>
+            <table>
+                <tr>
+                    <td rowspan="2" width="200">Left</td>
+                    <td>B</td>
+                </tr>
+                <tr>
+                    <td>C</td>
+                </tr>
+            </table>
+        </body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.x())),
+                _ => None,
+            })
+            .collect();
+
+        let left_item = text_items.iter().find(|(t, _)| t == "Left").expect("Left missing");
+        let b_item = text_items.iter().find(|(t, _)| t == "B").expect("B missing");
+        let c_item = text_items.iter().find(|(t, _)| t == "C").expect("C missing");
+
+        // B and C should both be to the right of Left (x >= 200).
+        assert!(b_item.1 >= 200, "B should be right of Left, B.x={} Left.x={}", b_item.1, left_item.1);
+        assert!(c_item.1 >= 200, "C should be right of Left, C.x={} Left.x={}", c_item.1, left_item.1);
+    }
+
+    #[test]
+    fn test_implicit_td_closing() {
+        // When <td> opens while inside <font> inside <td>, the parser should
+        // close the existing <td> (and <font>) so cells become siblings, not nested.
+        let html = "<html><head></head><body><table><tr><td width=\"10\"><font color=\"red\">A<td width=\"100\">B</tr></table></body></html>".to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.x())),
+                _ => None,
+            })
+            .collect();
+
+        let a_item = text_items.iter().find(|(t, _)| t.contains("A")).expect("A missing");
+        let b_item = text_items.iter().find(|(t, _)| t.contains("B")).expect("B missing");
+
+        // B should be to the right of A (not nested inside it).
+        assert!(b_item.1 > a_item.1, "B should be right of A, B.x={} A.x={}", b_item.1, a_item.1);
     }
 }
