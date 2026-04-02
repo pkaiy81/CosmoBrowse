@@ -79,32 +79,47 @@ impl HtmlParser {
         }
     }
 
+    /// Check if an element kind is in the stack, but only within the innermost
+    /// scope boundary (e.g., don't look past <table> for table-internal tags).
+    fn contain_in_scope(&self, target: ElementKind, boundary: ElementKind) -> bool {
+        for item in self.stack_of_open_elements.iter().rev() {
+            let kind = item.borrow().element_kind();
+            if kind == Some(target) {
+                return true;
+            }
+            if kind == Some(boundary) {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Implicitly close elements that should be closed when a new element
     /// of the same kind (or an element that implies closing) is opened.
     /// Ref: HTML spec — optional end tags for td, th, tr, li, p, dt, dd.
     fn close_implicit(&mut self, new_tag: &str) {
         match new_tag {
             "td" | "th" => {
-                // Close any open td/th (and intervening inline elements like <font>).
-                if self.contain_in_stack(ElementKind::Td) {
+                // Close any open td/th within the current table scope.
+                if self.contain_in_scope(ElementKind::Td, ElementKind::Table) {
                     self.pop_until(ElementKind::Td);
-                } else if self.contain_in_stack(ElementKind::Th) {
+                } else if self.contain_in_scope(ElementKind::Th, ElementKind::Table) {
                     self.pop_until(ElementKind::Th);
                 }
             }
             "tr" => {
-                // Close any open td/th first, then any open tr.
-                if self.contain_in_stack(ElementKind::Td) {
+                // Close any open td/th first, then any open tr, within current table.
+                if self.contain_in_scope(ElementKind::Td, ElementKind::Table) {
                     self.pop_until(ElementKind::Td);
-                } else if self.contain_in_stack(ElementKind::Th) {
+                } else if self.contain_in_scope(ElementKind::Th, ElementKind::Table) {
                     self.pop_until(ElementKind::Th);
                 }
-                if self.contain_in_stack(ElementKind::Tr) {
+                if self.contain_in_scope(ElementKind::Tr, ElementKind::Table) {
                     self.pop_until(ElementKind::Tr);
                 }
             }
             "li" => {
-                if self.contain_in_stack(ElementKind::Li) {
+                if self.contain_in_scope(ElementKind::Li, ElementKind::Ul) {
                     self.pop_until(ElementKind::Li);
                 }
             }
@@ -114,9 +129,9 @@ impl HtmlParser {
                 }
             }
             "dt" | "dd" => {
-                if self.contain_in_stack(ElementKind::Dt) {
+                if self.contain_in_scope(ElementKind::Dt, ElementKind::Dl) {
                     self.pop_until(ElementKind::Dt);
-                } else if self.contain_in_stack(ElementKind::Dd) {
+                } else if self.contain_in_scope(ElementKind::Dd, ElementKind::Dl) {
                     self.pop_until(ElementKind::Dd);
                 }
             }
@@ -171,9 +186,37 @@ impl HtmlParser {
             return;
         }
 
-        // Do not add the text node when the character is a space character or return character.
+        // Collapse whitespace: skip space/newline that would create a new text node.
+        // Preserve a single space between inline siblings as a word separator.
         if c == '\n' || c == ' ' {
-            return;
+            // Never create whitespace text nodes inside table structural elements.
+            let parent_kind = current.borrow().element_kind();
+            if matches!(
+                parent_kind,
+                Some(ElementKind::Table)
+                    | Some(ElementKind::Tr)
+                    | Some(ElementKind::Head)
+                    | Some(ElementKind::Html)
+                    | Some(ElementKind::Ul)
+                    | Some(ElementKind::Dl)
+            ) {
+                return;
+            }
+            if current.borrow().first_child().is_none() {
+                return;
+            }
+            // Find the last child and check if it is a text node.
+            let last_child = current.borrow().last_child().upgrade();
+            let last_child_is_text = last_child
+                .as_ref()
+                .map(|n| matches!(n.borrow().kind(), NodeKind::Text(_)))
+                .unwrap_or(false);
+            // If the last child is already a text node, the space was already
+            // handled (appended to that text node) in the branch above.
+            // If the last child is an element, create a space text node as separator.
+            if last_child_is_text {
+                return;
+            }
         }
 
         let node = Rc::new(RefCell::new(self.create_char(c))); // 4

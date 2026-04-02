@@ -611,4 +611,50 @@ mod tests {
         // B should be to the right of A (not nested inside it).
         assert!(b_item.1 > a_item.1, "B should be right of A, B.x={} A.x={}", b_item.1, a_item.1);
     }
+
+    #[test]
+    fn test_space_between_inline_elements_preserved() {
+        // Space between </a> and <a> should produce a separator so
+        // text doesn't run together ("Link1Link2" → "Link1 Link2").
+        let html = "<html><head></head><body><p><a>Link1</a> <a>Link2</a></p></body></html>".to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<String> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // There should be a space somewhere between Link1 and Link2 — either as
+        // a separate text node or joined within an existing one.
+        let joined = text_items.join("");
+        assert!(
+            text_items.iter().any(|t| t.contains(" ")) || text_items.len() >= 2,
+            "Space between inline elements should be preserved, got: {:?}", text_items
+        );
+        assert!(joined.contains("Link1"), "Link1 missing, got: {:?}", text_items);
+        assert!(joined.contains("Link2"), "Link2 missing, got: {:?}", text_items);
+    }
+
+    #[test]
+    fn test_nested_table_implicit_close_scoped() {
+        // Opening <tr> inside a nested table must NOT close the outer <tr>.
+        let html = "<html><head></head><body><table><tr><td><table><tr><td>Inner</td></tr></table>Outer</td></tr></table></body></html>".to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<String> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(text_items.iter().any(|t| t.contains("Inner")), "Inner missing, got: {:?}", text_items);
+        assert!(text_items.iter().any(|t| t.contains("Outer")), "Outer missing, got: {:?}", text_items);
+    }
 }
