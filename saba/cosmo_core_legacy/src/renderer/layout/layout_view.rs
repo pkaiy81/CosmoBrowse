@@ -696,4 +696,138 @@ mod tests {
         assert!(text_items.iter().any(|t| t.contains("Inner")), "Inner missing, got: {:?}", text_items);
         assert!(text_items.iter().any(|t| t.contains("Outer")), "Outer missing, got: {:?}", text_items);
     }
+
+    #[test]
+    fn test_abe_hiroshi_like_layout() {
+        // Realistic structure mimicking top.htm: first td has nested content
+        // (image + inner table + text), second and third td should be to the right.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table>",
+            "<tr>",
+            "<td rowspan=\"2\" width=\"350\">",
+            "<img src=\"photo.jpg\" width=\"350\" height=\"414\">",
+            "<br><br>",
+            "<table width=\"256\">",
+            "<tr><td width=\"14\"> </td><td width=\"230\">Profile</td></tr>",
+            "</table>",
+            "<br>Address",
+            "</td>",
+            "<td> </td>",
+            "<td><div align=\"center\">LatestNews</div></td>",
+            "</tr>",
+            "<tr>",
+            "<td></td>",
+            "<td>DramaInfo</td>",
+            "</tr>",
+            "</table>",
+            "</body></html>"
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => {
+                    Some((text.clone(), layout_point.x(), layout_point.y()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let debug: Vec<String> = text_items.iter()
+            .map(|(t, x, y)| alloc::format!("{}@({},{})", t, x, y))
+            .collect();
+
+        let latest = text_items.iter().find(|(t, _, _)| t.contains("LatestNews"))
+            .expect(&alloc::format!("LatestNews missing, items: {:?}", debug));
+        let drama = text_items.iter().find(|(t, _, _)| t.contains("DramaInfo"))
+            .expect(&alloc::format!("DramaInfo missing, items: {:?}", debug));
+
+        // LatestNews should be to the right of left column (x > 350).
+        assert!(latest.1 > 350,
+            "LatestNews x={} should be > 350 (right of left column), all: {:?}", latest.1, debug);
+        // DramaInfo should also be to the right.
+        assert!(drama.1 > 350,
+            "DramaInfo x={} should be > 350, all: {:?}", drama.1, debug);
+    }
+
+    #[test]
+    fn test_inline_text_no_unnecessary_wrap() {
+        // "生年月日 1964年6月22日" should fit on one line in a 230px container.
+        let html = "<html><head></head><body><table><tr><td width=\"230\">生年月日 1964年6月22日</td></tr></table></body></html>".to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+
+        // All text should be on one line (same Y coordinate).
+        let ys: Vec<i64> = text_items.iter().map(|(_, y)| *y).collect();
+        if ys.len() > 1 {
+            assert!(ys.iter().all(|y| *y == ys[0]),
+                "All text should be on same line, got Y values: {:?}, texts: {:?}", ys, text_items);
+        }
+    }
+
+    #[test]
+    fn test_h1_align_center_title() {
+        // <h1 align="center">阿部 寛のホームページ</h1> should be centered.
+        let html = "<html><head></head><body><h1 align=\"center\">阿部 寛のホームページ</h1></body></html>".to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.x())),
+                _ => None,
+            })
+            .collect();
+
+
+        let title = text_items.iter().find(|(t, _)| t.contains("阿部")).expect("title missing");
+        // Title should be centered: x > 0 and roughly in the middle area.
+        assert!(title.1 > 100, "Title should be centered, x={}", title.1);
+    }
+
+    #[test]
+    fn test_table_column_width_inherited_across_rows() {
+        // Row 1 has explicit widths (14, 230). Row 2 has no explicit widths.
+        // Row 2 cells should inherit column widths from row 1.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table width=\"256\">",
+            "<tr><td width=\"14\">A</td><td width=\"230\">B</td></tr>",
+            "<tr><td>C</td><td>生年月日 1964年6月22日</td></tr>",
+            "</table>",
+            "</body></html>"
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        // "生年月日 1964年6月22日" (176px) fits in 230px — must be one line.
+        let date_items: Vec<_> = text_items.iter()
+            .filter(|(t, _)| t.contains("生年月日") || t.contains("1964"))
+            .collect();
+        assert!(!date_items.is_empty(), "date text missing");
+        // Should be exactly 1 item (not split across lines).
+        assert_eq!(date_items.len(), 1,
+            "Date text should be on one line, got: {:?}", date_items);
+    }
 }

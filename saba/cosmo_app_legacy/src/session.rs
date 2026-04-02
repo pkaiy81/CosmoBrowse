@@ -1942,4 +1942,114 @@ mod tests {
             child_frames: Vec::new(),
         }
     }
+
+    #[test]
+    fn debug_abe_top_layout_positions() {
+        use crate::layout::build_layout_scene;
+        use crate::model::SceneItem;
+        // Use the actual top.htm HTML (converted from Shift_JIS).
+        let html = "\
+<html>\n\
+<head>\n\
+<title>阿部 寛のホームページ</title>\n\
+</head>\n\
+<body background=\"image/abehiroshi.jpg\">\n\
+<br>\n\
+<h1 align=\"center\">阿部 寛のホームページ</h1>\n\
+<div align=\"center\">\n\
+</div>\n\
+<table align=\"center\">\n\
+  <tr>\n\
+    <td rowspan=\"2\"><img src=\"abe-top.jpg\" width=\"350\" height=\"414\" border=\"0\"><br>\n\
+      <br>\n\
+      <table width=\"256\">\n\
+        <tr>\n\
+          <td width=\"14\">&nbsp;</td>\n\
+          <td width=\"230\">阿部 寛（あべ ひろし）<br>\n\
+        Hiroshi Abe<br>\n\
+        </td>\n\
+        </tr>\n\
+        <tr>\n\
+          <td>&nbsp;</td>\n\
+          <td>生年月日 1964年6月22日<br></td>\n\
+        </tr>\n\
+        <tr>\n\
+          <td>&nbsp;</td>\n\
+          <td>血液型 A型<br></td>\n\
+        </tr>\n\
+        <tr>\n\
+          <td>&nbsp;</td>\n\
+          <td><a href=\"prof/prof.htm\">プロフィール</a></td>\n\
+        </tr>\n\
+        <tr>\n\
+          <td>&nbsp;</td>\n\
+          <td>&nbsp;</td>\n\
+        </tr>\n\
+        <tr>\n\
+          <td colspan=\"2\"><br>\n\
+            If you have any enquiries regarding my works or would like to discuss future projects with me, please do not hesitate to contact me at <a href=\"mailto:info@office-a2023.co.jp\">info@office-a2023.co.jp</a><br>\n\
+            <br>\n\
+      </td>\n\
+        </tr>\n\
+    </table>\n\
+      <br>\n\
+      所属<strong>:</strong><br>\n\
+      株式会社オフィスA<br>\n\
+      107-0052<br>\n\
+  東京都港区赤坂9-5-29 <br>\n\
+    赤坂ロイヤルマンション301<br>\n\
+    TEL : +81-3-6434-7140<br>\n\
+    FAX : +81-3-6434-7141 <br>\n\
+    </td>\n\
+    <td>&nbsp;</td>\n\
+    <td><div align=\"center\">★★★　最新情報　★★★</div></td>\n\
+  </tr>\n\
+  <tr>\n\
+    <td></td>\n\
+    <td>\n\
+<br>\n\
+      <table border=\"0\" cellpadding=\"0\">\n\
+           <tr>\n\
+           <td width=\"70\" align=\"left\" valign=\"top\"></td>\n\
+           <td><strong>・ドラマ「まだ結婚できない男」</strong><br>\n\
+           </td>\n\
+         </tr>\n\
+      </table>\n\
+    </td>\n\
+  </tr>\n\
+</table>\n\
+</body>\n\
+</html>";
+        let rect = FrameRect { x: 0, y: 0, width: 839, height: 768 };
+        let scene = build_layout_scene(html, &rect);
+
+        let text_items: Vec<_> = scene.scene_items.iter()
+            .filter_map(|item| match item {
+                SceneItem::Text { text, x, y, .. } => Some((text.clone(), *x, *y)),
+                _ => None,
+            })
+            .collect();
+
+        for (text, x, y) in &text_items {
+            eprintln!("  x={:5} y={:5} text={}", x, y, text);
+        }
+
+        // Title should be centered (x > 100).
+        let title = text_items.iter().find(|(t, _, _)| t.contains("阿部 寛のホームページ"));
+        assert!(title.is_some(), "Title missing, items: {:?}", text_items.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>());
+        let (_, tx, _) = title.unwrap();
+        assert!(*tx > 100, "Title should be centered, x={}", tx);
+
+        // "★★★ 最新情報 ★★★" should be right of left column.
+        let latest = text_items.iter().find(|(t, _, _)| t.contains("最新情報"));
+        assert!(latest.is_some(), "Latest news missing");
+        let (_, lx, _) = latest.unwrap();
+        assert!(*lx > 350, "Latest news x={} should be > 350 (right of image)", lx);
+
+        // "・ドラマ" should also be right of left column.
+        let drama = text_items.iter().find(|(t, _, _)| t.contains("ドラマ"));
+        assert!(drama.is_some(), "Drama missing");
+        let (_, dx, _) = drama.unwrap();
+        assert!(*dx > 350, "Drama x={} should be > 350", dx);
+    }
 }

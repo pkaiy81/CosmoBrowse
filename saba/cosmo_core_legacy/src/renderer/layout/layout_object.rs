@@ -422,11 +422,125 @@ impl LayoutObject {
         self.parent.upgrade()?.borrow().element_kind()
     }
 
+    /// Scan immediate children for elements that imply a minimum width
+    /// (e.g. `<img width="350">`, `<table width="256">`).
+    /// Returns the maximum such hint, or 0 if none found.
+    fn min_content_width_hint(&self) -> i64 {
+        let mut max_hint: i64 = 0;
+        let mut child = self.first_child();
+        while let Some(c) = child {
+            let borrowed = c.borrow();
+            let hint = parse_dimension_attr(borrowed.element_attribute("width")).unwrap_or(0);
+            max_hint = max_hint.max(hint);
+            // Also recurse one level for nested containers.
+            let mut grandchild = borrowed.first_child();
+            while let Some(gc) = grandchild {
+                let gc_hint =
+                    parse_dimension_attr(gc.borrow().element_attribute("width")).unwrap_or(0);
+                max_hint = max_hint.max(gc_hint);
+                let next = gc.borrow().next_sibling();
+                grandchild = next;
+            }
+            let next = borrowed.next_sibling();
+            drop(borrowed);
+            child = next;
+        }
+        max_hint
+    }
+
+    /// Determine this cell's column index (0-based) within its parent row.
+    fn cell_column_index(&self) -> usize {
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return 0,
+        };
+        let mut index: usize = 0;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            match c.try_borrow() {
+                Ok(borrowed) => {
+                    if borrowed.is_table_cell() {
+                        index += 1;
+                    }
+                    let next = borrowed.next_sibling();
+                    drop(borrowed);
+                    child = next;
+                }
+                Err(_) => {
+                    // This is self.
+                    return index;
+                }
+            }
+        }
+        index
+    }
+
+    /// Look at sibling rows in the same table for an explicit width or already-
+    /// computed size at the given column index.  Returns the width if found.
+    fn column_width_from_sibling_rows(&self, col_index: usize) -> Option<i64> {
+        let row = self.parent.upgrade()?;
+        let table = row.borrow().parent.upgrade()?;
+        let mut sibling_row = table.borrow().first_child();
+        while let Some(sr) = sibling_row {
+            let sr_borrowed = sr.borrow();
+            if sr_borrowed.is_table_row() && !Rc::ptr_eq(&sr, &row) {
+                let mut idx: usize = 0;
+                let mut cell = sr_borrowed.first_child();
+                while let Some(c) = cell {
+                    let cb = c.borrow();
+                    if cb.is_table_cell() {
+                        if idx == col_index {
+                            if let Some(w) = parse_dimension_attr(cb.element_attribute("width")) {
+                                return Some(w);
+                            }
+                            if cb.size.width() > 0 {
+                                return Some(cb.size.width());
+                            }
+                        }
+                        idx += 1;
+                    }
+                    let next = cb.next_sibling();
+                    drop(cb);
+                    cell = next;
+                }
+            }
+            let next = sr_borrowed.next_sibling();
+            drop(sr_borrowed);
+            sibling_row = next;
+        }
+        None
+    }
+
+    /// Return this cell's colspan attribute value (defaults to 1).
+    fn cell_colspan(&self) -> usize {
+        parse_dimension_attr(self.element_attribute("colspan"))
+            .unwrap_or(1)
+            .max(1) as usize
+    }
+
     /// Compute the width this cell should use, accounting for sibling cells
     /// that have explicit HTML width attributes, and rowspan cells from
     /// previous rows that reduce the available width.
-    /// Returns the remaining width divided among cells without explicit widths.
+    /// Auto-width cells with large intrinsic content (images, nested tables)
+    /// receive at least their minimum content width before equal distribution.
+    /// Also checks sibling rows for column width hints (including colspan).
     fn table_cell_auto_width(&self, available_width: i64) -> i64 {
+        // Check if sibling rows have explicit widths for the columns this cell spans.
+        let col_index = self.cell_column_index();
+        let colspan = self.cell_colspan();
+        let mut total_from_siblings: i64 = 0;
+        let mut found_all = true;
+        for ci in col_index..(col_index + colspan) {
+            if let Some(w) = self.column_width_from_sibling_rows(ci) {
+                total_from_siblings += w;
+            } else {
+                found_all = false;
+            }
+        }
+        if found_all && total_from_siblings > 0 {
+            return total_from_siblings.min(available_width);
+        }
+
         let parent = match self.parent.upgrade() {
             Some(p) => p,
             None => return available_width,
@@ -436,7 +550,8 @@ impl LayoutObject {
         let effective_width = (available_width - rowspan_offset).max(0);
 
         let mut total_explicit: i64 = 0;
-        let mut auto_count: usize = 0;
+        let mut auto_cells: Vec<(bool, i64)> = Vec::new(); // (is_self, min_hint)
+        let mut self_index: usize = 0;
         let mut child = parent.borrow().first_child();
         while let Some(c) = child {
             match c.try_borrow() {
@@ -445,7 +560,8 @@ impl LayoutObject {
                         if let Some(w) = parse_dimension_attr(borrowed.element_attribute("width")) {
                             total_explicit += w;
                         } else {
-                            auto_count += 1;
+                            let hint = borrowed.min_content_width_hint();
+                            auto_cells.push((false, hint));
                         }
                     }
                     let next = borrowed.next_sibling();
@@ -454,17 +570,49 @@ impl LayoutObject {
                 }
                 Err(_) => {
                     // This is self — it has no explicit width (caller already checked).
-                    auto_count += 1;
+                    let hint = self.min_content_width_hint();
+                    self_index = auto_cells.len();
+                    auto_cells.push((true, hint));
                     let next = c.as_ptr();
                     child = unsafe { (*next).next_sibling() };
                 }
             }
         }
+
         let remaining = (effective_width - total_explicit).max(0);
-        if auto_count > 0 {
-            remaining / auto_count as i64
+        let auto_count = auto_cells.len();
+        if auto_count == 0 {
+            return effective_width;
+        }
+
+        // Check if any auto cell needs more than equal share.
+        let equal_share = remaining / auto_count as i64;
+        let total_min: i64 = auto_cells.iter().map(|(_, h)| *h).sum();
+        if total_min <= remaining && total_min > 0 {
+            // Allocate min widths first, then distribute surplus equally
+            // among cells whose min is below the equal share.
+            let surplus = remaining - total_min;
+            let flexible_count = auto_cells
+                .iter()
+                .filter(|(_, h)| *h <= equal_share)
+                .count() as i64;
+            let bonus = if flexible_count > 0 {
+                surplus / flexible_count
+            } else {
+                0
+            };
+            let (is_self, my_min) = auto_cells[self_index];
+            let _ = is_self; // suppress unused warning
+            if my_min > equal_share {
+                // This cell needs its minimum — give it that.
+                my_min
+            } else {
+                // This cell gets its minimum plus a share of the surplus.
+                my_min + bonus
+            }
         } else {
-            effective_width
+            // Simple equal division (no mins, or mins exceed available).
+            equal_share
         }
     }
 
@@ -876,8 +1024,15 @@ impl LayoutObject {
                     let c = child.expect("first child should exist");
                     let c_kind = c.borrow().kind();
                     if is_row {
-                        // Table row: height = max of cell heights.
-                        content_height = content_height.max(c.borrow().size.height());
+                        // Table row: height = max of cell heights,
+                        // but skip cells with rowspan > 1 (they span multiple rows).
+                        let rowspan = parse_dimension_attr(
+                            c.borrow().element_attribute("rowspan"),
+                        )
+                        .unwrap_or(1);
+                        if rowspan <= 1 {
+                            content_height = content_height.max(c.borrow().size.height());
+                        }
                     } else if previous_child_kind.normal_flow_spec().stacks_vertically
                         || c_kind.normal_flow_spec().stacks_vertically
                     {
