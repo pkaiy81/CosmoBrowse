@@ -889,10 +889,13 @@ impl LayoutObject {
                     child = c.borrow().next_sibling();
                 }
 
-                // <br> elements produce exactly one line break even with no children.
+                // <br> and <hr> have intrinsic heights even without children.
                 let content_height = if self.element_kind() == Some(ElementKind::Br) {
                     let ratio = font_ratio(self.style.font_size());
                     CHAR_HEIGHT_WITH_PADDING * ratio
+                } else if self.element_kind() == Some(ElementKind::Hr) {
+                    // <hr> renders as a 2px line with 8px margin above/below.
+                    2
                 } else {
                     let explicit_height = self.resolved_height(parent_size);
                     if explicit_height > 0 {

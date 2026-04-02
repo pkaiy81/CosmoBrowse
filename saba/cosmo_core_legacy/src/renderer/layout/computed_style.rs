@@ -185,13 +185,18 @@ impl ComputedStyle {
                 Some(ElementKind::Button) | Some(ElementKind::Img) | Some(ElementKind::Input) => {
                     Color::lightgray()
                 }
+                Some(ElementKind::Hr) => Color::gray(),
                 Some(ElementKind::Body) => Color::white(),
                 // Use transparent default so parent backgrounds (e.g. body bgcolor) show through.
                 _ => Color::transparent(),
             });
         }
         if self.color.is_none() {
-            self.color = Some(Color::black());
+            if node.borrow().element_kind() == Some(ElementKind::A) {
+                self.color = Some(Color::link_blue());
+            } else {
+                self.color = Some(Color::black());
+            }
         }
         if self.display.is_none() {
             self.display = Some(DisplayType::default(node));
@@ -251,7 +256,11 @@ impl ComputedStyle {
         }
 
         if self.margin.is_none() {
-            self.margin = Some(EdgeSize::zero());
+            if node.borrow().element_kind() == Some(ElementKind::Hr) {
+                self.margin = Some(EdgeSize::from_values(8.0, 0.0, 8.0, 0.0));
+            } else {
+                self.margin = Some(EdgeSize::zero());
+            }
         }
         if self.padding.is_none() {
             // Default padding-left for list containers (UA stylesheet).
@@ -631,6 +640,20 @@ impl Color {
         Self {
             name: Some("black".to_string()),
             code: "#000000".to_string(),
+        }
+    }
+
+    pub fn link_blue() -> Self {
+        Self {
+            name: Some("blue".to_string()),
+            code: "#0000ee".to_string(),
+        }
+    }
+
+    pub fn gray() -> Self {
+        Self {
+            name: Some("gray".to_string()),
+            code: "#808080".to_string(),
         }
     }
 
