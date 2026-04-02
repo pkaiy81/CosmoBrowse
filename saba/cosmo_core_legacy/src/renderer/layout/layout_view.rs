@@ -640,6 +640,45 @@ mod tests {
     }
 
     #[test]
+    fn test_h1_align_center() {
+        // <h1 align="center"> should center text within the viewport.
+        let html = "<html><head></head><body><h1 align=\"center\">Title</h1></body></html>".to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let title = display_items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } if text == "Title" => Some(layout_point.x()),
+                _ => None,
+            })
+            .expect("Title text missing");
+
+        // Title should be roughly centered (x > 0 and x < 800/2).
+        assert!(title > 0, "Title should not be at x=0, got x={}", title);
+        assert!(title < 400, "Title should be in the left half when centered, got x={}", title);
+    }
+
+    #[test]
+    fn test_table_align_center_shrinks_to_fit() {
+        // <table align="center"> should shrink to content width and be centered.
+        let html = "<html><head></head><body><table align=\"center\"><tr><td width=\"200\">Cell</td></tr></table></body></html>".to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let cell_text = display_items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } if text == "Cell" => Some(layout_point.x()),
+                _ => None,
+            })
+            .expect("Cell text missing");
+
+        // The table is 200px wide, centered in 800px → starts around x=300.
+        assert!(cell_text > 100, "Table should be centered, cell x={}", cell_text);
+    }
+
+    #[test]
     fn test_nested_table_implicit_close_scoped() {
         // Opening <tr> inside a nested table must NOT close the outer <tr>.
         let html = "<html><head></head><body><table><tr><td><table><tr><td>Inner</td></tr></table>Outer</td></tr></table></body></html>".to_string();

@@ -840,6 +840,30 @@ impl LayoutObject {
                     explicit_width.min(available_width)
                 } else if let Some(w) = html_width {
                     w.min(available_width)
+                } else if self.element_kind() == Some(ElementKind::Table) {
+                    // Tables without explicit width use shrink-to-fit: the width
+                    // of the widest row (sum of cell widths), capped at available.
+                    let mut max_row_width: i64 = 0;
+                    let mut row = self.first_child();
+                    while let Some(r) = row {
+                        if r.borrow().is_table_row() {
+                            let mut row_width: i64 = 0;
+                            let mut cell = r.borrow().first_child();
+                            while let Some(c) = cell {
+                                row_width += c.borrow().size.width();
+                                let next = c.borrow().next_sibling();
+                                cell = next;
+                            }
+                            max_row_width = max_row_width.max(row_width);
+                        }
+                        let next = r.borrow().next_sibling();
+                        row = next;
+                    }
+                    if max_row_width > 0 {
+                        max_row_width.min(available_width)
+                    } else {
+                        available_width
+                    }
                 } else {
                     available_width
                 };
