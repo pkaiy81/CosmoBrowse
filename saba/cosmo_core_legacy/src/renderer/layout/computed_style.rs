@@ -220,11 +220,19 @@ impl ComputedStyle {
             self.width = Some(0.0);
         }
         // Handle HTML align attribute (presentational hint).
+        // Spec: HTML Living Standard §14.3 — presentational hints for alignment.
+        // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+        //
+        // align="center" on a TABLE element means "center the table horizontally"
+        // (equivalent to margin-left:auto; margin-right:auto).  It does NOT imply
+        // text-align:center for the table's cell contents.  On other block elements
+        // (h1, p, div…) align="center" maps to text-align:center.
+        let is_table = node.borrow().element_kind() == Some(ElementKind::Table);
         if let Some(align) = get_element_attribute(node, "align") {
             if align.eq_ignore_ascii_case("center") {
                 self.margin_left_auto = true;
                 self.margin_right_auto = true;
-                if self.text_align.is_none() {
+                if !is_table && self.text_align.is_none() {
                     self.text_align = Some(TextAlign::Center);
                 }
             } else if align.eq_ignore_ascii_case("right") {
