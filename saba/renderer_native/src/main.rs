@@ -46,6 +46,7 @@ struct App {
     needs_redraw: bool,
     status_message: String,
     pending_url: Option<String>,
+    save_screenshot: bool,
 }
 
 impl App {
@@ -64,6 +65,7 @@ impl App {
             needs_redraw: true,
             status_message: String::new(),
             pending_url: None,
+            save_screenshot: false,
         }
     }
 
@@ -80,6 +82,9 @@ impl App {
 
         match self.bridge.navigate(url) {
             Ok(()) => {
+                // Sync the layout engine's viewport with the current window size.
+                // The session snapshot may carry a stale viewport from a previous run.
+                let _ = self.bridge.set_viewport(self.viewport_width, self.viewport_height);
                 self.chrome.set_url(&self.bridge.current_url());
                 // Spec: HTML Living Standard §7.4 — scroll to fragment anchor if present.
                 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
@@ -192,6 +197,16 @@ impl App {
         }
         buffer.present().expect("Failed to present buffer");
         self.needs_redraw = false;
+
+        // Save a PNG snapshot if requested (e.g. via Ctrl+S).
+        if self.save_screenshot {
+            self.save_screenshot = false;
+            let path = "/tmp/cosmo_screenshot.png";
+            match pixmap.save_png(path) {
+                Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", path),
+                Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+            }
+        }
     }
 
     fn handle_key(&mut self, event: KeyEvent) {
@@ -247,6 +262,12 @@ impl App {
                 if ch.eq("l") && !event.repeat && is_ctrl_pressed(&event) {
                     self.chrome.is_focused = true;
                     self.chrome.select_all();
+                    self.needs_redraw = true;
+                    return;
+                }
+                // Ctrl+S: save screenshot to /tmp/cosmo_screenshot.png.
+                if ch.eq("s") && !event.repeat && is_ctrl_pressed(&event) {
+                    self.save_screenshot = true;
                     self.needs_redraw = true;
                     return;
                 }
@@ -464,8 +485,74 @@ fn is_ctrl_pressed(event: &KeyEvent) -> bool {
     event.text.is_none()
 }
 
+/// Headless screenshot mode: render `url` to a PNG at `out_path` without opening a window.
+fn headless_screenshot(url: &str, out_path: &str) {
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+
+    let width = DEFAULT_WIDTH;
+    let height = DEFAULT_HEIGHT;
+
+    let mut text_renderer = TextRenderer::new();
+    let mut image_cache = ImageCache::new();
+    let mut bridge = AppBridge::new();
+
+    if let Err(e) = bridge.navigate(&url) {
+        eprintln!("[SCREENSHOT] navigate error: {}", e);
+        return;
+    }
+    // set_viewport must be called after navigate (requires a loaded page)
+    // to override any stale viewport from the session snapshot.
+    if let Err(e) = bridge.set_viewport(width, height) {
+        eprintln!("[SCREENSHOT] set_viewport error: {}", e);
+        return;
+    }
+
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    pixmap.fill(tiny_skia::Color::WHITE);
+
+    let chrome = ChromeState::new();
+    ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
+
+    let base_url = bridge.current_url();
+    let frame_commands = bridge.collect_paint_commands();
+    for (frame_id, commands) in &frame_commands {
+        render_commands(
+            &mut pixmap,
+            commands,
+            &mut text_renderer,
+            &mut image_cache,
+            &base_url,
+            0,
+            CHROME_HEIGHT,
+            frame_id,
+        );
+    }
+
+    let content_height = bridge.content_height();
+    ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+
+    match pixmap.save_png(out_path) {
+        Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
+        Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+    }
+}
+
 fn main() {
-    let url = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().collect();
+
+    // --screenshot <url> [out.png]
+    if args.get(1).map(|s| s.as_str()) == Some("--screenshot") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
+        let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
+        headless_screenshot(url, out);
+        return;
+    }
+
+    let url = args.get(1).cloned();
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let mut app = App::new();

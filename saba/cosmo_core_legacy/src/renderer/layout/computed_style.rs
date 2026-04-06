@@ -256,10 +256,27 @@ impl ComputedStyle {
         }
 
         if self.margin.is_none() {
-            if node.borrow().element_kind() == Some(ElementKind::Hr) {
-                self.margin = Some(EdgeSize::from_values(8.0, 0.0, 8.0, 0.0));
-            } else {
-                self.margin = Some(EdgeSize::zero());
+            // UA stylesheet defaults (CSS2 §6.4 — browser default styles).
+            match node.borrow().element_kind() {
+                Some(ElementKind::Hr) => {
+                    self.margin = Some(EdgeSize::from_values(8.0, 0.0, 8.0, 0.0));
+                }
+                Some(ElementKind::P) => {
+                    // Browsers give <p> 1em top + 1em bottom margin by default.
+                    self.margin = Some(EdgeSize::from_values(16.0, 0.0, 16.0, 0.0));
+                }
+                Some(ElementKind::H1) => {
+                    self.margin = Some(EdgeSize::from_values(21.0, 0.0, 21.0, 0.0));
+                }
+                Some(ElementKind::H2) => {
+                    self.margin = Some(EdgeSize::from_values(19.0, 0.0, 19.0, 0.0));
+                }
+                Some(ElementKind::H3) => {
+                    self.margin = Some(EdgeSize::from_values(17.0, 0.0, 17.0, 0.0));
+                }
+                _ => {
+                    self.margin = Some(EdgeSize::zero());
+                }
             }
         }
         if self.padding.is_none() {
