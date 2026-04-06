@@ -506,10 +506,23 @@ impl BrowserSession {
         href: &str,
         target: Option<&str>,
     ) -> AppResult<PageViewModel> {
-        let normalized_href = normalize_url_like(href)?;
+        // Resolve the href against the source frame URL before normalizing.
+        // This enables relative URLs ("page.html"), root-relative ("/path"),
+        // and fragment-only ("#section") hrefs to be navigated correctly.
+        // Spec: HTML Living Standard §7.1 — navigating to a URL.
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
+        // Spec: WHATWG URL §5.1 — URL parsing with a base URL.
+        // https://url.spec.whatwg.org/#concept-url-parser
         let current = self
             .current_page()
             .ok_or_else(|| AppError::state("No page loaded"))?;
+        let source_url = frame_current_url(&current.root_frame, frame_id)
+            .unwrap_or_else(|| current.current_url.clone());
+        // resolve_url uses Url::join which handles all relative reference forms.
+        // Fall back to the raw href only if the base is not yet a valid URL
+        // (e.g. blank page before the first navigation).
+        let resolved_href = resolve_url(&source_url, href).unwrap_or_else(|_| href.to_string());
+        let normalized_href = normalize_url_like(&resolved_href)?;
         let normalized_target = normalize_target_keyword(target);
         if normalized_target.as_deref() == Some("_top")
             || current.root_frame.child_frames.is_empty()
@@ -520,8 +533,6 @@ impl BrowserSession {
             return Ok(view);
         }
         let mut overrides = snapshot_frame_urls(&current.root_frame);
-        let source_url = frame_current_url(&current.root_frame, frame_id)
-            .unwrap_or_else(|| current.current_url.clone());
         enforce_mixed_content_policy(&source_url, &normalized_href)?;
         if !is_same_origin(&source_url, &normalized_href) {
             return Err(AppError::navigation_guard(format!(
@@ -535,6 +546,27 @@ impl BrowserSession {
             normalized_target.as_deref(),
         )
         .ok_or_else(|| AppError::state("Target frame is unavailable"))?;
+        // Spec: HTML Living Standard §7.1 — fragment navigation within the same
+        // document must not cause a full reload.
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-the-fragment-identifier
+        // When a child-frame link targets itself (no `target` attribute or
+        // explicit self-target) and the href only adds/changes a fragment on the
+        // currently loaded URL, avoid reloading the entire frameset.
+        // Per-frame scroll is not yet implemented, so we return the current view
+        // unchanged rather than causing a disruptive blank flash.
+        if destination == frame_id {
+            let href_base = normalized_href
+                .split_once('#')
+                .map(|(b, _)| b)
+                .unwrap_or(&normalized_href);
+            let source_base = source_url
+                .split_once('#')
+                .map(|(b, _)| b)
+                .unwrap_or(&source_url);
+            if href_base == source_base {
+                return Ok(current);
+            }
+        }
         overrides.insert(destination, normalized_href);
         let view = self.load_page(
             &current.current_url,
@@ -2020,10 +2052,17 @@ mod tests {
 </table>\n\
 </body>\n\
 </html>";
-        let rect = FrameRect { x: 0, y: 0, width: 839, height: 768 };
+        let rect = FrameRect {
+            x: 0,
+            y: 0,
+            width: 839,
+            height: 768,
+        };
         let scene = build_layout_scene(html, &rect);
 
-        let text_items: Vec<_> = scene.scene_items.iter()
+        let text_items: Vec<_> = scene
+            .scene_items
+            .iter()
             .filter_map(|item| match item {
                 SceneItem::Text { text, x, y, .. } => Some((text.clone(), *x, *y)),
                 _ => None,
@@ -2035,8 +2074,17 @@ mod tests {
         }
 
         // Title should be centered (x > 100).
-        let title = text_items.iter().find(|(t, _, _)| t.contains("阿部 寛のホームページ"));
-        assert!(title.is_some(), "Title missing, items: {:?}", text_items.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>());
+        let title = text_items
+            .iter()
+            .find(|(t, _, _)| t.contains("阿部 寛のホームページ"));
+        assert!(
+            title.is_some(),
+            "Title missing, items: {:?}",
+            text_items
+                .iter()
+                .map(|(t, _, _)| t.as_str())
+                .collect::<Vec<_>>()
+        );
         let (_, tx, _) = title.unwrap();
         assert!(*tx > 100, "Title should be centered, x={}", tx);
 
@@ -2044,12 +2092,62 @@ mod tests {
         let latest = text_items.iter().find(|(t, _, _)| t.contains("最新情報"));
         assert!(latest.is_some(), "Latest news missing");
         let (_, lx, _) = latest.unwrap();
-        assert!(*lx > 350, "Latest news x={} should be > 350 (right of image)", lx);
+        assert!(
+            *lx > 350,
+            "Latest news x={} should be > 350 (right of image)",
+            lx
+        );
 
         // "・ドラマ" should also be right of left column.
         let drama = text_items.iter().find(|(t, _, _)| t.contains("ドラマ"));
         assert!(drama.is_some(), "Drama missing");
         let (_, dx, _) = drama.unwrap();
         assert!(*dx > 350, "Drama x={} should be > 350", dx);
+    }
+
+    #[test]
+    fn display_items_to_scene_propagates_link_target() {
+        use crate::layout::build_layout_scene;
+        use crate::model::SceneItem;
+
+        let html = r#"<html><body>
+          <a href="page.htm" target="right">Link</a>
+        </body></html>"#;
+        let rect = FrameRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let scene = build_layout_scene(html, &rect);
+
+        let link_item = scene
+            .scene_items
+            .iter()
+            .find(|item| matches!(item, SceneItem::Text { href: Some(_), .. }));
+        assert!(link_item.is_some(), "link text item should exist");
+        match link_item.unwrap() {
+            SceneItem::Text { target, href, .. } => {
+                assert_eq!(href.as_deref(), Some("page.htm"));
+                assert_eq!(target.as_deref(), Some("right"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn navigate_to_butai_page_does_not_panic() {
+        let mut session = BrowserSession::new();
+        let view = session
+            .open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+        let left = view.root_frame.child_frames[0].id.clone();
+        let result =
+            session.activate_link(&left, "fixture://abehiroshi/stage/butai.htm", Some("right"));
+        assert!(
+            result.is_ok(),
+            "butai navigation should not panic: {:?}",
+            result.err()
+        );
     }
 }

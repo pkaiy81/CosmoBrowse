@@ -542,6 +542,10 @@ pub fn load_fixture_document(url: &str) -> Option<LoadedDocument> {
             "fixture://abehiroshi/prof".to_string(),
             include_str!("../../testdata/abehiroshi/prof/prof.htm").to_string(),
         ),
+        "fixture://abehiroshi/butai" | "fixture://abehiroshi/stage/butai.htm" => (
+            "fixture://abehiroshi/butai".to_string(),
+            include_str!("../../testdata/abehiroshi/butai.htm").to_string(),
+        ),
         "fixture://legacy_frames/nested" => (
             "fixture://legacy_frames/nested".to_string(),
             include_str!("../../testdata/legacy_frames/nested.htm").to_string(),
