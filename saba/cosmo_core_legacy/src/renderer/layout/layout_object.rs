@@ -414,6 +414,23 @@ impl LayoutObject {
         None
     }
 
+    /// Walk ancestor chain to the nearest `<a>` element and return its `target`
+    /// attribute value.
+    /// Spec: HTML Living Standard §4.6.21 — the `target` attribute on `<a>`.
+    /// https://html.spec.whatwg.org/multipage/links.html#attr-hyperlink-target
+    fn link_target(&self) -> Option<String> {
+        let mut current = Some(self.node.clone());
+        while let Some(node) = current {
+            if let NodeKind::Element(element) = node.borrow().kind() {
+                if element.kind() == ElementKind::A {
+                    return element.get_attribute("target");
+                }
+            }
+            current = node.borrow().parent().upgrade();
+        }
+        None
+    }
+
     fn element_kind(&self) -> Option<ElementKind> {
         self.node.borrow().element_kind()
     }
@@ -805,6 +822,12 @@ impl LayoutObject {
             LayoutObjectKind::Block => {
                 if let NodeKind::Element(_) = self.node_kind() {
                     if self.size.width() > 0 && self.size.height() > 0 {
+                        // Capture the element's `id` attribute so the adapter
+                        // can resolve URL fragment anchors to a scroll offset.
+                        // Spec: HTML Living Standard §7.4 — navigating to a
+                        // fragment identifier within a document.
+                        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
+                        let anchor_id = self.element_attribute("id");
                         return vec![DisplayItem::Rect {
                             style: self.style(),
                             layout_point: self.point(),
@@ -827,6 +850,7 @@ impl LayoutObject {
                             } else {
                                 None
                             },
+                            anchor_id,
                         }];
                     }
                 }
@@ -835,6 +859,7 @@ impl LayoutObject {
                 if let NodeKind::Element(_) = self.node_kind() {
                     let mut items = Vec::new();
                     if self.size.width() > 0 && self.size.height() > 0 {
+                        let anchor_id = self.element_attribute("id");
                         items.push(DisplayItem::Rect {
                             style: self.style(),
                             layout_point: self.point(),
@@ -857,6 +882,7 @@ impl LayoutObject {
                             } else {
                                 None
                             },
+                            anchor_id,
                         });
                     }
 
@@ -870,6 +896,7 @@ impl LayoutObject {
                             layout_size: self.size(),
                             style: self.style(),
                             href: self.link_href(),
+                            target: self.link_target(),
                             paint_order: PaintOrder {
                                 stacking_context: if self.style.position() != PositionType::Static {
                                     1
@@ -898,6 +925,7 @@ impl LayoutObject {
                                 self.point().y() + 10,
                             ),
                             href: self.link_href(),
+                            target: self.link_target(),
                             paint_order: PaintOrder {
                                 stacking_context: if self.style.position() != PositionType::Static {
                                     1
@@ -940,6 +968,7 @@ impl LayoutObject {
                     };
                     let lines = split_text(plain_text, CHAR_WIDTH * ratio, max_width);
                     let href = self.link_href();
+                    let target = self.link_target();
 
                     for (i, line) in lines.into_iter().enumerate() {
                         let item = DisplayItem::Text {
@@ -950,6 +979,7 @@ impl LayoutObject {
                                 self.point().y() + CHAR_HEIGHT_WITH_PADDING * ratio * i as i64,
                             ),
                             href: href.clone(),
+                            target: target.clone(),
                             paint_order: PaintOrder {
                                 stacking_context: if self.style.position() != PositionType::Static {
                                     1

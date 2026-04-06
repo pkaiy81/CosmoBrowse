@@ -262,6 +262,12 @@ pub enum SceneItem {
         opacity: f64,
         z_index: i32,
         clip_rect: Option<(i64, i64, i64, i64)>,
+        // The value of the element's HTML `id` attribute, when present.
+        // Enables fragment-anchor (#id) scroll offset resolution without
+        // an additional DOM query.
+        // Spec: HTML Living Standard §7.4 — scrolling to a fragment.
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
+        anchor_id: Option<String>,
     },
     Text {
         x: i64,

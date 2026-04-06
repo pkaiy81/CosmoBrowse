@@ -56,6 +56,13 @@ pub struct DrawRect {
     pub opacity: f64,
     pub z_index: i32,
     pub clip_rect: Option<(i64, i64, i64, i64)>,
+    // The value of the element's HTML `id` attribute, when present.
+    // Enables the renderer to resolve URL fragment anchors (#id) to a
+    // pixel scroll offset without an additional DOM query.
+    // Spec: HTML Living Standard §7.4 — scrolling to a fragment.
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

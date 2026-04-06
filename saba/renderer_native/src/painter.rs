@@ -357,6 +357,7 @@ fn draw_image(
         opacity: img.opacity,
         z_index: img.z_index,
         clip_rect: img.clip_rect,
+        anchor_id: None,
     };
     draw_rect(pixmap, &placeholder, scroll_y, chrome_height, image_cache, base_url);
 

@@ -27,6 +27,7 @@ pub fn map_display_items_to_paint_commands(
                 layout_size,
                 paint_order,
                 clip_rect,
+                anchor_id,
             } => {
                 commands.push(PaintCommand::DrawRect(DrawRect {
                     x: origin_x + layout_point.x(),
@@ -38,6 +39,7 @@ pub fn map_display_items_to_paint_commands(
                     opacity: style.opacity(),
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    anchor_id: anchor_id.clone(),
                 }));
             }
             DisplayItem::Text {
@@ -45,6 +47,7 @@ pub fn map_display_items_to_paint_commands(
                 style,
                 layout_point,
                 href,
+                target,
                 paint_order,
                 clip_rect,
             } => {
@@ -74,7 +77,7 @@ pub fn map_display_items_to_paint_commands(
                     underline: style.text_decoration() == TextDecoration::Underline,
                     opacity: style.opacity(),
                     href: href.clone(),
-                    target: None,
+                    target: target.clone(),
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 }));
@@ -86,6 +89,7 @@ pub fn map_display_items_to_paint_commands(
                 layout_size,
                 style,
                 href,
+                target,
                 paint_order,
                 clip_rect,
             } => {
@@ -98,7 +102,7 @@ pub fn map_display_items_to_paint_commands(
                     alt: alt.clone(),
                     opacity: style.opacity(),
                     href: href.clone(),
-                    target: None,
+                    target: target.clone(),
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 }));
@@ -140,12 +144,14 @@ mod tests {
                 layout_size: LayoutSize::new(80, 20),
                 paint_order: PaintOrder::root(),
                 clip_rect: None,
+                anchor_id: None,
             },
             DisplayItem::Text {
                 text: "hello".to_string(),
                 style: text_style,
                 layout_point: LayoutPoint::new(8, 10),
                 href: Some("https://example.com".to_string()),
+                target: None,
                 paint_order: PaintOrder { stacking_context: 0, z_index: 1 },
                 clip_rect: None,
             },

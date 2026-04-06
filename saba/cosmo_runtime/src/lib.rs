@@ -27,6 +27,7 @@ pub fn scene_items_to_paint_commands(
                 opacity,
                 z_index,
                 clip_rect,
+                anchor_id,
             } => commands.push(PaintCommand::DrawRect(DrawRect {
                 x: *x,
                 y: *y,
@@ -37,6 +38,7 @@ pub fn scene_items_to_paint_commands(
                 opacity: *opacity,
                 z_index: *z_index,
                 clip_rect: *clip_rect,
+                anchor_id: anchor_id.clone(),
             })),
             SceneItem::Text {
                 x,
@@ -110,6 +112,7 @@ pub fn scene_items_to_paint_commands(
                         opacity: *opacity,
                         z_index: *z_index,
                         clip_rect: *clip_rect,
+                        anchor_id: None,
                     }));
                     commands.push(PaintCommand::fallback_text(
                         *x + 4,

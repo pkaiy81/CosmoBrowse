@@ -65,6 +65,7 @@ pub fn parse_and_render(html: &str, canvas_width: f64, _canvas_height: f64) -> J
                 style,
                 layout_point,
                 layout_size,
+                ..
             } => {
                 DrawCommand::Rect {
                     x: layout_point.x() as f64,

@@ -1382,6 +1382,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 opacity: rect.opacity,
                 z_index: rect.z_index,
                 clip_rect: rect.clip_rect,
+                anchor_id: rect.anchor_id.clone(),
             }),
             PaintCommand::DrawText(text) => items.push(SceneItem::Text {
                 x: text.x,

@@ -162,6 +162,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 layout_size,
                 paint_order,
                 clip_rect,
+                anchor_id,
             } => {
                 let x = rect.x + layout_point.x();
                 let y = rect.y + layout_point.y();
@@ -177,6 +178,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     opacity: style.opacity(),
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    anchor_id,
                 });
             }
             DisplayItem::Text {
@@ -184,6 +186,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 style,
                 layout_point,
                 href,
+                target,
                 paint_order,
                 clip_rect,
             } => {
@@ -203,7 +206,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     underline: style.text_decoration() == TextDecoration::Underline,
                     opacity: style.opacity(),
                     href,
-                    target: None,
+                    target,
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 });
@@ -215,6 +218,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 layout_size,
                 style,
                 href,
+                target,
                 paint_order,
                 clip_rect,
             } => {
@@ -231,7 +235,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     alt,
                     opacity: style.opacity(),
                     href,
-                    target: None,
+                    target,
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 });
@@ -387,6 +391,7 @@ mod diff_tests {
             opacity: 1.0,
             z_index: 0,
             clip_rect: None,
+            anchor_id: None,
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -398,6 +403,7 @@ mod diff_tests {
             opacity: 1.0,
             z_index: 1,
             clip_rect: None,
+            anchor_id: None,
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

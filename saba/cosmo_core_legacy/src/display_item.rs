@@ -38,12 +38,20 @@ pub enum DisplayItem {
         layout_size: LayoutSize,
         paint_order: PaintOrder,
         clip_rect: Option<ClipRect>,
+        // The value of the element's `id` attribute, when present.
+        // Used to resolve URL fragment anchors to a scroll offset.
+        // Spec: HTML Living Standard §7.4 — navigating to a fragment.
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
+        anchor_id: Option<String>,
     },
     Text {
         text: String,
         style: ComputedStyle,
         layout_point: LayoutPoint,
         href: Option<String>,
+        // Spec: HTML Living Standard §4.6.21 — the `target` attribute on `<a>`.
+        // https://html.spec.whatwg.org/multipage/links.html#attr-hyperlink-target
+        target: Option<String>,
         paint_order: PaintOrder,
         clip_rect: Option<ClipRect>,
     },
@@ -54,6 +62,9 @@ pub enum DisplayItem {
         layout_size: LayoutSize,
         style: ComputedStyle,
         href: Option<String>,
+        // Spec: HTML Living Standard §4.6.21 — the `target` attribute on `<a>`.
+        // https://html.spec.whatwg.org/multipage/links.html#attr-hyperlink-target
+        target: Option<String>,
         paint_order: PaintOrder,
         clip_rect: Option<ClipRect>,
     },

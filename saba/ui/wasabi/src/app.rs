@@ -227,6 +227,7 @@ impl WasabiUI {
                     style,
                     layout_point,
                     layout_size,
+                    ..
                 } => {
                     if self
                         .window

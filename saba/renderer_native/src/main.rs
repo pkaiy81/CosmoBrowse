@@ -74,16 +74,16 @@ impl App {
     }
 
     fn navigate(&mut self, url: &str) {
-
         self.status_message = format!("Loading {}...", url);
         self.needs_redraw = true;
         self.redraw();
 
         match self.bridge.navigate(url) {
             Ok(()) => {
-
                 self.chrome.set_url(&self.bridge.current_url());
-                self.scroll_y = 0;
+                // Spec: HTML Living Standard §7.4 — scroll to fragment anchor if present.
+                // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
+                self.scroll_y = self.bridge.anchor_scroll_y();
                 self.status_message.clear();
                 if let Some(ws) = &self.window_state {
                     let title = self.bridge.current_title();
@@ -96,7 +96,6 @@ impl App {
                 }
             }
             Err(e) => {
-
                 self.status_message = format!("Error: {}", e);
             }
         }
@@ -302,13 +301,24 @@ impl App {
             let href = region.href.clone();
             let target = region.target.clone();
             let frame_id = region.frame_id.clone();
+            // Save the current top-level URL so we can detect root navigations.
+            let prev_url = self.bridge.current_url();
             match self
                 .bridge
                 .activate_link(&frame_id, &href, target.as_deref())
             {
                 Ok(()) => {
                     self.chrome.set_url(&self.bridge.current_url());
-                    self.scroll_y = 0;
+                    // Only reset scroll when the root-level URL changes (i.e. a new
+                    // standalone page was loaded).  For child-frame-only navigations
+                    // (e.g. frameset target="right" or in-page anchor in a sub-frame)
+                    // the top-level URL stays the same and we preserve the current
+                    // scroll position so the viewport does not jump to the top.
+                    // Spec: HTML Living Standard §7.4 — navigating to a fragment.
+                    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
+                    if self.bridge.current_url() != prev_url {
+                        self.scroll_y = self.bridge.anchor_scroll_y();
+                    }
                 }
                 Err(e) => {
                     self.status_message = format!("Error: {}", e);
