@@ -799,6 +799,40 @@ mod tests {
     }
 
     #[test]
+    fn test_table_align_center_with_width() {
+        // <TABLE width="752" align="center"> in a 1024px viewport should be
+        // centered, so the first column should start at roughly (1024-752)/2=136.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table width=\"752\" align=\"center\">",
+            "<tr><td width=\"120\">ラベル</td><td>データ</td></tr>",
+            "</table></body></html>"
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let label = display_items.iter().find_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } if text.contains("ラベル") => {
+                Some(layout_point.x())
+            }
+            _ => None,
+        }).expect("label text not found");
+
+        let data = display_items.iter().find_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } if text.contains("データ") => {
+                Some(layout_point.x())
+            }
+            _ => None,
+        }).expect("data text not found");
+
+        // Table centered in 1024: left edge at ~136. Label column = 120px wide,
+        // so data column starts at ~256.
+        assert!(label >= 100, "label x={} should be >= 100 (table is centered)", label);
+        assert!(data > label, "data x={} should be to the right of label x={}", data, label);
+        assert!(data >= 200, "data column x={} should be around 256 (136+120)", data);
+    }
+
+    #[test]
     fn test_table_column_width_inherited_across_rows() {
         // Row 1 has explicit widths (14, 230). Row 2 has no explicit widths.
         // Row 2 cells should inherit column widths from row 1.
