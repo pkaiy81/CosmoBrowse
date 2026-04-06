@@ -1157,6 +1157,13 @@ mod tests {
     use cosmo_runtime::ScrollPosition;
     use std::sync::{Arc, OnceLock};
 
+    fn unix_timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
     #[derive(Default)]
     struct FakeProcessState {
         running: bool,
