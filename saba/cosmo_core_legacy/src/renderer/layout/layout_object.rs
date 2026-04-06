@@ -366,6 +366,13 @@ pub struct LayoutObject {
     style: ComputedStyle,
     point: LayoutPoint,
     size: LayoutSize,
+    // The max_width used in split_text() during compute_size for Text nodes.
+    // Cached here so that paint() uses the identical line-breaking boundary,
+    // preventing the double-split divergence that causes text to stack
+    // vertically instead of flowing horizontally.
+    // Spec: CSS2.2 §9.4.2 — inline formatting context line construction.
+    // https://www.w3.org/TR/CSS22/visuren.html#inline-formatting
+    text_line_max_width: i64,
 }
 
 impl PartialEq for LayoutObject {
@@ -390,6 +397,7 @@ impl LayoutObject {
             style: ComputedStyle::new(),
             point: LayoutPoint::new(0, 0),
             size: LayoutSize::new(0, 0),
+            text_line_max_width: 0,
         }
     }
 
@@ -418,29 +426,24 @@ impl LayoutObject {
         matches!(self.element_kind(), Some(ElementKind::Tr))
     }
 
-    fn parent_element_kind(&self) -> Option<ElementKind> {
-        self.parent.upgrade()?.borrow().element_kind()
-    }
-
-    /// Scan immediate children for elements that imply a minimum width
-    /// (e.g. `<img width="350">`, `<table width="256">`).
+    /// Scan descendants (up to `depth` levels) for elements that imply a
+    /// minimum width (e.g. `<img width="350">`, `<table width="256">`).
     /// Returns the maximum such hint, or 0 if none found.
     fn min_content_width_hint(&self) -> i64 {
+        self.min_content_width_hint_depth(3)
+    }
+
+    fn min_content_width_hint_depth(&self, depth: u32) -> i64 {
+        if depth == 0 {
+            return 0;
+        }
         let mut max_hint: i64 = 0;
         let mut child = self.first_child();
         while let Some(c) = child {
             let borrowed = c.borrow();
             let hint = parse_dimension_attr(borrowed.element_attribute("width")).unwrap_or(0);
             max_hint = max_hint.max(hint);
-            // Also recurse one level for nested containers.
-            let mut grandchild = borrowed.first_child();
-            while let Some(gc) = grandchild {
-                let gc_hint =
-                    parse_dimension_attr(gc.borrow().element_attribute("width")).unwrap_or(0);
-                max_hint = max_hint.max(gc_hint);
-                let next = gc.borrow().next_sibling();
-                grandchild = next;
-            }
+            max_hint = max_hint.max(borrowed.min_content_width_hint_depth(depth - 1));
             let next = borrowed.next_sibling();
             drop(borrowed);
             child = next;
@@ -525,28 +528,34 @@ impl LayoutObject {
     /// receive at least their minimum content width before equal distribution.
     /// Also checks sibling rows for column width hints (including colspan).
     fn table_cell_auto_width(&self, available_width: i64) -> i64 {
-        // Check if sibling rows have explicit widths for the columns this cell spans.
-        let col_index = self.cell_column_index();
-        let colspan = self.cell_colspan();
-        let mut total_from_siblings: i64 = 0;
-        let mut found_all = true;
-        for ci in col_index..(col_index + colspan) {
-            if let Some(w) = self.column_width_from_sibling_rows(ci) {
-                total_from_siblings += w;
-            } else {
-                found_all = false;
-            }
-        }
-        if found_all && total_from_siblings > 0 {
-            return total_from_siblings.min(available_width);
-        }
-
         let parent = match self.parent.upgrade() {
             Some(p) => p,
             None => return available_width,
         };
         // Reduce available width by rowspan columns from previous rows.
         let rowspan_offset = parent.borrow().rowspan_column_offset();
+
+        // Check if sibling rows have explicit widths for the columns this cell
+        // spans.  Skip this check when rowspan columns shift cell indices
+        // across rows, because the raw cell_column_index does not account for
+        // rowspan-occupied columns.
+        if rowspan_offset == 0 {
+            let col_index = self.cell_column_index();
+            let colspan = self.cell_colspan();
+            let mut total_from_siblings: i64 = 0;
+            let mut found_all = true;
+            for ci in col_index..(col_index + colspan) {
+                if let Some(w) = self.column_width_from_sibling_rows(ci) {
+                    total_from_siblings += w;
+                } else {
+                    found_all = false;
+                }
+            }
+            if found_all && total_from_siblings > 0 {
+                return total_from_siblings.min(available_width);
+            }
+        }
+
         let effective_width = (available_width - rowspan_offset).max(0);
 
         let mut total_explicit: i64 = 0;
@@ -589,25 +598,27 @@ impl LayoutObject {
         let equal_share = remaining / auto_count as i64;
         let total_min: i64 = auto_cells.iter().map(|(_, h)| *h).sum();
         if total_min <= remaining && total_min > 0 {
-            // Allocate min widths first, then distribute surplus equally
-            // among cells whose min is below the equal share.
             let surplus = remaining - total_min;
-            let flexible_count = auto_cells
-                .iter()
-                .filter(|(_, h)| *h <= equal_share)
-                .count() as i64;
-            let bonus = if flexible_count > 0 {
-                surplus / flexible_count
-            } else {
-                0
-            };
-            let (is_self, my_min) = auto_cells[self_index];
-            let _ = is_self; // suppress unused warning
+            let (_, my_min) = auto_cells[self_index];
             if my_min > equal_share {
                 // This cell needs its minimum — give it that.
                 my_min
             } else {
-                // This cell gets its minimum plus a share of the surplus.
+                // Distribute surplus proportionally to each flexible cell's
+                // effective content hint so that spacer cells (hint ≈ 0) get
+                // only a small share while content-heavy cells get more.
+                const DEFAULT_MIN: i64 = 16;
+                let total_effective: i64 = auto_cells
+                    .iter()
+                    .filter(|(_, h)| *h <= equal_share)
+                    .map(|(_, h)| (*h).max(DEFAULT_MIN))
+                    .sum();
+                let my_effective = my_min.max(DEFAULT_MIN);
+                let bonus = if total_effective > 0 {
+                    surplus * my_effective / total_effective
+                } else {
+                    0
+                };
                 my_min + bonus
             }
         } else {
@@ -914,7 +925,19 @@ impl LayoutObject {
                         .filter(|s| !s.is_empty())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let max_width = self.size().width().max(CHAR_WIDTH * ratio);
+                    // Use the max_width that was established during compute_size so
+                    // that the line-break boundaries are identical between the sizing
+                    // and painting passes.  Recomputing against self.size().width()
+                    // here would produce narrower wrapping because size.width() is
+                    // the width of the widest *result* line, not the available
+                    // container width.
+                    // Spec: CSS2.2 §9.4.2 — inline formatting context, line boxes.
+                    // https://www.w3.org/TR/CSS22/visuren.html#inline-formatting
+                    let max_width = if self.text_line_max_width > 0 {
+                        self.text_line_max_width
+                    } else {
+                        self.size().width().max(CHAR_WIDTH * ratio)
+                    };
                     let lines = split_text(plain_text, CHAR_WIDTH * ratio, max_width);
                     let href = self.link_href();
 
@@ -1090,8 +1113,16 @@ impl LayoutObject {
                         .filter(|s| !s.is_empty())
                         .collect::<Vec<_>>()
                         .join(" ");
+                    // max_width is the available horizontal space for this text
+                    // node within its containing block.  We cache it so that the
+                    // paint pass can reproduce the same line-break decisions.
+                    // Spec: CSS2.2 §10.3.3 — available width in a block
+                    // formatting context.
+                    // https://www.w3.org/TR/CSS22/visudet.html#blockwidth
                     let max_width =
                         (parent_size.width() - metrics.outer_horizontal()).max(CHAR_WIDTH * ratio);
+                    // Cache so paint() uses the identical boundary (see paint Text arm).
+                    self.text_line_max_width = max_width;
                     let lines = split_text(plain_text.clone(), CHAR_WIDTH * ratio, max_width);
                     let width = lines
                         .iter()
@@ -1169,8 +1200,21 @@ impl LayoutObject {
             }
             (LayoutFlow::InlineFlow, LayoutFlow::InlineFlow) => {
                 if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
-                    point.set_x(pos.x() + size.width() + metrics.margin.left);
-                    point.set_y(pos.y() + metrics.margin.top);
+                    // Candidate X if we place this element right after the previous one.
+                    let candidate_x = pos.x() + size.width() + metrics.margin.left;
+                    let right_edge = parent_point.x() + parent_size.width();
+                    if parent_size.width() > 0 && candidate_x + self.size.width() > right_edge {
+                        // This inline element does not fit on the current line;
+                        // wrap it to the start of the next line.
+                        // Spec: CSS2.2 §9.4.2 — when an inline box doesn't fit on
+                        // the current line box it wraps to a new line box below.
+                        // https://www.w3.org/TR/CSS22/visuren.html#inline-formatting
+                        point.set_x(parent_point.x() + metrics.margin.left);
+                        point.set_y(pos.y() + size.height() + metrics.margin.top);
+                    } else {
+                        point.set_x(candidate_x);
+                        point.set_y(pos.y() + metrics.margin.top);
+                    }
                 } else {
                     // First inline child: apply text-align centering if set.
                     match self.style.text_align() {
