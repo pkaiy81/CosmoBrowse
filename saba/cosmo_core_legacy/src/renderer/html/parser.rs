@@ -60,12 +60,14 @@ impl HtmlParser {
     }
 
     // pop_until pops the element from the stack of open elements until the element is found.
+    // Spec: HTML Living Standard — closing elements may reference tags that have
+    // already been implicitly closed or were never opened (e.g. `</center>` when
+    // `<center>` was already popped by a prior close tag).  Gracefully bail out
+    // instead of panicking when the element is absent.
     fn pop_until(&mut self, element_kind: ElementKind) {
-        assert!(
-            self.contain_in_stack(element_kind),
-            "stack doesn't have an element {:?}",
-            element_kind,
-        );
+        if !self.contain_in_stack(element_kind) {
+            return;
+        }
 
         loop {
             let current = match self.stack_of_open_elements.pop() {
@@ -519,81 +521,75 @@ impl HtmlParser {
                 }
 
                 // InBody handles mainly <body> tag tag(like <p>, <div>, etc.).
-                InsertionMode::InBody => {
-                    match token {
-                        Some(HtmlToken::StartTag {
-                            ref tag,
-                            self_closing: _,
-                            ref attributes,
-                        }) => match tag.as_str() {
-                            "a" | "button" | "div" | "form" | "h1" | "h2" | "h3"
-                            | "header" | "li" | "main" | "p" | "section" | "span"
-                            | "ul" | "center" | "table" | "tr" | "td" | "th"
-                            | "font" | "b" | "i" | "strong" | "em" | "pre"
-                            | "blockquote" | "dl" | "dt" | "dd" => {
-                                self.close_implicit(tag);
-                                self.insert_element(tag, attributes.to_vec());
-                                token = self.t.next();
-                                continue;
-                            }
-                            "img" | "input" | "br" | "hr" => {
-                                self.insert_element(tag, attributes.to_vec());
-                                let element_kind = ElementKind::from_str(tag)
-                                    .expect("failed to convert string to ElementKind");
-                                self.pop_current_node(element_kind);
-                                token = self.t.next();
-                                continue;
-                            }
-                            _ => {
-                                token = self.t.next();
-                            }
-                        },
-                        Some(HtmlToken::EndTag { ref tag }) => {
-                            match tag.as_str() {
-                                "body" => {
-                                    self.mode = InsertionMode::AfterBody;
-                                    token = self.t.next();
-                                    if !self.contain_in_stack(ElementKind::Body) {
-                                        continue;
-                                    }
-                                    self.pop_until(ElementKind::Body);
-                                    continue;
-                                }
-                                "html" => {
-                                    if self.pop_current_node(ElementKind::Body) {
-                                        self.mode = InsertionMode::AfterBody;
-                                        assert!(self.pop_current_node(ElementKind::Html));
-                                    } else {
-                                        token = self.t.next();
-                                    }
-                                    continue;
-                                }
-                                "a" | "button" | "div" | "form" | "h1" | "h2" | "h3"
-                                | "header" | "li" | "main" | "p" | "section" | "span"
-                                | "ul" | "center" | "table" | "tr" | "td" | "th"
-                                | "font" | "b" | "i" | "strong" | "em" | "pre"
-                                | "blockquote" | "dl" | "dt" | "dd" => {
-                                    let element_kind = ElementKind::from_str(tag)
-                                        .expect("failed to convert string to ElementKind");
-                                    token = self.t.next();
-                                    self.pop_until(element_kind);
-                                    continue;
-                                }
-                                _ => {
-                                    token = self.t.next();
-                                }
-                            }
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                        Some(HtmlToken::Char(c)) => {
-                            self.insert_char(c);
+                InsertionMode::InBody => match token {
+                    Some(HtmlToken::StartTag {
+                        ref tag,
+                        self_closing: _,
+                        ref attributes,
+                    }) => match tag.as_str() {
+                        "a" | "button" | "div" | "form" | "h1" | "h2" | "h3" | "header" | "li"
+                        | "main" | "p" | "section" | "span" | "ul" | "center" | "table" | "tr"
+                        | "td" | "th" | "font" | "b" | "i" | "strong" | "em" | "pre"
+                        | "blockquote" | "dl" | "dt" | "dd" => {
+                            self.close_implicit(tag);
+                            self.insert_element(tag, attributes.to_vec());
                             token = self.t.next();
                             continue;
                         }
+                        "img" | "input" | "br" | "hr" => {
+                            self.insert_element(tag, attributes.to_vec());
+                            let element_kind = ElementKind::from_str(tag)
+                                .expect("failed to convert string to ElementKind");
+                            self.pop_current_node(element_kind);
+                            token = self.t.next();
+                            continue;
+                        }
+                        _ => {
+                            token = self.t.next();
+                        }
+                    },
+                    Some(HtmlToken::EndTag { ref tag }) => match tag.as_str() {
+                        "body" => {
+                            self.mode = InsertionMode::AfterBody;
+                            token = self.t.next();
+                            if !self.contain_in_stack(ElementKind::Body) {
+                                continue;
+                            }
+                            self.pop_until(ElementKind::Body);
+                            continue;
+                        }
+                        "html" => {
+                            if self.pop_current_node(ElementKind::Body) {
+                                self.mode = InsertionMode::AfterBody;
+                                assert!(self.pop_current_node(ElementKind::Html));
+                            } else {
+                                token = self.t.next();
+                            }
+                            continue;
+                        }
+                        "a" | "button" | "div" | "form" | "h1" | "h2" | "h3" | "header" | "li"
+                        | "main" | "p" | "section" | "span" | "ul" | "center" | "table" | "tr"
+                        | "td" | "th" | "font" | "b" | "i" | "strong" | "em" | "pre"
+                        | "blockquote" | "dl" | "dt" | "dd" => {
+                            let element_kind = ElementKind::from_str(tag)
+                                .expect("failed to convert string to ElementKind");
+                            token = self.t.next();
+                            self.pop_until(element_kind);
+                            continue;
+                        }
+                        _ => {
+                            token = self.t.next();
+                        }
+                    },
+                    Some(HtmlToken::Eof) | None => {
+                        return self.window.clone();
                     }
-                }
+                    Some(HtmlToken::Char(c)) => {
+                        self.insert_char(c);
+                        token = self.t.next();
+                        continue;
+                    }
+                },
 
                 // Text handles mainly text content.
                 // 2. Add the text content to the DOM tree until the token is end of <style> or <script> tag.
