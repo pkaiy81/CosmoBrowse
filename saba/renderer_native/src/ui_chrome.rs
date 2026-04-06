@@ -1,5 +1,4 @@
 /// Minimal browser UI chrome: URL bar + back/forward buttons.
-
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
 use crate::text_render::TextRenderer;
@@ -26,6 +25,10 @@ pub struct ChromeState {
     pub url_text: String,
     pub cursor_pos: usize,
     pub is_focused: bool,
+    /// Whether the session has a page to go back to.
+    pub can_back: bool,
+    /// Whether the session has a page to go forward to.
+    pub can_forward: bool,
 }
 
 impl ChromeState {
@@ -34,6 +37,8 @@ impl ChromeState {
             url_text: String::new(),
             cursor_pos: 0,
             is_focused: false,
+            can_back: false,
+            can_forward: false,
         }
     }
 
@@ -133,11 +138,32 @@ pub fn draw_chrome(
     }
 
     // Back button.
-    draw_button(pixmap, text_renderer, BACK_BTN_X, BUTTON_Y, "\u{25C0}");
+    draw_button(
+        pixmap,
+        text_renderer,
+        BACK_BTN_X,
+        BUTTON_Y,
+        "\u{25C0}",
+        chrome.can_back,
+    );
     // Forward button.
-    draw_button(pixmap, text_renderer, FORWARD_BTN_X, BUTTON_Y, "\u{25B6}");
+    draw_button(
+        pixmap,
+        text_renderer,
+        FORWARD_BTN_X,
+        BUTTON_Y,
+        "\u{25B6}",
+        chrome.can_forward,
+    );
     // Reload button.
-    draw_button(pixmap, text_renderer, RELOAD_BTN_X, BUTTON_Y, "\u{21BB}");
+    draw_button(
+        pixmap,
+        text_renderer,
+        RELOAD_BTN_X,
+        BUTTON_Y,
+        "\u{21BB}",
+        true,
+    );
 
     // URL bar background.
     let url_bar_width = (viewport_width as i64 - URL_BAR_X - 12).max(100);
@@ -211,51 +237,98 @@ pub fn draw_chrome(
 }
 
 /// Handle a mouse click in the chrome area. Returns the action to perform.
-pub fn handle_chrome_click(x: i64, y: i64, viewport_width: u32) -> ChromeAction {
+pub fn handle_chrome_click(
+    x: i64,
+    y: i64,
+    viewport_width: u32,
+    chrome: &ChromeState,
+) -> ChromeAction {
     if y < 0 || y >= CHROME_HEIGHT {
         return ChromeAction::None;
     }
 
-    // Back button.
-    if x >= BACK_BTN_X && x < BACK_BTN_X + BUTTON_SIZE && y >= BUTTON_Y && y < BUTTON_Y + BUTTON_SIZE {
-        return ChromeAction::Back;
+    // Back button — only fire when history allows it.
+    if x >= BACK_BTN_X
+        && x < BACK_BTN_X + BUTTON_SIZE
+        && y >= BUTTON_Y
+        && y < BUTTON_Y + BUTTON_SIZE
+    {
+        return if chrome.can_back {
+            ChromeAction::Back
+        } else {
+            ChromeAction::None
+        };
     }
-    // Forward button.
-    if x >= FORWARD_BTN_X && x < FORWARD_BTN_X + BUTTON_SIZE && y >= BUTTON_Y && y < BUTTON_Y + BUTTON_SIZE {
-        return ChromeAction::Forward;
+    // Forward button — only fire when history allows it.
+    if x >= FORWARD_BTN_X
+        && x < FORWARD_BTN_X + BUTTON_SIZE
+        && y >= BUTTON_Y
+        && y < BUTTON_Y + BUTTON_SIZE
+    {
+        return if chrome.can_forward {
+            ChromeAction::Forward
+        } else {
+            ChromeAction::None
+        };
     }
     // Reload button.
-    if x >= RELOAD_BTN_X && x < RELOAD_BTN_X + BUTTON_SIZE && y >= BUTTON_Y && y < BUTTON_Y + BUTTON_SIZE {
+    if x >= RELOAD_BTN_X
+        && x < RELOAD_BTN_X + BUTTON_SIZE
+        && y >= BUTTON_Y
+        && y < BUTTON_Y + BUTTON_SIZE
+    {
         return ChromeAction::Reload;
     }
     // URL bar.
     let url_bar_width = (viewport_width as i64 - URL_BAR_X - 12).max(100);
-    if x >= URL_BAR_X && x < URL_BAR_X + url_bar_width && y >= URL_BAR_Y && y < URL_BAR_Y + URL_BAR_HEIGHT {
+    if x >= URL_BAR_X
+        && x < URL_BAR_X + url_bar_width
+        && y >= URL_BAR_Y
+        && y < URL_BAR_Y + URL_BAR_HEIGHT
+    {
         return ChromeAction::FocusUrlBar;
     }
 
     ChromeAction::None
 }
 
-fn draw_button(pixmap: &mut Pixmap, text_renderer: &mut TextRenderer, x: i64, y: i64, label: &str) {
-    // Button background.
-    if let Some(rect) = Rect::from_xywh(x as f32, y as f32, BUTTON_SIZE as f32, BUTTON_SIZE as f32) {
+fn draw_button(
+    pixmap: &mut Pixmap,
+    text_renderer: &mut TextRenderer,
+    x: i64,
+    y: i64,
+    label: &str,
+    enabled: bool,
+) {
+    // Button background — lighter when disabled.
+    let bg = if enabled {
+        (0xE0, 0xE0, 0xE0)
+    } else {
+        (0xF0, 0xF0, 0xF0)
+    };
+    if let Some(rect) = Rect::from_xywh(x as f32, y as f32, BUTTON_SIZE as f32, BUTTON_SIZE as f32)
+    {
         let mut paint = Paint::default();
-        paint.set_color_rgba8(0xE0, 0xE0, 0xE0, 255);
+        paint.set_color_rgba8(bg.0, bg.1, bg.2, 255);
         pixmap.fill_rect(rect, &paint, Transform::identity(), None);
     }
     draw_rect_border(pixmap, x, y, BUTTON_SIZE, BUTTON_SIZE, (0xBB, 0xBB, 0xBB));
 
-    // Button label.
+    // Button label — grayed out when disabled.
+    let text_color = if enabled {
+        BUTTON_TEXT_COLOR
+    } else {
+        (0xBB, 0xBB, 0xBB)
+    };
     text_renderer.draw_text(
         pixmap,
         label,
         x + 4,
         y + 18,
         14,
-        BUTTON_TEXT_COLOR.0,
-        BUTTON_TEXT_COLOR.1,
-        BUTTON_TEXT_COLOR.2,
+        text_color.0,
+        text_color.1,
+        text_color.2,
         255,
         0,
     );
@@ -280,5 +353,72 @@ fn draw_rect_border(pixmap: &mut Pixmap, x: i64, y: i64, w: i64, h: i64, color: 
     // right
     if let Some(r) = Rect::from_xywh((x + w - 1) as f32, y as f32, 1.0, h as f32) {
         pixmap.fill_rect(r, &paint, Transform::identity(), None);
+    }
+}
+
+/// Width of the scrollbar in pixels.
+pub const SCROLLBAR_WIDTH: i64 = 12;
+
+/// Minimum thumb height in pixels.
+const SCROLLBAR_THUMB_MIN: i64 = 20;
+
+/// Draw a vertical scrollbar on the right edge of the page area.
+///
+/// - `scroll_y`: current scroll offset in CSS pixels.
+/// - `content_height`: total height of the page content in CSS pixels.
+/// - `viewport_width` / `viewport_height`: window dimensions in physical pixels.
+///
+/// The scrollbar is only drawn when the content is taller than the visible
+/// page area (`content_height > page_height`).
+pub fn draw_scrollbar(
+    pixmap: &mut Pixmap,
+    scroll_y: i64,
+    content_height: i64,
+    viewport_width: u32,
+    viewport_height: u32,
+) {
+    let page_height = viewport_height as i64 - CHROME_HEIGHT;
+    if page_height <= 0 || content_height <= page_height {
+        return;
+    }
+
+    let track_x = viewport_width as i64 - SCROLLBAR_WIDTH;
+    let track_y = CHROME_HEIGHT;
+
+    // Track background.
+    if let Some(rect) = Rect::from_xywh(
+        track_x as f32,
+        track_y as f32,
+        SCROLLBAR_WIDTH as f32,
+        page_height as f32,
+    ) {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(0xE8, 0xE8, 0xE8, 220);
+        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+    }
+
+    // Thumb sizing.
+    // Spec: CSS OM View §11 — scrollbar thumb proportional to scroll range.
+    let thumb_ratio = (page_height as f64 / content_height as f64).min(1.0);
+    let thumb_height = ((page_height as f64 * thumb_ratio) as i64).max(SCROLLBAR_THUMB_MIN);
+    let scroll_range = content_height - page_height;
+    let thumb_travel = (page_height - thumb_height).max(0);
+    let thumb_y = track_y
+        + if scroll_range > 0 {
+            (thumb_travel as f64 * scroll_y as f64 / scroll_range as f64) as i64
+        } else {
+            0
+        };
+
+    // Thumb.
+    if let Some(rect) = Rect::from_xywh(
+        (track_x + 2) as f32,
+        thumb_y as f32,
+        (SCROLLBAR_WIDTH - 4) as f32,
+        thumb_height as f32,
+    ) {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(0xA0, 0xA0, 0xA0, 200);
+        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
     }
 }

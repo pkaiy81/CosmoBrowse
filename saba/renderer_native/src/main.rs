@@ -84,6 +84,7 @@ impl App {
                 // Spec: HTML Living Standard §7.4 — scroll to fragment anchor if present.
                 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
                 self.scroll_y = self.bridge.anchor_scroll_y();
+                self.update_nav_state();
                 self.status_message.clear();
                 if let Some(ws) = &self.window_state {
                     let title = self.bridge.current_title();
@@ -101,6 +102,12 @@ impl App {
         }
         self.needs_redraw = true;
         self.request_redraw();
+    }
+
+    /// Refresh back/forward button states from the navigation history.
+    fn update_nav_state(&mut self) {
+        self.chrome.can_back = self.bridge.can_go_back();
+        self.chrome.can_forward = self.bridge.can_go_forward();
     }
 
     fn redraw(&mut self) {
@@ -124,12 +131,7 @@ impl App {
         pixmap.fill(tiny_skia::Color::WHITE);
 
         // Draw chrome.
-        ui_chrome::draw_chrome(
-            &mut pixmap,
-            &mut self.text_renderer,
-            &self.chrome,
-            width,
-        );
+        ui_chrome::draw_chrome(&mut pixmap, &mut self.text_renderer, &self.chrome, width);
 
         // Draw page content.
         let mut all_hit_regions = Vec::new();
@@ -149,6 +151,10 @@ impl App {
             all_hit_regions.extend(regions);
         }
         self.hit_regions = all_hit_regions;
+
+        // Draw scrollbar over the page area.
+        let content_height = self.bridge.content_height();
+        ui_chrome::draw_scrollbar(&mut pixmap, self.scroll_y, content_height, width, height);
 
         // Draw status message.
         if !self.status_message.is_empty() {
@@ -261,11 +267,12 @@ impl App {
     fn handle_mouse_click(&mut self, x: i64, y: i64) {
         // Chrome area click.
         if y < CHROME_HEIGHT {
-            let action = ui_chrome::handle_chrome_click(x, y, self.viewport_width);
+            let action = ui_chrome::handle_chrome_click(x, y, self.viewport_width, &self.chrome);
             match action {
                 ChromeAction::Back => {
                     if self.bridge.back().is_ok() {
                         self.chrome.set_url(&self.bridge.current_url());
+                        self.update_nav_state();
                         self.scroll_y = 0;
                     }
                     self.needs_redraw = true;
@@ -273,6 +280,7 @@ impl App {
                 ChromeAction::Forward => {
                     if self.bridge.forward().is_ok() {
                         self.chrome.set_url(&self.bridge.current_url());
+                        self.update_nav_state();
                         self.scroll_y = 0;
                     }
                     self.needs_redraw = true;
@@ -319,6 +327,7 @@ impl App {
                     if self.bridge.current_url() != prev_url {
                         self.scroll_y = self.bridge.anchor_scroll_y();
                     }
+                    self.update_nav_state();
                 }
                 Err(e) => {
                     self.status_message = format!("Error: {}", e);
@@ -335,7 +344,10 @@ impl App {
     }
 
     fn handle_scroll(&mut self, delta_y: f64) {
-        self.scroll_y = (self.scroll_y - delta_y as i64 * 40).max(0);
+        let page_height = self.viewport_height as i64 - CHROME_HEIGHT;
+        let content_height = self.bridge.content_height();
+        let max_scroll = (content_height - page_height).max(0);
+        self.scroll_y = (self.scroll_y - delta_y as i64 * 40).max(0).min(max_scroll);
         self.needs_redraw = true;
     }
 
@@ -399,6 +411,14 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 self.viewport_width = size.width;
                 self.viewport_height = size.height;
+                // Notify the layout engine so it can reflow content against
+                // the new viewport width.
+                // Spec: CSS2.2 §10.1 — viewport is the containing block for
+                // the initial block formatting context.
+                // https://www.w3.org/TR/CSS22/visudet.html#containing-block-details
+                if let Err(e) = self.bridge.set_viewport(size.width, size.height) {
+                    self.status_message = format!("Viewport error: {}", e);
+                }
                 self.needs_redraw = true;
                 self.request_redraw();
             }

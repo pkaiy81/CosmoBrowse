@@ -59,6 +59,28 @@ impl AppBridge {
         Ok(())
     }
 
+    /// Notify the layout engine of a new viewport size and return the
+    /// re-laid-out page.  Called on every window resize so that block widths,
+    /// inline wrapping, and background rects are all recomputed against the
+    /// new available width.
+    ///
+    /// Spec: CSS2.2 §10.1 — the containing block for the initial block
+    /// formatting context is the viewport.
+    /// https://www.w3.org/TR/CSS22/visudet.html#containing-block-details
+    pub fn set_viewport(&mut self, width: u32, height: u32) -> Result<(), String> {
+        // Only call the backend when a page is already loaded; ignore resize
+        // events that arrive before the first navigation.
+        if self.current_page.is_none() {
+            return Ok(());
+        }
+        let page = self
+            .adapter
+            .set_viewport(width as i64, height as i64)
+            .map_err(|e| e.message)?;
+        self.current_page = Some(page);
+        Ok(())
+    }
+
     pub fn current_url(&self) -> String {
         self.current_page
             .as_ref()
@@ -73,13 +95,31 @@ impl AppBridge {
             .unwrap_or_default()
     }
 
-    /// Returns the scroll-Y offset set by the most recent anchor-scroll, in
-    /// CSS pixels.  Zero if no anchor was found or no page is loaded.
-    pub fn anchor_scroll_y(&self) -> i64 {
-        self.current_page
-            .as_ref()
-            .map(|p| p.root_frame.scroll_position.y)
-            .unwrap_or(0)
+    /// Returns whether the session has a previous document to go back to.
+    pub fn can_go_back(&self) -> bool {
+        self.adapter
+            .get_navigation_state()
+            .map(|s| s.can_back)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether the session has a forward document to navigate to.
+    pub fn can_go_forward(&self) -> bool {
+        self.adapter
+            .get_navigation_state()
+            .map(|s| s.can_forward)
+            .unwrap_or(false)
+    }
+
+    /// Returns the total pixel height of all frame content by scanning
+    /// paint commands across the root frame and all child frames.
+    /// For frameset pages the root frame itself may have no paint commands;
+    /// all visible content lives in the child frames.
+    pub fn content_height(&self) -> i64 {
+        let Some(page) = &self.current_page else {
+            return 0;
+        };
+        max_content_height(&page.root_frame)
     }
 
     /// Collect all paint commands from all frames (root + children).
@@ -90,6 +130,15 @@ impl AppBridge {
         let mut result = Vec::new();
         collect_frame_commands(&page.root_frame, &mut result);
         result
+    }
+
+    /// Returns the scroll-Y offset set by the most recent anchor-scroll, in
+    /// CSS pixels.  Zero if no anchor was found or no page is loaded.
+    pub fn anchor_scroll_y(&self) -> i64 {
+        self.current_page
+            .as_ref()
+            .map(|p| p.root_frame.scroll_position.y)
+            .unwrap_or(0)
     }
 
     /// Scan the current page's paint commands for a `DrawRect` whose
@@ -122,6 +171,27 @@ fn collect_frame_commands(frame: &BrowserFrameDto, out: &mut Vec<(String, Vec<Pa
     for child in &frame.child_frames {
         collect_frame_commands(child, out);
     }
+}
+
+/// Recursively compute the maximum content bottom-edge across a frame and all
+/// its children.  Frame-absolute coordinates are already baked into paint
+/// commands by `display_items_to_scene()`, so no offset adjustment is needed.
+fn max_content_height(frame: &BrowserFrameDto) -> i64 {
+    let local = frame
+        .paint_commands
+        .iter()
+        .map(|cmd| match cmd {
+            PaintCommand::DrawRect(r) => r.y + r.height,
+            PaintCommand::DrawText(t) => t.y + t.font_px,
+            PaintCommand::DrawImage(i) => i.y + i.height,
+        })
+        .max()
+        .unwrap_or(0);
+
+    frame
+        .child_frames
+        .iter()
+        .fold(local, |acc, child| acc.max(max_content_height(child)))
 }
 
 /// Extract the fragment identifier (the part after `#`) from a URL or

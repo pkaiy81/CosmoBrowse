@@ -1,8 +1,7 @@
 /// Renders PaintCommands to a tiny-skia Pixmap.
-
 use std::collections::HashMap;
 
-use cosmo_core::paint_commands::{PaintCommand, DrawRect, DrawText, DrawImage};
+use cosmo_core::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
 
 use crate::color::parse_css_color;
@@ -123,7 +122,15 @@ pub fn render_commands(
                 }
             }
             PaintCommand::DrawImage(img) => {
-                draw_image(pixmap, img, text_renderer, image_cache, base_url, scroll_y, chrome_height);
+                draw_image(
+                    pixmap,
+                    img,
+                    text_renderer,
+                    image_cache,
+                    base_url,
+                    scroll_y,
+                    chrome_height,
+                );
                 if let Some(href) = &img.href {
                     hit_regions.push(HitRegion {
                         x: img.x,
@@ -142,7 +149,13 @@ pub fn render_commands(
     hit_regions
 }
 
-fn apply_clip(x: i64, y: i64, w: i64, h: i64, clip: &Option<(i64, i64, i64, i64)>) -> Option<(i64, i64, i64, i64)> {
+fn apply_clip(
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    clip: &Option<(i64, i64, i64, i64)>,
+) -> Option<(i64, i64, i64, i64)> {
     if let Some((cx, cy, cw, ch)) = clip {
         let left = x.max(*cx);
         let top = y.max(*cy);
@@ -158,10 +171,38 @@ fn apply_clip(x: i64, y: i64, w: i64, h: i64, clip: &Option<(i64, i64, i64, i64)
     }
 }
 
-fn draw_rect(pixmap: &mut Pixmap, rect: &DrawRect, scroll_y: i64, chrome_height: i64, image_cache: &mut ImageCache, base_url: &str) {
+fn draw_rect(
+    pixmap: &mut Pixmap,
+    rect: &DrawRect,
+    scroll_y: i64,
+    chrome_height: i64,
+    image_cache: &mut ImageCache,
+    base_url: &str,
+) {
+    // Spec: CSS Backgrounds §2.11.2 — the background of the root element is
+    // propagated to the viewport canvas, and must cover the entire viewport
+    // regardless of the document's computed height.
+    // https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds
+    // Detect the page-canvas background: a full-width rect at document top
+    // (y=0 in absolute coordinates) with no explicit clip.  The layout engine
+    // starts from the <body> element, so in a frameset the body rect for the
+    // right frame starts at its frame x-offset (e.g. x=184), not at x=0.
+    // We therefore only check y=0 and large-width, not x=0.
+    // Use 1/8 of viewport width as threshold to also cover narrow frames
+    // (e.g. 18% nav frames) while still excluding small element backgrounds.
+    let effective_height =
+        if rect.y == 0 && rect.clip_rect.is_none() && rect.width >= pixmap.width() as i64 / 8 {
+            let min_fill = pixmap.height() as i64 + scroll_y - chrome_height;
+            rect.height.max(min_fill)
+        } else {
+            rect.height
+        };
+
     let ry = rect.y + chrome_height - scroll_y;
-    let screen_clip = rect.clip_rect.map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
-    let clipped = apply_clip(rect.x, ry, rect.width, rect.height, &screen_clip);
+    let screen_clip = rect
+        .clip_rect
+        .map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
+    let clipped = apply_clip(rect.x, ry, rect.width, effective_height, &screen_clip);
     let Some((x, y, w, h)) = clipped else { return };
 
     let (r, g, b, a) = parse_css_color(&rect.background_color);
@@ -172,12 +213,15 @@ fn draw_rect(pixmap: &mut Pixmap, rect: &DrawRect, scroll_y: i64, chrome_height:
     };
 
     let mut paint = Paint::default();
-    paint.set_color(Color::from_rgba(
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        b as f32 / 255.0,
-        opacity,
-    ).unwrap_or(Color::BLACK));
+    paint.set_color(
+        Color::from_rgba(
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+            opacity,
+        )
+        .unwrap_or(Color::BLACK),
+    );
     paint.anti_alias = false;
 
     pixmap.fill_rect(skia_rect, &paint, Transform::identity(), None);
@@ -225,9 +269,12 @@ fn draw_rect(pixmap: &mut Pixmap, rect: &DrawRect, scroll_y: i64, chrome_height:
                                 } else if sa > 0 {
                                     let a = sa as u32;
                                     let inv_a = 255 - a;
-                                    data[di] = ((sr as u32 * a + data[di] as u32 * inv_a) / 255) as u8;
-                                    data[di + 1] = ((sg as u32 * a + data[di + 1] as u32 * inv_a) / 255) as u8;
-                                    data[di + 2] = ((sb as u32 * a + data[di + 2] as u32 * inv_a) / 255) as u8;
+                                    data[di] =
+                                        ((sr as u32 * a + data[di] as u32 * inv_a) / 255) as u8;
+                                    data[di + 1] =
+                                        ((sg as u32 * a + data[di + 1] as u32 * inv_a) / 255) as u8;
+                                    data[di + 2] =
+                                        ((sb as u32 * a + data[di + 2] as u32 * inv_a) / 255) as u8;
                                     data[di + 3] = 255;
                                 }
                             }
@@ -255,7 +302,9 @@ fn draw_text(
     // Approximate baseline = top + font_size (ascent ≈ font_size for most fonts).
     let ty = text.y + chrome_height + font_px as i64;
 
-    let end_x = text_renderer.draw_text(pixmap, &text.text, text.x, ty, font_px, r, g, b, alpha, scroll_y);
+    let end_x = text_renderer.draw_text(
+        pixmap, &text.text, text.x, ty, font_px, r, g, b, alpha, scroll_y,
+    );
 
     // Draw underline for links.
     if text.underline || text.href.is_some() {
@@ -359,7 +408,14 @@ fn draw_image(
         clip_rect: img.clip_rect,
         anchor_id: None,
     };
-    draw_rect(pixmap, &placeholder, scroll_y, chrome_height, image_cache, base_url);
+    draw_rect(
+        pixmap,
+        &placeholder,
+        scroll_y,
+        chrome_height,
+        image_cache,
+        base_url,
+    );
 
     let label = if img.alt.is_empty() {
         "[image]"
