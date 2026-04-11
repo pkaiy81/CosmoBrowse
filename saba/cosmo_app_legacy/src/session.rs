@@ -2106,6 +2106,38 @@ mod tests {
     }
 
     #[test]
+    fn hr_renders_as_gray_rect() {
+        use crate::layout::build_layout_scene;
+        use crate::model::SceneItem;
+        let html = r#"<html><body>
+<table width="400" border="0" cellpadding="0">
+  <tr><td align="left"><hr width="100%" size="1"></td></tr>
+  <tr><td><strong>Section</strong></td></tr>
+</table>
+</body></html>"#;
+        let rect = FrameRect { x: 0, y: 0, width: 800, height: 600 };
+        let scene = build_layout_scene(html, &rect);
+
+        let rect_items: Vec<_> = scene.scene_items.iter().filter_map(|item| match item {
+            SceneItem::Rect { x, y, width, height, background_color, .. } =>
+                Some((*x, *y, *width, *height, background_color.clone())),
+            _ => None,
+        }).collect();
+        for (x, y, w, h, color) in &rect_items {
+            eprintln!("  rect x={} y={} w={} h={} color={}", x, y, w, h, color);
+        }
+
+        let hr_rect = rect_items.iter().find(|(_, _, _, h, color)| *h <= 4 && color.contains("808080"));
+        assert!(
+            hr_rect.is_some(),
+            "HR gray rect missing; rects: {:?}",
+            rect_items
+        );
+        let (_, _, w, _, _) = hr_rect.unwrap();
+        assert!(*w > 100, "HR should span most of the table width, got w={}", w);
+    }
+
+    #[test]
     fn display_items_to_scene_propagates_link_target() {
         use crate::layout::build_layout_scene;
         use crate::model::SceneItem;

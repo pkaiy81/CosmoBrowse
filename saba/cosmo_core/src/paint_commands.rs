@@ -30,6 +30,7 @@ impl PaintCommand {
             font_px,
             font_family: String::from("monospace"),
             underline: false,
+            bold: false,
             opacity,
             href,
             target: None,
@@ -74,6 +75,8 @@ pub struct DrawText {
     pub font_px: i64,
     pub font_family: String,
     pub underline: bool,
+    #[serde(default)]
+    pub bold: bool,
     pub opacity: f64,
     pub href: Option<String>,
     pub target: Option<String>,

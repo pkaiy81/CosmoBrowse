@@ -206,6 +206,7 @@ pub fn draw_chrome(
         0x22,
         255,
         0,
+        false,
     );
 
     // Cursor.
@@ -331,6 +332,7 @@ fn draw_button(
         text_color.2,
         255,
         0,
+        false,
     );
 }
 

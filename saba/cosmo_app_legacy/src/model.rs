@@ -277,6 +277,7 @@ pub enum SceneItem {
         font_px: i64,
         font_family: String,
         underline: bool,
+        bold: bool,
         opacity: f64,
         href: Option<String>,
         target: Option<String>,

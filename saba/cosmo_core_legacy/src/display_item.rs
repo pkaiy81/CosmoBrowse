@@ -54,6 +54,7 @@ pub enum DisplayItem {
         target: Option<String>,
         paint_order: PaintOrder,
         clip_rect: Option<ClipRect>,
+        bold: bool,
     },
     Image {
         src: String,

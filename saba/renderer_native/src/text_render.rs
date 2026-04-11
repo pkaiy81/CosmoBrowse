@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 pub struct TextRenderer {
     fonts: Vec<Font>,
-    glyph_cache: HashMap<(char, u32), GlyphBitmap>,
+    bold_fonts: Vec<Font>,
+    glyph_cache: HashMap<(char, u32, bool), GlyphBitmap>,
 }
 
 struct GlyphBitmap {
@@ -22,8 +23,10 @@ struct GlyphBitmap {
 impl TextRenderer {
     pub fn new() -> Self {
         let fonts = load_font_chain();
+        let bold_fonts = load_bold_font_chain();
         Self {
             fonts,
+            bold_fonts,
             glyph_cache: HashMap::new(),
         }
     }
@@ -40,11 +43,12 @@ impl TextRenderer {
         b: u8,
         alpha: u8,
         scroll_y: i64,
+        bold: bool,
     ) -> i64 {
         let baseline_y = y - scroll_y;
 
         for ch in text.chars() {
-            let glyph = self.rasterize_glyph(ch, font_px);
+            let glyph = self.rasterize_glyph(ch, font_px, bold);
             let gx = x + glyph.offset_x as i64;
             let gy = baseline_y - glyph.offset_y as i64;
 
@@ -72,21 +76,34 @@ impl TextRenderer {
     pub fn measure_text(&mut self, text: &str, font_px: u32) -> i64 {
         let mut width: f32 = 0.0;
         for ch in text.chars() {
-            let glyph = self.rasterize_glyph(ch, font_px);
+            let glyph = self.rasterize_glyph(ch, font_px, false);
             width += glyph.advance_width;
         }
         width as i64
     }
 
-    fn rasterize_glyph(&mut self, ch: char, font_px: u32) -> &GlyphBitmap {
-        let key = (ch, font_px);
+    fn rasterize_glyph(&mut self, ch: char, font_px: u32, bold: bool) -> &GlyphBitmap {
+        let key = (ch, font_px, bold);
         if !self.glyph_cache.contains_key(&key) {
             let px = font_px as f32;
+
+            // Select font chain based on bold flag.
+            // Fall back to regular fonts if bold chain is empty.
+            let primary_chain: &[Font] = if bold && !self.bold_fonts.is_empty() {
+                &self.bold_fonts
+            } else {
+                &self.fonts
+            };
+            let fallback_chain: &[Font] = if bold && !self.bold_fonts.is_empty() {
+                &self.fonts
+            } else {
+                &[]
+            };
 
             // Try each font in the chain; use the first one that produces a real glyph.
             let mut best_metrics = None;
             let mut best_bitmap = None;
-            for font in &self.fonts {
+            for font in primary_chain.iter().chain(fallback_chain.iter()) {
                 // Check if this font has the glyph (not .notdef).
                 let glyph_index = font.lookup_glyph_index(ch);
                 if glyph_index == 0 && ch != '\0' {
@@ -101,10 +118,15 @@ impl TextRenderer {
                 }
             }
 
-            // Final fallback: rasterize from first font even if .notdef.
+            // Final fallback: rasterize from first available font even if .notdef.
+            let first_font = if !self.bold_fonts.is_empty() && bold {
+                &self.bold_fonts[0]
+            } else {
+                &self.fonts[0]
+            };
             let (metrics, bitmap) = match (best_metrics, best_bitmap) {
                 (Some(m), Some(b)) => (m, b),
-                _ => self.fonts[0].rasterize(ch, px),
+                _ => first_font.rasterize(ch, px),
             };
 
             self.glyph_cache.insert(key, GlyphBitmap {
@@ -142,6 +164,39 @@ fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) 
         data[idx + 2] = ((b as u32 * sa + data[idx + 2] as u32 * da) / 255) as u8;
         data[idx + 3] = ((sa + data[idx + 3] as u32 * da / 255).min(255)) as u8;
     }
+}
+
+fn load_bold_font_chain() -> Vec<Font> {
+    let mut fonts = Vec::new();
+
+    // Bold Latin font.
+    let bold_latin_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+    ];
+    if let Some(font) = try_load_font(&bold_latin_candidates) {
+        eprintln!("[FONT] Bold (Latin) loaded");
+        fonts.push(font);
+    }
+
+    // Bold CJK font for Japanese/Chinese/Korean bold text.
+    let bold_cjk_candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
+        "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
+        "/usr/share/fonts/truetype/ipa/ipagp.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ];
+    if let Some(font) = try_load_font(&bold_cjk_candidates) {
+        eprintln!("[FONT] Bold CJK loaded");
+        fonts.push(font);
+    }
+
+    fonts
 }
 
 fn load_font_chain() -> Vec<Font> {

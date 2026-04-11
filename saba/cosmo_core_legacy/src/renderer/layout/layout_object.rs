@@ -141,6 +141,12 @@ fn parse_margin_auto_flags(value: &[ComponentValue]) -> (bool, bool) {
 
 fn parse_dimension_attr(value: Option<String>) -> Option<i64> {
     let value = value?;
+    // Percentage values (e.g. "100%") are not treated as fixed pixel widths.
+    // Returning None lets the caller fall through to the available-width default,
+    // which gives the correct "fill container" behaviour for width="100%".
+    if value.trim_start().contains('%') {
+        return None;
+    }
     let digits = value
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
@@ -149,6 +155,22 @@ fn parse_dimension_attr(value: Option<String>) -> Option<i64> {
         None
     } else {
         digits.parse::<i64>().ok()
+    }
+}
+
+/// Parse an HTML dimension attribute, resolving percentage values against `avail`.
+/// `"22%"` with `avail = Some(700)` returns `Some(154)`.
+/// Falls back to `parse_dimension_attr` for pixel values.
+/// Returns `None` when the value is absent, unparseable, or `avail` is None for a percentage.
+fn parse_dimension_pct_attr(value: Option<String>, avail: Option<i64>) -> Option<i64> {
+    let value = value?;
+    let trimmed = value.trim();
+    if let Some(pct_str) = trimmed.strip_suffix('%') {
+        let pct: f64 = pct_str.trim().parse().ok()?;
+        let avail = avail?;
+        Some(((avail as f64) * pct / 100.0) as i64)
+    } else {
+        parse_dimension_attr(Some(value))
     }
 }
 
@@ -435,11 +457,11 @@ impl LayoutObject {
         self.node.borrow().element_kind()
     }
 
-    fn is_table_cell(&self) -> bool {
+    pub fn is_table_cell(&self) -> bool {
         matches!(self.element_kind(), Some(ElementKind::Td) | Some(ElementKind::Th))
     }
 
-    fn is_table_row(&self) -> bool {
+    pub fn is_table_row(&self) -> bool {
         matches!(self.element_kind(), Some(ElementKind::Tr))
     }
 
@@ -460,6 +482,14 @@ impl LayoutObject {
             let borrowed = c.borrow();
             let hint = parse_dimension_attr(borrowed.element_attribute("width")).unwrap_or(0);
             max_hint = max_hint.max(hint);
+            // For text nodes, estimate their minimum width from character count so that
+            // spacer cells like <td>&nbsp;</td> get a small non-zero hint instead of 0.
+            // Without this, spacer cells are treated identically to wide content cells
+            // and receive an equal (large) share of surplus table width.
+            if let NodeKind::Text(ref t) = borrowed.node_kind() {
+                let text_hint = measure_text_width(t.trim(), borrowed.style.font_size());
+                max_hint = max_hint.max(text_hint);
+            }
             max_hint = max_hint.max(borrowed.min_content_width_hint_depth(depth - 1));
             let next = borrowed.next_sibling();
             drop(borrowed);
@@ -500,7 +530,14 @@ impl LayoutObject {
     fn column_width_from_sibling_rows(&self, col_index: usize) -> Option<i64> {
         let row = self.parent.upgrade()?;
         let table = row.borrow().parent.upgrade()?;
+        // Resolve percentage width attributes against the table's explicit pixel width.
+        let table_px_width = parse_dimension_attr(table.borrow().element_attribute("width"))
+            .or_else(|| {
+                let tw = table.borrow().size.width();
+                if tw > 0 { Some(tw) } else { None }
+            });
         let mut sibling_row = table.borrow().first_child();
+        let mut best: Option<i64> = None;
         while let Some(sr) = sibling_row {
             let sr_borrowed = sr.borrow();
             if sr_borrowed.is_table_row() && !Rc::ptr_eq(&sr, &row) {
@@ -510,11 +547,11 @@ impl LayoutObject {
                     let cb = c.borrow();
                     if cb.is_table_cell() {
                         if idx == col_index {
-                            if let Some(w) = parse_dimension_attr(cb.element_attribute("width")) {
-                                return Some(w);
-                            }
-                            if cb.size.width() > 0 {
-                                return Some(cb.size.width());
+                            let candidate =
+                                parse_dimension_pct_attr(cb.element_attribute("width"), table_px_width)
+                                .or_else(|| if cb.size.width() > 0 { Some(cb.size.width()) } else { None });
+                            if let Some(w) = candidate {
+                                best = Some(best.map_or(w, |b: i64| b.max(w)));
                             }
                         }
                         idx += 1;
@@ -528,7 +565,13 @@ impl LayoutObject {
             drop(sr_borrowed);
             sibling_row = next;
         }
-        None
+        best
+    }
+
+    /// Public entry point for `column_width_from_sibling_rows` so that sibling
+    /// cells can call it during the width-distribution pass.
+    pub fn column_width_from_sibling_rows_pub(&self, col_index: usize) -> Option<i64> {
+        self.column_width_from_sibling_rows(col_index)
     }
 
     /// Return this cell's colspan attribute value (defaults to 1).
@@ -553,10 +596,15 @@ impl LayoutObject {
         let rowspan_offset = parent.borrow().rowspan_column_offset();
 
         // Check if sibling rows have explicit widths for the columns this cell
-        // spans.  Skip this check when rowspan columns shift cell indices
-        // across rows, because the raw cell_column_index does not account for
-        // rowspan-occupied columns.
-        if rowspan_offset == 0 {
+        // spans.  Skip this check when:
+        //  - rowspan columns shift cell indices (raw cell_column_index is unreliable), or
+        //  - self has rowspan > 1: sibling rows don't have a real cell at this
+        //    cell's column — the slot is occupied by the rowspan cell itself, so
+        //    sibling-row lookups return data from the WRONG column.
+        let self_rowspan = parse_dimension_attr(self.element_attribute("rowspan"))
+            .unwrap_or(1)
+            .max(1);
+        if rowspan_offset == 0 && self_rowspan <= 1 {
             let col_index = self.cell_column_index();
             let colspan = self.cell_colspan();
             let mut total_from_siblings: i64 = 0;
@@ -575,20 +623,51 @@ impl LayoutObject {
 
         let effective_width = (available_width - rowspan_offset).max(0);
 
+        // Pre-compute the column index of this cell so we can identify our own slot.
+        let my_col_index = if rowspan_offset == 0 { self.cell_column_index() } else { usize::MAX };
+
         let mut total_explicit: i64 = 0;
         let mut auto_cells: Vec<(bool, i64)> = Vec::new(); // (is_self, min_hint)
         let mut self_index: usize = 0;
+        let mut col_idx: usize = 0;
         let mut child = parent.borrow().first_child();
         while let Some(c) = child {
             match c.try_borrow() {
                 Ok(borrowed) => {
                     if borrowed.is_table_cell() {
-                        if let Some(w) = parse_dimension_attr(borrowed.element_attribute("width")) {
+                        // Percentage widths are resolved against effective_width here.
+                        if let Some(w) = parse_dimension_pct_attr(
+                            borrowed.element_attribute("width"),
+                            Some(effective_width),
+                        ) {
+                            total_explicit += w;
+                        } else if let Some(w) = (col_idx != my_col_index
+                            // Skip the sibling-row lookup for cells with rowspan > 1.
+                            // Such cells span into sibling rows where the column index
+                            // corresponds to a different cell (shifted by the rowspan
+                            // occupying that slot), so the lookup returns wrong widths.
+                            && parse_dimension_attr(borrowed.element_attribute("rowspan"))
+                                .unwrap_or(1)
+                                .max(1)
+                                <= 1
+                            // Skip sibling-row lookup when this row has a rowspan
+                            // offset: the physical col_idx in this row does not match
+                            // the logical column in sibling rows (they are shifted by
+                            // the number of rowspan-occupied columns), so the lookup
+                            // would return the width of the wrong column.
+                            && rowspan_offset == 0)
+                            .then(|| borrowed.column_width_from_sibling_rows_pub(col_idx))
+                            .flatten()
+                        {
+                            // This sibling has no explicit width in this row but will
+                            // inherit one from sibling rows; treat it as "explicit" so
+                            // the remaining space is divided correctly.
                             total_explicit += w;
                         } else {
                             let hint = borrowed.min_content_width_hint();
                             auto_cells.push((false, hint));
                         }
+                        col_idx += 1;
                     }
                     let next = borrowed.next_sibling();
                     drop(borrowed);
@@ -599,6 +678,7 @@ impl LayoutObject {
                     let hint = self.min_content_width_hint();
                     self_index = auto_cells.len();
                     auto_cells.push((true, hint));
+                    col_idx += 1;
                     let next = c.as_ptr();
                     child = unsafe { (*next).next_sibling() };
                 }
@@ -611,23 +691,70 @@ impl LayoutObject {
             return effective_width;
         }
 
-        // Check if any auto cell needs more than equal share.
         let equal_share = remaining / auto_count as i64;
         let total_min: i64 = auto_cells.iter().map(|(_, h)| *h).sum();
         if total_min <= remaining && total_min > 0 {
             let surplus = remaining - total_min;
             let (_, my_min) = auto_cells[self_index];
-            if my_min > equal_share {
-                // This cell needs its minimum — give it that.
+
+            // Cells whose hint is "large" (≥ CONTENT_SIZED_THRESHOLD) represent
+            // fixed-size content like images or large explicitly-sized nested tables.
+            // These cells should not grow beyond their minimum content width — extra
+            // space inside an image cell, for instance, does nothing useful.
+            //
+            // Cells with hints between SPACER_THRESHOLD and CONTENT_SIZED_THRESHOLD
+            // are "flexible" content cells: they grow to fill remaining space.
+            //
+            // Cells with tiny hints (< SPACER_THRESHOLD) are decorative spacers
+            // (e.g. <td>&nbsp;</td>) that must not absorb surplus table width.
+            const CONTENT_SIZED_THRESHOLD: i64 = 150;
+            const SPACER_THRESHOLD: i64 = 20;
+            let total_content_sized: i64 = auto_cells
+                .iter()
+                .filter(|(_, h)| *h >= CONTENT_SIZED_THRESHOLD)
+                .map(|(_, h)| *h)
+                .sum();
+            let has_flexible = auto_cells
+                .iter()
+                .any(|(_, h)| *h >= SPACER_THRESHOLD && *h < CONTENT_SIZED_THRESHOLD);
+
+            if my_min >= CONTENT_SIZED_THRESHOLD {
+                // Large content hint: do not grow beyond the minimum.
+                my_min
+            } else if my_min < SPACER_THRESHOLD {
+                // Tiny spacer: stay at minimum, never absorb surplus.
+                my_min.max(1)
+            } else if has_flexible {
+                // Flexible content cell: split remaining space after content-sized
+                // cells and spacers.
+                let total_spacer: i64 = auto_cells
+                    .iter()
+                    .filter(|(_, h)| *h < SPACER_THRESHOLD)
+                    .map(|(_, h)| *h)
+                    .sum();
+                let remaining_for_flexible =
+                    (remaining - total_content_sized - total_spacer).max(0);
+                let total_flexible_min: i64 = auto_cells
+                    .iter()
+                    .filter(|(_, h)| *h >= SPACER_THRESHOLD && *h < CONTENT_SIZED_THRESHOLD)
+                    .map(|(_, h)| *h)
+                    .sum();
+                let flex_surplus =
+                    (remaining_for_flexible - total_flexible_min).max(0);
+                let flexible_count = auto_cells
+                    .iter()
+                    .filter(|(_, h)| *h >= SPACER_THRESHOLD && *h < CONTENT_SIZED_THRESHOLD)
+                    .count()
+                    .max(1);
+                my_min + flex_surplus / flexible_count as i64
+            } else if my_min > equal_share {
+                // All cells are content-sized and this one needs more than equal share.
                 my_min
             } else {
-                // Distribute surplus proportionally to each flexible cell's
-                // effective content hint so that spacer cells (hint ≈ 0) get
-                // only a small share while content-heavy cells get more.
+                // All cells are content-sized: distribute surplus proportionally.
                 const DEFAULT_MIN: i64 = 16;
                 let total_effective: i64 = auto_cells
                     .iter()
-                    .filter(|(_, h)| *h <= equal_share)
                     .map(|(_, h)| (*h).max(DEFAULT_MIN))
                     .sum();
                 let my_effective = my_min.max(DEFAULT_MIN);
@@ -677,11 +804,31 @@ impl LayoutObject {
         total
     }
 
-    fn element_attribute(&self, name: &str) -> Option<String> {
+    pub fn element_attribute(&self, name: &str) -> Option<String> {
         match self.node.borrow().kind() {
             NodeKind::Element(ref element) => element.get_attribute(name),
             _ => None,
         }
+    }
+
+    /// Returns true if every child layout object of this cell is Inline or Text
+    /// (i.e. no block-level children).  Used to detect bullet-marker cells that
+    /// should be vertically centred inside the row.
+    fn has_only_inline_children(&self) -> bool {
+        let mut child = self.first_child();
+        let mut found_any = false;
+        while let Some(c) = child {
+            let b = c.borrow();
+            match b.kind() {
+                LayoutObjectKind::Block => return false,
+                _ => {}
+            }
+            found_any = true;
+            let next = b.next_sibling();
+            drop(b);
+            child = next;
+        }
+        found_any
     }
 
     /// Compute the x-offset for cells in this row due to rowspan cells from
@@ -935,6 +1082,7 @@ impl LayoutObject {
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: None,
+                            bold: self.style.is_bold(),
                         });
                     }
 
@@ -970,6 +1118,7 @@ impl LayoutObject {
                     let href = self.link_href();
                     let target = self.link_target();
 
+                    let bold = self.style.is_bold();
                     for (i, line) in lines.into_iter().enumerate() {
                         let item = DisplayItem::Text {
                             text: line,
@@ -989,6 +1138,7 @@ impl LayoutObject {
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: None,
+                            bold,
                         };
                         v.push(item);
                     }
@@ -1017,7 +1167,12 @@ impl LayoutObject {
                 // When total explicit widths exceed available space, scale
                 // proportionally to fit.
                 let content_width = if self.is_table_cell() {
-                    let attr_width = parse_dimension_attr(self.element_attribute("width"));
+                    // Resolve HTML width attribute — percentage values are computed
+                    // against available_width (the parent row's inner width).
+                    let attr_width = parse_dimension_pct_attr(
+                        self.element_attribute("width"),
+                        Some(available_width),
+                    );
                     if let Some(w) = attr_width {
                         let rowspan_offset = self
                             .parent
@@ -1089,7 +1244,15 @@ impl LayoutObject {
                     } else if previous_child_kind.normal_flow_spec().stacks_vertically
                         || c_kind.normal_flow_spec().stacks_vertically
                     {
-                        content_height += c.borrow().size.height();
+                        // Include the child's vertical margin so that the parent
+                        // is tall enough to contain the child even when it has
+                        // margin-top/bottom that shift it downward (e.g. <hr>,
+                        // <h1>…<h3>, <p>).  This matches the CSS2 block height
+                        // algorithm (§10.6.3) where margin participates in height.
+                        let c_metrics = compute_box_model_metrics(&c.borrow().style());
+                        content_height += c.borrow().size.height()
+                            + c_metrics.margin.top
+                            + c_metrics.margin.bottom;
                     } else {
                         content_height = content_height.max(c.borrow().size.height());
                     }
@@ -1112,8 +1275,13 @@ impl LayoutObject {
                         content_height.max(0)
                     }
                 };
+                // For table cells, add cellpadding to both dimensions so that the
+                // cell's outer box includes the padding space on all four sides.
+                // content_origin() and content_size() subtract/add cp so that
+                // children are inset by cp pixels inside the cell.
+                let cp = if self.is_table_cell() { self.ancestor_table_cellpadding() } else { 0 };
                 size.set_width((content_width + metrics.inner_horizontal()).max(0));
-                size.set_height((content_height + metrics.inner_vertical()).max(0));
+                size.set_height((content_height + metrics.inner_vertical() + 2 * cp).max(0));
             }
             LayoutObjectKind::Inline => {
                 if let Some(intrinsic) = self.intrinsic_inline_size(parent_size) {
@@ -1121,14 +1289,31 @@ impl LayoutObject {
                     size.set_height((intrinsic.height() + metrics.inner_vertical()).max(0));
                 } else {
                     let mut content_width = 0;
-                    let mut content_height = 0;
+                    let mut current_line_height: i64 = 0;
+                    let mut content_height: i64 = 0;
                     let mut child = self.first_child();
                     while child.is_some() {
                         let c = child.expect("child should exist");
-                        content_width += c.borrow().size.width();
-                        content_height = content_height.max(c.borrow().size.height());
+                        let c_kind = c.borrow().kind();
+                        let c_h = c.borrow().size.height();
+                        let c_w = c.borrow().size.width();
+                        // Always accumulate width the same way as before so that
+                        // the inline element's box width (and thus content_size()
+                        // used in the position pass) is unchanged.
+                        content_width += c_w;
+                        if c_kind.normal_flow_spec().stacks_vertically {
+                            // Block child (e.g. <br>): flush the current inline
+                            // line and advance the vertical cursor by the larger
+                            // of the pending line height and the block child height.
+                            content_height += current_line_height.max(c_h);
+                            current_line_height = 0;
+                        } else {
+                            current_line_height = current_line_height.max(c_h);
+                        }
                         child = c.borrow().next_sibling();
                     }
+                    // Flush any remaining inline content on the last line.
+                    content_height += current_line_height;
 
                     size.set_width((content_width + metrics.inner_horizontal()).max(0));
                     size.set_height((content_height + metrics.inner_vertical()).max(0));
@@ -1186,9 +1371,26 @@ impl LayoutObject {
 
         // Table cells: position horizontally within the row.
         if self.is_table_cell() {
+            // Vertical alignment within the row.
+            // Honour explicit valign="middle"/"bottom"/"top"; fall back to
+            // auto-centering for cells whose content is purely inline/text
+            // (e.g. bullet-marker cells like ●), which matches browser behaviour
+            // of baseline-aligning small inline cells within a taller row.
+            let valign = self
+                .element_attribute("valign")
+                .map(|v| v.to_lowercase())
+                .unwrap_or_default();
+            let v_offset = if valign == "middle" || (valign.is_empty() && self.has_only_inline_children()) {
+                (parent_size.height() - self.size.height()).max(0) / 2
+            } else if valign == "bottom" {
+                (parent_size.height() - self.size.height()).max(0)
+            } else {
+                0
+            };
+
             if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
                 point.set_x(pos.x() + size.width() + metrics.margin.left);
-                point.set_y(parent_point.y() + metrics.margin.top);
+                point.set_y(parent_point.y() + metrics.margin.top + v_offset);
             } else {
                 // First cell in row: apply rowspan offset from previous rows.
                 let rowspan_offset = self
@@ -1197,7 +1399,7 @@ impl LayoutObject {
                     .map(|p| p.borrow().rowspan_column_offset())
                     .unwrap_or(0);
                 point.set_x(parent_point.x() + rowspan_offset + metrics.margin.left);
-                point.set_y(parent_point.y() + metrics.margin.top);
+                point.set_y(parent_point.y() + metrics.margin.top + v_offset);
             }
         } else {
         match (
@@ -1556,21 +1758,80 @@ impl LayoutObject {
         self.size
     }
 
+    /// Return the HTML `cellpadding` value from the nearest ancestor `<table>`.
+    ///
+    /// Walks up at most a few layout-tree steps (td → tr → optional tbody → table)
+    /// and reads the table's `cellpadding` attribute.  Returns the HTML4 default
+    /// of 1 when no attribute is present, and 0 when the attribute is explicitly "0".
+    /// Returns 0 when called on a non-cell element.
+    ///
+    /// Spec: HTML4.01 §11.3.2 — cellpadding default is 1.
+    /// https://www.w3.org/TR/html4/struct/tables.html#adef-cellpadding
+    fn ancestor_table_cellpadding(&self) -> i64 {
+        let mut current = self.parent.upgrade();
+        let mut steps = 0;
+        while let Some(ancestor) = current {
+            steps += 1;
+            if steps > 5 {
+                break;
+            }
+            let b = ancestor.borrow();
+            if b.is_table() {
+                return b
+                    .element_attribute("cellpadding")
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .unwrap_or(1); // HTML4 default
+            }
+            let next = b.parent.upgrade();
+            drop(b);
+            current = next;
+        }
+        0
+    }
+
     pub fn content_origin(&self) -> LayoutPoint {
         let metrics = compute_box_model_metrics(&self.style);
+        let cp = if self.is_table_cell() {
+            self.ancestor_table_cellpadding()
+        } else {
+            0
+        };
         LayoutPoint::new(
-            self.point.x() + metrics.padding.left + metrics.border.left,
-            self.point.y() + metrics.padding.top + metrics.border.top,
+            self.point.x() + metrics.padding.left + metrics.border.left + cp,
+            self.point.y() + metrics.padding.top + metrics.border.top + cp,
         )
     }
 
     pub fn content_size(&self) -> LayoutSize {
         let metrics = compute_box_model_metrics(&self.style);
+        let cp = if self.is_table_cell() {
+            self.ancestor_table_cellpadding()
+        } else {
+            0
+        };
         LayoutSize::new(
-            (self.size.width() - metrics.inner_horizontal()).max(0),
-            (self.size.height() - metrics.inner_vertical()).max(0),
+            (self.size.width() - metrics.inner_horizontal() - 2 * cp).max(0),
+            (self.size.height() - metrics.inner_vertical() - 2 * cp).max(0),
         )
     }
+
+    /// Returns the total box model overhead (border + padding) in the vertical axis.
+    pub fn vertical_overhead(&self) -> i64 {
+        let metrics = compute_box_model_metrics(&self.style);
+        metrics.inner_vertical()
+    }
+
+    /// Directly overrides the computed height. Used by the rowspan height
+    /// expansion pass to expand rows that are constrained by rowspan cells.
+    pub fn force_set_height(&mut self, h: i64) {
+        self.size.set_height(h);
+    }
+
+    /// Returns true if this layout object corresponds to a `<table>` element.
+    pub fn is_table(&self) -> bool {
+        self.element_kind() == Some(ElementKind::Table)
+    }
+
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

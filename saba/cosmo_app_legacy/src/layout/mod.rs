@@ -177,7 +177,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
                     z_index: paint_order.z_index,
-                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                     anchor_id,
                 });
             }
@@ -189,6 +189,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 target,
                 paint_order,
                 clip_rect,
+                bold,
             } => {
                 let x = rect.x + layout_point.x();
                 let y = rect.y + layout_point.y();
@@ -204,11 +205,12 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     font_px: style.font_size().px(),
                     font_family: style.font_family(),
                     underline: style.text_decoration() == TextDecoration::Underline,
+                    bold,
                     opacity: style.opacity(),
                     href,
                     target,
                     z_index: paint_order.z_index,
-                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                 });
             }
             DisplayItem::Image {
@@ -237,7 +239,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     href,
                     target,
                     z_index: paint_order.z_index,
-                    clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                 });
             }
         }

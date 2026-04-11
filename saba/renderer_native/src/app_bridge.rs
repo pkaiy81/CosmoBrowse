@@ -122,8 +122,23 @@ impl AppBridge {
         max_content_height(&page.root_frame)
     }
 
+    /// Collect frameset border rectangles (x, y, width, height) by detecting
+    /// gaps between adjacent child frame rects.  Gaps arise because
+    /// `FramesetSpec::child_rects` reserves `FRAMESET_BORDER_WIDTH` pixels
+    /// between each pair of frames.
+    pub fn collect_frameset_borders(&self) -> Vec<(i64, i64, i64, i64)> {
+        let Some(page) = &self.current_page else {
+            return Vec::new();
+        };
+        let mut borders = Vec::new();
+        collect_borders(&page.root_frame, &mut borders);
+        borders
+    }
+
     /// Collect all paint commands from all frames (root + children).
-    pub fn collect_paint_commands(&self) -> Vec<(String, Vec<PaintCommand>)> {
+    /// Returns `(frame_id, frame_url, commands)` so the renderer can resolve
+    /// relative image URLs against the frame's own document URL.
+    pub fn collect_paint_commands(&self) -> Vec<(String, String, Vec<PaintCommand>)> {
         let Some(page) = &self.current_page else {
             return Vec::new();
         };
@@ -163,10 +178,42 @@ impl AppBridge {
     }
 }
 
-fn collect_frame_commands(frame: &BrowserFrameDto, out: &mut Vec<(String, Vec<PaintCommand>)>) {
+/// Detect frameset border gaps between adjacent child frames and append
+/// their rects to `out` as (x, y, width, height) tuples.
+/// A gap is present when adjacent frames do not abut exactly.
+fn collect_borders(frame: &BrowserFrameDto, out: &mut Vec<(i64, i64, i64, i64)>) {
+    let children = &frame.child_frames;
+    if children.len() >= 2 {
+        for i in 0..children.len() - 1 {
+            let a = &children[i].rect;
+            let b = &children[i + 1].rect;
+            // Vertical border (cols-based frameset): frames share the same y/height.
+            if a.y == b.y && a.height == b.height {
+                let gap_x = a.x + a.width;
+                let gap_w = b.x - gap_x;
+                if gap_w > 0 {
+                    out.push((gap_x, a.y, gap_w, a.height));
+                }
+            }
+            // Horizontal border (rows-based frameset): frames share the same x/width.
+            if a.x == b.x && a.width == b.width {
+                let gap_y = a.y + a.height;
+                let gap_h = b.y - gap_y;
+                if gap_h > 0 {
+                    out.push((a.x, gap_y, a.width, gap_h));
+                }
+            }
+        }
+    }
+    for child in children {
+        collect_borders(child, out);
+    }
+}
+
+fn collect_frame_commands(frame: &BrowserFrameDto, out: &mut Vec<(String, String, Vec<PaintCommand>)>) {
     // Paint commands already have frame-absolute coordinates applied by
     // display_items_to_scene(), so no additional offset is needed here.
-    out.push((frame.id.clone(), frame.paint_commands.clone()));
+    out.push((frame.id.clone(), frame.current_url.clone(), frame.paint_commands.clone()));
 
     for child in &frame.child_frames {
         collect_frame_commands(child, out);

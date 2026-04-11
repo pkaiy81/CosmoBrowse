@@ -303,7 +303,7 @@ fn draw_text(
     let ty = text.y + chrome_height + font_px as i64;
 
     let end_x = text_renderer.draw_text(
-        pixmap, &text.text, text.x, ty, font_px, r, g, b, alpha, scroll_y,
+        pixmap, &text.text, text.x, ty, font_px, r, g, b, alpha, scroll_y, text.bold,
     );
 
     // Draw underline for links.
@@ -433,5 +433,6 @@ fn draw_image(
         0x44,
         255,
         scroll_y,
+        false,
     );
 }

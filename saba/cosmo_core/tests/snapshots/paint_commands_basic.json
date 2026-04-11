@@ -21,6 +21,7 @@
       "font_px": 16,
       "font_family": "serif",
       "underline": true,
+      "bold": false,
       "opacity": 0.9,
       "href": "https://example.com",
       "target": null,

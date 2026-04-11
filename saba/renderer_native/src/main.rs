@@ -140,15 +140,14 @@ impl App {
 
         // Draw page content.
         let mut all_hit_regions = Vec::new();
-        let base_url = self.bridge.current_url();
         let frame_commands = self.bridge.collect_paint_commands();
-        for (frame_id, commands) in &frame_commands {
+        for (frame_id, frame_url, commands) in &frame_commands {
             let regions = render_commands(
                 &mut pixmap,
                 commands,
                 &mut self.text_renderer,
                 &mut self.image_cache,
-                &base_url,
+                frame_url,
                 self.scroll_y,
                 CHROME_HEIGHT,
                 frame_id,
@@ -156,6 +155,47 @@ impl App {
             all_hit_regions.extend(regions);
         }
         self.hit_regions = all_hit_regions;
+
+        // Draw frameset borders (raised 3-D effect: light top/left, dark bottom/right).
+        let borders = self.bridge.collect_frameset_borders();
+        for (bx, _by, bw, bh) in &borders {
+            // Fill the border area with the standard mid-gray frameset color.
+            let mid = tiny_skia::Color::from_rgba8(0xC0, 0xC0, 0xC0, 255);
+            let light = tiny_skia::Color::from_rgba8(0xFF, 0xFF, 0xFF, 255);
+            let dark = tiny_skia::Color::from_rgba8(0x80, 0x80, 0x80, 255);
+            let sby = CHROME_HEIGHT - self.scroll_y;
+
+            let fill_rect = tiny_skia::Rect::from_xywh(
+                *bx as f32,
+                sby as f32,
+                *bw as f32,
+                *bh as f32,
+            );
+            if let Some(r) = fill_rect {
+                let mut p = tiny_skia::Paint::default();
+                p.set_color(mid);
+                pixmap.fill_rect(r, &p, tiny_skia::Transform::identity(), None);
+            }
+            // 1-px highlight on the left/top edge.
+            let hi_rect = tiny_skia::Rect::from_xywh(*bx as f32, sby as f32, 1.0, *bh as f32);
+            if let Some(r) = hi_rect {
+                let mut p = tiny_skia::Paint::default();
+                p.set_color(light);
+                pixmap.fill_rect(r, &p, tiny_skia::Transform::identity(), None);
+            }
+            // 1-px shadow on the right/bottom edge.
+            let sh_rect = tiny_skia::Rect::from_xywh(
+                (bx + bw - 1) as f32,
+                sby as f32,
+                1.0,
+                *bh as f32,
+            );
+            if let Some(r) = sh_rect {
+                let mut p = tiny_skia::Paint::default();
+                p.set_color(dark);
+                pixmap.fill_rect(r, &p, tiny_skia::Transform::identity(), None);
+            }
+        }
 
         // Draw scrollbar over the page area.
         let content_height = self.bridge.content_height();
@@ -175,6 +215,7 @@ impl App {
                 0x66,
                 200,
                 0,
+                false,
             );
         }
 
@@ -517,15 +558,14 @@ fn headless_screenshot(url: &str, out_path: &str) {
     let chrome = ChromeState::new();
     ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
 
-    let base_url = bridge.current_url();
     let frame_commands = bridge.collect_paint_commands();
-    for (frame_id, commands) in &frame_commands {
+    for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(
             &mut pixmap,
             commands,
             &mut text_renderer,
             &mut image_cache,
-            &base_url,
+            frame_url,
             0,
             CHROME_HEIGHT,
             frame_id,
@@ -541,14 +581,100 @@ fn headless_screenshot(url: &str, out_path: &str) {
     }
 }
 
+fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+    let height = DEFAULT_HEIGHT;
+    let mut text_renderer = TextRenderer::new();
+    let mut image_cache = ImageCache::new();
+    let mut bridge = AppBridge::new();
+    if let Err(e) = bridge.navigate(&url) {
+        eprintln!("[SCREENSHOT] navigate error: {}", e);
+        return;
+    }
+    if let Err(e) = bridge.set_viewport(width, height) {
+        eprintln!("[SCREENSHOT] set_viewport error: {}", e);
+        return;
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    pixmap.fill(tiny_skia::Color::WHITE);
+    let chrome = ChromeState::new();
+    ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
+    let frame_commands = bridge.collect_paint_commands();
+    for (frame_id, frame_url, commands) in &frame_commands {
+        render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
+            frame_url, 0, CHROME_HEIGHT, frame_id);
+    }
+    let content_height = bridge.content_height();
+    ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+    match pixmap.save_png(out_path) {
+        Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
+        Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+    }
+}
+
+fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+    let mut text_renderer = TextRenderer::new();
+    let mut image_cache = ImageCache::new();
+    let mut bridge = AppBridge::new();
+    if let Err(e) = bridge.navigate(&url) {
+        eprintln!("[SCREENSHOT] navigate error: {}", e);
+        return;
+    }
+    if let Err(e) = bridge.set_viewport(width, height) {
+        eprintln!("[SCREENSHOT] set_viewport error: {}", e);
+        return;
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    pixmap.fill(tiny_skia::Color::WHITE);
+    let chrome = ChromeState::new();
+    ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
+    let frame_commands = bridge.collect_paint_commands();
+    for (frame_id, frame_url, commands) in &frame_commands {
+        render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
+            frame_url, 0, CHROME_HEIGHT, frame_id);
+    }
+    let content_height = bridge.content_height();
+    ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+    match pixmap.save_png(out_path) {
+        Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
+        Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // --screenshot <url> [out.png]
+    // --screenshot <url> [out.png] [width]
     if args.get(1).map(|s| s.as_str()) == Some("--screenshot") {
         let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
         let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
         headless_screenshot(url, out);
+        return;
+    }
+    // --screenshot-w <url> <out.png> <width>
+    if args.get(1).map(|s| s.as_str()) == Some("--screenshot-w") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
+        let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
+        let w: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_WIDTH);
+        headless_screenshot_w(url, out, w);
+        return;
+    }
+    // --screenshot-wh <url> <out.png> <width> <height>
+    if args.get(1).map(|s| s.as_str()) == Some("--screenshot-wh") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
+        let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
+        let w: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_WIDTH);
+        let h: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_HEIGHT);
+        headless_screenshot_wh(url, out, w, h);
         return;
     }
 

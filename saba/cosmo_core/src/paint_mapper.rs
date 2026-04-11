@@ -50,6 +50,7 @@ pub fn map_display_items_to_paint_commands(
                 target,
                 paint_order,
                 clip_rect,
+                bold,
             } => {
                 let font_family = style.font_family();
                 if font_family.trim().is_empty() {
@@ -75,6 +76,7 @@ pub fn map_display_items_to_paint_commands(
                     font_px: style.font_size().px(),
                     font_family,
                     underline: style.text_decoration() == TextDecoration::Underline,
+                    bold: *bold,
                     opacity: style.opacity(),
                     href: href.clone(),
                     target: target.clone(),
@@ -154,6 +156,7 @@ mod tests {
                 target: None,
                 paint_order: PaintOrder { stacking_context: 0, z_index: 1 },
                 clip_rect: None,
+                bold: false,
             },
         ];
 

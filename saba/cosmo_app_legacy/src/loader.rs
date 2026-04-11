@@ -389,14 +389,22 @@ pub fn parse_frameset_document(html: &str) -> Option<FramesetSpec> {
     Some(frameset)
 }
 
+/// Width of the visual separator drawn between frameset panes.
+/// Matches the default HTML frameset border width used by Netscape/IE.
+pub const FRAMESET_BORDER_WIDTH: i64 = 6;
+
 impl FramesetSpec {
     pub fn child_rects(&self, parent: &FrameRect) -> Vec<FrameRect> {
         if let Some(cols) = &self.cols {
-            let widths = resolve_tracks(cols, parent.width);
+            let n_borders = (cols.len() as i64 - 1).max(0);
+            let available = (parent.width - n_borders * FRAMESET_BORDER_WIDTH).max(0);
+            let widths = resolve_tracks(cols, available);
+            let n = cols.len();
             let mut x = parent.x;
             return widths
                 .into_iter()
-                .map(|width| {
+                .enumerate()
+                .map(|(i, width)| {
                     let rect = FrameRect {
                         x,
                         y: parent.y,
@@ -404,17 +412,24 @@ impl FramesetSpec {
                         height: parent.height,
                     };
                     x += width;
+                    if i + 1 < n {
+                        x += FRAMESET_BORDER_WIDTH;
+                    }
                     rect
                 })
                 .collect();
         }
 
         if let Some(rows) = &self.rows {
-            let heights = resolve_tracks(rows, parent.height);
+            let n_borders = (rows.len() as i64 - 1).max(0);
+            let available = (parent.height - n_borders * FRAMESET_BORDER_WIDTH).max(0);
+            let heights = resolve_tracks(rows, available);
+            let n = rows.len();
             let mut y = parent.y;
             return heights
                 .into_iter()
-                .map(|height| {
+                .enumerate()
+                .map(|(i, height)| {
                     let rect = FrameRect {
                         x: parent.x,
                         y,
@@ -422,6 +437,9 @@ impl FramesetSpec {
                         height,
                     };
                     y += height;
+                    if i + 1 < n {
+                        y += FRAMESET_BORDER_WIDTH;
+                    }
                     rect
                 })
                 .collect();

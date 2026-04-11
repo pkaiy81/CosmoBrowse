@@ -177,9 +177,80 @@ impl LayoutView {
         }
     }
 
+    /// Post-processing pass: for each table, expand row heights so that rowspan
+    /// cells never overflow their spanning row group.
+    ///
+    /// Algorithm (CSS 2.2 §17.5.3 — table height algorithm):
+    ///   1. For every rowspan > 1 cell, sum the heights of the rows it spans.
+    ///   2. If the cell's computed height exceeds that sum, distribute the
+    ///      deficit to the *last* spanned row (simplest distribution).
+    ///   3. Recompute the table's total height from its updated rows.
+    fn adjust_rowspan_heights(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(n) = node else { return };
+
+        if n.borrow().is_table() {
+            // Collect all direct-child rows.
+            let mut rows: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+            let mut child = n.borrow().first_child();
+            while let Some(c) = child {
+                if c.borrow().is_table_row() {
+                    rows.push(c.clone());
+                }
+                let next = c.borrow().next_sibling();
+                child = next;
+            }
+            let row_count = rows.len();
+
+            // Scan each row for rowspan > 1 cells.
+            for row_idx in 0..row_count {
+                let mut cell = rows[row_idx].borrow().first_child();
+                while let Some(c) = cell {
+                    let rowspan = {
+                        let b = c.borrow();
+                        if b.is_table_cell() {
+                            b.element_attribute("rowspan")
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(1)
+                        } else {
+                            1
+                        }
+                    };
+                    if rowspan > 1 {
+                        let last_row = (row_idx + rowspan - 1).min(row_count - 1);
+                        let spanned_h: i64 = rows[row_idx..=last_row]
+                            .iter()
+                            .map(|r| r.borrow().size().height())
+                            .sum();
+                        let cell_h = c.borrow().size().height();
+                        if cell_h > spanned_h {
+                            let extra = cell_h - spanned_h;
+                            let new_h = rows[last_row].borrow().size().height() + extra;
+                            rows[last_row].borrow_mut().force_set_height(new_h);
+                        }
+                    }
+                    let next = c.borrow().next_sibling();
+                    cell = next;
+                }
+            }
+
+            // Update the table's total height based on revised row heights.
+            let total_row_h: i64 = rows.iter().map(|r| r.borrow().size().height()).sum();
+            let overhead = n.borrow().vertical_overhead();
+            let new_table_h = (total_row_h + overhead).max(0);
+            n.borrow_mut().force_set_height(new_table_h);
+        }
+
+        // Recurse.
+        let first_child = n.borrow().first_child();
+        Self::adjust_rowspan_heights(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        Self::adjust_rowspan_heights(&next_sibling);
+    }
+
     fn update_layout(&mut self) {
         let viewport_size = LayoutSize::new(self.viewport_width, 0);
         Self::calculate_node_size(&self.root, viewport_size);
+        Self::adjust_rowspan_heights(&self.root);
         Self::calculate_node_position(
             &self.root,
             LayoutPoint::new(0, 0),
@@ -590,6 +661,57 @@ mod tests {
     }
 
     #[test]
+    fn test_table_rowspan_height_expansion() {
+        // A tall rowspan=2 cell should cause row 2 to expand so that the
+        // right-column text in row 2 (C) appears ABOVE the rowspan cell's tail
+        // content (Tall), not below it.
+        //
+        // Layout expectation:
+        //   Row 1: [Tall (rowspan=2, 414px img)] | [B]
+        //   Row 2:                               | [C]
+        //
+        // After rowspan height fix, row 2 should be expanded and C should appear
+        // at y < image_end_y. Without the fix, C would be at a small y because
+        // rows are only as tall as their non-rowspan content.
+        let html = r#"<html><head></head><body>
+            <table>
+                <tr>
+                    <td rowspan="2"><img src="x.jpg" width="200" height="400" border="0">Tail</td>
+                    <td>B</td>
+                </tr>
+                <tr>
+                    <td>C</td>
+                </tr>
+            </table>
+        </body></html>"#.to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } =>
+                    Some((text.clone(), layout_point.x(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        let b_item = text_items.iter().find(|(t, _, _)| t.contains('B')).expect("B missing");
+        let c_item = text_items.iter().find(|(t, _, _)| t.contains('C')).expect("C missing");
+        let tail_item = text_items.iter().find(|(t, _, _)| t.contains("Tail")).expect("Tail missing");
+
+        // C should be at a y value between B and Tail (not below Tail).
+        // Before fix: B.y ≈ 8, C.y ≈ 28, Tail.y ≈ 420+ (C < Tail ✓ but by accident)
+        // After fix: row 2 expands to fit image+Tail, so C.y is still reasonable.
+        // The key assertion: Tail should be to the LEFT of C (x < C.x).
+        assert!(tail_item.1 < c_item.1,
+            "Tail (x={}) should be left of C (x={})", tail_item.1, c_item.1);
+        // And C should be to the right of B (same column).
+        assert_eq!(b_item.1, c_item.1,
+            "B.x={} should equal C.x={} (same column)", b_item.1, c_item.1);
+    }
+
+    #[test]
     fn test_implicit_td_closing() {
         // When <td> opens while inside <font> inside <td>, the parser should
         // close the existing <td> (and <font>) so cells become siblings, not nested.
@@ -863,5 +985,125 @@ mod tests {
         // Should be exactly 1 item (not split across lines).
         assert_eq!(date_items.len(), 1,
             "Date text should be on one line, got: {:?}", date_items);
+    }
+
+    /// Regression test: a table with a rowspan=2 cell plus a narrow spacer cell
+    /// must not use the spacer's width="10" for the rowspan column.  The
+    /// large left column should receive most of the table width so that the
+    /// right content column is also visible at a reasonable width.
+    #[test]
+    fn test_rowspan_cell_does_not_steal_sibling_width() {
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table width=\"760\">",
+            // Row 1: large rowspan=2 cell (image), 10px spacer, right content
+            "<tr>",
+            "  <td rowspan=\"2\"><img src=\"img.jpg\" width=\"350\" height=\"414\"></td>",
+            "  <td width=\"10\">&nbsp;</td>",
+            "  <td>right row1</td>",
+            "</tr>",
+            // Row 2: only spacer + right content (col0 occupied by rowspan)
+            "<tr>",
+            "  <td width=\"10\">&nbsp;</td>",
+            "  <td>drama content</td>",
+            "</tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        // "drama content" must appear in the display items.
+        let has_drama = display_items.iter().any(|item| {
+            matches!(item, DisplayItem::Text { text, .. } if text.contains("drama"))
+        });
+        assert!(has_drama, "drama content text should be present");
+
+        // The drama content cell must have a large x coordinate (not squished to
+        // the left by a 10px rowspan column).
+        let drama_x = display_items.iter().find_map(|item| {
+            match item {
+                DisplayItem::Text { text, layout_point, .. } if text.contains("drama") => {
+                    Some(layout_point.x())
+                }
+                _ => None,
+            }
+        });
+        assert!(
+            drama_x.map(|x| x > 50).unwrap_or(false),
+            "drama content should be well to the right of the table origin, got x={:?}",
+            drama_x
+        );
+    }
+
+    /// Regression test: 3-column table where some rows have explicit cell widths
+    /// and earlier rows do not.  All rows must use the same column widths so
+    /// text in col-2 (theater/dates) is NOT positioned on top of col-1 (title).
+    #[test]
+    fn test_table_3col_mixed_explicit_widths() {
+        // Mirrors the stage page: <TABLE width="700"> with some rows having
+        // width="145" / width="350" on col 0/1 and other rows having no widths.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table width=\"700\">",
+            // Rows without explicit cell widths (like first 6 rows on stage page)
+            "<tr>",
+            "  <td><strong>2022年9月</strong></td>",
+            "  <td><strong>Title A</strong></td>",
+            "  <td><strong>2022年9月16日〜9月25日</strong></td>",
+            "</tr>",
+            "<tr>",
+            "  <td><strong>2020年2月</strong></td>",
+            "  <td><strong>Title B</strong></td>",
+            "  <td><strong>2020年2月14日〜3月1日</strong></td>",
+            "</tr>",
+            // Row with explicit widths (like rows 7+ on stage page)
+            "<tr>",
+            "  <td width=\"145\"><strong>2005年1月</strong></td>",
+            "  <td width=\"350\"><strong>Title C</strong></td>",
+            "  <td><strong>2005年1月2日〜27日</strong></td>",
+            "</tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.x())),
+                _ => None,
+            })
+            .collect();
+        let debug: Vec<_> = items.iter()
+            .map(|(t, x)| alloc::format!("{}@x={}", t, x))
+            .collect();
+
+        // Col-2 content (dates) must be to the RIGHT of col-1 content (titles).
+        let title_a_x = items.iter().find(|(t, _)| t.contains("Title A"))
+            .map(|(_, x)| *x)
+            .expect(&alloc::format!("Title A missing, items: {:?}", debug));
+        let date_a_x = items.iter().find(|(t, _)| t.contains("〜9月25日"))
+            .map(|(_, x)| *x)
+            .expect(&alloc::format!("date A missing, items: {:?}", debug));
+
+        assert!(
+            date_a_x > title_a_x,
+            "col-2 date x={} must be > col-1 title x={} (no overlap), items: {:?}",
+            date_a_x, title_a_x, debug
+        );
+        // Col-1 should start at x>=145 (after explicit 145px col-0)
+        assert!(
+            title_a_x >= 100,
+            "Title A (col-1) x={} should be around 145 (after 145px col-0), items: {:?}",
+            title_a_x, debug
+        );
+        // Col-2 should start around x=495 (145+350)
+        assert!(
+            date_a_x >= 400,
+            "date A (col-2) x={} should be around 495 (145+350), items: {:?}",
+            date_a_x, debug
+        );
     }
 }

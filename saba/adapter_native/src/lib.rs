@@ -1399,6 +1399,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 font_px: text.font_px,
                 font_family: text.font_family.clone(),
                 underline: text.underline,
+                bold: text.bold,
                 opacity: text.opacity,
                 href: text.href.clone(),
                 target: text.target.clone(),

@@ -73,6 +73,7 @@ pub struct ComputedStyle {
     font_family: Option<String>,
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
+    bold: Option<bool>,
     opacity: Option<f64>,
     height: Option<f64>,
     height_ratio: Option<f64>,
@@ -101,6 +102,7 @@ impl ComputedStyle {
             font_family: None,
             font_size: None,
             text_decoration: None,
+            bold: None,
             opacity: None,
             height: None,
             height_ratio: None,
@@ -121,6 +123,32 @@ impl ComputedStyle {
     }
 
     pub fn defaulting(&mut self, node: &Rc<RefCell<Node>>, parent_style: Option<ComputedStyle>) {
+        // Handle HTML align attribute (presentational hint) BEFORE inheritance so
+        // that an explicit align="left" / "right" on an element can prevent the
+        // inherited text-align (e.g. from a <center> ancestor) from taking over.
+        // Spec: HTML Living Standard §14.3 — presentational hints.
+        // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+        let is_table = node.borrow().element_kind() == Some(ElementKind::Table);
+        if let Some(align) = get_element_attribute(node, "align") {
+            if align.eq_ignore_ascii_case("center") {
+                self.margin_left_auto = true;
+                self.margin_right_auto = true;
+                // align="center" on a TABLE centers the table box (margin auto),
+                // but does NOT set text-align:center on cell contents.
+                if !is_table && self.text_align.is_none() {
+                    self.text_align = Some(TextAlign::Center);
+                }
+            } else if align.eq_ignore_ascii_case("right") {
+                if self.text_align.is_none() {
+                    self.text_align = Some(TextAlign::Right);
+                }
+            } else if align.eq_ignore_ascii_case("left") {
+                // Unconditionally set Left: HTML align="left" must override any
+                // inherited text-align:center from a <center> ancestor.
+                self.text_align = Some(TextAlign::Left);
+            }
+        }
+
         if let Some(parent_style) = parent_style {
             if self.background_color.is_none() && parent_style.background_color() != Color::white()
             {
@@ -139,6 +167,10 @@ impl ComputedStyle {
                 && parent_style.text_decoration() != TextDecoration::None
             {
                 self.text_decoration = Some(parent_style.text_decoration());
+            }
+            // font-weight (bold) is inherited.
+            if self.bold.is_none() && parent_style.bold == Some(true) {
+                self.bold = Some(true);
             }
             // text-align is inherited.
             if self.text_align.is_none() && parent_style.text_align != Some(TextAlign::Left) {
@@ -180,12 +212,15 @@ impl ComputedStyle {
             }
         }
 
+        // HR always renders with its own gray background, ignoring parent inheritance.
+        if node.borrow().element_kind() == Some(ElementKind::Hr) {
+            self.background_color = Some(Color::gray());
+        }
         if self.background_color.is_none() {
             self.background_color = Some(match node.borrow().element_kind() {
                 Some(ElementKind::Button) | Some(ElementKind::Img) | Some(ElementKind::Input) => {
                     Color::lightgray()
                 }
-                Some(ElementKind::Hr) => Color::gray(),
                 Some(ElementKind::Body) => Color::white(),
                 // Use transparent default so parent backgrounds (e.g. body bgcolor) show through.
                 _ => Color::transparent(),
@@ -210,6 +245,18 @@ impl ComputedStyle {
         if self.text_decoration.is_none() {
             self.text_decoration = Some(TextDecoration::default(node));
         }
+        if self.bold.is_none() {
+            // UA stylesheet: <strong>, <b>, <h1>-<h3> are bold by default.
+            let is_bold = matches!(
+                node.borrow().element_kind(),
+                Some(ElementKind::Strong)
+                    | Some(ElementKind::B)
+                    | Some(ElementKind::H1)
+                    | Some(ElementKind::H2)
+                    | Some(ElementKind::H3)
+            );
+            self.bold = Some(is_bold);
+        }
         if self.opacity.is_none() {
             self.opacity = Some(1.0);
         }
@@ -218,28 +265,6 @@ impl ComputedStyle {
         }
         if self.width.is_none() {
             self.width = Some(0.0);
-        }
-        // Handle HTML align attribute (presentational hint).
-        // Spec: HTML Living Standard §14.3 — presentational hints for alignment.
-        // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
-        //
-        // align="center" on a TABLE element means "center the table horizontally"
-        // (equivalent to margin-left:auto; margin-right:auto).  It does NOT imply
-        // text-align:center for the table's cell contents.  On other block elements
-        // (h1, p, div…) align="center" maps to text-align:center.
-        let is_table = node.borrow().element_kind() == Some(ElementKind::Table);
-        if let Some(align) = get_element_attribute(node, "align") {
-            if align.eq_ignore_ascii_case("center") {
-                self.margin_left_auto = true;
-                self.margin_right_auto = true;
-                if !is_table && self.text_align.is_none() {
-                    self.text_align = Some(TextAlign::Center);
-                }
-            } else if align.eq_ignore_ascii_case("right") {
-                if self.text_align.is_none() {
-                    self.text_align = Some(TextAlign::Right);
-                }
-            }
         }
         // <center> tag implies text-align: center for children.
         if node.borrow().element_kind() == Some(ElementKind::Center) && self.text_align.is_none() {
@@ -388,6 +413,10 @@ impl ComputedStyle {
     pub fn text_decoration(&self) -> TextDecoration {
         self.text_decoration
             .expect("failed to access CSS property: text-decoration")
+    }
+
+    pub fn is_bold(&self) -> bool {
+        self.bold.unwrap_or(false)
     }
 
     pub fn set_opacity(&mut self, opacity: f64) {
