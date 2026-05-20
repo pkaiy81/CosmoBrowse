@@ -524,7 +524,12 @@ impl BrowserSession {
         let resolved_href = resolve_url(&source_url, href).unwrap_or_else(|_| href.to_string());
         let normalized_href = normalize_url_like(&resolved_href)?;
         let normalized_target = normalize_target_keyword(target);
-        if normalized_target.as_deref() == Some("_top")
+        // `_blank` is treated the same as `_top` for a single-pane renderer:
+        // the user explicitly asked to follow the link, so navigate the
+        // top-level traversable rather than enforcing same-origin against a
+        // child frame.  Spec: HTML Living Standard §7.1 (browsing context names).
+        // https://html.spec.whatwg.org/multipage/browsers.html#valid-browsing-context-name-or-keyword
+        if matches!(normalized_target.as_deref(), Some("_top") | Some("_blank"))
             || current.root_frame.child_frames.is_empty()
         {
             let view = self.load_page(&normalized_href, None, Some(RelayoutTrigger::DomChanged))?;
@@ -1645,6 +1650,42 @@ mod tests {
         assert_eq!(next.current_url, "fixture://abehiroshi/prof");
         assert!(next.root_frame.child_frames.is_empty());
         assert!(next.root_frame.current_url.ends_with("/prof"));
+    }
+
+    #[test]
+    fn activate_link_with_blank_target_navigates_top_level() {
+        // target="_blank" in a child frame must navigate the top-level
+        // traversable, bypassing the per-frame same-origin guard.
+        // Spec: HTML Living Standard §7.1 — _blank is a valid browsing-
+        // context-name-or-keyword that requests a new top-level navigable.
+        // https://html.spec.whatwg.org/multipage/browsers.html#valid-browsing-context-name-or-keyword
+        let mut session = BrowserSession::new();
+        let _ = session
+            .open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+
+        let next = session
+            .activate_link("root/left", "fixture://abehiroshi/prof", Some("_blank"))
+            .expect("_blank navigation should reload the root document");
+
+        assert_eq!(next.current_url, "fixture://abehiroshi/prof");
+        assert!(next.root_frame.child_frames.is_empty());
+        assert!(next.root_frame.current_url.ends_with("/prof"));
+    }
+
+    #[test]
+    fn activate_link_treats_blank_keyword_as_ascii_case_insensitive() {
+        let mut session = BrowserSession::new();
+        let _ = session
+            .open_url("fixture://abehiroshi/index")
+            .expect("fixture should load");
+
+        let next = session
+            .activate_link("root/left", "fixture://abehiroshi/prof", Some("  _BLANK "))
+            .expect("_blank navigation should reload the root document");
+
+        assert_eq!(next.current_url, "fixture://abehiroshi/prof");
+        assert!(next.root_frame.child_frames.is_empty());
     }
 
     #[test]

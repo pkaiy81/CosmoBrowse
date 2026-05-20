@@ -84,6 +84,9 @@ pub struct ComputedStyle {
     margin: Option<EdgeSize>,
     padding: Option<EdgeSize>,
     border: Option<EdgeSize>,
+    /// Visual color for border strokes (set from HTML `border` attribute or CSS).
+    /// None means no visible border stroke even if border-width > 0.
+    border_color: Option<Color>,
     position: Option<PositionType>,
     offset_top: Option<f64>,
     offset_left: Option<f64>,
@@ -113,6 +116,7 @@ impl ComputedStyle {
             margin: None,
             padding: None,
             border: None,
+            border_color: None,
             position: None,
             offset_top: None,
             offset_left: None,
@@ -307,6 +311,18 @@ impl ComputedStyle {
                 Some(ElementKind::H3) => {
                     self.margin = Some(EdgeSize::from_values(17.0, 0.0, 17.0, 0.0));
                 }
+                Some(ElementKind::Tr) => {
+                    // HTML4 cellspacing: add a gap above each table row so that
+                    // adjacent cell borders don't visually merge into a double line.
+                    // Default cellspacing = 2 per HTML4.01 §11.3.3.
+                    // https://www.w3.org/TR/html4/struct/tables.html#adef-cellspacing
+                    let cs = find_ancestor_table_cellspacing(node);
+                    self.margin = Some(EdgeSize::from_values(cs as f64, 0.0, 0.0, 0.0));
+                }
+                Some(ElementKind::Caption) => {
+                    // <caption> gets small top/bottom margin to separate it from the table rows.
+                    self.margin = Some(EdgeSize::from_values(4.0, 0.0, 4.0, 0.0));
+                }
                 _ => {
                     self.margin = Some(EdgeSize::zero());
                 }
@@ -323,6 +339,35 @@ impl ComputedStyle {
         if self.position.is_none() {
             self.position = Some(PositionType::Static);
         }
+        // HTML `border` presentational hint on <table> and its cells.
+        // Spec: HTML Living Standard §14.3 — presentational hints for tables.
+        // <TABLE BORDER=N> sets a N-px border on the table, and a 1-px border
+        // on every <td>/<th> inside it.
+        if self.border.is_none() {
+            let elem_kind = node.borrow().element_kind();
+            if elem_kind == Some(ElementKind::Table) {
+                if let Some(border_str) = get_element_attribute(node, "border") {
+                    let px: f64 = if border_str.trim().is_empty() {
+                        1.0 // bare `border` attribute with no value → 1
+                    } else {
+                        border_str.trim().parse().unwrap_or(0.0)
+                    };
+                    if px > 0.0 {
+                        self.border = Some(EdgeSize::all(px));
+                        if self.border_color.is_none() {
+                            self.border_color = Some(Color::from_code("#808080").unwrap());
+                        }
+                    }
+                }
+            } else if elem_kind == Some(ElementKind::Td) || elem_kind == Some(ElementKind::Th) {
+                if find_ancestor_table_border(node) > 0 {
+                    self.border = Some(EdgeSize::all(1.0));
+                    if self.border_color.is_none() {
+                        self.border_color = Some(Color::from_code("#808080").unwrap());
+                    }
+                }
+            }
+        }
         if self.border.is_none() {
             self.border = Some(EdgeSize::zero());
         }
@@ -333,7 +378,12 @@ impl ComputedStyle {
             self.offset_left = Some(0.0);
         }
         if self.text_align.is_none() {
-            self.text_align = Some(TextAlign::Left);
+            // <caption> is centered by default per CSS 2.2 table spec.
+            if node.borrow().element_kind() == Some(ElementKind::Caption) {
+                self.text_align = Some(TextAlign::Center);
+            } else {
+                self.text_align = Some(TextAlign::Left);
+            }
         }
         if self.z_index.is_none() {
             self.z_index = Some(0);
@@ -526,6 +576,20 @@ impl ComputedStyle {
 
     pub fn border(&self) -> EdgeSize {
         self.border.expect("failed to access CSS property: border")
+    }
+
+    /// Returns the border EdgeSize, or `EdgeSize::zero()` if not yet set.
+    /// Use this in paint-mapping where `defaulting()` may not have been called.
+    pub fn border_or_zero(&self) -> EdgeSize {
+        self.border.unwrap_or(EdgeSize::zero())
+    }
+
+    pub fn set_border_color(&mut self, color: Color) {
+        self.border_color = Some(color);
+    }
+
+    pub fn border_color(&self) -> Option<Color> {
+        self.border_color.clone()
     }
 
     pub fn set_position(&mut self, position: PositionType) {
@@ -874,6 +938,52 @@ fn get_element_attribute(node: &Rc<RefCell<Node>>, name: &str) -> Option<String>
     match node.borrow().kind() {
         NodeKind::Element(ref element) => element.get_attribute(name),
         _ => None,
+    }
+}
+
+/// Walk up the DOM tree to find the nearest ancestor `<table>` and return
+/// the value of its `border` attribute (0 if absent or zero).
+/// Used to propagate `<TABLE BORDER=N>` to individual `<td>`/`<th>` cells.
+fn find_ancestor_table_border(node: &Rc<RefCell<Node>>) -> i64 {
+    let mut p = node.borrow().parent().upgrade();
+    loop {
+        let Some(current) = p else { return 0 };
+        if current.borrow().element_kind() == Some(ElementKind::Table) {
+            let border_str = get_element_attribute(&current, "border");
+            return border_str
+                .map(|s| {
+                    if s.trim().is_empty() {
+                        1 // bare `border` attribute with no value → 1
+                    } else {
+                        s.trim().parse::<i64>().unwrap_or(0)
+                    }
+                })
+                .unwrap_or(0);
+        }
+        let next = current.borrow().parent().upgrade();
+        p = next;
+    }
+}
+
+/// Walk up the DOM tree to find the nearest ancestor `<table>` and return
+/// the value of its `cellspacing` attribute (default 2 per HTML4).
+/// Used to add gaps between table rows so adjacent cell borders don't merge.
+/// Returns 0 when no TABLE ancestor is found (e.g., malformed HTML).
+///
+/// Spec: HTML4.01 §11.3.3 — cellspacing default is 2.
+/// https://www.w3.org/TR/html4/struct/tables.html#adef-cellspacing
+fn find_ancestor_table_cellspacing(node: &Rc<RefCell<Node>>) -> i64 {
+    let mut p = node.borrow().parent().upgrade();
+    loop {
+        let Some(current) = p else { return 0 };
+        if current.borrow().element_kind() == Some(ElementKind::Table) {
+            let cs_str = get_element_attribute(&current, "cellspacing");
+            return cs_str
+                .map(|s| s.trim().parse::<i64>().unwrap_or(2))
+                .unwrap_or(2); // HTML4 default
+        }
+        let next = current.borrow().parent().upgrade();
+        p = next;
     }
 }
 

@@ -202,7 +202,12 @@ impl Iterator for CssTokenizer {
                     t
                 }
                 _ => {
-                    unimplemented!("char {} is not implemented yet", c);
+                    // Unsupported character — emit a delim-token so the parser
+                    // can decide whether to skip it.  Crashing the renderer for
+                    // a stray CSS char (any non-ASCII punctuation, escapes,
+                    // exotic Unicode used by CMS-generated stylesheets, etc.)
+                    // is worse than producing a best-effort stream.
+                    CssToken::Delim(c)
                 }
             };
 

@@ -186,9 +186,47 @@ pub fn get_style_content(root: Rc<RefCell<Node>>) -> String {
 }
 
 pub fn get_js_content(root: Rc<RefCell<Node>>) -> String {
+    // Only collect <script> elements whose `type` is a JavaScript MIME type
+    // (or unset, which per HTML defaults to JavaScript).  CMS pages embed
+    // large JSON/`application/ld+json` blobs inside <script> tags as a way
+    // to ship configuration to their runtime — those payloads must not be
+    // fed to our JavaScript parser, which would either crash or loop
+    // trying to make sense of them.
+    // Spec: HTML Living Standard §4.12.1 — script types.
+    // https://html.spec.whatwg.org/multipage/scripting.html#the-script-element
     let mut scripts = Vec::new();
-    collect_tag_texts(Some(root), ElementKind::Script, &mut scripts);
+    collect_javascript_texts(Some(root), &mut scripts);
     scripts.join("\n")
+}
+
+fn collect_javascript_texts(node: Option<Rc<RefCell<Node>>>, output: &mut Vec<String>) {
+    let Some(node) = node else {
+        return;
+    };
+    if let NodeKind::Element(element) = node.borrow().kind() {
+        if element.kind() == ElementKind::Script {
+            let is_js = match element.get_attribute("type") {
+                None => true,
+                Some(t) => {
+                    let t = t.trim().to_ascii_lowercase();
+                    t.is_empty()
+                        || t == "text/javascript"
+                        || t == "application/javascript"
+                        || t == "application/ecmascript"
+                        || t == "module"
+                }
+            };
+            if is_js {
+                let mut text = String::new();
+                collect_text(node.borrow().first_child(), &mut text);
+                if !text.is_empty() {
+                    output.push(text);
+                }
+            }
+        }
+    }
+    collect_javascript_texts(node.borrow().first_child(), output);
+    collect_javascript_texts(node.borrow().next_sibling(), output);
 }
 
 pub fn get_title_content(root: Rc<RefCell<Node>>) -> Option<String> {

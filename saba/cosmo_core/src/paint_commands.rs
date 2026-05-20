@@ -64,6 +64,17 @@ pub struct DrawRect {
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_id: Option<String>,
+    /// Border width in pixels (0 = no border).
+    /// Set from the HTML `border` attribute on `<table>` (propagated to cells).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub border_width: i64,
+    /// CSS color string for the border (e.g. "#808080"). Empty when no border.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub border_color: String,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

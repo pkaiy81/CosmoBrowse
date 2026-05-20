@@ -73,8 +73,15 @@ impl Page {
         };
 
         let js = get_js_content(dom.clone());
+        // Skip JS execution entirely when there's nothing meaningful to run
+        // or when the payload is large enough that parsing would take an
+        // unreasonable amount of time (CMS pages routinely ship hundreds of
+        // kilobytes of minified JS that this engine cannot execute anyway).
+        const MAX_SCRIPT_BYTES: usize = 32 * 1024;
+        if js.trim().is_empty() || js.len() > MAX_SCRIPT_BYTES {
+            return;
+        }
         let lexer = JsLexer::new(js);
-
         let mut parser = JsParser::new(lexer);
         let ast = parser.parse_ast();
 

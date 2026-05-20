@@ -226,6 +226,49 @@ fn draw_rect(
 
     pixmap.fill_rect(skia_rect, &paint, Transform::identity(), None);
 
+    // Draw border strokes (CSS box-model: border inside the element's box).
+    if rect.border_width > 0 && !rect.border_color.is_empty() {
+        let bw = rect.border_width;
+        let (br, bg_c, bb, _) = parse_css_color(&rect.border_color);
+        let border_opacity = (rect.opacity).clamp(0.0, 1.0) as f32;
+        let mut bp = Paint::default();
+        bp.set_color(
+            Color::from_rgba(
+                br as f32 / 255.0,
+                bg_c as f32 / 255.0,
+                bb as f32 / 255.0,
+                border_opacity,
+            )
+            .unwrap_or(Color::BLACK),
+        );
+        bp.anti_alias = false;
+
+        // Top border
+        if let Some((cx, cy, cw, ch)) = apply_clip(x, y, w, bw, &screen_clip) {
+            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            }
+        }
+        // Bottom border
+        if let Some((cx, cy, cw, ch)) = apply_clip(x, y + h - bw, w, bw, &screen_clip) {
+            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            }
+        }
+        // Left border
+        if let Some((cx, cy, cw, ch)) = apply_clip(x, y, bw, h, &screen_clip) {
+            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            }
+        }
+        // Right border
+        if let Some((cx, cy, cw, ch)) = apply_clip(x + w - bw, y, bw, h, &screen_clip) {
+            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            }
+        }
+    }
+
     // Tile background image if present.
     if let Some(ref bg_src) = rect.background_image {
         if let Some(decoded) = image_cache.get_or_fetch(bg_src, base_url) {
@@ -407,6 +450,8 @@ fn draw_image(
         z_index: img.z_index,
         clip_rect: img.clip_rect,
         anchor_id: None,
+        border_width: 0,
+        border_color: String::new(),
     };
     draw_rect(
         pixmap,

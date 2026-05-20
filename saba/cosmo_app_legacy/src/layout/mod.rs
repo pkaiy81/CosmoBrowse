@@ -118,7 +118,15 @@ pub fn build_layout_scene_with_script_runtime(
     let script = get_js_content(dom.clone());
     let mut runtime = JsRuntime::new(dom.clone());
     runtime.replace_local_storage_entries(local_storage_snapshot(document_url));
-    if !script.trim().is_empty() {
+    // Real-world pages (Wix, Squarespace, GA/GTM-instrumented sites) ship
+    // hundreds of kilobytes of minified JavaScript that this engine cannot
+    // meaningfully execute.  Even just *parsing* that volume of tokens can
+    // take many seconds and trip an infinite loop in the recursive-descent
+    // parser when fed constructs it doesn't understand.  Bail out early when
+    // the script payload exceeds a conservative size so navigation to such
+    // pages stays responsive — the engine doesn't run their JS anyway.
+    const MAX_SCRIPT_BYTES: usize = 32 * 1024;
+    if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
         let lexer = JsLexer::new(script);
         let mut parser = JsParser::new(lexer);
         let program = parser.parse_ast();
@@ -168,6 +176,15 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 let y = rect.y + layout_point.y();
                 max_width = max_width.max(layout_point.x() + layout_size.width());
                 max_height = max_height.max(layout_point.y() + layout_size.height());
+                let border = style.border_or_zero();
+                let border_width = border.top()
+                    .max(border.right())
+                    .max(border.bottom())
+                    .max(border.left())
+                    .round() as i64;
+                let border_color = style.border_color()
+                    .map(|c| c.code().to_string())
+                    .unwrap_or_default();
                 scene_items.push(SceneItem::Rect {
                     x,
                     y,
@@ -179,6 +196,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                     anchor_id,
+                    border_width,
+                    border_color,
                 });
             }
             DisplayItem::Text {
@@ -394,6 +413,8 @@ mod diff_tests {
             z_index: 0,
             clip_rect: None,
             anchor_id: None,
+            border_width: 0,
+            border_color: String::new(),
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -406,6 +427,8 @@ mod diff_tests {
             z_index: 1,
             clip_rect: None,
             anchor_id: None,
+            border_width: 0,
+            border_color: String::new(),
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

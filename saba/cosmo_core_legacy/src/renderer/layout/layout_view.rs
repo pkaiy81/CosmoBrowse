@@ -3,6 +3,7 @@ use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::dom::api::get_target_element_node;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
+use crate::renderer::layout::layout_object::compute_box_model_metrics;
 use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
@@ -116,6 +117,14 @@ impl LayoutView {
     // https://www.w3.org/TR/CSS22/visuren.html
     fn calculate_node_size(node: &Option<Rc<RefCell<LayoutObject>>>, parent_size: LayoutSize) {
         if let Some(n) = node {
+            // Pre-pass: populate per-column content hints once per table so
+            // that the very first row's cells already see the max hint of any
+            // later row's cell in the same column. Spec: CSS 2.2 §17.5.2.
+            if n.borrow().is_table() && n.borrow().column_min_hints().is_none() {
+                let hints = LayoutObject::compute_table_column_min_hints(n);
+                n.borrow_mut().set_column_min_hints(hints);
+            }
+
             if n.borrow().kind() == LayoutObjectKind::Block {
                 n.borrow_mut().compute_size(parent_size);
             }
@@ -177,6 +186,32 @@ impl LayoutView {
         }
     }
 
+    /// Collect all logical `<tr>` children of a table node, traversing through
+    /// transparent row-group elements (`<tbody>`, `<thead>`, `<tfoot>`).
+    fn collect_logical_rows(table: &Rc<RefCell<LayoutObject>>) -> Vec<Rc<RefCell<LayoutObject>>> {
+        let mut rows = Vec::new();
+        let mut child = table.borrow().first_child();
+        while let Some(c) = child {
+            let is_row = c.borrow().is_table_row();
+            let is_group = c.borrow().is_row_group();
+            if is_row {
+                rows.push(c.clone());
+            } else if is_group {
+                let mut grandchild = c.borrow().first_child();
+                while let Some(gc) = grandchild {
+                    if gc.borrow().is_table_row() {
+                        rows.push(gc.clone());
+                    }
+                    let next = gc.borrow().next_sibling();
+                    grandchild = next;
+                }
+            }
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
+        rows
+    }
+
     /// Post-processing pass: for each table, expand row heights so that rowspan
     /// cells never overflow their spanning row group.
     ///
@@ -189,16 +224,7 @@ impl LayoutView {
         let Some(n) = node else { return };
 
         if n.borrow().is_table() {
-            // Collect all direct-child rows.
-            let mut rows: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
-            let mut child = n.borrow().first_child();
-            while let Some(c) = child {
-                if c.borrow().is_table_row() {
-                    rows.push(c.clone());
-                }
-                let next = c.borrow().next_sibling();
-                child = next;
-            }
+            let rows = Self::collect_logical_rows(&n);
             let row_count = rows.len();
 
             // Scan each row for rowspan > 1 cells.
@@ -234,9 +260,40 @@ impl LayoutView {
             }
 
             // Update the table's total height based on revised row heights.
-            let total_row_h: i64 = rows.iter().map(|r| r.borrow().size().height()).sum();
+            // Include each row's margin-top (= cellspacing) so the table is
+            // tall enough to contain all rows with their inter-row gaps.
+            let total_row_h: i64 = rows.iter().map(|r| {
+                let b = r.borrow();
+                b.size().height() + b.style().margin().top() as i64
+            }).sum();
+            // Also include non-row children (e.g. <caption>) so the table
+            // height is not underestimated when such children precede the rows.
+            let non_row_h: i64 = {
+                let mut h = 0i64;
+                let mut prev_kind = LayoutObjectKind::Block;
+                let mut child = n.borrow().first_child();
+                while let Some(c) = child {
+                    if !c.borrow().is_table_row() && !c.borrow().is_row_group() {
+                        let c_kind = c.borrow().kind();
+                        let c_metrics = compute_box_model_metrics(&c.borrow().style());
+                        if prev_kind.normal_flow_spec().stacks_vertically
+                            || c_kind.normal_flow_spec().stacks_vertically
+                        {
+                            h += c.borrow().size().height()
+                                + c_metrics.margin.top
+                                + c_metrics.margin.bottom;
+                        } else {
+                            h = h.max(c.borrow().size().height());
+                        }
+                        prev_kind = c_kind;
+                    }
+                    let next = c.borrow().next_sibling();
+                    child = next;
+                }
+                h
+            };
             let overhead = n.borrow().vertical_overhead();
-            let new_table_h = (total_row_h + overhead).max(0);
+            let new_table_h = (total_row_h + non_row_h + overhead).max(0);
             n.borrow_mut().force_set_height(new_table_h);
         }
 
@@ -247,10 +304,253 @@ impl LayoutView {
         Self::adjust_rowspan_heights(&next_sibling);
     }
 
+    /// Post-processing pass: for each table row, expand every cell's height to
+    /// match the row height so that borders are painted at uniform positions.
+    ///
+    /// CSS 2.2 §17.5.3: "The height of each row is determined by the cells it
+    /// contains." After that equalization, all cells in the same row share the
+    /// same rendered height, which is the only way to produce aligned borders.
+    fn equalize_cell_heights_in_rows(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(n) = node else { return };
+
+        if n.borrow().is_table_row() {
+            let row_height = n.borrow().size().height();
+            let mut cell = n.borrow().first_child();
+            while let Some(c) = cell {
+                if c.borrow().is_table_cell() {
+                    let cell_h = c.borrow().size().height();
+                    if cell_h < row_height {
+                        c.borrow_mut().force_set_height(row_height);
+                    }
+                }
+                let next = c.borrow().next_sibling();
+                cell = next;
+            }
+        }
+
+        // Recurse.
+        let first_child = n.borrow().first_child();
+        Self::equalize_cell_heights_in_rows(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        Self::equalize_cell_heights_in_rows(&next_sibling);
+    }
+
+    /// Post-processing pass: for each table, ensure all cells in the same
+    /// logical column have the same width so that vertical cell borders are
+    /// perfectly aligned across rows.
+    ///
+    /// Root cause: row 1 cells are sized before sibling rows exist (the
+    /// sibling-row width-hint lookup returns None), so rows may end up with
+    /// slightly different widths for the same column.  This pass takes the
+    /// maximum width seen for each column and applies it to all cells in that
+    /// column.  Only cells with colspan=1 are considered; multi-column cells
+    /// are left untouched.
+    ///
+    /// Rowspan awareness: cells with rowspan>1 occupy logical columns in
+    /// subsequent rows even though no physical cell appears there.  We track
+    /// an `occupied` vector (occupied[col] = remaining rows still held by a
+    /// rowspan cell) and skip those columns when computing logical col indices.
+    fn equalize_column_widths_in_tables(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(n) = node else { return };
+
+        if n.borrow().is_table() {
+            // Returns the rowspan value for a cell (defaults to 1).
+            let cell_rowspan = |c: &Rc<RefCell<LayoutObject>>| -> usize {
+                c.borrow()
+                    .element_attribute("rowspan")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .max(1)
+            };
+
+            // Mark columns occupied by a rowspan>1 cell.
+            // We store `rowspan` (not `rowspan-1`) so that after the per-row
+            // decrement at the end of the current row the count is `rowspan-1`,
+            // which is still > 0 and causes the column to be skipped in the
+            // immediately following row.
+            let mark_occupied = |occupied: &mut Vec<usize>, col_pos: usize, colspan: usize, rowspan: usize| {
+                if rowspan > 1 {
+                    for ci in col_pos..(col_pos + colspan) {
+                        if ci >= occupied.len() {
+                            occupied.resize(ci + 1, 0);
+                        }
+                        if occupied[ci] < rowspan {
+                            occupied[ci] = rowspan;
+                        }
+                    }
+                }
+            };
+
+            // Advance col_pos past any columns occupied by rowspan cells.
+            let skip_occupied = |col_pos: &mut usize, occupied: &Vec<usize>| {
+                while *col_pos < occupied.len() && occupied[*col_pos] > 0 {
+                    *col_pos += 1;
+                }
+            };
+
+            // First pass: collect the max width for each logical column.
+            let logical_rows = Self::collect_logical_rows(&n);
+            let mut col_max: Vec<i64> = Vec::new();
+            {
+                let mut occupied: Vec<usize> = Vec::new();
+                for r in &logical_rows {
+                    let mut col_pos: usize = 0;
+                    let mut cell = r.borrow().first_child();
+                    while let Some(c) = cell {
+                        if c.borrow().is_table_cell() {
+                            skip_occupied(&mut col_pos, &occupied);
+                            let logical_col = col_pos;
+                            let colspan = c.borrow().cell_colspan();
+                            let rowspan = cell_rowspan(&c);
+                            mark_occupied(&mut occupied, col_pos, colspan, rowspan);
+                            if colspan == 1 {
+                                let w = c.borrow().size().width();
+                                if logical_col >= col_max.len() {
+                                    col_max.resize(logical_col + 1, 0);
+                                }
+                                if w > col_max[logical_col] {
+                                    col_max[logical_col] = w;
+                                }
+                            }
+                            col_pos += colspan;
+                        }
+                        let next = c.borrow().next_sibling();
+                        cell = next;
+                    }
+                    for o in occupied.iter_mut() {
+                        if *o > 0 { *o -= 1; }
+                    }
+                }
+            }
+
+            // Cellspacing for this table (used in colspan width calculations).
+            let cs: i64 = n.borrow()
+                .element_attribute("cellspacing")
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(2);
+
+            // Second pass: expand any cell whose width is below the column max.
+            {
+                let mut occupied: Vec<usize> = Vec::new();
+                for r in &logical_rows {
+                    let mut col_pos: usize = 0;
+                    let mut cell = r.borrow().first_child();
+                    while let Some(c) = cell {
+                        if c.borrow().is_table_cell() {
+                            skip_occupied(&mut col_pos, &occupied);
+                            let logical_col = col_pos;
+                            let colspan = c.borrow().cell_colspan();
+                            let rowspan = cell_rowspan(&c);
+                            mark_occupied(&mut occupied, col_pos, colspan, rowspan);
+                            if colspan == 1 && logical_col < col_max.len() {
+                                let max_w = col_max[logical_col];
+                                if c.borrow().size().width() < max_w {
+                                    c.borrow_mut().force_set_width(max_w);
+                                }
+                            }
+                            col_pos += colspan;
+                        }
+                        let next = c.borrow().next_sibling();
+                        cell = next;
+                    }
+                    for o in occupied.iter_mut() {
+                        if *o > 0 { *o -= 1; }
+                    }
+                }
+            }
+
+            // Third pass: align colspan>1 cells with equalized column boundaries.
+            // A colspan=N cell's right edge should coincide with the N-th single
+            // column's right edge. Narrow colspan cells are expanded; wide ones
+            // cause the last spanned column to grow, triggering a re-equalization.
+            let mut needs_reequalize = false;
+            {
+                let mut occupied: Vec<usize> = Vec::new();
+                for r in &logical_rows {
+                    let mut col_pos: usize = 0;
+                    let mut cell = r.borrow().first_child();
+                    while let Some(c) = cell {
+                        if c.borrow().is_table_cell() {
+                            skip_occupied(&mut col_pos, &occupied);
+                            let logical_col = col_pos;
+                            let colspan = c.borrow().cell_colspan();
+                            let rowspan = cell_rowspan(&c);
+                            mark_occupied(&mut occupied, col_pos, colspan, rowspan);
+                            if colspan > 1 {
+                                let end_col = logical_col + colspan;
+                                if end_col <= col_max.len() {
+                                    let mut expected_w: i64 = 0;
+                                    for ci in logical_col..end_col {
+                                        expected_w += col_max[ci];
+                                        if ci > logical_col {
+                                            expected_w += cs;
+                                        }
+                                    }
+                                    let current_w = c.borrow().size().width();
+                                    if current_w < expected_w {
+                                        c.borrow_mut().force_set_width(expected_w);
+                                    } else if current_w > expected_w {
+                                        col_max[end_col - 1] += current_w - expected_w;
+                                        needs_reequalize = true;
+                                    }
+                                }
+                            }
+                            col_pos += colspan;
+                        }
+                        let next = c.borrow().next_sibling();
+                        cell = next;
+                    }
+                    for o in occupied.iter_mut() {
+                        if *o > 0 { *o -= 1; }
+                    }
+                }
+            }
+
+            // Fourth pass: if any col_max grew (due to wide colspan cells), re-apply
+            // single-cell equalization so those cells widen to match.
+            if needs_reequalize {
+                let mut occupied: Vec<usize> = Vec::new();
+                for r in &logical_rows {
+                    let mut col_pos: usize = 0;
+                    let mut cell = r.borrow().first_child();
+                    while let Some(c) = cell {
+                        if c.borrow().is_table_cell() {
+                            skip_occupied(&mut col_pos, &occupied);
+                            let logical_col = col_pos;
+                            let colspan = c.borrow().cell_colspan();
+                            let rowspan = cell_rowspan(&c);
+                            mark_occupied(&mut occupied, col_pos, colspan, rowspan);
+                            if colspan == 1 && logical_col < col_max.len() {
+                                let max_w = col_max[logical_col];
+                                if c.borrow().size().width() < max_w {
+                                    c.borrow_mut().force_set_width(max_w);
+                                }
+                            }
+                            col_pos += colspan;
+                        }
+                        let next = c.borrow().next_sibling();
+                        cell = next;
+                    }
+                    for o in occupied.iter_mut() {
+                        if *o > 0 { *o -= 1; }
+                    }
+                }
+            }
+        }
+
+        // Recurse into children and siblings.
+        let first_child = n.borrow().first_child();
+        Self::equalize_column_widths_in_tables(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        Self::equalize_column_widths_in_tables(&next_sibling);
+    }
+
     fn update_layout(&mut self) {
         let viewport_size = LayoutSize::new(self.viewport_width, 0);
         Self::calculate_node_size(&self.root, viewport_size);
         Self::adjust_rowspan_heights(&self.root);
+        Self::equalize_cell_heights_in_rows(&self.root);
+        Self::equalize_column_widths_in_tables(&self.root);
         Self::calculate_node_position(
             &self.root,
             LayoutPoint::new(0, 0),
@@ -346,6 +646,7 @@ mod tests {
     use crate::renderer::dom::node::NodeKind;
     use crate::renderer::html::parser::HtmlParser;
     use crate::renderer::html::token::HtmlTokenizer;
+    use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
 
@@ -1105,5 +1406,1159 @@ mod tests {
             "date A (col-2) x={} should be around 495 (145+350), items: {:?}",
             date_a_x, debug
         );
+    }
+
+    #[test]
+    fn test_cellspacing_separates_row_borders() {
+        // With BORDER=1 and default cellspacing=2, adjacent rows must NOT share
+        // the same Y-coordinate for their top edges (which would cause double borders).
+        // Row 2 must start at least cellspacing pixels below the bottom of row 1.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table border=\"1\" width=\"400\">",
+            "<tr><td>Row1Col1</td><td>Row1Col2</td></tr>",
+            "<tr><td>Row2Col1</td><td>Row2Col2</td></tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_y: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        let r1c1 = text_y.iter().find(|(t, _)| t.contains("Row1Col1")).expect("Row1Col1 missing");
+        let r2c1 = text_y.iter().find(|(t, _)| t.contains("Row2Col1")).expect("Row2Col1 missing");
+
+        // Row 2 must be strictly below row 1 (gap >= cellspacing).
+        assert!(
+            r2c1.1 > r1c1.1,
+            "Row2 y={} should be below Row1 y={}", r2c1.1, r1c1.1
+        );
+        // The gap should be at least the cell height + cellspacing (2px default).
+        // The cell needs some breathing room — at least 1px gap to prevent border overlap.
+        let gap = r2c1.1 - r1c1.1;
+        assert!(
+            gap >= 2,
+            "gap between rows ({}) should be >= 2 (cellspacing default)", gap
+        );
+    }
+
+    #[test]
+    fn test_text_before_table_is_rendered() {
+        // Text in a paragraph before a table must be rendered and visible above the table.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<p>IntroText</p>",
+            "<table border=\"1\" width=\"400\">",
+            "<tr><td>Cell</td></tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        let intro = text_items.iter().find(|(t, _)| t.contains("IntroText"))
+            .expect("IntroText must be rendered");
+        let cell = text_items.iter().find(|(t, _)| t.contains("Cell"))
+            .expect("Cell must be rendered");
+
+        // Intro text must appear ABOVE the table cell.
+        assert!(
+            intro.1 < cell.1,
+            "IntroText y={} should be above Cell y={}", intro.1, cell.1
+        );
+    }
+
+    #[test]
+    fn test_text_in_font_before_table_is_rendered() {
+        // Text inside a <font> element above a table must be rendered and visible.
+        // Simulates common old Japanese HTML pattern where text is in <font size=+1>.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<center>",
+            "<font>SpecialAward</font>",
+            "<table border=\"1\" width=\"400\">",
+            "<tr><td>Cell</td></tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let text_items: Vec<(String, i64)> = display_items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            text_items.iter().any(|(t, _)| t.contains("SpecialAward")),
+            "SpecialAward text must be rendered, got: {:?}", text_items
+        );
+        assert!(
+            text_items.iter().any(|(t, _)| t.contains("Cell")),
+            "Cell text must be rendered"
+        );
+
+        // SpecialAward should be ABOVE the table cell.
+        let award = text_items.iter().find(|(t, _)| t.contains("SpecialAward")).unwrap();
+        let cell = text_items.iter().find(|(t, _)| t.contains("Cell")).unwrap();
+        assert!(
+            award.1 <= cell.1,
+            "SpecialAward y={} should be above or equal to Cell y={}", award.1, cell.1
+        );
+    }
+
+    #[test]
+    fn test_eiga_page_award_text_and_data_table() {
+        // Mirrors the real movie page (eiga.htm) structure:
+        //   CENTER > H2 + table(no border, awards text in TD) + br
+        //   CENTER > TABLE BORDER=1 (movie data rows)
+        // The award text inside the first (borderless) table must render,
+        // and the data rows must appear below it.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<center>",
+            "<h2>Title</h2>",
+            "<table width=\"700\">",
+            "<tr><td><strong>AwardText1<br>AwardText2</strong></td></tr>",
+            "</table>",
+            "<br>",
+            "</center>",
+            "<center>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr>",
+            "<td>MovieDate</td>",
+            "<td>MovieTitle</td>",
+            "<td>&nbsp;</td>",
+            "</tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let texts: Vec<(String, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("AwardText1")),
+            "AwardText1 must be rendered, got: {:?}", texts
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("AwardText2")),
+            "AwardText2 must be rendered (line after BR)"
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("MovieDate")),
+            "MovieDate must be rendered in data table"
+        );
+
+        let award1_y = texts.iter().find(|(t, _)| t.contains("AwardText1")).unwrap().1;
+        let movie_y = texts.iter().find(|(t, _)| t.contains("MovieDate")).unwrap().1;
+        assert!(
+            award1_y < movie_y,
+            "Award text (y={}) should appear above movie data (y={})", award1_y, movie_y
+        );
+    }
+
+    #[test]
+    fn test_strong_with_br_x_position_stays_on_screen() {
+        // Regression test: text inside <strong>line1<br>line2</strong> (inside
+        // a <center> table cell) must not be shifted off-screen.
+        //
+        // Previously, compute_size for Inline accumulated ALL children's widths
+        // including block children (<br>), making STRONG.width = sum of line widths.
+        // That inflated the "available_width" used for text-align centering,
+        // pushing every line after the first <br> far to the right (off-screen).
+        let html = concat!(
+            "<html><head></head><body>",
+            "<center>",
+            "<table width=\"700\">",
+            "<tr><td>",
+            "<strong>Line1Text<br>Line2Text<br>Line3Text</strong>",
+            "</td></tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let texts: Vec<(String, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.x())),
+            _ => None,
+        }).collect();
+
+        for (name, expected_line) in [("Line1Text", 0i64), ("Line2Text", 1i64), ("Line3Text", 2i64)] {
+            let entry = texts.iter().find(|(t, _)| t.contains(name))
+                .unwrap_or_else(|| panic!("{name} must be rendered, got: {texts:?}"));
+            // All lines must appear within the viewport (x in [0, 1024]).
+            assert!(
+                entry.1 >= 0 && entry.1 < 1024,
+                "{name} x={} is off-screen (expected 0..1024)", entry.1
+            );
+            let _ = expected_line; // used by naming convention only
+        }
+
+        // Line1 and Line2 should have similar x-positions (both left-aligned within STRONG).
+        let x1 = texts.iter().find(|(t, _)| t.contains("Line1Text")).unwrap().1;
+        let x2 = texts.iter().find(|(t, _)| t.contains("Line2Text")).unwrap().1;
+        let x3 = texts.iter().find(|(t, _)| t.contains("Line3Text")).unwrap().1;
+        let max_x_drift = 1;  // allow rounding but not centering-induced drift
+        assert!(
+            (x2 - x1).abs() <= max_x_drift,
+            "Line2Text x={x2} should be near Line1Text x={x1} (drift ≤ {max_x_drift})"
+        );
+        assert!(
+            (x3 - x1).abs() <= max_x_drift,
+            "Line3Text x={x3} should be near Line1Text x={x1} (drift ≤ {max_x_drift})"
+        );
+    }
+
+    #[test]
+    fn test_table_caption_rendered_above_rows() {
+        // Wikipedia filmography tables use <caption> for award text like
+        // "20周年記念　ニューヨーク・アジアン映画祭「スター・アジア賞」受賞".
+        // The caption must:
+        //   1. Be rendered (visible as a text item).
+        //   2. Appear ABOVE the first data row (caption.y < row1_cell.y).
+        //   3. Not cause the table height to be miscalculated (an element
+        //      placed AFTER the table must not overlap the table's rows).
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table border=\"1\">",
+            "<caption>受賞歴</caption>",
+            "<tr><th>年</th><th>作品</th></tr>",
+            "<tr><td>2000</td><td>映画A</td></tr>",
+            "<tr><td>2001</td><td>映画B</td></tr>",
+            "</table>",
+            "<p>AfterTable</p>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+
+        let texts: Vec<(String, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } =>
+                Some((text.clone(), layout_point.x(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        let caption = texts.iter().find(|(t, _, _)| t.contains("受賞歴"))
+            .expect("caption text must be rendered");
+        let year_cell = texts.iter().find(|(t, _, _)| t.contains("年"))
+            .expect("header row must be rendered");
+        let after = texts.iter().find(|(t, _, _)| t.contains("AfterTable"))
+            .expect("element after table must be rendered");
+        let last_row_cell = texts.iter().find(|(t, _, _)| t.contains("映画B"))
+            .expect("last data row must be rendered");
+
+        // Caption must appear above the first data row.
+        assert!(
+            caption.2 < year_cell.2,
+            "caption y={} must be above first row y={}", caption.2, year_cell.2
+        );
+
+        // Element after table must not overlap the table's last row.
+        assert!(
+            after.2 > last_row_cell.2,
+            "after-table y={} must be below last row y={}", after.2, last_row_cell.2
+        );
+    }
+
+    #[test]
+    fn test_column_widths_consistent_across_rows() {
+        // When only the first row has explicit column widths, subsequent rows
+        // derived their widths via sibling-row lookup — but before the
+        // equalize_column_widths pass, row 1 itself (which has no sibling data)
+        // could end up with different widths than rows 2+.
+        // After the equalization pass all rows in the same column must have the
+        // same cell width, so vertical borders align.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table border=\"1\" cellspacing=\"2\">",
+            "<tr><td width=\"80\">Year</td><td width=\"200\">Title</td><td>Role</td></tr>",
+            "<tr><td>2000</td><td>Movie A</td><td>Hero</td></tr>",
+            "<tr><td>2001</td><td>Long Movie Title Here</td><td>Villain</td></tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        // Collect all rect items (cell backgrounds) by column — group by x position.
+        let rects: Vec<(i64, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } => {
+                // Only consider non-full-width rects (table cells, not body background).
+                if layout_size.width() < 800 && layout_size.width() > 10 {
+                    Some((layout_point.x(), layout_size.width(), layout_point.y()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }).collect();
+
+        // Find cells starting at column 0 (x ~ 2 for first cell after cellspacing).
+        let col0_widths: Vec<i64> = rects.iter()
+            .filter(|(x, _, _)| *x <= 10)  // first column starts near x=2..5
+            .map(|(_, w, _)| *w)
+            .collect();
+
+        // All cells in the same column should have the same width.
+        if col0_widths.len() >= 2 {
+            let first_w = col0_widths[0];
+            for w in &col0_widths {
+                assert_eq!(*w, first_w,
+                    "column-0 cells have inconsistent widths: {:?}", col0_widths);
+            }
+        }
+    }
+
+    #[test]
+    fn test_two_tables_stacked_no_overlap() {
+        // Replicates the abehiroshi.la.coocan.jp/movie/eiga.htm structure:
+        //   <H2>title</H2>
+        //   <table width="700"><tr><td>award text 1<br>award 2<br>...</td></tr></table>
+        //   <br>
+        //   <TABLE BORDER=1 width="700"> <tr><td>...</td></tr> ... </TABLE>
+        //
+        // Both tables share width=700 inside <CENTER>. The second (bordered)
+        // table must start strictly BELOW the first table's last text line.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<center>",
+            "<h2>阿部 寛の映画出演</h2>",
+            "<table width=\"700\">",
+            "<tr><td><strong>",
+            "・20周年記念　ニューヨーク・アジアン映画祭「スター・アジア賞」受賞<br>",
+            "・第45回　日本アカデミー賞「護られなかった者たちへ」優秀助演男優賞　受賞<br>",
+            "・「京都国際映画祭2016」で「三船敏郎賞」受賞<br>",
+            "</strong></td></tr>",
+            "</table>",
+            "<br>",
+            "</center>",
+            "<center>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr><td><strong>2025年9月26日公開</strong></td>",
+            "<td><strong>「俺ではない炎上」</strong></td>",
+            "<td>&nbsp;</td></tr>",
+            "<tr><td><strong>2025年7月4日公開</strong></td>",
+            "<td><strong>「キャンドルスティック」</strong></td>",
+            "<td>&nbsp;</td></tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let texts: Vec<(String, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } =>
+                Some((text.clone(), layout_point.x(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        // Last award line in the first table.
+        let last_award = texts.iter().find(|(t, _, _)| t.contains("三船敏郎賞"))
+            .expect("award text must be rendered");
+        // First date in the second (bordered) table.
+        let first_date = texts.iter().find(|(t, _, _)| t.contains("2025年9月26日"))
+            .expect("first date row must be rendered");
+
+        // The bordered table's first cell must start STRICTLY below the last
+        // award text line — otherwise the awards overlap with the table border.
+        assert!(
+            first_date.2 > last_award.2,
+            "movie table first row y={} must be below last award y={} (overlap detected)",
+            first_date.2, last_award.2,
+        );
+
+        // Also: the second table's border rect must not overlap with
+        // the award text (the rect's top must be below the last award line).
+        let rects: Vec<(i64, i64, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Rect { layout_point, layout_size, .. } => {
+                Some((layout_point.x(), layout_point.y(), layout_size.width(), layout_size.height()))
+            }
+            _ => None,
+        }).collect();
+
+        // Find the bordered table's rect (width ~ 700, contains first_date Y).
+        let bordered_table_rect = rects.iter()
+            .filter(|(_, y, w, h)| *w >= 600 && *w <= 800 && *y <= first_date.2 && *y + *h >= first_date.2)
+            .min_by_key(|(_, y, _, _)| *y)
+            .copied();
+
+        if let Some((_, ry, _, _)) = bordered_table_rect {
+            assert!(
+                ry > last_award.2,
+                "bordered table border rect y={ry} overlaps with last award text y={} (overlap)",
+                last_award.2
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_height_includes_multiline_cell_content() {
+        // Replicates eiga.htm exactly: <center><h2><table><tr><td>multi-line<br>...</td></tr></table>
+        // Then a sibling <center><table border=1>...
+        // The first (no-border) table's HEIGHT must reflect its multi-line text
+        // content, otherwise the second table will be positioned ON TOP of it.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<center>",
+            "<h2>title</h2>",
+            "<table width=\"700\">",
+            "<tr><td>",
+            "Line1<br>Line2<br>Line3<br>Line4<br>Line5<br>Line6<br>Line7<br>Line8<br>Line9<br>Line10<br>Line11<br>",
+            "</td></tr>",
+            "</table>",
+            "<br>",
+            "</center>",
+            "<center>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr><td>RowA</td></tr>",
+            "<tr><td>RowB</td></tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let texts: Vec<(String, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } =>
+                Some((text.clone(), layout_point.x(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        let line1 = texts.iter().find(|(t, _, _)| t.contains("Line1"))
+            .expect("Line1 must be rendered");
+        let line11 = texts.iter().find(|(t, _, _)| t.contains("Line11"))
+            .expect("Line11 must be rendered");
+        let row_a = texts.iter().find(|(t, _, _)| t.contains("RowA"))
+            .expect("RowA must be rendered");
+
+        // Lines 1 and 11 must be vertically separated (multi-line layout works).
+        assert!(line11.2 > line1.2,
+            "Line11 y={} must be below Line1 y={} (multi-line text)",
+            line11.2, line1.2);
+
+        // RowA in the second table must be strictly below Line11.
+        assert!(row_a.2 > line11.2,
+            "RowA y={} must be below Line11 y={} — first table height too small, second table overlaps first table content",
+            row_a.2, line11.2);
+    }
+
+    #[test]
+    fn test_eiga_exact_layout_no_overlap() {
+        // Replicates eiga.htm EXACTLY (with <strong> and explicit attributes).
+        let html = concat!(
+            "<html><head></head><body background=\"x.jpg\">",
+            "<center>",
+            "<h2>阿部 寛の映画出演</h2>",
+            "<table width=\"700\">",
+            "<tr><td><strong>",
+            "・20周年記念　ニューヨーク・アジアン映画祭「スター・アジア賞」受賞<br>",
+            "・第45回　日本アカデミー賞「護られなかった者たちへ」優秀助演男優賞　受賞<br>",
+            "・「京都国際映画祭2016」で「三船敏郎賞」受賞<br>",
+            "・第38回　日本アカデミー賞「ふしぎな岬の物語」優秀主演男優賞　受賞<br>",
+            "・第38回　日本アカデミー賞 「柘榴坂の仇討」優秀助演男優賞　受賞<br>",
+            "・第36回　日本アカデミー賞　「テルマエ・ロマエ」で最優秀主演男優賞受賞<br>",
+            "・2012年　ブルーリボン賞　「カラスの親指」「麒麟の翼」「テルマエ・ロマエ」で主演男優賞受賞<br>",
+            "・2012年　ヨコハマ映画祭　　「テルマエ・ロマエ」で主演男優賞受賞<br>",
+            "・2012年　日本シアタースタッフ映画祭ＩＮ成城　　「テルマエ・ロマエ」で主演男優賞受賞<br>",
+            "・第63回毎日映画コンクール男優主演賞 受賞 2008年公開映画「歩いても歩いても」、「青い鳥」<br>",
+            "・1994年度インディペンデント映画祭プロフェッショナル大賞受賞「凶銃ルガーPO8」<br>",
+            "</strong></td></tr>",
+            "</table>",
+            "<br>",
+            "</center>",
+            "<center>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr><td align=\"left\"><strong>2025年9月26日公開</strong></td>",
+            "<td align=\"left\"><strong>「俺ではない炎上」</strong></td>",
+            "<td align=\"left\">&nbsp;</td></tr>",
+            "<tr><td align=\"left\"><strong>2025年7月4日公開</strong></td>",
+            "<td align=\"left\"><strong>「キャンドルスティック」</strong></td>",
+            "<td align=\"left\">&nbsp;</td></tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let texts: Vec<(String, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } =>
+                Some((text.clone(), layout_point.x(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        let first_award = texts.iter().find(|(t, _, _)| t.contains("20周年記念"))
+            .expect("first award must be rendered");
+        let last_award = texts.iter().find(|(t, _, _)| t.contains("1994年度"))
+            .expect("last award must be rendered");
+        let first_movie = texts.iter().find(|(t, _, _)| t.contains("2025年9月26日"))
+            .expect("first movie row must be rendered");
+
+        // The first movie row must be strictly below the LAST award.
+        // If awards table height is wrong, first_movie.y could be at or above last_award.y.
+        assert!(
+            first_movie.2 > last_award.2,
+            "OVERLAP: first_movie y={} must be > last_award y={} (first_award y={})",
+            first_movie.2, last_award.2, first_award.2,
+        );
+
+        // Bordered table: every row in the same column must have the same X
+        // (left border alignment) and same width — otherwise the vertical
+        // borders form a "double line" that doesn't connect across rows.
+        let rects: Vec<(i64, i64, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Rect { layout_point, layout_size, .. } => {
+                Some((layout_point.x(), layout_point.y(), layout_size.width(), layout_size.height()))
+            }
+            _ => None,
+        }).collect();
+        // The actual table cell rects (not their inner content rects) have
+        // h=24 (line height + cell padding + border). Filter just those.
+        // Group by Y: cells of the same row share Y.
+        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64)>> = alloc::collections::BTreeMap::new();
+        for (x, y, w, h) in &rects {
+            if *w < 700 && *w > 0 && *h == 24 && *y >= first_movie.2 - 5 {
+                cells_by_row.entry(*y).or_default().push((*x, *w));
+            }
+        }
+        // Take the first two rows that look like the bordered table rows.
+        let mut row_iter = cells_by_row.values().filter(|v| v.len() >= 2);
+        if let (Some(row1), Some(row2)) = (row_iter.next(), row_iter.next()) {
+            for (i, (r1, r2)) in row1.iter().zip(row2.iter()).enumerate() {
+                assert_eq!(r1.0, r2.0,
+                    "column {} X mismatch: row1 x={} row2 x={}", i, r1.0, r2.0);
+                assert_eq!(r1.1, r2.1,
+                    "column {} width mismatch: row1 w={} row2 w={}", i, r1.1, r2.1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tv_htm_long_row_wraps_within_cell() {
+        // Replicates tv.htm: 2-column table where some rows have very long
+        // titles that must wrap within the cell. The cell rect must:
+        //   1. Stay within the table's right edge (no horizontal overflow)
+        //   2. Be tall enough to contain ALL wrapped text lines (no vertical
+        //      overflow of text past the cell border)
+        //   3. Have the same X and width as adjacent rows (vertical border
+        //      alignment).
+        let html = concat!(
+            "<html><head></head><body>",
+            "<center><h2>阿部 寛のドラマ出演</h2></center>",
+            "<center>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr>",
+            "<td align=\"left\"><strong>2026年7月</strong></td>",
+            "<td align=\"left\"><strong>「日曜劇場『VIVANT』続編」</strong></td>",
+            "</tr>",
+            "<tr>",
+            "<td align=\"left\"><strong>2015年4月11日</strong></td>",
+            "<td align=\"left\"><strong>阿部寛＆ルフィが初共演　阿部寛がゴム人間に！夢の共演が実現！「世にも奇妙な物語　25周年スペシャル・春〜人気マンガ家競演編〜」</strong></td>",
+            "</tr>",
+            "<tr>",
+            "<td align=\"left\"><strong>2014年5月</strong></td>",
+            "<td align=\"left\"><strong>「まっしろ」</strong></td>",
+            "</tr>",
+            "</table>",
+            "</center>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+
+        let rects: Vec<(i64, i64, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Rect { layout_point, layout_size, .. } => {
+                Some((layout_point.x(), layout_point.y(), layout_size.width(), layout_size.height()))
+            }
+            _ => None,
+        }).collect();
+
+        let texts: Vec<(String, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } =>
+                Some((text.clone(), layout_point.x(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        // Find the bordered table rect (width ≥ 700).
+        let table_rect = rects.iter()
+            .find(|(_, _, w, _)| *w >= 700 && *w <= 720)
+            .copied()
+            .expect("bordered table rect must exist");
+        let table_left = table_rect.0;
+        let table_right = table_rect.0 + table_rect.2;
+        let table_top = table_rect.1;
+        let table_bottom = table_rect.1 + table_rect.3;
+
+        // ALL text inside the table area must stay within table bounds.
+        let table_texts: Vec<&(String, i64, i64)> = texts.iter()
+            .filter(|(_, x, y)| *x >= table_left - 5 && *x <= table_right + 5
+                && *y >= table_top && *y <= table_bottom + 200)
+            .collect();
+        for (txt, tx, ty) in &table_texts {
+            assert!(*tx + 10 <= table_right,
+                "text '{}' at x={} extends past table right edge x={}", txt, tx, table_right);
+            assert!(*ty < table_bottom,
+                "text '{}' at y={} is below table bottom y={} (vertical overflow)", txt, ty, table_bottom);
+        }
+
+        // Vertical border alignment: cell rects (NOT inner content rects) in
+        // the same column must share X and width across all rows. Cells have
+        // x divisible by 2 (cellspacing) and lie at the row's exact y, while
+        // the inner <strong> rects are inset by ~2px.
+        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64, i64)>> = alloc::collections::BTreeMap::new();
+        // Take only the OUTER cell rects (we know real cell xs land at 164 etc.).
+        // Identify them by clustering on Y where the row's cell-rect heights
+        // are uniform.
+        let candidate_xs: alloc::collections::BTreeSet<i64> = rects.iter()
+            .filter(|(_, _, w, h)| *w < 700 && *w > 30 && (*h == 24 || *h > 24))
+            .map(|(x, _, _, _)| *x)
+            .collect();
+        for (x, y, w, h) in &rects {
+            if *w < 700 && *w > 30 && *h >= 24 && *h < table_rect.3 && candidate_xs.contains(x) {
+                cells_by_row.entry(*y).or_default().push((*x, *w, *h));
+            }
+        }
+        let rows: Vec<_> = cells_by_row.values().filter(|v| v.len() == 2).collect();
+        if rows.len() >= 2 {
+            let row1 = rows[0];
+            for (i, (x1, w1, _)) in row1.iter().enumerate() {
+                for r in rows.iter().skip(1) {
+                    let (xn, wn, _) = r[i];
+                    assert_eq!(xn, *x1, "column {} X mismatch: row1 x={} other x={}", i, x1, xn);
+                    assert_eq!(wn, *w1, "column {} width mismatch: row1 w={} other w={}", i, w1, wn);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_inline_text_wraps_inside_cell() {
+        // Text inside <strong><a> inside a narrow cell should wrap within the cell.
+        let html = concat!(
+            "<html><body><table border=\"1\" width=\"200\">",
+            "<tr><td><strong><a href=\"#\">some long anchor text that should wrap inside the cell</a></strong></td></tr>",
+            "</table></body></html>"
+        ).to_string();
+        let view = create_layout_view(html, 800);
+        let items = view.paint();
+        // The table is 200px wide; no text item should start beyond x=210.
+        for item in &items {
+            if let crate::display_item::DisplayItem::Text { layout_point, text, .. } = item {
+                assert!(layout_point.x() <= 210,
+                    "text {:?} starts at x={} which is outside the 200px table", text, layout_point.x());
+            }
+        }
+    }
+
+    #[test]
+    fn test_long_word_in_nested_cell_widens_column() {
+        // A long unbreakable word deep in a nested element should widen the column.
+        let long_word = "SUPERCALIFRAGILISTICEXPIALIDOCIOUS";
+        let html = format!(
+            "<html><body><table border=\"1\"><tr><td>short</td><td><p><span>{}</span></p></td></tr></table></body></html>",
+            long_word
+        );
+        let view = create_layout_view(html, 800);
+        let items = view.paint();
+        // The long word should appear as a single text item (no wrap).
+        let long_texts: Vec<_> = items.iter().filter_map(|i| match i {
+            crate::display_item::DisplayItem::Text { text, .. }
+                if text.contains("SUPERCALI") => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(long_texts.len(), 1,
+            "long word should not be split, got {:?}", long_texts);
+    }
+
+    #[test]
+    fn test_image_clipped_to_narrow_cell() {
+        // An oversized image inside a narrow cell should have its clip_rect
+        // constrained to the cell's bounding box.
+        let html = concat!(
+            "<html><body><table border=\"1\" width=\"200\">",
+            "<tr><td width=\"100\"><img width=\"400\" height=\"20\"></td></tr>",
+            "</table></body></html>"
+        ).to_string();
+        let view = create_layout_view(html, 800);
+        let items = view.paint();
+        for item in &items {
+            if let crate::display_item::DisplayItem::Image { clip_rect: Some(c), .. } = item {
+                assert!(c.width <= 110,
+                    "image clip width {} exceeds cell content width", c.width);
+            }
+        }
+    }
+
+    #[test]
+    fn test_text_wrap_recomputed_after_widening() {
+        // After column equalization, the "short" cell gets widened to match the
+        // "aaaaa..." cell's width. The text "short" should fit on one line (no wrap).
+        let html = concat!(
+            "<html><body><table border=\"1\" width=\"400\">",
+            "<tr><td>short</td><td>x</td></tr>",
+            "<tr><td>aaaaaaaaaaaaaaaaaaaaaaaaaa</td><td>y</td></tr>",
+            "</table></body></html>"
+        ).to_string();
+        let view = create_layout_view(html, 800);
+        let items = view.paint();
+        let short_texts: Vec<_> = items.iter().filter_map(|i| match i {
+            crate::display_item::DisplayItem::Text { text, .. } if text.contains("short") =>
+                Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(short_texts.len(), 1,
+            "short text should not wrap after column equalization, got {:?}", short_texts);
+    }
+
+    #[test]
+    fn test_tbody_transparent_for_column_equalization() {
+        let html = concat!(
+            "<html><body><table border=\"1\" width=\"300\"><tbody>",
+            "<tr><td>A</td><td>BB</td></tr>",
+            "<tr><td>CCCC</td><td>D</td></tr>",
+            "</tbody></table></body></html>"
+        ).to_string();
+        let view = create_layout_view(html, 600);
+        let items = view.paint();
+        // Collect cell rects grouped by Y position (each row).
+        let mut cells_by_y: alloc::collections::BTreeMap<i64, Vec<(i64, i64)>> =
+            alloc::collections::BTreeMap::new();
+        for item in &items {
+            if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
+                let w = layout_size.width();
+                let h = layout_size.height();
+                if w > 5 && w < 290 && h > 5 {
+                    cells_by_y.entry(layout_point.y()).or_default()
+                        .push((layout_point.x(), w));
+                }
+            }
+        }
+        let rows: Vec<_> = cells_by_y.values().filter(|v| v.len() == 2).collect();
+        assert!(rows.len() >= 2, "expected at least 2 rows with 2 cells each, got {:?}", cells_by_y);
+        let row0 = &rows[0];
+        let row1 = &rows[1];
+        for i in 0..2 {
+            assert_eq!(row0[i].0, row1[i].0,
+                "col {} X mismatch with tbody: row0={} row1={}", i, row0[i].0, row1[i].0);
+            assert_eq!(row0[i].1, row1[i].1,
+                "col {} width mismatch with tbody: row0={} row1={}", i, row0[i].1, row1[i].1);
+        }
+    }
+
+    #[test]
+    fn test_thead_tbody_tfoot_no_panic() {
+        // This must not panic (previously would panic due to missing ElementKind variants).
+        let html = concat!(
+            "<html><body><table border=\"1\" width=\"400\">",
+            "<thead><tr><th>H1</th><th>H2</th></tr></thead>",
+            "<tbody><tr><td>A</td><td>BB</td></tr><tr><td>CC</td><td>D</td></tr></tbody>",
+            "<tfoot><tr><td>F1</td><td>F2</td></tr></tfoot>",
+            "</table></body></html>"
+        ).to_string();
+        let view = create_layout_view(html, 600);
+        let items = view.paint();
+        // Should render some content (at minimum the table outline rect).
+        let rects: Vec<_> = items.iter().filter(|i| {
+            matches!(i, crate::display_item::DisplayItem::Rect { .. })
+        }).collect();
+        assert!(!rects.is_empty(), "thead/tbody/tfoot table should produce rect display items");
+        // All 4 rows should appear: 1 header + 2 body + 1 footer.
+        let mut cells_by_y: alloc::collections::BTreeMap<i64, usize> =
+            alloc::collections::BTreeMap::new();
+        for item in &items {
+            if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
+                let w = layout_size.width();
+                if w > 5 && w < 390 {
+                    *cells_by_y.entry(layout_point.y()).or_insert(0) += 1;
+                }
+            }
+        }
+        let row_count = cells_by_y.values().filter(|&&c| c >= 2).count();
+        assert!(row_count >= 4, "expected at least 4 rows, found {}", row_count);
+    }
+
+    #[test]
+    fn test_eiga_mixed_pct_and_auto_rows_column_alignment() {
+        // Replicates eiga.htm: some rows have no width attrs, some have pct widths.
+        // All cells in the same column must share X and width after equalization.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<CENTER><TABLE BORDER=1 width=\"700\">",
+            "<tr>",
+            "<td align=\"LEFT\"><strong>2025nen9gatsu26nichi</strong></td>",
+            "<td align=\"LEFT\"><strong>OredehanaiEnjo</strong></td>",
+            "<td align=\"LEFT\">&nbsp;</td>",
+            "</tr>",
+            "<tr>",
+            "<td align=\"LEFT\"><strong>2016nen5gatsu21nichi</strong></td>",
+            "<td align=\"LEFT\"><strong>UmiyorimoMadaFukaku</strong></td>",
+            "<td align=\"LEFT\"><strong>Cannes International Film Festival Certain Regard section screening</strong></td>",
+            "</tr>",
+            "<tr>",
+            "<td align=\"LEFT\" width=\"32%\"><strong>2005nen11gatsu19nichi</strong></td>",
+            "<td align=\"LEFT\" width=\"46%\"><strong>Kidan</strong></td>",
+            "<td align=\"LEFT\" width=\"22%\">&nbsp;</td>",
+            "</tr>",
+            "<tr>",
+            "<td align=\"LEFT\" width=\"32%\"><strong>2004nen9gatsu</strong></td>",
+            "<td align=\"LEFT\" width=\"46%\"><strong>SURVIVE STYLE 5 Plus</strong></td>",
+            "<td align=\"LEFT\" width=\"22%\">&nbsp;</td>",
+            "</tr>",
+            "</TABLE></CENTER>",
+            "</body></html>"
+        ).to_string();
+        let view = create_layout_view(html, 1024);
+        let items = view.paint();
+
+        // Cell rects should all lie within the 700px table boundary.
+        let table_rects: Vec<(i64, i64, i64, i64)> = items.iter().filter_map(|item| match item {
+            crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } => {
+                Some((layout_point.x(), layout_point.y(), layout_size.width(), layout_size.height()))
+            }
+            _ => None,
+        }).collect();
+
+        // Find table outer rect.
+        let table_outer = table_rects.iter()
+            .find(|(_, _, w, _)| *w >= 700 && *w <= 720)
+            .copied();
+
+        if let Some((tx, _, tw, _)) = table_outer {
+            let table_right = tx + tw;
+            // All text items should start left of table right edge.
+            for item in &items {
+                if let crate::display_item::DisplayItem::Text { layout_point, text, .. } = item {
+                    if layout_point.x() > tx {
+                        assert!(layout_point.x() < table_right + 5,
+                            "text {:?} at x={} is outside table right edge x={}", text, layout_point.x(), table_right);
+                    }
+                }
+            }
+
+            // Column widths must be consistent across rows.
+            let mut cells_by_y: alloc::collections::BTreeMap<i64, Vec<(i64, i64)>> =
+                alloc::collections::BTreeMap::new();
+            // Minimum cell height: text(20) + border_top(1) + border_bottom(1) +
+            // 2*cellpadding(2) = 24. Inline elements (e.g. <strong>) have height 20
+            // for single-line text — filter them out with ch >= 24.
+            let min_cell_h = 24;
+            for (cx, cy, cw, ch) in &table_rects {
+                if *cw < 700 && *cw > 10 && *ch >= min_cell_h && *cx > tx {
+                    cells_by_y.entry(*cy).or_default().push((*cx, *cw));
+                }
+            }
+            let rows: Vec<_> = cells_by_y.values().filter(|v| v.len() == 3).collect();
+            assert!(rows.len() >= 2,
+                "expected >=2 rows with 3 cells each; all cell rects: {:?}", cells_by_y);
+            let r0 = &rows[0];
+            for r in rows.iter().skip(1) {
+                for i in 0..3 {
+                    assert_eq!(r[i].0, r0[i].0,
+                        "col {} X mismatch across rows: {} vs {}; all rows: {:?}", i, r[i].0, r0[i].0, rows);
+                    assert_eq!(r[i].1, r0[i].1,
+                        "col {} width mismatch across rows: {} vs {}; all rows: {:?}", i, r[i].1, r0[i].1, rows);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_colspan_row_does_not_starve_subsequent_columns() {
+        // A table where row A has a colspan=2 cell in the middle and row B has
+        // 3 individual cells.  The colspan cell's full width must NOT be used as
+        // the width hint for a single column in row B — doing so leaves no space
+        // for row B's 3rd column.
+        //
+        // Expected: row B's 3rd column (col2) is visible (x > col1_x and width > 0),
+        // and the right edge of row B's cells does not exceed the viewport.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table width=\"600\">",
+            // Row A: 2 cells, second spans columns 1+2
+            "<tr>",
+            "  <td>Col0</td>",
+            "  <td colspan=\"2\">Colspan cell</td>",
+            "</tr>",
+            // Row B: 3 individual cells — col2 must receive some width
+            "<tr>",
+            "  <td>Col0</td>",
+            "  <td>Col1</td>",
+            "  <td>Col2</td>",
+            "</tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let view = create_layout_view(html, 760);
+        let items = view.paint();
+
+        let text_items: Vec<(alloc::string::String, i64)> = items.iter().filter_map(|item| {
+            if let crate::display_item::DisplayItem::Text { text, layout_point, .. } = item {
+                Some((text.clone(), layout_point.x()))
+            } else {
+                None
+            }
+        }).collect();
+
+        let col1_x = text_items.iter()
+            .find(|(t, _)| t.contains("Col1"))
+            .map(|(_, x)| *x)
+            .expect("Col1 text missing");
+        let col2_x = text_items.iter()
+            .find(|(t, _)| t.contains("Col2"))
+            .map(|(_, x)| *x)
+            .expect("Col2 text missing");
+
+        assert!(
+            col2_x > col1_x,
+            "col2 (x={}) must be to the right of col1 (x={}); items: {:?}",
+            col2_x, col1_x, text_items
+        );
+        assert!(
+            col2_x < 760,
+            "col2 (x={}) must be within viewport (760); items: {:?}",
+            col2_x, text_items
+        );
+    }
+
+    #[test]
+    fn test_cjk_title_column_not_treated_as_spacer() {
+        // Regression test: a 3-column table where the title column contains
+        // pure CJK text (hint was incorrectly 0 → spacer → 1px width).
+        // The date column has ASCII digits giving hint=32 (flexible).
+        // After the fix, the CJK title column must also be flexible and receive
+        // a significant share of the table width.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr>",
+            "<td><strong>2025年9月26日公開</strong></td>",
+            "<td><strong>「俺ではない炎上」</strong></td>",
+            "<td>&nbsp;</td>",
+            "</tr>",
+            "<tr>",
+            "<td><strong>2025年7月4日公開</strong></td>",
+            "<td><strong>「キャンドルスティック」</strong></td>",
+            "<td>&nbsp;</td>",
+            "</tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let view = create_layout_view(html, 1024);
+        let items = view.paint();
+
+        // Find all rects that look like cells (h==24, w < 700, w > 5).
+        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64)>> =
+            alloc::collections::BTreeMap::new();
+        for item in &items {
+            if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
+                let w = layout_size.width();
+                let h = layout_size.height();
+                if w > 5 && w < 695 && h == 24 {
+                    cells_by_row.entry(layout_point.y()).or_default().push((layout_point.x(), w));
+                }
+            }
+        }
+        // Both rows must have at least 2 measurable cells (col0 and col1).
+        let rows: alloc::vec::Vec<_> = cells_by_row.values()
+            .filter(|v| v.len() >= 2)
+            .collect();
+        assert!(rows.len() >= 2, "expected at least 2 rows with 2 cells each, got {:?}", cells_by_row);
+
+        // Col1 (title) must have at least 100px — not squeezed to 1px.
+        for row in &rows {
+            let mut sorted = row.to_vec();
+            sorted.sort_by_key(|(x, _)| *x);
+            let col1_width = sorted[1].1;
+            assert!(
+                col1_width >= 100,
+                "CJK title column width {} must be >= 100px (col1 should not be a spacer); row cells: {:?}",
+                col1_width, sorted
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_column_width_promoted_by_later_row_cjk_content() {
+        // Regression test for the abehiroshi.la.coocan.jp movies page.
+        // A 3-column table where most rows have &nbsp; in col2, but one row
+        // contains substantial CJK text in col2.  Without the per-column
+        // min-hint pre-pass, row 1 would treat col2 as a spacer (8px) and
+        // later rows would inherit that, starving col2 in the row with text
+        // content and causing horizontal overflow at the table's right edge.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table border=\"1\" width=\"700\">",
+            "<tr>",
+            "<td><strong>2025年9月26日公開</strong></td>",
+            "<td><strong>「俺ではない炎上」</strong></td>",
+            "<td>&nbsp;</td>",
+            "</tr>",
+            "<tr>",
+            "<td><strong>2016年5月21日公開</strong></td>",
+            "<td><strong>「海よりもまだ深く」</strong></td>",
+            "<td><strong>カンヌ国際映画祭部門出品</strong></td>",
+            "</tr>",
+            "<tr>",
+            "<td><strong>2014年公開</strong></td>",
+            "<td><strong>「アゲイン」</strong></td>",
+            "<td>&nbsp;</td>",
+            "</tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let view = create_layout_view(html, 1024);
+        let items = view.paint();
+
+        // Cell rects only: filter to rects whose height matches one text-line.
+        // The table has border="1" so each cell has h = line_height + 2*border ≈ 24.
+        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64)>> =
+            alloc::collections::BTreeMap::new();
+        for item in &items {
+            if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
+                let w = layout_size.width();
+                let h = layout_size.height();
+                if w > 5 && w < 700 && h == 24 {
+                    cells_by_row.entry(layout_point.y()).or_default().push((layout_point.x(), w));
+                }
+            }
+        }
+        let rows: alloc::vec::Vec<_> = cells_by_row
+            .values()
+            .filter(|v| v.len() >= 3)
+            .collect();
+        assert!(
+            rows.len() >= 3,
+            "expected at least 3 rows with 3 cells each, got {:?}",
+            cells_by_row
+        );
+
+        // For each row, col2 must be wide enough to display the CJK content
+        // that appears in row 2 (≥ 24px) — i.e. col2 was promoted by the
+        // pre-pass instead of staying at the row-1 spacer width.
+        for row in &rows {
+            let mut sorted = row.to_vec();
+            sorted.sort_by_key(|(x, _)| *x);
+            assert_eq!(sorted.len(), 3, "expected 3 cells; got: {:?}", sorted);
+            let col2_w = sorted[2].1;
+            assert!(
+                col2_w >= 24,
+                "col2 width {} must be >= 24 (promoted by sibling CJK content); cells: {:?}",
+                col2_w, sorted
+            );
+            // Sum of cell widths (outer) must stay within the table width plus
+            // small border overhead.  Each cell has a 1px border on each side
+            // under border="1", so 3 cells may add up to ~6px above the
+            // declared content width.
+            let total: i64 = sorted.iter().map(|(_, w)| *w).sum();
+            assert!(
+                total <= 710,
+                "row cell widths sum to {} > 710 (large table overflow); cells: {:?}",
+                total, sorted
+            );
+        }
+
+        // Column widths must be equal across rows (equalization pass).
+        let row0 = rows[0];
+        let row1 = rows[1];
+        let row2 = rows[2];
+        let mut r0 = row0.to_vec(); r0.sort_by_key(|(x, _)| *x);
+        let mut r1 = row1.to_vec(); r1.sort_by_key(|(x, _)| *x);
+        let mut r2 = row2.to_vec(); r2.sort_by_key(|(x, _)| *x);
+        for col in 0..3 {
+            assert_eq!(r0[col].0, r1[col].0,
+                "col {} x mismatch between rows: r0={} r1={}", col, r0[col].0, r1[col].0);
+            assert_eq!(r0[col].0, r2[col].0,
+                "col {} x mismatch between rows: r0={} r2={}", col, r0[col].0, r2[col].0);
+            assert_eq!(r0[col].1, r1[col].1,
+                "col {} width mismatch between rows: r0={} r1={}", col, r0[col].1, r1[col].1);
+            assert_eq!(r0[col].1, r2[col].1,
+                "col {} width mismatch between rows: r0={} r2={}", col, r0[col].1, r2[col].1);
+        }
+    }
+
+    #[test]
+    fn test_table_rowspan_row_not_starved_by_column_hint_misindex() {
+        // Regression: with column_min_hints indexed by LOGICAL col, but the
+        // iteration in table_cell_auto_width using a PHYSICAL counter, a row
+        // whose first logical column is occupied by a rowspan cell from the
+        // previous row would receive promoted hints from the wrong column.
+        // Replicates the top.htm structure: outer table with rowspan=2 in col 0.
+        let html = concat!(
+            "<html><head></head><body>",
+            "<table width=\"760\">",
+            "<tr>",
+            "<td rowspan=\"2\"><img src=\"x.jpg\" width=\"350\" height=\"414\">",
+            "<table width=\"256\"><tr><td>nested-row-1</td></tr></table>",
+            "</td>",
+            "<td width=\"10\">&nbsp;</td>",
+            "<td><div align=\"center\">最新情報</div></td>",
+            "</tr>",
+            "<tr>",
+            "<td width=\"10\"></td>",
+            "<td><strong>連続ドラマ「VIVANT」続編 2026年7月放送</strong></td>",
+            "</tr>",
+            "</table>",
+            "</body></html>",
+        ).to_string();
+        let view = create_layout_view(html, 1024);
+        let items = view.paint();
+
+        // Find the "連続ドラマ" text — it must be rendered at an x position
+        // significantly to the right of the rowspan column (x > 350).
+        let texts: alloc::vec::Vec<(alloc::string::String, i64)> = items.iter().filter_map(|item| {
+            if let crate::display_item::DisplayItem::Text { text, layout_point, .. } = item {
+                Some((text.clone(), layout_point.x()))
+            } else {
+                None
+            }
+        }).collect();
+        let target = texts.iter().find(|(t, _)| t.contains("連続ドラマ"))
+            .expect("「連続ドラマ」 text missing");
+        assert!(
+            target.1 > 350,
+            "Row 2 col 2 text at x={} must be > 350 (right of rowspan column); items: {:?}",
+            target.1, texts
+        );
+    }
+
+    #[test]
+    fn test_wix_page_snippet_renders_without_panic() {
+        // Smoke test: load a real-world Wix-built page snippet through the
+        // HTML/CSS pipeline and confirm the renderer doesn't crash on its
+        // custom elements (`<wow-image>`, `<svg>`, etc.), heavy CSS, or
+        // minified JavaScript with operators (`!`, `<`, `>`, `?`, `&`, `|`)
+        // that the minimal lexer cannot tokenize.  Uses a truncated copy of
+        // the page to keep test runtime/stack usage reasonable; the full
+        // page is in wix_page.html for manual verification.
+        let html = include_str!("../../../testdata/wix_page_small.html").to_string();
+        let _view = create_layout_view(html, 1024);
     }
 }

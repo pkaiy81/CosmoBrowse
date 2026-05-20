@@ -154,11 +154,16 @@ pub struct Element {
 
 impl Element {
     pub fn new(element_name: &str, attributes: Vec<Attribute>) -> Self {
-        Self {
-            kind: ElementKind::from_str(element_name)
-                .expect("failed to convert string to ElementKind"),
-            attributes,
-        }
+        // Unknown/custom element names (e.g. `<meta>`, `<svg>`, `<noscript>`,
+        // `<wix-image>` and the countless tags used by modern CMS/framework
+        // pages) must not crash the parser.  HTML5 specifies that unknown
+        // elements behave as `HTMLUnknownElement` and default to inline
+        // display, so we fall back to `Span` — this preserves the document
+        // tree shape for selector matching while keeping content visible.
+        // Spec: HTML Living Standard §4.2.2 — Custom and unknown elements.
+        // https://html.spec.whatwg.org/multipage/dom.html#htmlunknownelement
+        let kind = ElementKind::from_str(element_name).unwrap_or(ElementKind::Span);
+        Self { kind, attributes }
     }
 
     pub fn kind(&self) -> ElementKind {
@@ -192,6 +197,10 @@ impl Element {
                 | ElementKind::Dl
                 | ElementKind::Dt
                 | ElementKind::Dd
+                | ElementKind::Caption
+                | ElementKind::Tbody
+                | ElementKind::Thead
+                | ElementKind::Tfoot
         )
     }
 
@@ -251,6 +260,12 @@ pub enum ElementKind {
     Dt,
     Dd,
     H3,
+    Caption,
+    Tbody,
+    Thead,
+    Tfoot,
+    Colgroup,
+    Col,
 }
 
 impl Display for ElementKind {
@@ -296,6 +311,12 @@ impl Display for ElementKind {
             ElementKind::Dt => "dt",
             ElementKind::Dd => "dd",
             ElementKind::H3 => "h3",
+            ElementKind::Caption => "caption",
+            ElementKind::Tbody => "tbody",
+            ElementKind::Thead => "thead",
+            ElementKind::Tfoot => "tfoot",
+            ElementKind::Colgroup => "colgroup",
+            ElementKind::Col => "col",
         };
         write!(f, "{}", s)
     }
@@ -346,6 +367,12 @@ impl FromStr for ElementKind {
             "dt" => Ok(ElementKind::Dt),
             "dd" => Ok(ElementKind::Dd),
             "h3" => Ok(ElementKind::H3),
+            "caption" => Ok(ElementKind::Caption),
+            "tbody" => Ok(ElementKind::Tbody),
+            "thead" => Ok(ElementKind::Thead),
+            "tfoot" => Ok(ElementKind::Tfoot),
+            "colgroup" => Ok(ElementKind::Colgroup),
+            "col" => Ok(ElementKind::Col),
             _ => Err(format!("unimplemented element name {:?}", s)),
         }
     }

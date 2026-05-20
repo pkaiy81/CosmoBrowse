@@ -120,44 +120,53 @@ impl Iterator for JsLexer {
     type Item = Token;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.input.len() {
-            return None;
-        }
-
-        // Move to the next position if a whitespace or line feed character follows it.
-        while self.input[self.pos] == ' ' || self.input[self.pos] == '\n' {
-            // 1
-            self.pos += 1;
-
+        // Skip ASCII whitespace and any character this minimal tokenizer
+        // does not understand. Real-world pages (especially Wix/CMS-built
+        // sites) ship JavaScript that uses dozens of operators (`!`, `<`,
+        // `>`, `*`, `/`, `:`, `?`, `[`, `]`, `&`, `|`, `'`, etc.) that the
+        // engine cannot produce tokens for. Rather than panicking, skip
+        // those bytes so the parser sees a (possibly partial) stream of
+        // tokens for the constructs we *do* support, plus EOF when the
+        // unknown tail is exhausted. We use a loop (not recursion) to
+        // avoid stack overflow on inputs with thousands of unsupported
+        // characters in a row.
+        loop {
             if self.pos >= self.input.len() {
                 return None;
             }
-        }
+            let c = self.input[self.pos];
 
-        // If the character is reserved word, return it as a keyword.
-        if let Some(keyword) = self.check_reserved_word() {
-            self.pos += keyword.len();
-            let token = Some(Token::Keyword(keyword));
-            return token;
-        }
-
-        let c = self.input[self.pos];
-
-        let token = match c {
-            '+' | '-' | ';' | '=' | '(' | ')' | '{' | '}' | ',' | '.' => {
-                // 2
-                let t = Token::Punctuator(c);
+            // Whitespace / newline.
+            if c == ' ' || c == '\n' || c == '\r' || c == '\t' {
                 self.pos += 1;
-                t
+                continue;
             }
-            '0'..='9' => Token::Number(self.cosume_number()), // 1
-            // https://262.ecma-international.org/#prod-IdentifierStart
-            'a'..='z' | 'A'..='Z' | '_' | '$' => Token::Identifier(self.consume_identifier()), // p.379
-            '"' => Token::StringLiteral(self.consume_string()),
-            _ => unimplemented!("char {:?} is not supported yet", c),
-        };
 
-        Some(token)
+            // Reserved word?
+            if let Some(keyword) = self.check_reserved_word() {
+                self.pos += keyword.len();
+                return Some(Token::Keyword(keyword));
+            }
+
+            return Some(match c {
+                '+' | '-' | ';' | '=' | '(' | ')' | '{' | '}' | ',' | '.' => {
+                    let t = Token::Punctuator(c);
+                    self.pos += 1;
+                    t
+                }
+                '0'..='9' => Token::Number(self.cosume_number()),
+                // https://262.ecma-international.org/#prod-IdentifierStart
+                'a'..='z' | 'A'..='Z' | '_' | '$' => {
+                    Token::Identifier(self.consume_identifier())
+                }
+                '"' => Token::StringLiteral(self.consume_string()),
+                _ => {
+                    // Unsupported character — skip and continue the loop.
+                    self.pos += 1;
+                    continue;
+                }
+            });
+        }
     }
 }
 
@@ -281,5 +290,28 @@ mod tests {
             i += 1;
         }
         assert!(lexer.peek().is_none());
+    }
+
+    #[test]
+    fn test_skip_unsupported_chars_does_not_panic() {
+        // Real-world JS uses operators this minimal tokenizer cannot produce
+        // tokens for.  Rather than panicking, those chars are silently skipped.
+        let input = "var x = a != b; if (!c) { return c < 1 ? 'a' : 'b'; }".to_string();
+        let mut lexer = JsLexer::new(input).peekable();
+        // Iterate to completion to ensure the loop terminates.
+        while lexer.next().is_some() {}
+    }
+
+    #[test]
+    fn test_long_run_of_unsupported_chars_does_not_overflow_stack() {
+        // 50k unknown chars in a row.  Used to recurse and stack-overflow;
+        // now must terminate quickly via the iterative skip loop.
+        let mut input = String::new();
+        for _ in 0..50_000 {
+            input.push('!');
+        }
+        input.push_str("var x = 1");
+        let mut lexer = JsLexer::new(input).peekable();
+        while lexer.next().is_some() {}
     }
 }

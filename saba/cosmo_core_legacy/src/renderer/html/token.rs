@@ -147,12 +147,18 @@ impl HtmlTokenizer {
 
     // Check if the current position is the end of the file
     fn is_eof(&self) -> bool {
-        self.pos > self.input.len()
+        self.pos >= self.input.len()
     }
 
-    // Current position moved to the next character
+    // Current position moved to the next character.  Returns '\0' if past EOF
+    // — callers should consult is_eof() to terminate, but this guard prevents
+    // an out-of-bounds index panic if a state branch forgets to.
     fn consume_next_input(&mut self) -> char {
-        let c = self.input[self.pos];
+        let c = if self.pos < self.input.len() {
+            self.input[self.pos]
+        } else {
+            '\0'
+        };
         self.pos += 1;
         c
     }
@@ -191,7 +197,9 @@ impl HtmlTokenizer {
                     attributes: _,   // Ignore attributes
                 }
                 | HtmlToken::EndTag { ref mut tag } => tag.push(c),
-                _ => panic!("`latest_token` should be either StartTag or EndTag"),
+                // Real-world HTML can drive the state machine into shapes the
+                // tokenizer doesn't anticipate; swallow rather than crash.
+                _ => {}
             }
         }
     }
@@ -221,7 +229,7 @@ impl HtmlTokenizer {
                 } => {
                     attributes.push(Attribute::new());
                 }
-                _ => panic!("`latest_token` should be either StartTag"),
+                _ => {}
             }
         }
     }
@@ -242,7 +250,7 @@ impl HtmlTokenizer {
 
                     attributes[len - 1].add_char(c, is_name);
                 }
-                _ => panic!("`latest_token` should be either StartTag"),
+                _ => {}
             }
         }
     }
@@ -258,7 +266,7 @@ impl HtmlTokenizer {
                     ref mut self_closing,
                     attributes: _,
                 } => *self_closing = true,
-                _ => panic!("`latest_token` should be a StartTag"),
+                _ => {}
             }
         }
     }

@@ -530,7 +530,7 @@ impl HtmlParser {
                         "a" | "button" | "div" | "form" | "h1" | "h2" | "h3" | "header" | "li"
                         | "main" | "p" | "section" | "span" | "ul" | "center" | "table" | "tr"
                         | "td" | "th" | "font" | "b" | "i" | "strong" | "em" | "pre"
-                        | "blockquote" | "dl" | "dt" | "dd" => {
+                        | "blockquote" | "dl" | "dt" | "dd" | "caption" => {
                             self.close_implicit(tag);
                             self.insert_element(tag, attributes.to_vec());
                             token = self.t.next();
@@ -570,7 +570,7 @@ impl HtmlParser {
                         "a" | "button" | "div" | "form" | "h1" | "h2" | "h3" | "header" | "li"
                         | "main" | "p" | "section" | "span" | "ul" | "center" | "table" | "tr"
                         | "td" | "th" | "font" | "b" | "i" | "strong" | "em" | "pre"
-                        | "blockquote" | "dl" | "dt" | "dd" => {
+                        | "blockquote" | "dl" | "dt" | "dd" | "caption" => {
                             let element_kind = ElementKind::from_str(tag)
                                 .expect("failed to convert string to ElementKind");
                             token = self.t.next();

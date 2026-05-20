@@ -29,6 +29,17 @@ pub fn map_display_items_to_paint_commands(
                 clip_rect,
                 anchor_id,
             } => {
+                let border = style.border_or_zero();
+                // `f64::round` lives in `std`; this crate is `no_std`. Border
+                // widths are non-negative, so round-half-up via `+ 0.5`.
+                let border_width = (border.top()
+                    .max(border.right())
+                    .max(border.bottom())
+                    .max(border.left())
+                    + 0.5) as i64;
+                let border_color = style.border_color()
+                    .map(|c| c.code().to_string())
+                    .unwrap_or_default();
                 commands.push(PaintCommand::DrawRect(DrawRect {
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
@@ -40,6 +51,8 @@ pub fn map_display_items_to_paint_commands(
                     z_index: paint_order.z_index,
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                     anchor_id: anchor_id.clone(),
+                    border_width,
+                    border_color,
                 }));
             }
             DisplayItem::Text {

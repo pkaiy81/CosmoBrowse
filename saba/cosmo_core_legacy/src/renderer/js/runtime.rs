@@ -74,7 +74,9 @@ impl Environment {
             }
         }
         if let Some(env) = &self.outer {
-            return env.borrow_mut().get_variable(name); // 2
+            // Read-only lookup; use try_borrow to avoid panicking if the
+            // outer scope is already borrowed by another active eval frame.
+            return env.try_borrow().ok().and_then(|e| e.get_variable(name)); // 2
         } else {
             None
         }
@@ -593,9 +595,10 @@ impl JsRuntime {
 
                 // If the object is a DOM node, update the `property` of the HtmlElement
                 // https://dom.spec.whatwg.org/#dom-node-textcontent
-                if let RuntimeValue::HtmlElement { object, property } = object_value {
-                    assert!(property.is_none());
-                    // Set the `property_value` string to the `property` of the HtmlElement
+                if let RuntimeValue::HtmlElement { object, property: _ } = object_value {
+                    // Allow re-setting an existing property — real-world scripts
+                    // frequently chain `.foo.bar = ...`, which previously hit an
+                    // assertion that the slot was empty.
                     return Some(RuntimeValue::HtmlElement {
                         object,
                         property: Some(property_value.to_string()),
@@ -625,7 +628,15 @@ impl JsRuntime {
                 None
             }
             Node::Identifier(name) => {
-                match env.borrow_mut().get_variable(name.to_string()) {
+                // `get_variable` only reads, so use `try_borrow` to avoid
+                // panicking when a recursive eval has already borrowed the
+                // same RefCell — real scripts can re-enter eval via callbacks
+                // or chained member access.
+                let lookup = env
+                    .try_borrow()
+                    .ok()
+                    .and_then(|e| e.get_variable(name.to_string()));
+                match lookup {
                     // X7
                     Some(v) => Some(v),
                     // When a variable name is used for the first time, it is treated as a String, since the value has not yet been stored.
@@ -704,15 +715,21 @@ impl JsRuntime {
                     }
                 };
 
-                // Assign arguments passed at function call as local variables of the newly created scope
-                assert!(arguments.len() == function.params.len());
-                for (i, item) in arguments.iter().enumerate() {
+                // Assign arguments passed at function call as local variables of
+                // the newly created scope.  Argument count may differ from the
+                // declared parameter count when the parser couldn't fully
+                // tokenize either site (a real-world hazard now that the
+                // tokenizer skips unsupported chars rather than panicking) —
+                // iterate the overlap and ignore the rest instead of asserting.
+                let pair_count = arguments.len().min(function.params.len());
+                for i in 0..pair_count {
                     if let Some(RuntimeValue::StringLiteral(name)) =
                         self.eval(&function.params[i], new_env.clone())
                     {
-                        new_env
-                            .borrow_mut()
-                            .add_variable(name, self.eval(item, new_env.clone()));
+                        new_env.borrow_mut().add_variable(
+                            name,
+                            self.eval(&arguments[i], new_env.clone()),
+                        );
                     } // Y10
                 }
 

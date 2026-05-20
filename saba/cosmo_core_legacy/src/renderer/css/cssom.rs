@@ -16,10 +16,8 @@ impl CssParser {
     }
 
     /// https://www.w3.org/TR/css-syntax-3/#consume-component-value
-    fn consume_component_value(&mut self) -> ComponentValue {
-        self.t
-            .next()
-            .expect("should have a token in consume_component_value")
+    fn consume_component_value(&mut self) -> Option<ComponentValue> {
+        self.t.next()
     }
 
     fn consume_component_values(&mut self) -> Vec<ComponentValue> {
@@ -28,22 +26,27 @@ impl CssParser {
         loop {
             match self.t.peek() {
                 Some(CssToken::SemiColon) | Some(CssToken::CloseCurly) | None => return values,
-                _ => values.push(self.consume_component_value()),
+                _ => match self.consume_component_value() {
+                    Some(v) => values.push(v),
+                    None => return values,
+                },
             }
         }
     }
 
     fn consume_ident(&mut self) -> String {
+        // Return empty on EOF/unexpected token instead of panicking — Wix/CMS
+        // pages routinely ship CSS with constructs this engine cannot parse,
+        // and crashing the renderer for a stray token is worse than producing
+        // an empty declaration that the cascade will harmlessly ignore.
         let token = match self.t.next() {
             Some(t) => t,
-            None => panic!("should have a token but got None"),
+            None => return String::new(),
         };
 
         match token {
             CssToken::Ident(ref ident) => ident.to_string(),
-            _ => {
-                panic!("Parse error: {:?} is an unexpected token.", token);
-            }
+            _ => String::new(),
         }
     }
 
@@ -98,7 +101,8 @@ impl CssParser {
     fn consume_selector(&mut self) -> Selector {
         let token = match self.t.next() {
             Some(t) => t,
-            None => panic!("should have a token but got None"),
+            // EOF — return an UnknownSelector so the caller can drop the rule.
+            None => return Selector::UnknownSelector,
         };
 
         match token {
@@ -107,7 +111,9 @@ impl CssParser {
                 if delim == '.' {
                     return Selector::ClassSelector(self.consume_ident());
                 }
-                panic!("Parse error: {:?} is an unexpected token.", token);
+                // Other delim characters (`>`, `+`, `~`, `*`, `!`, etc.):
+                // treat as an unknown selector rather than crashing.
+                Selector::UnknownSelector
             }
             CssToken::Ident(ident) => {
                 if self.t.peek() == Some(&CssToken::Colon) {

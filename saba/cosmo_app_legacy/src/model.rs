@@ -268,6 +268,10 @@ pub enum SceneItem {
         // Spec: HTML Living Standard §7.4 — scrolling to a fragment.
         // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
         anchor_id: Option<String>,
+        /// Border width in pixels from `border` HTML attribute (0 = no border).
+        border_width: i64,
+        /// CSS color string for the border (e.g. "#808080"). Empty = no border.
+        border_color: String,
     },
     Text {
         x: i64,

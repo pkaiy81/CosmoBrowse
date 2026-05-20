@@ -157,11 +157,34 @@ impl Program {
 // Construct an AST from the token stream.
 pub struct JsParser {
     t: Peekable<JsLexer>,
+    // Recursion depth guard.  Real-world (especially minified) JavaScript can
+    // produce expression chains thousands of operators deep; the recursive-
+    // descent grammar would otherwise blow the stack.  Each entry point that
+    // can recurse must check this against MAX_DEPTH and bail out gracefully.
+    depth: usize,
 }
+
+const MAX_DEPTH: usize = 256;
 
 impl JsParser {
     pub fn new(t: JsLexer) -> Self {
-        Self { t: t.peekable() }
+        Self { t: t.peekable(), depth: 0 }
+    }
+
+    #[inline]
+    fn enter(&mut self) -> bool {
+        if self.depth >= MAX_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    #[inline]
+    fn leave(&mut self) {
+        if self.depth > 0 {
+            self.depth -= 1;
+        }
     }
 
     // p.363
@@ -219,14 +242,16 @@ impl JsParser {
     fn parameter_list(&mut self) -> Vec<Option<Rc<Node>>> {
         let mut params = Vec::new();
 
-        // Consume a '('. If the next token is not '(', occurs error.
+        // Consume a '('. If the next token is not '(', bail out (don't panic):
+        // real-world JS may have syntax this engine doesn't support; we'd
+        // rather skip the script than crash the renderer.
         match self.t.next() {
             // 1
             Some(t) => match t {
-                Token::Punctuator(c) => assert!(c == '('),
-                _ => panic!("function should have '(' but got {:?}", t),
+                Token::Punctuator(c) if c == '(' => {}
+                _ => return params,
             },
-            None => panic!("function should have '(' but got None"),
+            None => return params,
         }
 
         loop {
@@ -243,6 +268,10 @@ impl JsParser {
                         if c == &',' {
                             // Consume a ','.
                             assert!(self.t.next().is_some());
+                        } else {
+                            // Unexpected punctuator — bail out instead of
+                            // looping forever.
+                            return params;
                         }
                     }
                     _ => {
@@ -256,17 +285,15 @@ impl JsParser {
 
     // FunctionBody ::= "{" SourceElements? "}"
     fn function_body(&mut self) -> Option<Rc<Node>> {
-        // Consume a '{'.
+        // Consume a '{'.  Bail out gracefully if not present rather than
+        // panicking — see comment in parameter_list.
         match self.t.next() {
             // 1
             Some(t) => match t {
-                Token::Punctuator(c) => assert!(c == '{'),
-                _ => unimplemented!(
-                    "function body should have open curly blacket but got {:?}",
-                    t
-                ),
+                Token::Punctuator(c) if c == '{' => {}
+                _ => return None,
             },
-            None => unimplemented!("function body should have open curly blacket but got None"),
+            None => return None,
         }
 
         let mut body = Vec::new();
@@ -284,10 +311,22 @@ impl JsParser {
                     }
                     _ => {}
                 },
-                None => {}
+                // EOF before a matching '}' — return what we have rather than
+                // looping forever pushing None.
+                None => return Node::new_block_statement(body),
             }
 
-            body.push(self.source_element()); // 3
+            // Track position before delegating so we can detect cases where
+            // source_element() returns None without consuming a token (which
+            // would otherwise spin the loop forever).
+            let before = self.t.peek().cloned();
+            let node = self.source_element(); // 3
+            let after = self.t.peek().cloned();
+            body.push(node);
+            if before == after {
+                // No progress — skip a token to avoid an infinite loop.
+                let _ = self.t.next();
+            }
         }
     }
 
@@ -375,45 +414,55 @@ impl JsParser {
     // AssignmentExpression ::= AdditiveExpression ( "=" AdditiveExpression )?
     // p.388
     fn assignment_expression(&mut self) -> Option<Rc<Node>> {
-        let expr = self.additive_expression();
+        if !self.enter() { return None; }
+        let result = (|| {
+            let expr = self.additive_expression();
 
-        let t = match self.t.peek() {
-            Some(token) => token,
-            None => return expr,
-        };
+            let t = match self.t.peek() {
+                Some(token) => token,
+                None => return expr,
+            };
 
-        match t {
-            Token::Punctuator('=') => {
-                // Consumes an assignment operator.(=)
-                assert!(self.t.next().is_some());
-                Node::new_assignment_expression('=', expr, self.assignment_expression())
-                // 1
+            match t {
+                Token::Punctuator('=') => {
+                    // Consumes an assignment operator.(=)
+                    assert!(self.t.next().is_some());
+                    Node::new_assignment_expression('=', expr, self.assignment_expression())
+                    // 1
+                }
+                _ => expr, // 2
             }
-            _ => expr, // 2
-        }
+        })();
+        self.leave();
+        result
     }
 
     // AdditiveExpression ::= LeftHandSideExpression ( AdditiveOperator AssignmentExpression )*
     fn additive_expression(&mut self) -> Option<Rc<Node>> {
-        let left = self.left_hand_side_expression(); // 1
+        if !self.enter() { return None; }
+        let result = (|| {
+            let left = self.left_hand_side_expression(); // 1
 
-        let t = match self.t.peek() {
-            Some(token) => token.clone(),
-            None => return left, // 2
-        };
+            let t = match self.t.peek() {
+                Some(token) => token.clone(),
+                None => return left, // 2
+            };
 
-        match t {
-            Token::Punctuator(c) => match c {
-                // 3
-                '+' | '-' => {
-                    // Consume an additive or subtractive operator.
-                    assert!(self.t.next().is_some());
-                    Node::new_additive_expression(c, left, self.assignment_expression())
-                }
+            match t {
+                Token::Punctuator(c) => match c {
+                    // 3
+                    '+' | '-' => {
+                        // Consume an additive or subtractive operator.
+                        assert!(self.t.next().is_some());
+                        Node::new_additive_expression(c, left, self.assignment_expression())
+                    }
+                    _ => left,
+                },
                 _ => left,
-            },
-            _ => left,
-        }
+            }
+        })();
+        self.leave();
+        result
     }
 
     // LeftHandSideExpression ::= CallExpression | MemberExpression
@@ -486,6 +535,13 @@ impl JsParser {
                         if c == &',' {
                             // Consume a ','.
                             assert!(self.t.next().is_some());
+                        } else {
+                            // Any other unexpected punctuator (e.g. `;`, `{`,
+                            // `=`): the script is malformed from this parser's
+                            // point of view. Abandon the argument list rather
+                            // than spinning forever — every branch above must
+                            // either consume a token or return.
+                            return arguments;
                         }
                     }
                     _ => arguments.push(self.assignment_expression()),
@@ -690,5 +746,50 @@ mod tests {
         }));
         expected.set_body(body);
         assert_eq!(expected, parser.parse_ast());
+    }
+
+    // Regression tests for hostility/parser robustness — must not panic, hang
+    // or stack-overflow when fed real-world (Wix-built) JavaScript that uses
+    // operators this minimal engine cannot represent.
+    #[test]
+    fn parser_does_not_hang_on_unexpected_punctuators_in_args() {
+        // Function call with an unexpected `;` inside the arg list.
+        let input = "foo(;)".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let _ = parser.parse_ast();
+    }
+
+    #[test]
+    fn parser_does_not_hang_on_unclosed_function_body() {
+        // Function declaration without closing brace.
+        let input = "function f(a, b) { var x = a + b".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let _ = parser.parse_ast();
+    }
+
+    #[test]
+    fn parser_handles_deeply_nested_expression_without_stack_overflow() {
+        // Construct `1 + 1 + 1 + ... + 1` with 5000 operators.  The recursive-
+        // descent parser would otherwise blow the stack; the depth guard caps
+        // it.
+        let mut input = String::from("1");
+        for _ in 0..5_000 {
+            input.push_str(" + 1");
+        }
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let _ = parser.parse_ast();
+    }
+
+    #[test]
+    fn parser_handles_arbitrary_real_world_garbage() {
+        // A bag of operators and constructs typical of minified JS that the
+        // tokenizer simply skips.  Must not crash.
+        let input = "var x = a != b; if (!c) { return c < 1 ? 'a' : 'b'; }".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let _ = parser.parse_ast();
     }
 }

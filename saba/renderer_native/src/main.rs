@@ -651,6 +651,24 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
 }
 
 fn main() {
+    // Real-world web pages (especially CMS-built sites like Wix, Squarespace)
+    // produce extremely deep DOM trees — single pages routinely nest 50+
+    // levels of <div>. The HTML/CSS/layout/paint pipeline is recursive
+    // descent, so each nesting level consumes a stack frame. The default
+    // 8 MiB main-thread stack on Linux is not enough; transfer work to a
+    // worker thread with a 64 MiB stack so navigation to such pages
+    // doesn't crash the renderer.
+    let join = std::thread::Builder::new()
+        .name("cosmo-renderer-main".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn renderer thread");
+    if let Err(payload) = join.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn real_main() {
     let args: Vec<String> = std::env::args().collect();
 
     // --screenshot <url> [out.png] [width]
@@ -680,7 +698,26 @@ fn main() {
 
     let url = args.get(1).cloned();
 
-    let event_loop = EventLoop::new().expect("Failed to create event loop");
+    // `real_main` runs on the 64 MiB worker thread (see `main`), not the OS
+    // main thread. winit normally rejects creating an event loop off the main
+    // thread; opt into `any_thread` so the worker can own it. This is sound on
+    // X11/Wayland; if this renderer is ever ported beyond Linux, the event
+    // loop must instead be created on the true main thread.
+    let event_loop = {
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::EventLoopBuilderExtWayland;
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            let mut builder = EventLoop::builder();
+            EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+            EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
+            builder.build().expect("Failed to create event loop")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            EventLoop::new().expect("Failed to create event loop")
+        }
+    };
     let mut app = App::new();
 
     if let Some(url) = &url {
