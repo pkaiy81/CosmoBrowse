@@ -875,6 +875,55 @@ mod tests {
     }
 
     #[test]
+    fn test_flex_row_lays_children_horizontally() {
+        let html = "<html><head><style>.f{display:flex}</style></head><body>\
+            <div class=\"f\"><div>Alpha</div><div>Beta</div></div></body></html>"
+            .to_string();
+        let layout_view = create_layout_view(html, 600);
+        let items: Vec<_> = layout_view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.clone(), layout_point.x(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+        let a = items.iter().find(|(t, _, _)| t == "Alpha").unwrap();
+        let b = items.iter().find(|(t, _, _)| t == "Beta").unwrap();
+        // Row flex: Beta is to the right of Alpha, on the same line.
+        assert!(b.1 > a.1, "Beta x={} should be right of Alpha x={}", b.1, a.1);
+        assert!(
+            (b.2 - a.2).abs() < 5,
+            "flex row items should share a line: y_a={}, y_b={}",
+            a.2, b.2
+        );
+    }
+
+    #[test]
+    fn test_flex_column_stacks_children_vertically() {
+        let html = "<html><head><style>.f{display:flex;flex-direction:column}</style></head>\
+            <body><div class=\"f\"><div>Alpha</div><div>Beta</div></div></body></html>"
+            .to_string();
+        let layout_view = create_layout_view(html, 600);
+        let items: Vec<_> = layout_view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.clone(), layout_point.x(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+        let a = items.iter().find(|(t, _, _)| t == "Alpha").unwrap();
+        let b = items.iter().find(|(t, _, _)| t == "Beta").unwrap();
+        // Column flex: Beta is below Alpha.
+        assert!(b.2 > a.2, "Beta y={} should be below Alpha y={}", b.2, a.2);
+    }
+
+    #[test]
     fn test_table_cell_explicit_width_leaves_remaining_for_auto() {
         // First cell has explicit width=200, second cell should get remaining space.
         let html = r#"<html><head></head><body><table><tr><td width="200">Left</td><td>Right</td></tr></table></body></html>"#.to_string();

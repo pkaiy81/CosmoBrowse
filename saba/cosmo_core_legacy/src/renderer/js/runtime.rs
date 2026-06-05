@@ -19,6 +19,15 @@ type VariableMap = Vec<(String, Option<RuntimeValue>)>;
 
 const MAX_EVENT_LOOP_ITERATIONS: usize = 10_000;
 const MAX_MICROTASK_DRAIN_ITERATIONS: usize = 10_000;
+/// Upper bound on the number of `eval` steps a single script run may take.
+/// This is a fuel budget: every AST evaluation consumes one unit, so it bounds
+/// runaway recursion, mutual-call cycles, and loops uniformly. Real-world
+/// minified JavaScript (Wix/Squarespace/GTM) routinely drives this toy
+/// interpreter into non-terminating execution; without a budget, navigating to
+/// such a page hangs the renderer indefinitely. Kept well above what any script
+/// this engine can meaningfully run would need, but low enough that exhaustion
+/// unwinds long before the 64 MiB render stack is at risk.
+const MAX_EVAL_STEPS: u64 = 500_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TimerTask {
@@ -114,6 +123,11 @@ pub struct JsRuntime {
     render_pipeline_invalidated: bool,
     dom_content_loaded_listeners: Vec<String>,
     local_storage: Vec<(String, String)>,
+    /// Remaining `eval` fuel; see [`MAX_EVAL_STEPS`]. Counts down across the
+    /// whole script run and, once exhausted, makes every further `eval` a
+    /// no-op so execution unwinds promptly instead of hanging.
+    eval_fuel: u64,
+    fuel_exhausted: bool,
 }
 
 impl JsRuntime {
@@ -132,6 +146,8 @@ impl JsRuntime {
             render_pipeline_invalidated: false,
             dom_content_loaded_listeners: Vec::new(),
             local_storage: Vec::new(),
+            eval_fuel: MAX_EVAL_STEPS,
+            fuel_exhausted: false,
         }
     }
 
@@ -492,6 +508,26 @@ impl JsRuntime {
         node: &Option<Rc<Node>>,
         env: Rc<RefCell<Environment>>, // X1
     ) -> Option<RuntimeValue> {
+        // Consume one unit of execution fuel. Once the budget is gone, every
+        // `eval` short-circuits so a non-terminating script (common in
+        // real-world minified JS this interpreter cannot truly run) unwinds
+        // instead of hanging the renderer. See [`MAX_EVAL_STEPS`].
+        if self.fuel_exhausted {
+            return None;
+        }
+        match self.eval_fuel.checked_sub(1) {
+            Some(remaining) => self.eval_fuel = remaining,
+            None => {
+                self.fuel_exhausted = true;
+                self.warn(
+                    "Script execution budget exhausted; aborting JavaScript run to keep \
+                     navigation responsive"
+                        .to_string(),
+                );
+                return None;
+            }
+        }
+
         let node = match node {
             Some(n) => n,
             None => return None,
@@ -726,10 +762,14 @@ impl JsRuntime {
                     if let Some(RuntimeValue::StringLiteral(name)) =
                         self.eval(&function.params[i], new_env.clone())
                     {
-                        new_env.borrow_mut().add_variable(
-                            name,
-                            self.eval(&arguments[i], new_env.clone()),
-                        );
+                        // Evaluate the argument BEFORE taking `borrow_mut`.
+                        // Inlining the `self.eval(...)` as a call argument would
+                        // hold the mutable borrow across the evaluation, and an
+                        // argument expression that touches the same scope (e.g.
+                        // an assignment) re-borrows it -> "RefCell already
+                        // borrowed" panic, crashing the whole renderer.
+                        let arg_value = self.eval(&arguments[i], new_env.clone());
+                        new_env.borrow_mut().add_variable(name, arg_value);
                     } // Y10
                 }
 

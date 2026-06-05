@@ -117,14 +117,21 @@ impl CssParser {
             }
             CssToken::Ident(ident) => {
                 if self.t.peek() == Some(&CssToken::Colon) {
-                    while self.t.peek() != Some(&CssToken::OpenCurly) {
+                    // Skip a pseudo-class/element tail up to the rule block.
+                    // MUST also stop at EOF: otherwise `peek()` returning `None`
+                    // (which is `!= Some(OpenCurly)`) spins forever on truncated
+                    // or unsupported CSS and hangs the renderer.
+                    while !matches!(self.t.peek(), Some(&CssToken::OpenCurly) | None) {
                         self.t.next();
                     }
                 }
                 Selector::TypeSelector(ident.to_string())
             }
             CssToken::AtKeyword(_keyword) => {
-                while self.t.peek() != Some(&CssToken::OpenCurly) {
+                // Skip an at-rule prelude (e.g. `@media ...`) up to its block.
+                // Stop at EOF as well to avoid an infinite loop — real pages are
+                // full of `@media`/`@font-face`/`@supports` at-rules.
+                while !matches!(self.t.peek(), Some(&CssToken::OpenCurly) | None) {
                     self.t.next();
                 }
                 Selector::UnknownSelector

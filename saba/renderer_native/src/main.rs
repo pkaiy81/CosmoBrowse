@@ -25,6 +25,14 @@ use winit::{
 const DEFAULT_WIDTH: u32 = 1024;
 const DEFAULT_HEIGHT: u32 = 768;
 
+/// Custom event delivered to the winit event loop from background threads.
+/// `Redraw` is sent by the image cache when an asynchronously-fetched image
+/// has finished decoding, so the window repaints to show it.
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    Redraw,
+}
+
 /// Holds the winit Window and softbuffer Surface together, sharing the
 /// same `Rc<winit::window::Window>`.
 struct WindowState {
@@ -137,6 +145,10 @@ impl App {
 
         // Draw chrome.
         ui_chrome::draw_chrome(&mut pixmap, &mut self.text_renderer, &self.chrome, width);
+
+        // Pull in any images that finished fetching on background threads
+        // since the last paint.
+        self.image_cache.integrate_results();
 
         // Draw page content.
         let mut all_hit_regions = Vec::new();
@@ -432,7 +444,14 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
+    /// Woken by a background image fetch completing; repaint so the new image
+    /// becomes visible.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window_state.is_some() {
             return;
@@ -708,17 +727,22 @@ fn real_main() {
         {
             use winit::platform::wayland::EventLoopBuilderExtWayland;
             use winit::platform::x11::EventLoopBuilderExtX11;
-            let mut builder = EventLoop::builder();
+            let mut builder = EventLoop::<UserEvent>::with_user_event();
             EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
             EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
             builder.build().expect("Failed to create event loop")
         }
         #[cfg(not(target_os = "linux"))]
         {
-            EventLoop::new().expect("Failed to create event loop")
+            EventLoop::<UserEvent>::with_user_event()
+                .build()
+                .expect("Failed to create event loop")
         }
     };
     let mut app = App::new();
+    // Let the image cache wake the event loop to repaint when an
+    // asynchronously-fetched image becomes available.
+    app.image_cache.set_notifier(event_loop.create_proxy());
 
     if let Some(url) = &url {
         app.chrome.set_url(url);

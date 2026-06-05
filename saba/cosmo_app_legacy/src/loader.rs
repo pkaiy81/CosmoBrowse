@@ -451,6 +451,79 @@ impl FramesetSpec {
 
 // Spec: RFC 3986 relative reference resolution.
 // https://datatracker.ietf.org/doc/html/rfc3986#section-5
+/// Bytes accepted from a single external stylesheet, and the combined cap per
+/// document. The cascade is O(rules × nodes), so total CSS is bounded to keep
+/// layout responsive on pages that ship megabytes of CSS.
+const MAX_STYLESHEET_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TOTAL_STYLESHEET_BYTES: usize = 6 * 1024 * 1024;
+
+fn stylesheet_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fetch and concatenate the CSS for external stylesheet `hrefs`, each resolved
+/// against `base_url`. Best-effort: non-HTTP(S) schemes, duplicate URLs, and
+/// network/HTTP failures are skipped. Results are cached by resolved URL so
+/// relayout (e.g. on window resize) does not re-fetch over the network.
+pub fn fetch_external_stylesheets(base_url: &str, hrefs: &[String]) -> String {
+    // Only documents loaded over HTTP(S) have resolvable external stylesheets;
+    // skip for about:blank, fixtures, and tests so no network I/O happens.
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return String::new();
+    }
+    let mut combined = String::new();
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for href in hrefs {
+        if combined.len() >= MAX_TOTAL_STYLESHEET_BYTES {
+            break;
+        }
+        let Ok(url) = resolve_url(base_url, href) else {
+            continue;
+        };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            continue;
+        }
+        if seen.insert(url.clone(), ()).is_some() {
+            continue;
+        }
+        let css = fetch_one_stylesheet(&url);
+        if !css.is_empty() {
+            combined.push_str(&css);
+            combined.push('\n');
+        }
+    }
+    combined
+}
+
+fn fetch_one_stylesheet(url: &str) -> String {
+    if let Some(cached) = stylesheet_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(url).cloned())
+    {
+        return cached;
+    }
+    let mut diagnostics = Vec::new();
+    let client = select_http_client(url, &mut diagnostics);
+    let css = match client.get(url).send() {
+        Ok(resp) if resp.status().is_success() => match resp.bytes() {
+            Ok(bytes) => {
+                let slice = &bytes[..bytes.len().min(MAX_STYLESHEET_BYTES)];
+                String::from_utf8_lossy(slice).into_owned()
+            }
+            Err(_) => String::new(),
+        },
+        _ => String::new(),
+    };
+    // Cache successes and failures alike (failure -> empty) so a dead or slow
+    // stylesheet is not re-requested on every relayout.
+    if let Ok(mut cache) = stylesheet_cache().lock() {
+        cache.insert(url.to_string(), css.clone());
+    }
+    css
+}
+
 pub fn resolve_url(base_url: &str, target: &str) -> AppResult<String> {
     let base = Url::parse(base_url)
         .map_err(|error| AppError::validation(format!("Invalid base URL: {error}")))?;

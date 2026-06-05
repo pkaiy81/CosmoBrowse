@@ -93,6 +93,10 @@ pub struct ComputedStyle {
     text_align: Option<TextAlign>,
     z_index: Option<i32>,
     overflow_clip: Option<bool>,
+    /// `flex-direction` of a flex container (`display:flex`). Only meaningful
+    /// when `display` is `Flex`; controls whether children are laid out along
+    /// the row (main = horizontal) or column (main = vertical) axis.
+    flex_direction: Option<FlexDirection>,
 }
 
 impl ComputedStyle {
@@ -123,6 +127,7 @@ impl ComputedStyle {
             text_align: None,
             z_index: None,
             overflow_clip: None,
+            flex_direction: None,
         }
     }
 
@@ -432,6 +437,15 @@ impl ComputedStyle {
     pub fn display(&self) -> DisplayType {
         self.display
             .expect("failed to access CSS property: display")
+    }
+
+    pub fn set_flex_direction(&mut self, dir: FlexDirection) {
+        self.flex_direction = Some(dir);
+    }
+
+    /// Flex main-axis direction; defaults to `row` per CSS Flexbox.
+    pub fn flex_direction(&self) -> FlexDirection {
+        self.flex_direction.unwrap_or(FlexDirection::Row)
     }
 
     pub fn set_font_family(&mut self, font_family: String) {
@@ -867,7 +881,28 @@ impl PositionType {
 pub enum DisplayType {
     Block,
     Inline,
+    /// `display:flex` — a block-level flex container. Its own box participates
+    /// in normal flow like a block; its children are laid out along the flex
+    /// main axis (see [`FlexDirection`]).
+    Flex,
     DisplayNone,
+}
+
+/// Main-axis direction of a flex container.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    Column,
+}
+
+impl FlexDirection {
+    pub fn from_str(value: &str) -> Self {
+        match value.trim() {
+            "column" | "column-reverse" => FlexDirection::Column,
+            // "row", "row-reverse", and anything unknown default to row.
+            _ => FlexDirection::Row,
+        }
+    }
 }
 
 impl DisplayType {
@@ -875,7 +910,9 @@ impl DisplayType {
         match &node.borrow().kind() {
             NodeKind::Document => DisplayType::Block,
             NodeKind::Element(e) => {
-                if e.is_block_element() {
+                if e.is_non_rendered_element() {
+                    DisplayType::DisplayNone
+                } else if e.is_block_element() {
                     DisplayType::Block
                 } else {
                     DisplayType::Inline
@@ -886,14 +923,20 @@ impl DisplayType {
     }
 
     pub fn from_str(s: &str) -> Result<Self, Error> {
-        match s {
-            "block" => Ok(Self::Block),
-            "inline" => Ok(Self::Inline),
+        // Map the outer display keyword. The engine has no flex/grid formatting
+        // context, so `flex`/`grid`/`table`/`flow-root`/unknown values are
+        // approximated as block flow. Crucially they must NOT fall through to
+        // `display:none`: real pages set their main containers to `flex`/`grid`,
+        // and hiding those blanks the entire page.
+        match s.trim() {
             "none" => Ok(Self::DisplayNone),
-            _ => Err(Error::UnexpectedInput(format!(
-                "display {:?} is not supported yet",
-                s
-            ))),
+            // Flex containers get real (if basic) flex layout. inline-flex is
+            // treated as a block-level flex container for simplicity.
+            "flex" | "inline-flex" => Ok(Self::Flex),
+            "inline" | "inline-block" | "inline-grid" | "inline-table" | "contents" => {
+                Ok(Self::Inline)
+            }
+            _ => Ok(Self::Block),
         }
     }
 }

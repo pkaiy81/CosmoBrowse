@@ -21,6 +21,7 @@ use crate::renderer::dom::node::NodeKind;
 use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
+use crate::renderer::layout::computed_style::FlexDirection;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
@@ -193,50 +194,72 @@ fn estimate_text_width_chars(text: &str) -> i64 {
 fn measure_text_width(text: &str, font_size: FontSize) -> i64 {
     estimate_text_width_chars(text) * CHAR_WIDTH * font_ratio(font_size)
 }
-/// Find a byte index suitable for line breaking at or before `max_char_index`
-/// characters. Returns a byte offset safe for `str::split_at`.
-fn find_byte_index_for_line_break(line: &str, max_char_index: usize) -> usize {
-    let char_indices: Vec<(usize, char)> = line.char_indices().collect();
-    let upper = max_char_index.min(char_indices.len().saturating_sub(1));
-    // Prefer breaking at a space.
-    for i in (0..=upper).rev() {
-        if char_indices[i].1 == ' ' || char_indices[i].1 == '\u{3000}' {
-            return char_indices[i].0;
-        }
-    }
-    // No space found; break at the character boundary.
-    if upper + 1 < char_indices.len() {
-        char_indices[upper + 1].0
-    } else {
-        line.len()
-    }
+fn is_break_space(c: char) -> bool {
+    c == ' ' || c == '\u{3000}'
 }
 
+/// Greedily wrap `line` into visual lines no wider than `max_width`.
+///
+/// This is a single forward pass: O(n) in the text length. The previous
+/// implementation recursed on the un-consumed remainder and, on every line,
+/// re-measured the whole remainder and re-collected all of its char indices —
+/// O(n²). On real pages that carry a very long unbroken run of text (e.g. a
+/// page's minified inline script that ends up in the inline flow) the quadratic
+/// cost stalled layout for many seconds and effectively hung the renderer.
+///
+/// Breaking prefers the last space that still fits on the line (the space is
+/// consumed, not rendered); if a single run has no space it is hard-broken at
+/// the character that would overflow. Wide (CJK) characters count as two units,
+/// matching [`estimate_text_width_chars`].
 fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
-    let mut result: Vec<String> = vec![];
     let safe_width = max_width.max(char_width).max(1);
-    let text_width = estimate_text_width_chars(&line) * char_width;
-    if text_width > safe_width {
-        // Find how many characters fit within safe_width, accounting for wide chars.
-        let max_width_units = (safe_width / char_width).max(1);
-        let mut units = 0i64;
-        let mut max_chars = 0usize;
-        for c in line.chars() {
-            let w = if is_wide_char(c) { 2 } else { 1 };
-            if units + w > max_width_units {
-                break;
+    let max_units = (safe_width / char_width).max(1);
+
+    let mut result: Vec<String> = vec![];
+    let mut line_start = 0usize; // byte offset where the current visual line starts
+    let mut cur_units = 0i64; // width units accumulated on the current line
+    let mut started = false; // whether the current line has consumed any char
+    // Last space seen on the current line: (its byte offset, byte offset just
+    // after it, units accumulated since it). Used to break at word boundaries.
+    let mut last_space: Option<usize> = None;
+    let mut byte_after_space = 0usize;
+    let mut units_after_space = 0i64;
+
+    for (idx, c) in line.char_indices() {
+        let w = if is_wide_char(c) { 2 } else { 1 };
+
+        if started && cur_units + w > max_units {
+            match last_space {
+                // Break at the last space: it is dropped and the next line
+                // starts after it, carrying the text seen since the space.
+                Some(space_byte) => {
+                    result.push(line[line_start..space_byte].to_string());
+                    line_start = byte_after_space;
+                    cur_units = units_after_space;
+                    last_space = None;
+                }
+                // No space to break on: hard-break before the overflowing char.
+                None => {
+                    result.push(line[line_start..idx].to_string());
+                    line_start = idx;
+                    cur_units = 0;
+                }
             }
-            units += w;
-            max_chars += 1;
         }
-        max_chars = max_chars.max(1);
-        let split_byte = find_byte_index_for_line_break(&line, max_chars);
-        let split_byte = split_byte.min(line.len());
-        let (left, right) = line.split_at(split_byte);
-        result.push(left.to_string());
-        result.extend(split_text(right.trim().to_string(), char_width, safe_width));
-    } else if !line.is_empty() {
-        result.push(line);
+
+        cur_units += w;
+        started = true;
+        if is_break_space(c) {
+            last_space = Some(idx);
+            byte_after_space = idx + c.len_utf8();
+            units_after_space = 0;
+        } else {
+            units_after_space += w;
+        }
+    }
+
+    if line_start < line.len() {
+        result.push(line[line_start..].to_string());
     }
     result
 }
@@ -513,6 +536,73 @@ impl LayoutObject {
     /// Scan descendants (up to `depth` levels) for elements that imply a
     /// minimum width (e.g. `<img width="350">`, `<table width="256">`).
     /// Returns the maximum such hint, or 0 if none found.
+    /// If this object's parent is a flex container (`display:flex`), return the
+    /// container's main-axis direction; otherwise `None`. Used so a flex item
+    /// can size and position itself against the flex algorithm.
+    fn parent_flex_direction(&self) -> Option<FlexDirection> {
+        let parent = self.parent.upgrade()?;
+        let p = parent.borrow();
+        if p.style.display() == DisplayType::Flex {
+            Some(p.style.flex_direction())
+        } else {
+            None
+        }
+    }
+
+    fn is_flex_container(&self) -> bool {
+        self.style.display() == DisplayType::Flex
+    }
+
+    /// Preferred (max-content) width: the width this subtree would take with no
+    /// line wrapping. Inline/text runs accumulate on a line; block children
+    /// each take their own line (we take the max). Used to shrink-to-fit flex
+    /// row items so siblings sit side by side instead of each filling the row.
+    fn max_content_width(&self) -> i64 {
+        self.max_content_width_depth(6)
+    }
+
+    fn max_content_width_depth(&self, depth: u32) -> i64 {
+        if depth == 0 {
+            return 0;
+        }
+        if let Some(w) = parse_dimension_attr(self.element_attribute("width")) {
+            return w;
+        }
+        let mut max_line: i64 = 0; // widest block-level line seen
+        let mut cur_line: i64 = 0; // current inline run accumulation
+        let mut child = self.first_child();
+        while let Some(c) = child {
+            let b = c.borrow();
+            match b.node_kind() {
+                NodeKind::Text(ref t) => {
+                    let fs = b.style.font_size();
+                    // Each hard line within the text starts a new line box.
+                    let widest = t
+                        .split('\n')
+                        .map(|line| measure_text_width(line.trim(), fs))
+                        .max()
+                        .unwrap_or(0);
+                    cur_line += widest;
+                }
+                _ => {
+                    let child_pref = b.max_content_width_depth(depth - 1);
+                    if b.kind().normal_flow_spec().stacks_vertically {
+                        // Block-level child: flush the inline run and stand alone.
+                        max_line = max_line.max(cur_line);
+                        cur_line = 0;
+                        max_line = max_line.max(child_pref);
+                    } else {
+                        cur_line += child_pref;
+                    }
+                }
+            }
+            let next = b.next_sibling();
+            drop(b);
+            child = next;
+        }
+        max_line.max(cur_line)
+    }
+
     fn min_content_width_hint(&self) -> i64 {
         self.min_content_width_hint_depth(6)
     }
@@ -1564,6 +1654,18 @@ impl LayoutObject {
                     } else {
                         self.table_cell_auto_width(available_width)
                     }
+                } else if let Some(FlexDirection::Row) = self.parent_flex_direction() {
+                    // Flex item on a row: shrink-to-fit its content (honoring an
+                    // explicit width) so siblings sit side by side instead of
+                    // each filling the container width like a normal block.
+                    let w = if explicit_width > 0 {
+                        explicit_width
+                    } else if let Some(hw) = html_width {
+                        hw
+                    } else {
+                        self.max_content_width()
+                    };
+                    w.min(available_width).max(0)
                 } else if explicit_width > 0 {
                     explicit_width.min(available_width)
                 } else if let Some(w) = html_width {
@@ -1611,6 +1713,10 @@ impl LayoutObject {
                 let mut content_height = 0;
                 let mut child = self.first_child();
                 let is_row = self.is_table_row();
+                // Flex row: items are placed side by side, so the container's
+                // height is the tallest item (max), not the sum.
+                let is_flex_row = self.is_flex_container()
+                    && self.style.flex_direction() == FlexDirection::Row;
                 let mut previous_child_kind = LayoutObjectKind::Block;
                 while child.is_some() {
                     let c = child.expect("first child should exist");
@@ -1625,6 +1731,13 @@ impl LayoutObject {
                         if rowspan <= 1 {
                             content_height = content_height.max(c.borrow().size.height());
                         }
+                    } else if is_flex_row {
+                        let c_metrics = compute_box_model_metrics(&c.borrow().style());
+                        content_height = content_height.max(
+                            c.borrow().size.height()
+                                + c_metrics.margin.top
+                                + c_metrics.margin.bottom,
+                        );
                     } else if previous_child_kind.normal_flow_spec().stacks_vertically
                         || c_kind.normal_flow_spec().stacks_vertically
                     {
@@ -1803,6 +1916,38 @@ impl LayoutObject {
                 point.set_x(parent_point.x() + rowspan_offset + metrics.margin.left + cs);
                 point.set_y(parent_point.y() + metrics.margin.top + v_offset);
             }
+        } else if let Some(dir) = self.parent_flex_direction() {
+            // Flex item placement (main-axis start packing; no grow/shrink yet).
+            match dir {
+                FlexDirection::Row => {
+                    // Lay out to the right of the previous item, aligned to the
+                    // container's top (align-items: flex-start).
+                    if let (Some(size), Some(pos)) =
+                        (previous_sibling_size, previous_sibling_point)
+                    {
+                        point.set_x(pos.x() + size.width() + metrics.margin.left);
+                    } else {
+                        point.set_x(parent_point.x() + metrics.margin.left);
+                    }
+                    point.set_y(parent_point.y() + metrics.margin.top);
+                }
+                FlexDirection::Column => {
+                    // Stack vertically like a block formatting context.
+                    if let (Some(size), Some(pos)) =
+                        (previous_sibling_size, previous_sibling_point)
+                    {
+                        point.set_y(
+                            pos.y()
+                                + size.height()
+                                + metrics.margin.top
+                                + metrics.margin.bottom,
+                        );
+                    } else {
+                        point.set_y(parent_point.y() + metrics.margin.top);
+                    }
+                    point.set_x(parent_point.x() + metrics.margin.left);
+                }
+            }
         } else {
         match (
             self.kind().normal_flow_spec().flow,
@@ -1940,8 +2085,13 @@ impl LayoutObject {
                 "display" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         let display_type =
-                            DisplayType::from_str(value).unwrap_or(DisplayType::DisplayNone);
+                            DisplayType::from_str(value).unwrap_or(DisplayType::Block);
                         self.style.set_display(display_type)
+                    }
+                }
+                "flex-direction" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style.set_flex_direction(FlexDirection::from_str(value));
                     }
                 }
                 "width" => match first_value {
@@ -2110,7 +2260,9 @@ impl LayoutObject {
         match self.node_kind() {
             NodeKind::Document => panic!("should not create a layout object for a document node"),
             NodeKind::Element(_) => match self.style.display() {
-                DisplayType::Block => self.kind = LayoutObjectKind::Block,
+                // A flex container is itself a block-level box; flex affects how
+                // its children are sized and positioned, not its own outer flow.
+                DisplayType::Block | DisplayType::Flex => self.kind = LayoutObjectKind::Block,
                 DisplayType::Inline => self.kind = LayoutObjectKind::Inline,
                 DisplayType::DisplayNone => {
                     panic!("should not create a layout object for a node with display:none")

@@ -215,6 +215,27 @@ impl HtmlTokenizer {
         t
     }
 
+    // Emit the latest token and move to the correct follow-up state.
+    //
+    // A `<script>` start tag must transition into the *script data* state so
+    // the JavaScript inside is consumed as raw text. Otherwise minified JS —
+    // which is dense with `<`, `>` and `</` (e.g. `a<b`, `e>6e4`, regex
+    // literals) — is tokenized as HTML, producing hundreds of thousands of
+    // bogus elements. That explodes the DOM and the CSS cascade in
+    // `LayoutView::new` then effectively hangs the renderer on real-world
+    // pages. All other tags fall back to the data state as before.
+    // Spec: https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-incdata
+    fn emit_latest_token(&mut self) -> Option<HtmlToken> {
+        let token = self.take_latest_token();
+        self.state = match token {
+            Some(HtmlToken::StartTag { ref tag, .. }) if tag.eq_ignore_ascii_case("script") => {
+                State::ScriptData
+            }
+            _ => State::Data,
+        };
+        token
+    }
+
     // Start a new attribute
     // Create a new Attribute and append it to the latest_token
     fn start_new_attribute(&mut self) {
@@ -423,8 +444,7 @@ impl Iterator for HtmlTokenizer {
                     }
 
                     if c == '>' {
-                        self.state = State::Data;
-                        return self.take_latest_token();
+                        return self.emit_latest_token();
                     }
 
                     if c.is_ascii_uppercase() {
@@ -503,8 +523,7 @@ impl Iterator for HtmlTokenizer {
                     }
 
                     if c == '>' {
-                        self.state = State::Data;
-                        return self.take_latest_token();
+                        return self.emit_latest_token();
                     }
 
                     if self.is_eof() {
@@ -602,8 +621,7 @@ impl Iterator for HtmlTokenizer {
                     }
 
                     if c == '>' {
-                        self.state = State::Data;
-                        return self.take_latest_token();
+                        return self.emit_latest_token();
                     }
 
                     if self.is_eof() {
@@ -631,8 +649,7 @@ impl Iterator for HtmlTokenizer {
                     }
 
                     if c == '>' {
-                        self.state = State::Data;
-                        return self.take_latest_token();
+                        return self.emit_latest_token();
                     }
 
                     if self.is_eof() {
@@ -650,8 +667,7 @@ impl Iterator for HtmlTokenizer {
                 State::SelfClosingStartTag => {
                     if c == '>' {
                         self.set_self_closing_flag();
-                        self.state = State::Data;
-                        return self.take_latest_token();
+                        return self.emit_latest_token();
                     }
 
                     if self.is_eof() {
@@ -719,9 +735,13 @@ impl Iterator for HtmlTokenizer {
                 //    Then, call append_tag_name method.
                 // 3. Otherwise, switch to TemporaryBuffer state and append '</' and current character to the temporary buffer.
                 State::ScriptDataEndTagName => {
-                    if c == '>' {
-                        self.state = State::Data;
-                        return self.take_latest_token();
+                    // Only an *appropriate* end tag (`</script>`) terminates
+                    // script data. A stray `</div>` etc. inside JS/JSON must be
+                    // treated as literal script text — otherwise the script
+                    // closes early and its source is dumped into the page.
+                    // Spec: https://html.spec.whatwg.org/multipage/parsing.html#script-data-end-tag-name-state
+                    if c == '>' && self.buf.eq_ignore_ascii_case("script") {
+                        return self.emit_latest_token();
                     }
 
                     if c.is_ascii_alphabetic() {
@@ -730,6 +750,8 @@ impl Iterator for HtmlTokenizer {
                         continue;
                     }
 
+                    // Not `</script>`: emit "</" + buffer (+ this char) as raw
+                    // script-data characters and resume script data.
                     self.state = State::TemporaryBuffer;
                     self.buf = String::from("</") + &self.buf;
                     self.buf.push(c);

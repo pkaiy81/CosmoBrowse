@@ -170,6 +170,24 @@ impl Element {
         self.kind
     }
 
+    /// HTML "metadata content" plus `<script>` — elements that generate no
+    /// rendered box. Their entire subtree (notably large inline `<script>` and
+    /// `<style>` text) must be excluded from the layout tree. Otherwise a page
+    /// carrying hundreds of kilobytes of inline script text builds an enormous
+    /// run of inline text layout and the engine effectively hangs.
+    /// Spec: the UA stylesheet sets `display: none` on these.
+    /// https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements
+    pub fn is_non_rendered_element(&self) -> bool {
+        matches!(
+            self.kind,
+            ElementKind::Head
+                | ElementKind::Link
+                | ElementKind::Style
+                | ElementKind::Script
+                | ElementKind::Title
+        )
+    }
+
     pub fn is_block_element(&self) -> bool {
         matches!(
             self.kind,

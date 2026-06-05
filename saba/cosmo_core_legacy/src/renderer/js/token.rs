@@ -61,7 +61,17 @@ impl JsLexer {
                 return result;
             }
 
-            if self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == '$' {
+            // Identifier-continue characters. This MUST stay in sync with the
+            // identifier-start set in `next()` (`a-z A-Z _ $`); otherwise a
+            // start character that this loop rejects (notably `_`) would make
+            // `next()` return an empty `Identifier("")` without advancing
+            // `pos`, spinning forever and emitting infinite tokens (which the
+            // parser then turns into unbounded AST allocation / OOM).
+            // Spec: https://262.ecma-international.org/#prod-IdentifierPart
+            if self.input[self.pos].is_ascii_alphanumeric()
+                || self.input[self.pos] == '$'
+                || self.input[self.pos] == '_'
+            {
                 result.push(self.input[self.pos]);
                 self.pos += 1;
             } else {
@@ -91,18 +101,23 @@ impl JsLexer {
     }
 
     fn contains(&self, keyword: &str) -> bool {
-        for i in 0..keyword.len() {
-            if keyword
-                .chars()
-                .nth(i)
-                .expect("failed to access to i-th char")
-                != self.input[self.pos + i]
-            {
-                return false;
+        // Bounds-checked: near EOF the remaining input can be shorter than the
+        // keyword, so `self.input[self.pos + i]` would panic. `get` returns
+        // `None` past the end, in which case the keyword cannot match.
+        for (i, kc) in keyword.chars().enumerate() {
+            match self.input.get(self.pos + i) {
+                Some(&c) if c == kc => {}
+                _ => return false,
             }
         }
 
-        true
+        // Require a word boundary: a reserved word must not be the prefix of a
+        // longer identifier (e.g. `variable` must not tokenize as `var` +
+        // `iable`). Otherwise the parser is fed bogus keyword tokens.
+        match self.input.get(self.pos + keyword.len()) {
+            Some(&c) if c.is_ascii_alphanumeric() || c == '_' || c == '$' => false,
+            _ => true,
+        }
     }
 
     fn check_reserved_word(&self) -> Option<String> {

@@ -6,7 +6,10 @@ use crate::security::{local_storage_snapshot, replace_local_storage};
 use cosmo_core::js_runtime::JsDomRuntimeBridge;
 use cosmo_core::nebula_renderer::css::cssom::CssParser;
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
-use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
+use crate::loader::fetch_external_stylesheets;
+use cosmo_core::nebula_renderer::dom::api::{
+    get_js_content, get_style_content, get_stylesheet_links,
+};
 use cosmo_core::nebula_renderer::dom::node::NodeKind;
 use cosmo_core::nebula_renderer::html::parser::HtmlParser;
 use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
@@ -134,7 +137,20 @@ pub fn build_layout_scene_with_script_runtime(
     }
     replace_local_storage(document_url, &runtime.local_storage_entries());
 
-    let style = get_style_content(dom.clone());
+    // Combine external <link rel="stylesheet"> sheets with inline <style>.
+    // External sheets are applied first so a later inline <style> wins on equal
+    // specificity (approximating document order). Fetching is cached by URL so
+    // relayout does not hit the network again.
+    // Spec: CSS Cascading §6 — declaration order within the same origin.
+    // https://www.w3.org/TR/css-cascade-4/#cascade-order
+    let links = get_stylesheet_links(dom.clone());
+    let external_css = fetch_external_stylesheets(document_url, &links);
+    let inline_css = get_style_content(dom.clone());
+    let style = if external_css.is_empty() {
+        inline_css
+    } else {
+        format!("{external_css}\n{inline_css}")
+    };
     let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
     let layout_view = LayoutView::new(dom, &cssom, rect.width.max(1));
 
@@ -350,6 +366,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
             display: match style.display() {
                 DisplayType::Block => "block",
                 DisplayType::Inline => "inline",
+                DisplayType::Flex => "flex",
                 DisplayType::DisplayNone => "none",
             }
             .to_string(),

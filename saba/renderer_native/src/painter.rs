@@ -1,12 +1,17 @@
 /// Renders PaintCommands to a tiny-skia Pixmap.
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use cosmo_core::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
+use winit::event_loop::EventLoopProxy;
 
 use crate::color::parse_css_color;
 use crate::hit_test::HitRegion;
 use crate::text_render::TextRenderer;
+use crate::UserEvent;
 
 /// Cached decoded image (RGBA pixels).
 struct DecodedImage {
@@ -15,25 +20,92 @@ struct DecodedImage {
     rgba: Vec<u8>,
 }
 
-/// Cache for fetched and decoded images, keyed by URL.
+/// Lifecycle of an image in the cache.
+enum ImageState {
+    /// A background fetch is in flight; paint a placeholder until it resolves.
+    Pending,
+    /// The fetch finished. `None` means it failed (or was a non-fetchable
+    /// scheme); this is cached so a redraw never re-attempts it.
+    Done(Option<DecodedImage>),
+}
+
+/// Result delivered from a background fetch thread back to the cache.
+struct FetchResult {
+    key: String,
+    decoded: Option<DecodedImage>,
+}
+
+/// Cache for fetched and decoded images, keyed by the (unresolved) `src`.
+///
+/// Images are fetched off the UI thread so a slow or unreachable sub-resource
+/// can never freeze the window. When a `notifier` proxy is installed (GUI
+/// mode), `get_or_fetch` spawns a background thread, records the entry as
+/// `Pending`, and the thread wakes the event loop (`UserEvent::Redraw`) once
+/// the bytes arrive. Without a notifier (headless screenshot mode) fetches run
+/// synchronously, so the single paint observes the decoded image.
 pub struct ImageCache {
-    cache: HashMap<String, Option<DecodedImage>>,
+    cache: HashMap<String, ImageState>,
+    notifier: Option<EventLoopProxy<UserEvent>>,
+    result_tx: Sender<FetchResult>,
+    result_rx: Receiver<FetchResult>,
 }
 
 impl ImageCache {
     pub fn new() -> Self {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
         Self {
             cache: HashMap::new(),
+            notifier: None,
+            result_tx,
+            result_rx,
+        }
+    }
+
+    /// Switch the cache into asynchronous mode. Image fetches will run on
+    /// background threads and `proxy` is signalled whenever one completes so
+    /// the window can repaint with the newly-available image.
+    pub fn set_notifier(&mut self, proxy: EventLoopProxy<UserEvent>) {
+        self.notifier = Some(proxy);
+    }
+
+    /// Drain completed background fetches into the cache. Call once at the
+    /// start of each paint so freshly-arrived images become visible.
+    pub fn integrate_results(&mut self) {
+        while let Ok(FetchResult { key, decoded }) = self.result_rx.try_recv() {
+            self.cache.insert(key, ImageState::Done(decoded));
         }
     }
 
     fn get_or_fetch(&mut self, src: &str, base_url: &str) -> Option<&DecodedImage> {
         if !self.cache.contains_key(src) {
             let resolved = resolve_url(src, base_url);
-            let decoded = fetch_and_decode(&resolved);
-            self.cache.insert(src.to_string(), decoded);
+            match self.notifier.clone() {
+                // Async: never block the UI thread on network I/O. Mark the
+                // entry Pending so subsequent paints don't re-spawn the fetch.
+                Some(proxy) => {
+                    self.cache.insert(src.to_string(), ImageState::Pending);
+                    let key = src.to_string();
+                    let tx = self.result_tx.clone();
+                    std::thread::spawn(move || {
+                        let decoded = fetch_and_decode(&resolved);
+                        // A send error means the window has closed; just exit.
+                        if tx.send(FetchResult { key, decoded }).is_ok() {
+                            let _ = proxy.send_event(UserEvent::Redraw);
+                        }
+                    });
+                }
+                // Sync (headless): fetch inline so this paint sees the image.
+                None => {
+                    let decoded = fetch_and_decode(&resolved);
+                    self.cache
+                        .insert(src.to_string(), ImageState::Done(decoded));
+                }
+            }
         }
-        self.cache.get(src).and_then(|v| v.as_ref())
+        match self.cache.get(src) {
+            Some(ImageState::Done(Some(img))) => Some(img),
+            _ => None,
+        }
     }
 }
 
@@ -49,11 +121,28 @@ fn resolve_url(src: &str, base_url: &str) -> String {
     }
 }
 
+// Images are non-critical sub-resources fetched serially on the UI thread, so
+// a request that connects but never delivers data must not stall the renderer.
+// These timeouts are deliberately shorter than the page loader's (10s/20s):
+// many images per page compound, and a dead host should fail fast.
+const IMAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared HTTP client for image fetches. Built once so connections are pooled
+/// and reused across the many images on a page.
+fn image_http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(IMAGE_CONNECT_TIMEOUT)
+            .timeout(IMAGE_REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build image HTTP client")
+    })
+}
+
 fn fetch_and_decode(url: &str) -> Option<DecodedImage> {
-    let bytes = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(false)
-        .build()
-        .ok()?
+    let bytes = image_http_client()
         .get(url)
         .send()
         .ok()?
