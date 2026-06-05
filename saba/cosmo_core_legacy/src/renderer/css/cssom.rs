@@ -1,6 +1,7 @@
 use crate::alloc::string::ToString;
 use crate::renderer::css::token::CssToken;
 use crate::renderer::css::token::CssTokenizer;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::iter::Peekable;
@@ -175,7 +176,13 @@ impl CssParser {
             };
             match token {
                 CssToken::AtKeyword(_keyword) => {
-                    let _rule = self.consume_qualified_rule();
+                    // Skip the whole at-rule. The engine can't evaluate at-rule
+                    // preludes (`@media`, `@supports`, `@font-face`, `@import`),
+                    // and the previous code parsed the *contents* of an
+                    // `@media { ... }` block as top-level rules — producing
+                    // spurious rules (e.g. mobile `width`/`display` overrides)
+                    // that collapsed desktop layouts such as Hacker News.
+                    self.consume_at_rule();
                 }
                 _ => {
                     let rule = self.consume_qualified_rule();
@@ -188,11 +195,141 @@ impl CssParser {
         }
     }
 
+    /// Consume and discard an at-rule: its prelude up to either a `;`
+    /// (statement at-rules like `@import`) or a `{ ... }` block (which is
+    /// consumed with balanced braces). Spec: CSS Syntax §5.4.2.
+    /// https://www.w3.org/TR/css-syntax-3/#consume-at-rule
+    fn consume_at_rule(&mut self) {
+        // Consume the at-keyword token itself.
+        self.t.next();
+        loop {
+            match self.t.next() {
+                None => return,
+                Some(CssToken::SemiColon) => return,
+                Some(CssToken::OpenCurly) => {
+                    // Discard the block, honouring nested braces.
+                    let mut depth = 1;
+                    while depth > 0 {
+                        match self.t.next() {
+                            None => return,
+                            Some(CssToken::OpenCurly) => depth += 1,
+                            Some(CssToken::CloseCurly) => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn parse_stylesheet(&mut self) -> StyleSheet {
         let mut sheet = StyleSheet::new();
         sheet.set_rules(self.consume_list_of_rules());
         sheet
     }
+}
+
+/// Resolve CSS custom properties: collect every `--name: value` declaration
+/// into a document-level map, then substitute `var(--name[, fallback])` in all
+/// other declaration values. Modern sites place design tokens on `:root` and
+/// reference them everywhere; without this their colors/spacing never apply.
+///
+/// This is a pragmatic, document-global resolution (no per-element cascade of
+/// custom properties), which covers the common `:root` design-token pattern.
+/// Spec: https://www.w3.org/TR/css-variables-1/
+pub fn resolve_css_variables(mut sheet: StyleSheet) -> StyleSheet {
+    // 1. Collect raw custom properties (last definition wins).
+    let mut vars: BTreeMap<String, Vec<CssToken>> = BTreeMap::new();
+    for rule in &sheet.rules {
+        for decl in &rule.declarations {
+            if decl.property.starts_with("--") {
+                vars.insert(decl.property.clone(), decl.value.clone());
+            }
+        }
+    }
+    if vars.is_empty() {
+        return sheet;
+    }
+    // 2. Resolve var() within custom-property values (nested vars), to a
+    //    fixpoint with a small cap to avoid cycles spinning.
+    for _ in 0..5 {
+        let snapshot = vars.clone();
+        let mut changed = false;
+        for value in vars.values_mut() {
+            if value_has_var(value) {
+                *value = substitute_vars(value, &snapshot);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // 3. Substitute var() in every non-custom declaration value.
+    for rule in &mut sheet.rules {
+        for decl in &mut rule.declarations {
+            if !decl.property.starts_with("--") && value_has_var(&decl.value) {
+                decl.value = substitute_vars(&decl.value, &vars);
+            }
+        }
+    }
+    sheet
+}
+
+fn value_has_var(value: &[CssToken]) -> bool {
+    value
+        .iter()
+        .any(|t| matches!(t, CssToken::Ident(s) if s == "var"))
+}
+
+/// Replace `var(--name[, fallback])` sequences in `value` using `vars`.
+/// Unknown variables fall back to the (optional) fallback tokens.
+fn substitute_vars(value: &[CssToken], vars: &BTreeMap<String, Vec<CssToken>>) -> Vec<CssToken> {
+    let mut out: Vec<CssToken> = Vec::new();
+    let mut i = 0;
+    while i < value.len() {
+        let is_var = matches!(&value[i], CssToken::Ident(s) if s == "var")
+            && value.get(i + 1) == Some(&CssToken::OpenParenthesis);
+        if !is_var {
+            out.push(value[i].clone());
+            i += 1;
+            continue;
+        }
+        // Find the matching close parenthesis (handle nested parens).
+        let mut depth = 1;
+        let mut j = i + 2;
+        while j < value.len() && depth > 0 {
+            match value[j] {
+                CssToken::OpenParenthesis => depth += 1,
+                CssToken::CloseParenthesis => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let inner = &value[(i + 2).min(value.len())..j.min(value.len())];
+        let name = match inner.first() {
+            Some(CssToken::Ident(n)) => n.clone(),
+            _ => String::new(),
+        };
+        let fallback: Vec<CssToken> = inner
+            .iter()
+            .position(|t| *t == CssToken::Delim(','))
+            .map(|p| inner[p + 1..].to_vec())
+            .unwrap_or_default();
+        match vars.get(&name) {
+            Some(v) => out.extend(v.clone()),
+            None => out.extend(fallback),
+        }
+        i = j + 1; // skip past the close paren
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -400,6 +537,76 @@ mod tests {
                 ComponentValue::Dimension(15.0, "vh".to_string()),
                 ComponentValue::Ident("auto".to_string()),
             ]
+        );
+    }
+
+    fn decl_value<'a>(sheet: &'a StyleSheet, selector: &str, prop: &str) -> &'a [ComponentValue] {
+        let rule = sheet
+            .rules
+            .iter()
+            .find(|r| r.selector == Selector::TypeSelector(selector.to_string()))
+            .expect("rule");
+        &rule
+            .declarations
+            .iter()
+            .find(|d| d.property == prop)
+            .expect("decl")
+            .value
+    }
+
+    #[test]
+    fn test_resolves_css_variables_and_fallback() {
+        let style = ":root { --brand: #2266cc; } \
+            p { color: var(--brand); } \
+            h1 { color: var(--missing, #11aa55); }"
+            .to_string();
+        let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+        let resolved = resolve_css_variables(cssom);
+        // Defined variable resolves to its value.
+        assert_eq!(
+            decl_value(&resolved, "p", "color"),
+            &[ComponentValue::HashToken("#2266cc".to_string())]
+        );
+        // Missing variable falls back to the provided fallback token.
+        assert_eq!(
+            decl_value(&resolved, "h1", "color"),
+            &[ComponentValue::HashToken("#11aa55".to_string())]
+        );
+    }
+
+
+
+
+
+
+
+    #[test]
+    fn test_at_rule_media_block_is_skipped() {
+        let style = "td { color: blue; } @media (max-width: 600px) { td { width: 10px; display: block; } } p { color: red; }".to_string();
+        let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+        // Only the two top-level rules (td, p) should survive; the @media block
+        // and its inner rules must be discarded, not mangled into rules.
+        let selectors: alloc::vec::Vec<_> = cssom.rules.iter().map(|r| r.selector.clone()).collect();
+        assert_eq!(
+            selectors,
+            alloc::vec![
+                Selector::TypeSelector("td".to_string()),
+                Selector::TypeSelector("p".to_string()),
+            ],
+            "got rules: {:?}", cssom.rules
+        );
+    }
+
+    #[test]
+    fn test_resolves_nested_css_variables() {
+        let style = ":root { --base: #abcdef; --accent: var(--base); } \
+            div { background: var(--accent); }"
+            .to_string();
+        let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+        let resolved = resolve_css_variables(cssom);
+        assert_eq!(
+            decl_value(&resolved, "div", "background"),
+            &[ComponentValue::HashToken("#abcdef".to_string())]
         );
     }
 }

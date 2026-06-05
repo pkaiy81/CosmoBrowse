@@ -4,7 +4,7 @@ use crate::model::{
 };
 use crate::security::{local_storage_snapshot, replace_local_storage};
 use cosmo_core::js_runtime::JsDomRuntimeBridge;
-use cosmo_core::nebula_renderer::css::cssom::CssParser;
+use cosmo_core::nebula_renderer::css::cssom::{resolve_css_variables, CssParser};
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
 use crate::loader::fetch_external_stylesheets;
 use cosmo_core::nebula_renderer::dom::api::{
@@ -152,6 +152,9 @@ pub fn build_layout_scene_with_script_runtime(
         format!("{external_css}\n{inline_css}")
     };
     let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+    // Resolve `var(--token)` references against `:root`/document custom
+    // properties before the cascade so design-token colors/spacing apply.
+    let cssom = resolve_css_variables(cssom);
     let layout_view = LayoutView::new(dom, &cssom, rect.width.max(1));
 
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);

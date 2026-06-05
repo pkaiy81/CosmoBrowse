@@ -154,8 +154,24 @@ impl Iterator for CssTokenizer {
                 ';' => CssToken::SemiColon,
                 '{' => CssToken::OpenCurly,
                 '}' => CssToken::CloseCurly,
-                ' ' | '\n' => {
+                ' ' | '\n' | '\t' | '\r' => {
                     self.pos += 1;
+                    continue;
+                }
+                // CSS comment `/* ... */`. Skipping these is essential: a comment
+                // before an at-rule (e.g. `/* mobile */ @media { ... }`) would
+                // otherwise leave the `@media` un-detected, and its block body
+                // would be parsed as top-level rules — leaking mobile overrides
+                // (display:block, width:100%) that collapse desktop layouts.
+                '/' if self.input.get(self.pos + 1) == Some(&'*') => {
+                    self.pos += 2;
+                    while self.pos + 1 < self.input.len()
+                        && !(self.input[self.pos] == '*' && self.input[self.pos + 1] == '/')
+                    {
+                        self.pos += 1;
+                    }
+                    // Skip past the closing `*/` (or to EOF if unterminated).
+                    self.pos = (self.pos + 2).min(self.input.len());
                     continue;
                 }
                 '"' | '\'' => {

@@ -1622,7 +1622,14 @@ impl LayoutObject {
                 let available_width = (parent_size.width() - metrics.outer_horizontal()).max(0);
                 let explicit_width = self.resolved_width(parent_size);
                 // Also check HTML width attribute for block elements (tables, etc.).
-                let html_width = parse_dimension_attr(self.element_attribute("width"));
+                // Percentages resolve against the available (containing) width so
+                // `<table width="85%">` and nested `width="100%"` tables expand to
+                // a real width instead of collapsing via shrink-to-fit (which on
+                // nested auto tables starves content columns to ~min-content).
+                let html_width = parse_dimension_pct_attr(
+                    self.element_attribute("width"),
+                    Some(available_width),
+                );
 
                 // Table cells: use width attribute, or allocate remaining width
                 // after subtracting explicitly-sized sibling cells.
