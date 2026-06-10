@@ -1756,6 +1756,42 @@ mod tests {
     }
 
     #[test]
+    fn test_display_grid_three_columns_row_major() {
+        let html = concat!(
+            "<html><head><style>",
+            ".grid{display:grid;grid-template-columns:repeat(3, 1fr);}",
+            ".card{height:50px;}",
+            "</style></head><body>",
+            "<div class=\"grid\">",
+            "<div class=\"card\">a</div><div class=\"card\">b</div><div class=\"card\">c</div>",
+            "<div class=\"card\">d</div><div class=\"card\">e</div>",
+            "</div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 900);
+        let body = layout_view.root().expect("body");
+        let grid = body.borrow().first_child().expect("grid container");
+        // Container: two rows of 50px cards.
+        assert_eq!(grid.borrow().size().height(), 100, "two 50px grid rows");
+        let a = grid.borrow().first_child().expect("card a");
+        let b = a.borrow().next_sibling().expect("card b");
+        let c = b.borrow().next_sibling().expect("card c");
+        let d = c.borrow().next_sibling().expect("card d");
+        // Equal 300px tracks at x = 0/300/600 (relative to the container).
+        assert_eq!(a.borrow().size().width(), 300, "track width = 900/3");
+        let (ax, ay) = (a.borrow().point().x(), a.borrow().point().y());
+        let (bx, by) = (b.borrow().point().x(), b.borrow().point().y());
+        let (cx, cy) = (c.borrow().point().x(), c.borrow().point().y());
+        let (dx, dy) = (d.borrow().point().x(), d.borrow().point().y());
+        assert_eq!(bx - ax, 300, "b in second track");
+        assert_eq!(cx - ax, 600, "c in third track");
+        assert_eq!(ay, by, "a/b share the first row");
+        assert_eq!(ay, cy, "a/c share the first row");
+        assert_eq!(dx, ax, "d wraps to the first track");
+        assert_eq!(dy - ay, 50, "d sits on the second row");
+    }
+
+    #[test]
     fn test_background_url_sets_background_image() {
         // Mirrors HN's .votearrow rule: a multi-layer background shorthand
         // whose first layer is a url().

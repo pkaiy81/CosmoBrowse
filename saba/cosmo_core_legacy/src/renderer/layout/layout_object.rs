@@ -97,6 +97,73 @@ fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64>
     }
 }
 
+/// Count the column tracks declared by a `grid-template-columns` value.
+/// Each top-level length/keyword is one track (`1fr 1fr 200px` → 3) and
+/// `repeat(N, ...)` contributes N tracks. Track sizes are ignored — the grid
+/// layout here gives every track equal width. Returns None when no track can
+/// be recognized.
+fn count_grid_template_tracks(values: &[ComponentValue]) -> Option<usize> {
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < values.len() {
+        match &values[i] {
+            ComponentValue::Ident(name) if name.eq_ignore_ascii_case("repeat") => {
+                // repeat(N, ...) — N from the first number inside the parens;
+                // skip to the matching close paren.
+                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
+                    let mut n: usize = 0;
+                    let mut depth = 1;
+                    let mut j = i + 2;
+                    while j < values.len() && depth > 0 {
+                        match &values[j] {
+                            ComponentValue::OpenParenthesis => depth += 1,
+                            ComponentValue::CloseParenthesis => depth -= 1,
+                            ComponentValue::Number(v) if n == 0 => n = *v as usize,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    // auto-fill/auto-fit have no fixed count; treat as 1 track.
+                    count += n.max(1);
+                    i = j;
+                    continue;
+                }
+                count += 1;
+            }
+            // A length (100px/1fr/10%), a number, or a keyword (auto,
+            // min-content, …) is one track.
+            ComponentValue::Dimension(..)
+            | ComponentValue::Number(_)
+            | ComponentValue::Ident(_) => {
+                count += 1;
+                // Skip a function's argument list (e.g. minmax(0, 1fr)) so its
+                // contents don't count as extra tracks.
+                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
+                    let mut depth = 1;
+                    let mut j = i + 2;
+                    while j < values.len() && depth > 0 {
+                        match &values[j] {
+                            ComponentValue::OpenParenthesis => depth += 1,
+                            ComponentValue::CloseParenthesis => depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if count > 0 {
+        Some(count)
+    } else {
+        None
+    }
+}
+
 /// Extract the first `url(...)` from a declaration's component values.
 /// Handles both the quoted form (`url("x.png")` — a StringToken between
 /// parens) and the unquoted form (`url(x.png)` — reassembled from the ident/
@@ -667,6 +734,55 @@ impl LayoutObject {
 
     fn is_flex_container(&self) -> bool {
         self.style.display() == DisplayType::Flex
+    }
+
+    /// If this object's parent is a grid container (`display:grid`), return its
+    /// column track count; otherwise `None`.
+    fn parent_grid_columns(&self) -> Option<usize> {
+        let parent = self.parent.upgrade()?;
+        let p = parent.borrow();
+        if p.style.display() == DisplayType::Grid {
+            Some(p.style.grid_columns())
+        } else {
+            None
+        }
+    }
+
+    /// True for a whitespace-only text node. Such nodes are formatting
+    /// artifacts of the markup (newlines/indentation between elements) and are
+    /// not grid items per CSS Grid §6 (only inter-element whitespace that
+    /// collapses away).
+    fn is_whitespace_text(&self) -> bool {
+        match self.node.borrow().kind() {
+            NodeKind::Text(ref t) => t.trim().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// 0-based grid-item index of this object among its parent's children:
+    /// whitespace-only text siblings are skipped (they are not grid items).
+    /// Identified by pointer identity, so it works while `self` is inside an
+    /// active borrow.
+    fn grid_item_index(&self) -> usize {
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return 0,
+        };
+        let mut idx = 0;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            if core::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
+                return idx;
+            }
+            let b = c.borrow();
+            if !b.is_whitespace_text() {
+                idx += 1;
+            }
+            let next = b.next_sibling();
+            drop(b);
+            child = next;
+        }
+        idx
     }
 
     /// Preferred (max-content) width: the width this subtree would take with no
@@ -1918,6 +2034,16 @@ impl LayoutObject {
                         self.max_content_width()
                     };
                     w.min(available_width).max(0)
+                } else if let Some(n) = self.parent_grid_columns() {
+                    // Grid item: every column track is parent width / N; the
+                    // item's content box is the track minus its own margins.
+                    let track =
+                        (parent_size.width() / n as i64 - metrics.outer_horizontal()).max(0);
+                    if explicit_width > 0 {
+                        explicit_width.min(track)
+                    } else {
+                        track
+                    }
                 } else if explicit_width > 0 {
                     explicit_width.min(available_width)
                 } else if let Some(w) = html_width {
@@ -1969,6 +2095,15 @@ impl LayoutObject {
                 // height is the tallest item (max), not the sum.
                 let is_flex_row = self.is_flex_container()
                     && self.style.flex_direction() == FlexDirection::Row;
+                // Grid: children fill rows of N columns; the container's height
+                // is the sum of each row's tallest item.
+                let grid_cols = if self.style.display() == DisplayType::Grid {
+                    Some(self.style.grid_columns())
+                } else {
+                    None
+                };
+                let mut grid_idx = 0usize;
+                let mut grid_row_height = 0i64;
                 let mut previous_child_kind = LayoutObjectKind::Block;
                 while child.is_some() {
                     let c = child.expect("first child should exist");
@@ -1990,6 +2125,21 @@ impl LayoutObject {
                                 + c_metrics.margin.top
                                 + c_metrics.margin.bottom,
                         );
+                    } else if let Some(n) = grid_cols {
+                        // Whitespace-only text children are not grid items.
+                        if !c.borrow().is_whitespace_text() {
+                            let c_metrics = compute_box_model_metrics(&c.borrow().style());
+                            grid_row_height = grid_row_height.max(
+                                c.borrow().size.height()
+                                    + c_metrics.margin.top
+                                    + c_metrics.margin.bottom,
+                            );
+                            grid_idx += 1;
+                            if grid_idx % n == 0 {
+                                content_height += grid_row_height;
+                                grid_row_height = 0;
+                            }
+                        }
                     } else if previous_child_kind.normal_flow_spec().stacks_vertically
                         || c_kind.normal_flow_spec().stacks_vertically
                     {
@@ -2008,6 +2158,8 @@ impl LayoutObject {
                     previous_child_kind = c_kind;
                     child = c.borrow().next_sibling();
                 }
+                // Final, possibly partial grid row.
+                content_height += grid_row_height;
 
                 // <br> and <hr> have intrinsic heights even without children.
                 let content_height = if self.element_kind() == Some(ElementKind::Br) {
@@ -2163,6 +2315,30 @@ impl LayoutObject {
                     .unwrap_or(0);
                 point.set_x(parent_point.x() + rowspan_offset + metrics.margin.left + cs);
                 point.set_y(parent_point.y() + metrics.margin.top + v_offset);
+            }
+        } else if let Some(n) = self.parent_grid_columns() {
+            // Grid item placement: row-major into N equal-width column tracks.
+            let idx = self.grid_item_index();
+            let col = idx % n;
+            let track = parent_size.width() / n as i64;
+            point.set_x(parent_point.x() + col as i64 * track + metrics.margin.left);
+            if col == 0 {
+                // First track: a new grid row below the previous sibling (which
+                // ended the previous row).
+                if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
+                    point.set_y(
+                        pos.y() + size.height() + metrics.margin.top + metrics.margin.bottom,
+                    );
+                } else {
+                    point.set_y(parent_point.y() + metrics.margin.top);
+                }
+            } else {
+                // Same row: share the previous sibling's top edge.
+                point.set_y(
+                    previous_sibling_point
+                        .map(|p| p.y())
+                        .unwrap_or(parent_point.y() + metrics.margin.top),
+                );
             }
         } else if let Some(dir) = self.parent_flex_direction() {
             // Flex item placement (main-axis start packing; no grow/shrink yet).
@@ -2356,6 +2532,11 @@ impl LayoutObject {
                         self.style.set_flex_direction(FlexDirection::from_str(value));
                     }
                 }
+                "grid-template-columns" => {
+                    if let Some(n) = count_grid_template_tracks(&declaration.value) {
+                        self.style.set_grid_columns(n);
+                    }
+                }
                 "width" => match first_value {
                     Some(ComponentValue::Number(value)) => {
                         self.style.set_width(*value);
@@ -2532,7 +2713,9 @@ impl LayoutObject {
             NodeKind::Element(_) => match self.style.display() {
                 // A flex container is itself a block-level box; flex affects how
                 // its children are sized and positioned, not its own outer flow.
-                DisplayType::Block | DisplayType::Flex => self.kind = LayoutObjectKind::Block,
+                DisplayType::Block | DisplayType::Flex | DisplayType::Grid => {
+                    self.kind = LayoutObjectKind::Block
+                }
                 DisplayType::Inline => self.kind = LayoutObjectKind::Inline,
                 DisplayType::DisplayNone => {
                     panic!("should not create a layout object for a node with display:none")

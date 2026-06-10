@@ -103,6 +103,9 @@ pub struct ComputedStyle {
     /// when `display` is `Flex`; controls whether children are laid out along
     /// the row (main = horizontal) or column (main = vertical) axis.
     flex_direction: Option<FlexDirection>,
+    /// Number of column tracks from `grid-template-columns` (track count only;
+    /// all tracks are equal width). Only meaningful when `display` is `Grid`.
+    grid_columns: Option<usize>,
 }
 
 impl ComputedStyle {
@@ -135,6 +138,7 @@ impl ComputedStyle {
             z_index: None,
             overflow_clip: None,
             flex_direction: None,
+            grid_columns: None,
         }
     }
 
@@ -480,6 +484,16 @@ impl ComputedStyle {
     /// Flex main-axis direction; defaults to `row` per CSS Flexbox.
     pub fn flex_direction(&self) -> FlexDirection {
         self.flex_direction.unwrap_or(FlexDirection::Row)
+    }
+
+    pub fn set_grid_columns(&mut self, n: usize) {
+        self.grid_columns = Some(n.max(1));
+    }
+
+    /// Column track count of a grid container; a grid without
+    /// `grid-template-columns` is a single column per CSS Grid §7.1.
+    pub fn grid_columns(&self) -> usize {
+        self.grid_columns.unwrap_or(1)
     }
 
     pub fn set_font_family(&mut self, font_family: String) {
@@ -923,6 +937,10 @@ pub enum DisplayType {
     /// in normal flow like a block; its children are laid out along the flex
     /// main axis (see [`FlexDirection`]).
     Flex,
+    /// `display:grid` — a block-level grid container. Children are placed
+    /// row-major into the equal-width column tracks declared by
+    /// `grid-template-columns` (track count only; no named lines/areas).
+    Grid,
     DisplayNone,
 }
 
@@ -971,6 +989,8 @@ impl DisplayType {
             // Flex containers get real (if basic) flex layout. inline-flex is
             // treated as a block-level flex container for simplicity.
             "flex" | "inline-flex" => Ok(Self::Flex),
+            // Grid containers get basic row-major track placement.
+            "grid" => Ok(Self::Grid),
             "inline" | "inline-block" | "inline-grid" | "inline-table" | "contents" => {
                 Ok(Self::Inline)
             }

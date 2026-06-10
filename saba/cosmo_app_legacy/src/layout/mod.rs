@@ -370,6 +370,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
                 DisplayType::Block => "block",
                 DisplayType::Inline => "inline",
                 DisplayType::Flex => "flex",
+                DisplayType::Grid => "grid",
                 DisplayType::DisplayNone => "none",
             }
             .to_string(),
