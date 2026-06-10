@@ -121,8 +121,10 @@ impl LayoutView {
             // that the very first row's cells already see the max hint of any
             // later row's cell in the same column. Spec: CSS 2.2 §17.5.2.
             if n.borrow().is_table() && n.borrow().column_min_hints().is_none() {
-                let hints = LayoutObject::compute_table_column_min_hints(n);
-                n.borrow_mut().set_column_min_hints(hints);
+                let min_hints = LayoutObject::compute_table_column_min_hints(n);
+                let max_hints = LayoutObject::compute_table_column_max_hints(n);
+                n.borrow_mut().set_column_min_hints(min_hints);
+                n.borrow_mut().set_column_max_hints(max_hints);
             }
 
             if n.borrow().kind() == LayoutObjectKind::Block {
@@ -1737,6 +1739,92 @@ mod tests {
     }
 
     #[test]
+    fn test_hn_itemlist_column_distribution() {
+        // Faithful full HN itemlist: 30 stories (rank | votelinks | title),
+        // each followed by a colspan=2 subtext row and a spacer row, then a
+        // trailing morespace + "More" colspan row.
+        // Regressions covered:
+        //  1. The rank column ("30.") must not absorb surplus width meant for
+        //     the title column (it has no growth headroom), so titles sit
+        //     immediately right of the rank instead of right-of-center.
+        //  2. The subtext cell (after a colspan=2 lead-in) must resolve its
+        //     LOGICAL column (2 = title), not its physical index (1 =
+        //     votelinks); otherwise it is sized at ~8px and its text stacks
+        //     vertically one character per line, inflating the row height.
+        let mut rows = String::new();
+        for i in 1..=30 {
+            rows.push_str(&format!(
+                "<tr class=\"athing\"><td align=\"right\" valign=\"top\" class=\"title\"><span class=\"rank\">{}.</span></td>\
+                 <td valign=\"top\" class=\"votelinks\"><center><a href=\"vote\"><div class=\"votearrow\" title=\"upvote\"></div></a></center></td>\
+                 <td class=\"title\"><span class=\"titleline\"><a href=\"http://example.com\">Story number {} with a reasonably long headline here</a> <span class=\"sitebit\"> (<a href=\"from\"><span class=\"sitestr\">example.com</span></a>)</span></span></td></tr>\
+                 <tr><td colspan=\"2\"></td><td class=\"subtext\"><span class=\"subline\">{} points by user{} 6 hours ago | hide | {} comments</span></td></tr>\
+                 <tr class=\"spacer\" style=\"height:5px\"></tr>",
+                i, i, 100 + i, i, 50 + i,
+            ));
+        }
+        rows.push_str(
+            "<tr class=\"morespace\" style=\"height:10px\"></tr>\
+             <tr><td colspan=\"2\"></td><td class=\"title\"><a href=\"news?p=2\" class=\"morelink\">More</a></td></tr>",
+        );
+        let html = format!(
+            "<html><head><style>\
+             td{{font-family:Verdana;font-size:10pt;color:#828282;}}\
+             .title{{font-family:Verdana;font-size:10pt;color:#828282;overflow:hidden;}}\
+             .title a{{word-break:break-word;}}\
+             .subtext{{font-family:Verdana;font-size:7pt;color:#828282;}}\
+             .votearrow{{width:10px;height:10px;border:0px;margin:3px 2px 6px;background:url(\"triangle.svg\");background-size:10px;}}\
+             .rank{{color:#888;}}\
+             </style></head><body>\
+             <center><table id=\"hnmain\" border=\"0\" cellpadding=\"0\" cellspacing=\"0\" width=\"85%\">\
+             <tr><td bgcolor=\"#ff6600\">Hacker News</td></tr>\
+             <tr><td><table border=\"0\" cellpadding=\"0\" cellspacing=\"0\">{}</table></td></tr>\
+             </table></center></body></html>",
+            rows,
+        );
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+        let texts: Vec<(String, i64, i64)> = display_items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } =>
+                Some((text.clone(), layout_point.x(), layout_point.y())),
+            _ => None,
+        }).collect();
+
+        let rank = texts.iter().find(|(t, _, _)| t == "1.")
+            .expect("rank 1. must be rendered");
+        let title = texts.iter().find(|(t, _, _)| t.starts_with("Story number 1 "))
+            .expect("story 1 title must be rendered");
+        let subtext = texts.iter().find(|(t, _, _)| t.starts_with("101 points"))
+            .expect("story 1 subtext must be rendered");
+        let title2 = texts.iter().find(|(t, _, _)| t.starts_with("Story number 2 "))
+            .expect("story 2 title must be rendered");
+
+        // 1. Title is on the same line as the rank, immediately to its right
+        //    (rank column stays narrow; no half-page gap).
+        assert_eq!(title.2, rank.2, "title must share the rank's line");
+        assert!(
+            title.1 - rank.1 < 80,
+            "title x={} sits too far right of rank x={} (rank column absorbed surplus)",
+            title.1, rank.1,
+        );
+        // 2. Subtext is a single line directly below the title: the next
+        //    story's title follows within a few line heights, not hundreds of
+        //    pixels (subtext text must not stack one character per line).
+        assert!(subtext.2 > title.2, "subtext must be below the title");
+        assert!(
+            title2.2 - title.2 < 100,
+            "story 2 title y={} is too far below story 1 y={} (subtext row inflated)",
+            title2.2, title.2,
+        );
+        // Subtext shares the title's left edge (logical column 2), rather
+        // than the votelinks column.
+        assert!(
+            (subtext.1 - title.1).abs() < 40,
+            "subtext x={} must align with title x={} (logical column mapping)",
+            subtext.1, title.1,
+        );
+    }
+
+    #[test]
     fn test_column_widths_consistent_across_rows() {
         // When only the first row has explicit column widths, subsequent rows
         // derived their widths via sibling-row lookup — but before the
@@ -2078,26 +2166,38 @@ mod tests {
                 "text '{}' at y={} is below table bottom y={} (vertical overflow)", txt, ty, table_bottom);
         }
 
-        // Vertical border alignment: cell rects (NOT inner content rects) in
-        // the same column must share X and width across all rows. Cells have
-        // x divisible by 2 (cellspacing) and lie at the row's exact y, while
-        // the inner <strong> rects are inset by ~2px.
+        // Vertical border alignment: the OUTER cell rects in the same column
+        // must share X and width across all rows. Cells lie at the row's exact
+        // y, while inner <strong> content rects are inset by ~2px and may be
+        // taller than one line when the cell wraps — so we must compare only
+        // outer cell rects. We identify the canonical column X-positions from
+        // the top row (which never wraps) and compare only rects at those Xs.
         let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64, i64)>> = alloc::collections::BTreeMap::new();
-        // Take only the OUTER cell rects (we know real cell xs land at 164 etc.).
-        // Identify them by clustering on Y where the row's cell-rect heights
-        // are uniform.
-        let candidate_xs: alloc::collections::BTreeSet<i64> = rects.iter()
-            .filter(|(_, _, w, h)| *w < 700 && *w > 30 && (*h == 24 || *h > 24))
-            .map(|(x, _, _, _)| *x)
-            .collect();
         for (x, y, w, h) in &rects {
-            if *w < 700 && *w > 30 && *h >= 24 && *h < table_rect.3 && candidate_xs.contains(x) {
+            if *w < 700 && *w > 30 && *h >= 24 && *h < table_rect.3 {
                 cells_by_row.entry(*y).or_default().push((*x, *w, *h));
             }
         }
-        let rows: Vec<_> = cells_by_row.values().filter(|v| v.len() == 2).collect();
+        // Canonical column X-positions: the top-most row's two outer cells.
+        let col_xs: alloc::collections::BTreeSet<i64> = cells_by_row
+            .values()
+            .find(|v| v.len() == 2)
+            .map(|v| v.iter().map(|(x, _, _)| *x).collect())
+            .unwrap_or_default();
+        // Restrict every row to cells sitting at a canonical column X; this
+        // drops inner content rects, which are offset by the cell border.
+        let rows: Vec<alloc::vec::Vec<(i64, i64, i64)>> = cells_by_row
+            .values()
+            .map(|v| {
+                let mut cells: alloc::vec::Vec<(i64, i64, i64)> =
+                    v.iter().filter(|(x, _, _)| col_xs.contains(x)).copied().collect();
+                cells.sort_by_key(|(x, _, _)| *x);
+                cells
+            })
+            .filter(|v| v.len() == 2)
+            .collect();
         if rows.len() >= 2 {
-            let row1 = rows[0];
+            let row1 = rows[0].clone();
             for (i, (x1, w1, _)) in row1.iter().enumerate() {
                 for r in rows.iter().skip(1) {
                     let (xn, wn, _) = r[i];

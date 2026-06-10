@@ -91,6 +91,12 @@ pub struct ComputedStyle {
     offset_top: Option<f64>,
     offset_left: Option<f64>,
     text_align: Option<TextAlign>,
+    /// True when `text_align` originates from a legacy presentational center
+    /// hint (a `<center>` element or `align="center"` attribute) rather than a
+    /// CSS `text-align` declaration. Legacy center aligns block boxes but is
+    /// reset to the start edge inside table cells, whereas CSS `text-align`
+    /// inherits into cells normally.
+    text_align_legacy: bool,
     z_index: Option<i32>,
     overflow_clip: Option<bool>,
     /// `flex-direction` of a flex container (`display:flex`). Only meaningful
@@ -125,6 +131,7 @@ impl ComputedStyle {
             offset_top: None,
             offset_left: None,
             text_align: None,
+            text_align_legacy: false,
             z_index: None,
             overflow_clip: None,
             flex_direction: None,
@@ -146,6 +153,7 @@ impl ComputedStyle {
                 // but does NOT set text-align:center on cell contents.
                 if !is_table && self.text_align.is_none() {
                     self.text_align = Some(TextAlign::Center);
+                    self.text_align_legacy = true;
                 }
             } else if align.eq_ignore_ascii_case("right") {
                 if self.text_align.is_none() {
@@ -183,7 +191,24 @@ impl ComputedStyle {
             }
             // text-align is inherited.
             if self.text_align.is_none() && parent_style.text_align != Some(TextAlign::Left) {
-                self.text_align = parent_style.text_align;
+                // A legacy presentational center (from a <center> element or an
+                // align="center" attribute) centers block boxes but is reset to
+                // the start edge inside table cells — it does not inherit as
+                // text-align into cell content. CSS `text-align:center`, which
+                // carries no legacy flag, inherits into cells normally.
+                let into_cell = matches!(
+                    node.borrow().element_kind(),
+                    Some(ElementKind::Td) | Some(ElementKind::Th)
+                );
+                if into_cell
+                    && parent_style.text_align == Some(TextAlign::Center)
+                    && parent_style.text_align_legacy
+                {
+                    self.text_align = Some(TextAlign::Left);
+                } else {
+                    self.text_align = parent_style.text_align;
+                    self.text_align_legacy = parent_style.text_align_legacy;
+                }
             }
             let parent_opacity = parent_style.opacity();
             if let Some(opacity) = self.opacity {
@@ -278,6 +303,7 @@ impl ComputedStyle {
         // <center> tag implies text-align: center for children.
         if node.borrow().element_kind() == Some(ElementKind::Center) && self.text_align.is_none() {
             self.text_align = Some(TextAlign::Center);
+            self.text_align_legacy = true;
         }
         // Block children of <center> should be horizontally centered (margin auto).
         {

@@ -426,6 +426,12 @@ pub struct LayoutObject {
     // Spec: CSS 2.2 §17.5.2 — table layout: auto.
     // https://www.w3.org/TR/CSS22/tables.html#auto-table-layout
     column_min_hints: Option<Vec<i64>>,
+    // Per-logical-column max of max_content_width (the column's preferred,
+    // longest-line width), populated alongside column_min_hints by the
+    // pre-pass.  Used by `table_cell_auto_width` to weight surplus distribution
+    // by each column's growth headroom (max - min), so a narrow label column
+    // (e.g. a rank number) does not absorb surplus meant for a wide text column.
+    column_max_hints: Option<Vec<i64>>,
 }
 
 impl PartialEq for LayoutObject {
@@ -452,6 +458,7 @@ impl LayoutObject {
             size: LayoutSize::new(0, 0),
             text_line_max_width: 0,
             column_min_hints: None,
+            column_max_hints: None,
         }
     }
 
@@ -653,7 +660,11 @@ impl LayoutObject {
         max_hint
     }
 
-    /// Determine this cell's column index (0-based) within its parent row.
+    /// Determine this cell's LOGICAL column index (0-based) within its parent
+    /// row: preceding cells advance the index by their colspan, so a cell after
+    /// a `<td colspan=2>` lead-in is at column 2, not 1. (Rowspan cells from
+    /// previous rows are not accounted for here; callers gate on
+    /// `rowspan_offset == 0`.)
     fn cell_column_index(&self) -> usize {
         let parent = match self.parent.upgrade() {
             Some(p) => p,
@@ -665,7 +676,7 @@ impl LayoutObject {
             match c.try_borrow() {
                 Ok(borrowed) => {
                     if borrowed.is_table_cell() {
-                        index += 1;
+                        index += borrowed.cell_colspan();
                     }
                     let next = borrowed.next_sibling();
                     drop(borrowed);
@@ -738,7 +749,10 @@ impl LayoutObject {
                             }
                         }
                     }
-                    idx += 1;
+                    // Advance by the cell's colspan so that sibling rows with
+                    // colspan cells (e.g. a `<td colspan=2>` lead-in) map to
+                    // LOGICAL column indices, matching the caller's index.
+                    idx += cb.cell_colspan();
                 }
                 let next = cb.next_sibling();
                 drop(cb);
@@ -790,6 +804,17 @@ impl LayoutObject {
         self.column_min_hints = Some(v);
     }
 
+    /// Return the per-column preferred (max-content) hint vector populated by
+    /// the table pre-pass, if any. Only set on `<table>` nodes.
+    pub fn column_max_hints(&self) -> Option<&[i64]> {
+        self.column_max_hints.as_deref()
+    }
+
+    /// Store the per-column preferred (max-content) hint vector on this table.
+    pub fn set_column_max_hints(&mut self, v: Vec<i64>) {
+        self.column_max_hints = Some(v);
+    }
+
     /// Walk all logical rows of a `<table>` and compute the maximum
     /// min_content_width_hint (and explicit HTML width attribute) per logical
     /// column index. The vector returned has one entry per column.
@@ -806,6 +831,20 @@ impl LayoutObject {
     /// spanned columns where the existing sum is below the hint, ensuring no
     /// over-allocation. Spec: CSS 2.2 §17.5.2.1.
     pub fn compute_table_column_min_hints(table: &Rc<RefCell<LayoutObject>>) -> Vec<i64> {
+        Self::compute_table_column_hints(table, false)
+    }
+
+    /// Per-logical-column maximum of each cell's preferred (max-content) width.
+    /// Mirror of `compute_table_column_min_hints` using `max_content_width`.
+    pub fn compute_table_column_max_hints(table: &Rc<RefCell<LayoutObject>>) -> Vec<i64> {
+        Self::compute_table_column_hints(table, true)
+    }
+
+    /// Shared implementation of the per-column hint pre-pass. When `use_max` is
+    /// false it accumulates `min_content_width_hint` (the column's minimum
+    /// width); when true it accumulates `max_content_width` (the column's
+    /// preferred width).
+    fn compute_table_column_hints(table: &Rc<RefCell<LayoutObject>>, use_max: bool) -> Vec<i64> {
         let table_px_width = parse_dimension_attr(table.borrow().element_attribute("width"));
         let logical_rows = Self::collect_logical_rows_static(table);
         let mut col_min: Vec<i64> = Vec::new();
@@ -844,7 +883,11 @@ impl LayoutObject {
                         table_px_width,
                     )
                     .unwrap_or(0);
-                    let content_hint = cb.min_content_width_hint();
+                    let content_hint = if use_max {
+                        cb.max_content_width()
+                    } else {
+                        cb.min_content_width_hint()
+                    };
                     let cell_hint = attr_w.max(content_hint);
                     if colspan == 1 {
                         col_min[logical_col] = col_min[logical_col].max(cell_hint);
@@ -918,6 +961,20 @@ impl LayoutObject {
         t.column_min_hints().map(|s| s.to_vec())
     }
 
+    /// From a table cell, walk up to the containing `<table>` and return its
+    /// per-column preferred (max-content) hints, if any.
+    fn ancestor_table_column_max_hints(&self) -> Option<Vec<i64>> {
+        let row = self.parent.upgrade()?;
+        let row_parent = row.borrow().parent.upgrade()?;
+        let table = if row_parent.borrow().is_row_group() {
+            row_parent.borrow().parent.upgrade()?
+        } else {
+            row_parent
+        };
+        let t = table.borrow();
+        t.column_max_hints().map(|s| s.to_vec())
+    }
+
     /// Compute the width this cell should use, accounting for sibling cells
     /// that have explicit HTML width attributes, and rowspan cells from
     /// previous rows that reduce the available width.
@@ -973,6 +1030,12 @@ impl LayoutObject {
         } else {
             None
         };
+        // Column-level preferred widths, gated identically to the min hints.
+        let column_max_hints = if rowspan_offset == 0 && !row_has_colspan {
+            self.ancestor_table_column_max_hints()
+        } else {
+            None
+        };
 
         // Check if sibling rows have explicit widths for the columns this cell
         // spans.  Skip this check when:
@@ -1020,7 +1083,11 @@ impl LayoutObject {
         let my_col_index = if rowspan_offset == 0 { self.cell_column_index() } else { usize::MAX };
 
         let mut total_explicit: i64 = 0;
-        let mut auto_cells: Vec<(bool, i64)> = Vec::new(); // (is_self, min_hint)
+        // (is_self, min_hint, max_content) — max_content is the cell's preferred
+        // (longest-line) width, used to cap how much surplus a column absorbs so
+        // a narrow label column (e.g. a rank number) does not balloon to share
+        // surplus equally with a genuinely flexible text column.
+        let mut auto_cells: Vec<(bool, i64, i64)> = Vec::new();
         let mut self_index: usize = 0;
         let mut col_idx: usize = 0;
         let mut child = parent.borrow().first_child();
@@ -1066,9 +1133,21 @@ impl LayoutObject {
                                 .and_then(|h| h.get(col_idx).copied())
                                 .unwrap_or(0);
                             let hint = cell_hint.max(col_hint);
-                            auto_cells.push((false, hint));
+                            // Promote to the column-level preferred width so a
+                            // spacer cell in this row still reflects how wide a
+                            // sibling row's content in the same column wants to be.
+                            let col_max = column_max_hints
+                                .as_ref()
+                                .and_then(|h| h.get(col_idx).copied())
+                                .unwrap_or(0);
+                            let max_content =
+                                borrowed.max_content_width().max(col_max).max(hint);
+                            auto_cells.push((false, hint, max_content));
                         }
-                        col_idx += 1;
+                        // Advance by colspan so col_idx stays a LOGICAL column
+                        // index, consistent with cell_column_index() and the
+                        // hint vectors.
+                        col_idx += borrowed.cell_colspan();
                     }
                     let next = borrowed.next_sibling();
                     drop(borrowed);
@@ -1082,9 +1161,14 @@ impl LayoutObject {
                         .and_then(|h| h.get(col_idx).copied())
                         .unwrap_or(0);
                     let hint = cell_hint.max(col_hint);
+                    let col_max = column_max_hints
+                        .as_ref()
+                        .and_then(|h| h.get(col_idx).copied())
+                        .unwrap_or(0);
+                    let max_content = self.max_content_width().max(col_max).max(hint);
                     self_index = auto_cells.len();
-                    auto_cells.push((true, hint));
-                    col_idx += 1;
+                    auto_cells.push((true, hint, max_content));
+                    col_idx += self.cell_colspan();
                     let next = c.as_ptr();
                     child = unsafe { (*next).next_sibling() };
                 }
@@ -1098,70 +1182,34 @@ impl LayoutObject {
         }
 
         let equal_share = remaining / auto_count as i64;
-        let total_min: i64 = auto_cells.iter().map(|(_, h)| *h).sum();
+        let total_min: i64 = auto_cells.iter().map(|(_, h, _)| *h).sum();
         if total_min <= remaining && total_min > 0 {
             let surplus = remaining - total_min;
-            let (_, my_min) = auto_cells[self_index];
+            let (_, my_min, my_max) = auto_cells[self_index];
 
-            // Cells whose hint is "large" (≥ CONTENT_SIZED_THRESHOLD) represent
-            // fixed-size content like images or large explicitly-sized nested tables.
-            // These cells should not grow beyond their minimum content width — extra
-            // space inside an image cell, for instance, does nothing useful.
-            //
-            // Cells with hints between SPACER_THRESHOLD and CONTENT_SIZED_THRESHOLD
-            // are "flexible" content cells: they grow to fill remaining space.
-            //
-            // Cells with tiny hints (< SPACER_THRESHOLD) are decorative spacers
-            // (e.g. <td>&nbsp;</td>) that must not absorb surplus table width.
-            const CONTENT_SIZED_THRESHOLD: i64 = 150;
-            const SPACER_THRESHOLD: i64 = 20;
-            let total_content_sized: i64 = auto_cells
+            // Every auto cell is guaranteed its min hint; the surplus is then
+            // distributed in proportion to each cell's growth headroom
+            // (max_content - min). Cells whose content cannot use more space —
+            // images, &nbsp; spacers, a rank number like "30." — have zero
+            // headroom and absorb nothing, while a text column that merely has
+            // a long unbreakable word (large min) still grows toward its
+            // preferred width. Spec: CSS 2.2 §17.5.2.2 (distribute excess in
+            // proportion to the difference between a column's maximum and
+            // minimum content widths).
+            let my_headroom = (my_max - my_min).max(0);
+            let total_headroom: i64 = auto_cells
                 .iter()
-                .filter(|(_, h)| *h >= CONTENT_SIZED_THRESHOLD)
-                .map(|(_, h)| *h)
+                .map(|(_, h, mx)| (*mx - *h).max(0))
                 .sum();
-            let has_flexible = auto_cells
-                .iter()
-                .any(|(_, h)| *h >= SPACER_THRESHOLD && *h < CONTENT_SIZED_THRESHOLD);
-
-            if my_min >= CONTENT_SIZED_THRESHOLD {
-                // Large content hint: do not grow beyond the minimum.
-                my_min
-            } else if my_min < SPACER_THRESHOLD {
-                // Tiny spacer: stay at minimum, never absorb surplus.
-                my_min.max(1)
-            } else if has_flexible {
-                // Flexible content cell: split remaining space after content-sized
-                // cells and spacers.
-                let total_spacer: i64 = auto_cells
-                    .iter()
-                    .filter(|(_, h)| *h < SPACER_THRESHOLD)
-                    .map(|(_, h)| *h)
-                    .sum();
-                let remaining_for_flexible =
-                    (remaining - total_content_sized - total_spacer).max(0);
-                let total_flexible_min: i64 = auto_cells
-                    .iter()
-                    .filter(|(_, h)| *h >= SPACER_THRESHOLD && *h < CONTENT_SIZED_THRESHOLD)
-                    .map(|(_, h)| *h)
-                    .sum();
-                let flex_surplus =
-                    (remaining_for_flexible - total_flexible_min).max(0);
-                let flexible_count = auto_cells
-                    .iter()
-                    .filter(|(_, h)| *h >= SPACER_THRESHOLD && *h < CONTENT_SIZED_THRESHOLD)
-                    .count()
-                    .max(1);
-                my_min + flex_surplus / flexible_count as i64
-            } else if my_min > equal_share {
-                // All cells are content-sized and this one needs more than equal share.
-                my_min
+            if total_headroom > 0 {
+                my_min.max(1) + surplus * my_headroom / total_headroom
             } else {
-                // All cells are content-sized: distribute surplus proportionally.
+                // No cell can grow: distribute surplus proportionally to mins
+                // so the row still fills the table width consistently.
                 const DEFAULT_MIN: i64 = 16;
                 let total_effective: i64 = auto_cells
                     .iter()
-                    .map(|(_, h)| (*h).max(DEFAULT_MIN))
+                    .map(|(_, h, _)| (*h).max(DEFAULT_MIN))
                     .sum();
                 let my_effective = my_min.max(DEFAULT_MIN);
                 let bonus = if total_effective > 0 {
@@ -1169,7 +1217,7 @@ impl LayoutObject {
                 } else {
                     0
                 };
-                my_min + bonus
+                my_min.max(1) + bonus
             }
         } else {
             // Simple equal division (no mins, or mins exceed available).

@@ -623,6 +623,24 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
     let chrome = ChromeState::new();
     ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
     let frame_commands = bridge.collect_paint_commands();
+    if std::env::var("COSMO_DEBUG_DUMP").is_ok() {
+        for (_fid, _furl, commands) in &frame_commands {
+            for cmd in commands {
+                match cmd {
+                    cosmo_core::paint_commands::PaintCommand::DrawText(t) => {
+                        let s: String = t.text.chars().take(48).collect();
+                        eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
+                    }
+                    cosmo_core::paint_commands::PaintCommand::DrawRect(r) => {
+                        eprintln!("RECT x={} y={} w={} h={}", r.x, r.y, r.width, r.height);
+                    }
+                    cosmo_core::paint_commands::PaintCommand::DrawImage(i) => {
+                        eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
+                    }
+                }
+            }
+        }
+    }
     for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
             frame_url, 0, CHROME_HEIGHT, frame_id);
@@ -657,6 +675,24 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     let chrome = ChromeState::new();
     ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
     let frame_commands = bridge.collect_paint_commands();
+    if std::env::var("COSMO_DEBUG_DUMP").is_ok() {
+        for (_fid, _furl, commands) in &frame_commands {
+            for cmd in commands {
+                match cmd {
+                    cosmo_core::paint_commands::PaintCommand::DrawText(t) => {
+                        let s: String = t.text.chars().take(48).collect();
+                        eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
+                    }
+                    cosmo_core::paint_commands::PaintCommand::DrawRect(r) => {
+                        eprintln!("RECT x={} y={} w={} h={}", r.x, r.y, r.width, r.height);
+                    }
+                    cosmo_core::paint_commands::PaintCommand::DrawImage(i) => {
+                        eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
+                    }
+                }
+            }
+        }
+    }
     for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
             frame_url, 0, CHROME_HEIGHT, frame_id);
