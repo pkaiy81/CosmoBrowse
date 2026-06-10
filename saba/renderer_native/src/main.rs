@@ -632,7 +632,7 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
                         eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
                     }
                     cosmo_core::paint_commands::PaintCommand::DrawRect(r) => {
-                        eprintln!("RECT x={} y={} w={} h={}", r.x, r.y, r.width, r.height);
+                        eprintln!("RECT x={} y={} w={} h={} bg={}", r.x, r.y, r.width, r.height, r.background_color);
                     }
                     cosmo_core::paint_commands::PaintCommand::DrawImage(i) => {
                         eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
@@ -684,7 +684,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
                         eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
                     }
                     cosmo_core::paint_commands::PaintCommand::DrawRect(r) => {
-                        eprintln!("RECT x={} y={} w={} h={}", r.x, r.y, r.width, r.height);
+                        eprintln!("RECT x={} y={} w={} h={} bg={}", r.x, r.y, r.width, r.height, r.background_color);
                     }
                     cosmo_core::paint_commands::PaintCommand::DrawImage(i) => {
                         eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);

@@ -145,6 +145,16 @@ impl ComputedStyle {
         // Spec: HTML Living Standard §14.3 — presentational hints.
         // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
         let is_table = node.borrow().element_kind() == Some(ElementKind::Table);
+        // Own bgcolor attribute must be applied BEFORE background inheritance,
+        // or an inherited ancestor background (e.g. <table bgcolor=...>) fills
+        // the slot first and the element's own bgcolor is ignored.
+        if self.background_color.is_none() {
+            if let Some(bgcolor) = get_element_attribute(node, "bgcolor") {
+                if let Some(color) = parse_html_color(&bgcolor) {
+                    self.background_color = Some(color);
+                }
+            }
+        }
         if let Some(align) = get_element_attribute(node, "align") {
             if align.eq_ignore_ascii_case("center") {
                 self.margin_left_auto = true;
@@ -218,14 +228,8 @@ impl ComputedStyle {
             }
         }
 
-        // Handle HTML bgcolor and text attributes (presentational hints).
-        if self.background_color.is_none() {
-            if let Some(bgcolor) = get_element_attribute(node, "bgcolor") {
-                if let Some(color) = parse_html_color(&bgcolor) {
-                    self.background_color = Some(color);
-                }
-            }
-        }
+        // (The bgcolor presentational hint is applied before inheritance, at
+        // the top of this function.)
         // Handle HTML <body background="..."> attribute for tiled background image.
         if self.background_image.is_none() {
             if let Some(bg) = get_element_attribute(node, "background") {

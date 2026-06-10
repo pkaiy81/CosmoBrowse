@@ -52,7 +52,13 @@ fn font_ratio(font_size: FontSize) -> i64 {
 /// the 16px default (CHAR_WIDTH is the advance at 16px).
 fn char_width_px(font_size: FontSize) -> i64 {
     match font_size {
-        FontSize::Px(n) => (CHAR_WIDTH * n / FontSize::Medium.px()).max(1),
+        // Round UP: underestimating the advance makes the next inline box
+        // overlap the tail of this text when the real font draws wider than
+        // the estimate (e.g. Verdana 13px averages ~7px, not 8*13/16 = 6.5).
+        FontSize::Px(n) => {
+            let base = FontSize::Medium.px();
+            ((CHAR_WIDTH * n + base - 1) / base).max(1)
+        }
         legacy => CHAR_WIDTH * font_ratio(legacy),
     }
 }
@@ -1133,6 +1139,12 @@ impl LayoutObject {
         // a narrow label column (e.g. a rank number) does not balloon to share
         // surplus equally with a genuinely flexible text column.
         let mut auto_cells: Vec<(bool, i64, i64)> = Vec::new();
+        // Sum of every auto cell's horizontal padding+border. The widths
+        // returned here are CONTENT widths and compute_size adds each cell's
+        // metrics.inner_horizontal() on top; without subtracting that overhead
+        // from the budget the row's cell boxes overflow the table's right edge
+        // by (cell count × padding).
+        let mut auto_box_overhead: i64 = 0;
         let mut self_index: usize = 0;
         let mut col_idx: usize = 0;
         let mut child = parent.borrow().first_child();
@@ -1188,6 +1200,8 @@ impl LayoutObject {
                             let max_content =
                                 borrowed.max_content_width().max(col_max).max(hint);
                             auto_cells.push((false, hint, max_content));
+                            auto_box_overhead +=
+                                compute_box_model_metrics(&borrowed.style).inner_horizontal();
                         }
                         // Advance by colspan so col_idx stays a LOGICAL column
                         // index, consistent with cell_column_index() and the
@@ -1213,6 +1227,8 @@ impl LayoutObject {
                     let max_content = self.max_content_width().max(col_max).max(hint);
                     self_index = auto_cells.len();
                     auto_cells.push((true, hint, max_content));
+                    auto_box_overhead +=
+                        compute_box_model_metrics(&self.style).inner_horizontal();
                     col_idx += self.cell_colspan();
                     let next = c.as_ptr();
                     child = unsafe { (*next).next_sibling() };
@@ -1220,7 +1236,7 @@ impl LayoutObject {
             }
         }
 
-        let remaining = (effective_width - total_explicit).max(0);
+        let remaining = (effective_width - total_explicit - auto_box_overhead).max(0);
         let auto_count = auto_cells.len();
         if auto_count == 0 {
             return effective_width;
@@ -1301,6 +1317,77 @@ impl LayoutObject {
             }
         }
         total
+    }
+
+    /// Collapse whitespace in a text node per CSS Text §4.1 (simplified):
+    /// newlines become spaces and runs of spaces collapse to one. A leading or
+    /// trailing space survives only when this text node has an adjacent INLINE
+    /// sibling on that side — it is then a word separator between inline boxes
+    /// (e.g. `<span>197 points</span> by <a>user</a>`). At block edges the
+    /// space is removed, as it would be at a line start/end.
+    /// https://www.w3.org/TR/css-text-3/#white-space-phase-2
+    fn collapse_text_whitespace(&self, t: &str) -> String {
+        let collapsed = t
+            .replace('\n', " ")
+            .split(' ')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let had_leading = t.starts_with([' ', '\n']);
+        let had_trailing = t.ends_with([' ', '\n']);
+        if !had_leading && !had_trailing {
+            return collapsed;
+        }
+        // Find this node among its siblings by pointer identity (self may be
+        // inside an active borrow during compute_size, so try_borrow-based
+        // detection is unreliable here).
+        let mut prev_inline = false;
+        let mut next_inline = false;
+        if let Some(parent) = self.parent.upgrade() {
+            let mut prev_kind: Option<LayoutObjectKind> = None;
+            let mut child = parent.borrow().first_child();
+            while let Some(c) = child {
+                if core::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
+                    prev_inline = matches!(
+                        prev_kind,
+                        Some(LayoutObjectKind::Inline) | Some(LayoutObjectKind::Text)
+                    );
+                    next_inline = self
+                        .next_sibling()
+                        .map(|n| {
+                            matches!(
+                                n.borrow().kind(),
+                                LayoutObjectKind::Inline | LayoutObjectKind::Text
+                            )
+                        })
+                        .unwrap_or(false);
+                    break;
+                }
+                let b = c.borrow();
+                prev_kind = Some(b.kind());
+                let next = b.next_sibling();
+                drop(b);
+                child = next;
+            }
+        }
+        if collapsed.is_empty() {
+            // Whitespace-only node: a single separator space when it sits
+            // between two inline boxes, nothing otherwise.
+            return if prev_inline && next_inline {
+                String::from(" ")
+            } else {
+                String::new()
+            };
+        }
+        let mut result = String::new();
+        if had_leading && prev_inline {
+            result.push(' ');
+        }
+        result.push_str(&collapsed);
+        if had_trailing && next_inline {
+            result.push(' ');
+        }
+        result
     }
 
     pub fn element_attribute(&self, name: &str) -> Option<String> {
@@ -1640,12 +1727,7 @@ impl LayoutObject {
                     let mut v = vec![];
                     let cw = char_width_px(self.style.font_size());
                     let lh = line_height_px(self.style.font_size());
-                    let plain_text = t
-                        .replace("\n", " ")
-                        .split(' ')
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let plain_text = self.collapse_text_whitespace(&t);
                     // Use the max_width that was established during compute_size so
                     // that the line-break boundaries are identical between the sizing
                     // and painting passes.  Recomputing against self.size().width()
@@ -1930,12 +2012,7 @@ impl LayoutObject {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let cw = char_width_px(self.style.font_size());
                     let lh = line_height_px(self.style.font_size());
-                    let plain_text = t
-                        .replace("\n", " ")
-                        .split(' ')
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let plain_text = self.collapse_text_whitespace(&t);
                     // max_width is the available horizontal space for this text
                     // node within its containing block.  Use the nearest block/cell
                     // ancestor's content width so that inline parents (e.g. <a>,
