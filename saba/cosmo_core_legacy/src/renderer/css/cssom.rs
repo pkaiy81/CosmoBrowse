@@ -69,6 +69,13 @@ impl CssParser {
         Some(declaration)
     }
 
+    /// Parse a freestanding declaration list — the contents of an inline
+    /// `style="..."` attribute. Spec: CSS Style Attributes
+    /// https://www.w3.org/TR/css-style-attr/#syntax
+    pub fn parse_declaration_list(&mut self) -> Vec<Declaration> {
+        self.consume_list_of_declarations()
+    }
+
     /// https://www.w3.org/TR/css-syntax-3/#consume-a-list-of-declarations
     fn consume_list_of_declarations(&mut self) -> Vec<Declaration> {
         let mut declarations = Vec::new();

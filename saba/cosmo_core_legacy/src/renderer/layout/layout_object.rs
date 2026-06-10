@@ -40,6 +40,29 @@ fn font_ratio(font_size: FontSize) -> i64 {
         FontSize::Medium => 1,
         FontSize::XLarge => 2,
         FontSize::XXLarge => 3,
+        // Arbitrary px sizes don't use the legacy integer ratio; callers that
+        // need text metrics use char_width_px / line_height_px below.
+        FontSize::Px(_) => 1,
+    }
+}
+
+/// Estimated advance width of one narrow character at the given font size.
+/// Legacy named buckets keep their historical integer-ratio metrics so
+/// existing layouts are unchanged; arbitrary `Px` sizes scale linearly from
+/// the 16px default (CHAR_WIDTH is the advance at 16px).
+fn char_width_px(font_size: FontSize) -> i64 {
+    match font_size {
+        FontSize::Px(n) => (CHAR_WIDTH * n / FontSize::Medium.px()).max(1),
+        legacy => CHAR_WIDTH * font_ratio(legacy),
+    }
+}
+
+/// Line height (glyph height + leading) at the given font size. Mirrors
+/// `char_width_px`: legacy buckets keep ratio metrics, `Px` scales linearly.
+fn line_height_px(font_size: FontSize) -> i64 {
+    match font_size {
+        FontSize::Px(n) => (CHAR_HEIGHT_WITH_PADDING * n / FontSize::Medium.px()).max(1),
+        legacy => CHAR_HEIGHT_WITH_PADDING * font_ratio(legacy),
     }
 }
 
@@ -57,6 +80,13 @@ fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64>
         "em" => Some(value * base_font_size.px() as f64),
         "rem" => Some(value * FontSize::Medium.px() as f64),
         "vh" | "vw" => Some(value),
+        // Absolute lengths, CSS Values & Units §6.2: 1in = 96px = 72pt = 6pc;
+        // 1in = 2.54cm = 25.4mm. https://www.w3.org/TR/css-values-4/#absolute-lengths
+        "pt" => Some(value * 96.0 / 72.0),
+        "pc" => Some(value * 16.0),
+        "in" => Some(value * 96.0),
+        "cm" => Some(value * 96.0 / 2.54),
+        "mm" => Some(value * 96.0 / 25.4),
         _ => None,
     }
 }
@@ -192,7 +222,7 @@ fn estimate_text_width_chars(text: &str) -> i64 {
 }
 
 fn measure_text_width(text: &str, font_size: FontSize) -> i64 {
-    estimate_text_width_chars(text) * CHAR_WIDTH * font_ratio(font_size)
+    estimate_text_width_chars(text) * char_width_px(font_size)
 }
 fn is_break_space(c: char) -> bool {
     c == ' ' || c == '\u{3000}'
@@ -277,6 +307,21 @@ pub fn create_layout_object(
                 layout_object
                     .borrow_mut()
                     .cascading_style(rule.declarations.clone());
+            }
+        }
+
+        // Inline `style="..."` attribute: applied after stylesheet rules so it
+        // wins the cascade (highest author-origin specificity).
+        // Spec: https://www.w3.org/TR/css-style-attr/#interpret
+        if let NodeKind::Element(ref element) = n.borrow().kind() {
+            if let Some(style_attr) = element.get_attribute("style") {
+                use crate::renderer::css::cssom::CssParser;
+                use crate::renderer::css::token::CssTokenizer;
+                let declarations =
+                    CssParser::new(CssTokenizer::new(style_attr)).parse_declaration_list();
+                if !declarations.is_empty() {
+                    layout_object.borrow_mut().cascading_style(declarations);
+                }
             }
         }
 
@@ -642,7 +687,7 @@ impl LayoutObject {
                         // SPACER_THRESHOLD (20) and is classified as flexible
                         // content rather than a decorative spacer.
                         let wide_min = if word.chars().any(|c| is_wide_char(c)) {
-                            3 * CHAR_WIDTH * font_ratio(font_size)
+                            3 * char_width_px(font_size)
                         } else {
                             0
                         };
@@ -1593,7 +1638,8 @@ impl LayoutObject {
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let mut v = vec![];
-                    let ratio = font_ratio(self.style.font_size());
+                    let cw = char_width_px(self.style.font_size());
+                    let lh = line_height_px(self.style.font_size());
                     let plain_text = t
                         .replace("\n", " ")
                         .split(' ')
@@ -1615,16 +1661,16 @@ impl LayoutObject {
                         .map(|cell| {
                             let cb = cell.borrow();
                             let cm = compute_box_model_metrics(&cb.style);
-                            (cb.size().width() - cm.inner_horizontal()).max(CHAR_WIDTH * ratio)
+                            (cb.size().width() - cm.inner_horizontal()).max(cw)
                         })
                         .unwrap_or_else(|| {
                             if self.text_line_max_width > 0 {
                                 self.text_line_max_width
                             } else {
-                                self.size().width().max(CHAR_WIDTH * ratio)
+                                self.size().width().max(cw)
                             }
                         });
-                    let lines = split_text(plain_text, CHAR_WIDTH * ratio, max_width);
+                    let lines = split_text(plain_text, cw, max_width);
                     let href = self.link_href();
                     let target = self.link_target();
 
@@ -1635,7 +1681,7 @@ impl LayoutObject {
                             style: self.style(),
                             layout_point: LayoutPoint::new(
                                 self.point().x(),
-                                self.point().y() + CHAR_HEIGHT_WITH_PADDING * ratio * i as i64,
+                                self.point().y() + lh * i as i64,
                             ),
                             href: href.clone(),
                             target: target.clone(),
@@ -1814,8 +1860,7 @@ impl LayoutObject {
 
                 // <br> and <hr> have intrinsic heights even without children.
                 let content_height = if self.element_kind() == Some(ElementKind::Br) {
-                    let ratio = font_ratio(self.style.font_size());
-                    CHAR_HEIGHT_WITH_PADDING * ratio
+                    line_height_px(self.style.font_size())
                 } else if self.element_kind() == Some(ElementKind::Hr) {
                     // <hr> renders as a 2px line with 8px margin above/below.
                     2
@@ -1883,7 +1928,8 @@ impl LayoutObject {
             }
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
-                    let ratio = font_ratio(self.style.font_size());
+                    let cw = char_width_px(self.style.font_size());
+                    let lh = line_height_px(self.style.font_size());
                     let plain_text = t
                         .replace("\n", " ")
                         .split(' ')
@@ -1898,22 +1944,22 @@ impl LayoutObject {
                     // formatting context.
                     // https://www.w3.org/TR/CSS22/visudet.html#blockwidth
                     let max_width = self.nearest_block_ancestor_width()
-                        .map(|w| (w - metrics.outer_horizontal()).max(CHAR_WIDTH * ratio))
+                        .map(|w| (w - metrics.outer_horizontal()).max(cw))
                         .unwrap_or_else(||
-                            (parent_size.width() - metrics.outer_horizontal()).max(CHAR_WIDTH * ratio)
+                            (parent_size.width() - metrics.outer_horizontal()).max(cw)
                         );
                     // Cache so paint() uses the identical boundary (see paint Text arm).
                     self.text_line_max_width = max_width;
-                    let lines = split_text(plain_text.clone(), CHAR_WIDTH * ratio, max_width);
+                    let lines = split_text(plain_text.clone(), cw, max_width);
                     let width = lines
                         .iter()
-                        .map(|line| estimate_text_width_chars(line) * CHAR_WIDTH * ratio)
+                        .map(|line| estimate_text_width_chars(line) * cw)
                         .max()
                         .unwrap_or(0);
                     let height = if lines.is_empty() {
                         0
                     } else {
-                        CHAR_HEIGHT_WITH_PADDING * ratio * lines.len() as i64
+                        lh * lines.len() as i64
                     };
                     size.set_width((width + metrics.inner_horizontal()).max(0));
                     size.set_height((height + metrics.inner_vertical()).max(0));

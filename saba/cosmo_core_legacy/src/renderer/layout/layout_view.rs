@@ -1739,6 +1739,23 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_style_attribute_applies_and_overrides_stylesheet() {
+        // Inline style="..." must be parsed and must win over stylesheet rules.
+        let html = concat!(
+            "<html><head><style>div{background-color:#00ff00;width:100px;}</style></head><body>",
+            "<div style=\"background-color: #ff0000; width: 300px\">x</div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let body = layout_view.root().expect("body should exist");
+        let div = body.borrow().first_child().expect("div should exist");
+        let style = div.borrow().style();
+        assert_eq!(style.width() as i64, 300, "inline width must override stylesheet");
+        let bg = style.background_color();
+        assert_eq!(bg.code_u32(), 0xff0000, "inline background-color must override stylesheet");
+    }
+
+    #[test]
     fn test_hn_itemlist_column_distribution() {
         // Faithful full HN itemlist: 30 stories (rank | votelinks | title),
         // each followed by a colspan=2 subtext row and a spacer row, then a

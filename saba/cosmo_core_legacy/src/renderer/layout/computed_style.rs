@@ -836,6 +836,11 @@ pub enum FontSize {
     Medium,
     XLarge,
     XXLarge,
+    /// Arbitrary pixel size resolved from a CSS length (e.g. 10pt → 13px).
+    /// The legacy named buckets are kept for element defaults (h1–h3) and
+    /// keyword values; CSS numeric lengths use this variant so that sizes
+    /// like 7pt/13px actually render smaller than the 16px default.
+    Px(i64),
 }
 
 impl FontSize {
@@ -864,13 +869,11 @@ impl FontSize {
     }
 
     pub fn from_px(value: f64) -> Self {
-        if value >= 32.0 {
-            Self::XXLarge
-        } else if value >= 24.0 {
-            Self::XLarge
-        } else {
-            Self::Medium
-        }
+        // Clamp to a sane range: tiny fonts stay legible (and avoid zero/negative
+        // sizes), huge fonts don't blow up layout estimates.
+        // (`f64::round` is unavailable in no_std; +0.5-truncate is fine for
+        // the positive values that survive the clamp.)
+        Self::Px(((value + 0.5) as i64).clamp(6, 128))
     }
 
     pub fn px(&self) -> i64 {
@@ -878,6 +881,7 @@ impl FontSize {
             FontSize::Medium => 16,
             FontSize::XLarge => 24,
             FontSize::XXLarge => 32,
+            FontSize::Px(n) => *n,
         }
     }
 }
