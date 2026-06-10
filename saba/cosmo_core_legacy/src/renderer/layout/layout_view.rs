@@ -1756,6 +1756,58 @@ mod tests {
     }
 
     #[test]
+    fn test_background_url_sets_background_image() {
+        // Mirrors HN's .votearrow rule: a multi-layer background shorthand
+        // whose first layer is a url().
+        let html = concat!(
+            "<html><head><style>",
+            ".votearrow{width:10px;height:10px;border:0px;margin:3px 2px 6px;",
+            "background:url(\"triangle.svg\"), linear-gradient(transparent, transparent) no-repeat;",
+            "background-size:10px;}",
+            "</style></head><body>",
+            // Same nesting as HN: cell > center > anchor > votearrow div.
+            "<table><tr><td class=\"votelinks\"><center>",
+            "<a href=\"vote\"><div class=\"votearrow\" title=\"upvote\"></div></a>",
+            "</center></td></tr></table>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let display_items = layout_view.paint();
+        let arrow = display_items.iter().find_map(|item| match item {
+            crate::display_item::DisplayItem::Rect { style, layout_size, .. }
+                if style.background_image() == Some("triangle.svg") =>
+            {
+                Some((layout_size.width(), layout_size.height()))
+            }
+            _ => None,
+        });
+        let (w, h) = arrow.expect("votearrow rect with background_image must be painted");
+        assert_eq!(w, 10, "CSS width:10px");
+        assert_eq!(h, 10, "CSS height:10px");
+    }
+
+    #[test]
+    fn test_font_size_em_and_percent_resolve_against_parent() {
+        let html = concat!(
+            "<html><head><style>",
+            "div{font-size:20px;}",
+            ".em{font-size:1.5em;}",
+            ".pct{font-size:50%;}",
+            "</style></head><body>",
+            "<div><span class=\"em\">big</span><span class=\"pct\">small</span></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1024);
+        let body = layout_view.root().expect("body");
+        let div = body.borrow().first_child().expect("div");
+        assert_eq!(div.borrow().style().font_size().px(), 20);
+        let em_span = div.borrow().first_child().expect("em span");
+        assert_eq!(em_span.borrow().style().font_size().px(), 30, "1.5em of 20px parent");
+        let pct_span = em_span.borrow().next_sibling().expect("pct span");
+        assert_eq!(pct_span.borrow().style().font_size().px(), 10, "50% of 20px parent");
+    }
+
+    #[test]
     fn test_hn_itemlist_column_distribution() {
         // Faithful full HN itemlist: 30 stories (rank | votelinks | title),
         // each followed by a colspan=2 subtext row and a spacer row, then a

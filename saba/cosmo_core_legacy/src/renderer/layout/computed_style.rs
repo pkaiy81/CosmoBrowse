@@ -442,6 +442,10 @@ impl ComputedStyle {
         self.background_image.as_deref()
     }
 
+    pub fn set_background_image(&mut self, url: String) {
+        self.background_image = Some(url);
+    }
+
     pub fn text_align(&self) -> TextAlign {
         self.text_align.unwrap_or(TextAlign::Left)
     }

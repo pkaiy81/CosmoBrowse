@@ -149,12 +149,50 @@ fn fetch_and_decode(url: &str) -> Option<DecodedImage> {
         .bytes()
         .ok()?;
 
+    // SVG (e.g. Hacker News' votearrow triangle.svg) — rasterize at the
+    // document's intrinsic size via resvg; the raster decoders below can't
+    // handle it.
+    let head = &bytes[..bytes.len().min(512)];
+    let looks_like_svg = url.split('?').next().is_some_and(|p| p.ends_with(".svg"))
+        || head.starts_with(b"<svg")
+        || (head.starts_with(b"<?xml") && bytes.windows(4).take(512).any(|w| w == b"<svg"));
+    if looks_like_svg {
+        return decode_svg(&bytes);
+    }
+
     let img = image::load_from_memory(&bytes).ok()?;
     let rgba = img.to_rgba8();
     Some(DecodedImage {
         width: rgba.width(),
         height: rgba.height(),
         rgba: rgba.into_raw(),
+    })
+}
+
+fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let (w, h) = (size.width().ceil() as u32, size.height().ceil() as u32);
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    // tiny-skia stores PREMULTIPLIED rgba; the blit/blend paths in this file
+    // expect straight alpha (like the `image` crate produces) — unpremultiply.
+    let mut rgba = pixmap.take();
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+            px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+            px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+    Some(DecodedImage {
+        width: w,
+        height: h,
+        rgba,
     })
 }
 
@@ -367,13 +405,19 @@ fn draw_rect(
             let src_h = decoded.height as i64;
             if src_w > 0 && src_h > 0 {
                 let data = pixmap.data_mut();
+                // An image larger than the rect is an icon/sprite drawn through
+                // background-size (which isn't propagated here): scale it to
+                // fit the rect once, nearest-neighbor. Tile-cropping the
+                // top-left corner instead would show an arbitrary fragment
+                // (e.g. the empty corner of HN's votearrow triangle.svg).
+                let scale_to_fit = src_w > w || src_h > h;
                 // Tile the image across the rect area.
                 let mut ty = 0i64;
                 while ty < h {
                     let mut tx = 0i64;
                     while tx < w {
-                        let tile_w = (src_w).min(w - tx);
-                        let tile_h = (src_h).min(h - ty);
+                        let tile_w = if scale_to_fit { w } else { (src_w).min(w - tx) };
+                        let tile_h = if scale_to_fit { h } else { (src_h).min(h - ty) };
                         for dy in 0..tile_h {
                             let py = y + ty + dy;
                             if py < 0 || py >= ph {
@@ -384,7 +428,12 @@ fn draw_rect(
                                 if px_x < 0 || px_x >= pw {
                                     continue;
                                 }
-                                let si = (dy * src_w + dx) as usize * 4;
+                                let (sx, sy) = if scale_to_fit {
+                                    ((dx * src_w / w).min(src_w - 1), (dy * src_h / h).min(src_h - 1))
+                                } else {
+                                    (dx, dy)
+                                };
+                                let si = (sy * src_w + sx) as usize * 4;
                                 let sr = decoded.rgba[si];
                                 let sg = decoded.rgba[si + 1];
                                 let sb = decoded.rgba[si + 2];

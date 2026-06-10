@@ -103,6 +103,13 @@ impl CssTokenizer {
                 let unit = self.consume_ident_token();
                 return CssToken::Dimension(num, unit);
             }
+            // <percentage-token>: represent as a Dimension with unit "%" so
+            // consumers can resolve it against the relevant base value.
+            // https://www.w3.org/TR/css-syntax-3/#percentage-token-diagram
+            if c == '%' {
+                self.pos += 1;
+                return CssToken::Dimension(num, String::from("%"));
+            }
         }
 
         CssToken::Number(num)

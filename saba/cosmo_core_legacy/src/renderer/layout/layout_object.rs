@@ -97,6 +97,46 @@ fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64>
     }
 }
 
+/// Extract the first `url(...)` from a declaration's component values.
+/// Handles both the quoted form (`url("x.png")` — a StringToken between
+/// parens) and the unquoted form (`url(x.png)` — reassembled from the ident/
+/// delim/number tokens the tokenizer produced).
+/// https://www.w3.org/TR/css-values-4/#urls
+fn extract_css_url(values: &[ComponentValue]) -> Option<String> {
+    let mut i = 0;
+    while i < values.len() {
+        let is_url_fn = matches!(&values[i], ComponentValue::Ident(s) if s.eq_ignore_ascii_case("url"))
+            && matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
+        if is_url_fn {
+            let mut url = String::new();
+            for v in &values[i + 2..] {
+                match v {
+                    ComponentValue::CloseParenthesis => {
+                        let trimmed = url.trim();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        return Some(trimmed.to_string());
+                    }
+                    ComponentValue::StringToken(s) | ComponentValue::Ident(s) => url.push_str(s),
+                    ComponentValue::Delim(c) => url.push(*c),
+                    ComponentValue::Colon => url.push(':'),
+                    ComponentValue::Number(n) => {
+                        url.push_str(&format!("{}", n));
+                    }
+                    ComponentValue::Dimension(n, u) => {
+                        url.push_str(&format!("{}{}", n, u));
+                    }
+                    _ => return None,
+                }
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
 fn first_font_family(value: &[ComponentValue]) -> Option<String> {
     value.iter().find_map(|component| match component {
         ComponentValue::Ident(name) | ComponentValue::StringToken(name) => Some(name.clone()),
@@ -227,8 +267,18 @@ fn estimate_text_width_chars(text: &str) -> i64 {
     text.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum::<i64>()
 }
 
-fn measure_text_width(text: &str, font_size: FontSize) -> i64 {
-    estimate_text_width_chars(text) * char_width_px(font_size)
+/// Bold faces draw roughly 10% wider than the regular face at the same size.
+/// Round up so a following inline box never overlaps the bold run's tail.
+fn bold_width_adjust(width: i64, bold: bool) -> i64 {
+    if bold {
+        width + (width + 7) / 8
+    } else {
+        width
+    }
+}
+
+fn measure_text_width(text: &str, font_size: FontSize, bold: bool) -> i64 {
+    bold_width_adjust(estimate_text_width_chars(text) * char_width_px(font_size), bold)
 }
 fn is_break_space(c: char) -> bool {
     c == ' ' || c == '\u{3000}'
@@ -308,11 +358,17 @@ pub fn create_layout_object(
     if let Some(n) = node {
         let layout_object = Rc::new(RefCell::new(LayoutObject::new(n.clone(), parent_obj)));
 
+        // Parent font size: the base for resolving font-size em/% values.
+        let parent_font_size = parent_obj
+            .as_ref()
+            .map(|p| p.borrow().style().font_size())
+            .unwrap_or(FontSize::Medium);
+
         for rule in &cssom.rules {
             if layout_object.borrow().is_node_selected(&rule.selector) {
                 layout_object
                     .borrow_mut()
-                    .cascading_style(rule.declarations.clone());
+                    .cascading_style(rule.declarations.clone(), parent_font_size);
             }
         }
 
@@ -326,7 +382,9 @@ pub fn create_layout_object(
                 let declarations =
                     CssParser::new(CssTokenizer::new(style_attr)).parse_declaration_list();
                 if !declarations.is_empty() {
-                    layout_object.borrow_mut().cascading_style(declarations);
+                    layout_object
+                        .borrow_mut()
+                        .cascading_style(declarations, parent_font_size);
                 }
             }
         }
@@ -634,10 +692,11 @@ impl LayoutObject {
             match b.node_kind() {
                 NodeKind::Text(ref t) => {
                     let fs = b.style.font_size();
+                    let bold = b.style.is_bold();
                     // Each hard line within the text starts a new line box.
                     let widest = t
                         .split('\n')
-                        .map(|line| measure_text_width(line.trim(), fs))
+                        .map(|line| measure_text_width(line.trim(), fs, bold))
                         .max()
                         .unwrap_or(0);
                     cur_line += widest;
@@ -675,17 +734,26 @@ impl LayoutObject {
             let borrowed = c.borrow();
             let hint = parse_dimension_attr(borrowed.element_attribute("width")).unwrap_or(0);
             max_hint = max_hint.max(hint);
+            // An explicit CSS width on a child box (e.g. HN's
+            // `.votearrow{width:10px}`) is part of the column's minimum: the
+            // box cannot shrink below it, plus its horizontal margins.
+            let css_w = borrowed.style.width() as i64;
+            if css_w > 0 {
+                let m = borrowed.style.margin();
+                max_hint = max_hint.max(css_w + m.left() as i64 + m.right() as i64);
+            }
             // For text nodes, use the longest *unbreakable* run.
             // CJK chars can break between any two characters; each is its own
             // minimum unit.  Pure-ASCII runs between wide chars are truly
             // unbreakable and may be wider — take the max of the two.
             if let NodeKind::Text(ref t) = borrowed.node_kind() {
                 let font_size = borrowed.style.font_size();
+                let bold = borrowed.style.is_bold();
                 let longest = t.split(|c: char| c == ' ' || c == '\u{3000}' || c == '\n' || c == '\t')
                     .map(|word| {
                         // Longest ASCII run between wide chars within this word.
                         let ascii_max = word.split(|c: char| is_wide_char(c))
-                            .map(|seg| measure_text_width(seg.trim(), font_size))
+                            .map(|seg| measure_text_width(seg.trim(), font_size, bold))
                             .max()
                             .unwrap_or(0);
                         // Each wide char is its own break unit.  We return
@@ -1530,7 +1598,7 @@ impl LayoutObject {
                     .unwrap_or_else(|| "Button".to_string());
                 Some(LayoutSize::new(
                     explicit_width
-                        .max(measure_text_width(&child_text, self.style.font_size()) + 28),
+                        .max(measure_text_width(&child_text, self.style.font_size(), self.style.is_bold()) + 28),
                     explicit_height.max(36),
                 ))
             }
@@ -1725,7 +1793,8 @@ impl LayoutObject {
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let mut v = vec![];
-                    let cw = char_width_px(self.style.font_size());
+                    let cw =
+                        bold_width_adjust(char_width_px(self.style.font_size()), self.style.is_bold());
                     let lh = line_height_px(self.style.font_size());
                     let plain_text = self.collapse_text_whitespace(&t);
                     // Use the max_width that was established during compute_size so
@@ -2010,7 +2079,8 @@ impl LayoutObject {
             }
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
-                    let cw = char_width_px(self.style.font_size());
+                    let cw =
+                        bold_width_adjust(char_width_px(self.style.font_size()), self.style.is_bold());
                     let lh = line_height_px(self.style.font_size());
                     let plain_text = self.collapse_text_whitespace(&t);
                     // max_width is the available horizontal space for this text
@@ -2234,21 +2304,35 @@ impl LayoutObject {
         }
     }
 
-    pub fn cascading_style(&mut self, declarations: Vec<Declaration>) {
+    pub fn cascading_style(&mut self, declarations: Vec<Declaration>, parent_font_size: FontSize) {
         for declaration in declarations {
             let first_value = declaration.first_value();
             match declaration.property.as_str() {
-                "background-color" | "background" => match first_value {
-                    Some(ComponentValue::Ident(value)) => {
-                        let color = Color::from_name(value).unwrap_or_else(|_| Color::white());
-                        self.style.set_background_color(color);
+                "background-color" | "background" => {
+                    match first_value {
+                        Some(ComponentValue::Ident(value)) => {
+                            let color = Color::from_name(value).unwrap_or_else(|_| Color::white());
+                            self.style.set_background_color(color);
+                        }
+                        Some(ComponentValue::HashToken(color_code)) => {
+                            let color =
+                                Color::from_code(color_code).unwrap_or_else(|_| Color::white());
+                            self.style.set_background_color(color);
+                        }
+                        _ => {}
                     }
-                    Some(ComponentValue::HashToken(color_code)) => {
-                        let color = Color::from_code(color_code).unwrap_or_else(|_| Color::white());
-                        self.style.set_background_color(color);
+                    // The background shorthand may also carry an image layer.
+                    if declaration.property == "background" {
+                        if let Some(url) = extract_css_url(&declaration.value) {
+                            self.style.set_background_image(url);
+                        }
                     }
-                    _ => {}
-                },
+                }
+                "background-image" => {
+                    if let Some(url) = extract_css_url(&declaration.value) {
+                        self.style.set_background_image(url);
+                    }
+                }
                 "color" => match first_value {
                     Some(ComponentValue::Ident(value)) => {
                         let color = Color::from_name(value).unwrap_or_else(|_| Color::black());
@@ -2398,7 +2482,15 @@ impl LayoutObject {
                         self.style.set_font_size(FontSize::from_px(*value));
                     }
                     Some(ComponentValue::Dimension(value, unit)) => {
-                        if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
+                        // font-size em and % resolve against the PARENT's font
+                        // size (CSS 2.2 §15.7); rem and absolute units resolve
+                        // via length_to_px against the 16px root default.
+                        let px = match unit.as_str() {
+                            "em" => Some(*value * parent_font_size.px() as f64),
+                            "%" => Some(*value / 100.0 * parent_font_size.px() as f64),
+                            _ => length_to_px(*value, unit, parent_font_size),
+                        };
+                        if let Some(px) = px {
                             self.style.set_font_size(FontSize::from_px(px));
                         }
                     }
