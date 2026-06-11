@@ -1,6 +1,7 @@
 use crate::alloc::string::ToString;
 use crate::renderer::css::token::CssToken;
 use crate::renderer::css::token::CssTokenizer;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -16,6 +17,14 @@ impl CssParser {
         Self { t: t.peekable() }
     }
 
+    /// Skip any whitespace tokens. Whitespace is only meaningful inside
+    /// selectors (descendant combinator); every other context ignores it.
+    fn skip_whitespace(&mut self) {
+        while self.t.peek() == Some(&CssToken::Whitespace) {
+            self.t.next();
+        }
+    }
+
     /// https://www.w3.org/TR/css-syntax-3/#consume-component-value
     fn consume_component_value(&mut self) -> Option<ComponentValue> {
         self.t.next()
@@ -27,6 +36,11 @@ impl CssParser {
         loop {
             match self.t.peek() {
                 Some(CssToken::SemiColon) | Some(CssToken::CloseCurly) | None => return values,
+                // Declaration values are token lists without whitespace; the
+                // value consumers (shorthands, url(), …) index adjacent tokens.
+                Some(CssToken::Whitespace) => {
+                    self.t.next();
+                }
                 _ => match self.consume_component_value() {
                     Some(v) => values.push(v),
                     None => return values,
@@ -59,10 +73,12 @@ impl CssParser {
 
         let mut declaration = Declaration::new();
         declaration.set_property(self.consume_ident());
+        self.skip_whitespace();
         match self.t.next() {
             Some(CssToken::Colon) => {}
             Some(_) | None => return None,
         }
+        self.skip_whitespace();
 
         declaration.set_values(self.consume_component_values());
 
@@ -106,68 +122,193 @@ impl CssParser {
         }
     }
 
-    fn consume_selector(&mut self) -> Selector {
-        let token = match self.t.next() {
-            Some(t) => t,
-            // EOF — return an UnknownSelector so the caller can drop the rule.
-            None => return Selector::UnknownSelector,
-        };
+    /// True when the upcoming token can start a simple selector.
+    fn peek_starts_simple_selector(&mut self) -> bool {
+        matches!(
+            self.t.peek(),
+            Some(CssToken::Ident(_))
+                | Some(CssToken::HashToken(_))
+                | Some(CssToken::Delim('.'))
+                | Some(CssToken::Delim('*'))
+                | Some(CssToken::Colon)
+        )
+    }
 
-        match token {
-            CssToken::HashToken(value) => Selector::IdSelector(value[1..].to_string()),
-            CssToken::Delim(delim) => {
-                if delim == '.' {
-                    return Selector::ClassSelector(self.consume_ident());
+    /// Consume one compound selector: a run of simple selectors with no
+    /// separator between them (`div.card#main:hover`). Returns the matching
+    /// model: a single simple selector, `Compound` for several, `Never` when
+    /// an interaction pseudo-class (`:hover` …) or pseudo-element
+    /// (`::before` …) makes the rule inapplicable to static layout.
+    /// https://www.w3.org/TR/selectors-4/#compound
+    fn consume_compound_selector(&mut self) -> Selector {
+        let mut parts: Vec<Selector> = Vec::new();
+        let mut never = false;
+        let mut saw_universal = false;
+        loop {
+            match self.t.peek() {
+                Some(CssToken::Ident(ident)) => {
+                    let ident = ident.clone();
+                    self.t.next();
+                    parts.push(Selector::TypeSelector(ident));
                 }
-                // Other delim characters (`>`, `+`, `~`, `*`, `!`, etc.):
-                // treat as an unknown selector rather than crashing.
-                Selector::UnknownSelector
-            }
-            CssToken::Ident(ident) => {
-                if self.t.peek() == Some(&CssToken::Colon) {
-                    // Skip a pseudo-class/element tail up to the rule block.
-                    // MUST also stop at EOF: otherwise `peek()` returning `None`
-                    // (which is `!= Some(OpenCurly)`) spins forever on truncated
-                    // or unsupported CSS and hangs the renderer.
-                    while !matches!(self.t.peek(), Some(&CssToken::OpenCurly) | None) {
-                        self.t.next();
+                Some(CssToken::HashToken(value)) => {
+                    let id = value[1..].to_string();
+                    self.t.next();
+                    parts.push(Selector::IdSelector(id));
+                }
+                Some(CssToken::Delim('.')) => {
+                    self.t.next();
+                    let class = self.consume_ident();
+                    if class.is_empty() {
+                        never = true;
+                    } else {
+                        parts.push(Selector::ClassSelector(class));
                     }
                 }
-                Selector::TypeSelector(ident.to_string())
+                Some(CssToken::Delim('*')) => {
+                    self.t.next();
+                    saw_universal = true;
+                }
+                Some(CssToken::Colon) => {
+                    // Pseudo-class or (with a second colon) pseudo-element.
+                    self.t.next();
+                    let pseudo_element = if self.t.peek() == Some(&CssToken::Colon) {
+                        self.t.next();
+                        true
+                    } else {
+                        false
+                    };
+                    let name = self.consume_ident().to_lowercase();
+                    // Functional pseudo (`:not(...)`, `:nth-child(2)`):
+                    // discard the argument list with balanced parens.
+                    if self.t.peek() == Some(&CssToken::OpenParenthesis) {
+                        self.t.next();
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match self.t.next() {
+                                None => break,
+                                Some(CssToken::OpenParenthesis) => depth += 1,
+                                Some(CssToken::CloseParenthesis) => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    // Interaction pseudo-classes never match in static
+                    // rendering; pseudo-elements (generated content like
+                    // ::before/::after) have no box in this engine — applying
+                    // their declarations to the element itself would leak
+                    // decoration styles. Legacy single-colon spellings of
+                    // before/after count as pseudo-elements too.
+                    let interactive = matches!(
+                        name.as_str(),
+                        "hover" | "active" | "focus" | "focus-within" | "focus-visible"
+                    );
+                    let legacy_pseudo_element =
+                        matches!(name.as_str(), "before" | "after" | "selection" | "placeholder");
+                    if interactive || pseudo_element || legacy_pseudo_element {
+                        never = true;
+                    }
+                    // All other pseudo-classes (:link, :visited, :root,
+                    // :first-child, :not(...) …) are approximated as matching.
+                }
+                _ => break,
             }
-            CssToken::AtKeyword(_keyword) => {
-                // Skip an at-rule prelude (e.g. `@media ...`) up to its block.
-                // Stop at EOF as well to avoid an infinite loop — real pages are
-                // full of `@media`/`@font-face`/`@supports` at-rules.
-                while !matches!(self.t.peek(), Some(&CssToken::OpenCurly) | None) {
+        }
+        if never {
+            return Selector::Never;
+        }
+        match parts.len() {
+            0 if saw_universal => Selector::Universal,
+            0 => Selector::UnknownSelector,
+            1 => parts.pop().expect("len checked"),
+            _ => Selector::Compound(parts),
+        }
+    }
+
+    /// Consume one complex selector: compound selectors joined by descendant
+    /// (whitespace) or child (`>`) combinators, e.g. `.admin td`, `ul > li`.
+    /// Sibling combinators (`+`, `~`) are not supported and poison the
+    /// selector to `Never` (matching too much is worse than not matching).
+    /// https://www.w3.org/TR/selectors-4/#complex
+    fn consume_complex_selector(&mut self) -> Selector {
+        let mut left = self.consume_compound_selector();
+        loop {
+            let mut saw_ws = false;
+            while self.t.peek() == Some(&CssToken::Whitespace) {
+                self.t.next();
+                saw_ws = true;
+            }
+            match self.t.peek() {
+                Some(CssToken::Delim('>')) => {
+                    self.t.next();
+                    self.skip_whitespace();
+                    let right = self.consume_compound_selector();
+                    left = Selector::Child(Box::new(left), Box::new(right));
+                }
+                Some(CssToken::Delim('+')) | Some(CssToken::Delim('~')) => {
+                    self.t.next();
+                    self.skip_whitespace();
+                    let _ = self.consume_compound_selector();
+                    left = Selector::Never;
+                }
+                Some(CssToken::Ident(_))
+                | Some(CssToken::HashToken(_))
+                | Some(CssToken::Delim('.'))
+                | Some(CssToken::Delim('*'))
+                | Some(CssToken::Colon)
+                    if saw_ws =>
+                {
+                    let right = self.consume_compound_selector();
+                    left = Selector::Descendant(Box::new(left), Box::new(right));
+                }
+                _ => return left,
+            }
+        }
+    }
+
+    /// Consume a selector list (`h1, h2 { … }`): complex selectors separated
+    /// by commas. https://www.w3.org/TR/selectors-4/#grouping
+    fn consume_selector_list(&mut self) -> Selector {
+        let mut alternatives = Vec::new();
+        loop {
+            self.skip_whitespace();
+            alternatives.push(self.consume_complex_selector());
+            self.skip_whitespace();
+            match self.t.peek() {
+                Some(CssToken::Delim(',')) => {
                     self.t.next();
                 }
-                Selector::UnknownSelector
+                _ => break,
             }
-            _ => {
-                self.t.next();
-                Selector::UnknownSelector
-            }
+        }
+        if alternatives.len() == 1 {
+            alternatives.pop().expect("len checked")
+        } else {
+            Selector::List(alternatives)
         }
     }
 
     fn consume_qualified_rule(&mut self) -> Option<QualifiedRule> {
         let mut rule = QualifiedRule::new();
 
-        loop {
-            let token = match self.t.peek() {
-                Some(t) => t,
-                None => return None,
-            };
+        self.skip_whitespace();
+        self.t.peek()?;
+        rule.set_selector(self.consume_selector_list());
 
-            match token {
-                CssToken::OpenCurly => {
+        // Error recovery: skip anything unparseable (attribute selectors,
+        // stray delimiters) up to the rule block, poisoning the selector so
+        // the partially-understood rule doesn't over-match.
+        loop {
+            match self.t.peek() {
+                None => return None,
+                Some(CssToken::OpenCurly) => {
                     assert_eq!(self.t.next(), Some(CssToken::OpenCurly));
                     rule.set_declarations(self.consume_list_of_declarations());
                     return Some(rule);
                 }
-                _ => {
-                    rule.set_selector(self.consume_selector());
+                Some(_) => {
+                    rule.set_selector(Selector::UnknownSelector);
+                    self.t.next();
                 }
             }
         }
@@ -182,6 +323,12 @@ impl CssParser {
                 None => return rules,
             };
             match token {
+                // Whitespace between rules must be skipped HERE: if it falls
+                // through to consume_qualified_rule, an at-rule behind it is
+                // never seen by the AtKeyword arm and its block leaks.
+                CssToken::Whitespace => {
+                    self.t.next();
+                }
                 CssToken::AtKeyword(_keyword) => {
                     // Skip the whole at-rule. The engine can't evaluate at-rule
                     // preludes (`@media`, `@supports`, `@font-face`, `@import`),
@@ -383,6 +530,22 @@ pub enum Selector {
     ClassSelector(String),
     IdSelector(String),
     UnknownSelector,
+    /// `*` — matches every element.
+    Universal,
+    /// All parts must match the same element (`div.card#main`).
+    Compound(Vec<Selector>),
+    /// Right side matches the element, left side matches SOME ancestor
+    /// (descendant combinator, `.admin td`).
+    Descendant(Box<Selector>, Box<Selector>),
+    /// Right side matches the element, left side matches its parent
+    /// (child combinator, `ul > li`).
+    Child(Box<Selector>, Box<Selector>),
+    /// Selector list (`h1, h2`) — any alternative matching suffices.
+    List(Vec<Selector>),
+    /// Never matches: interaction pseudo-classes (`:hover`), pseudo-elements
+    /// (`::before`), and unsupported combinators are poisoned to this rather
+    /// than over-matching.
+    Never,
 }
 
 #[derive(Debug, Clone, PartialEq)]

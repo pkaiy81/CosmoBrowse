@@ -29,6 +29,10 @@ pub enum CssToken {
     StringToken(String),
     /// https://www.w3.org/TR/css-syntax-3/#typedef-at-keyword-token
     AtKeyword(String),
+    /// https://www.w3.org/TR/css-syntax-3/#typedef-whitespace-token
+    /// A run of whitespace (or a comment). Significant only in selectors,
+    /// where it is the descendant combinator; skipped everywhere else.
+    Whitespace,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,15 +165,23 @@ impl Iterator for CssTokenizer {
                 ';' => CssToken::SemiColon,
                 '{' => CssToken::OpenCurly,
                 '}' => CssToken::CloseCurly,
+                // Whitespace runs collapse into a single <whitespace-token>.
+                // Selector parsing needs it to distinguish the descendant
+                // combinator `.a .b` from the compound selector `.a.b`; all
+                // other consumers skip it. Spec: CSS Syntax §4.3.1.
                 ' ' | '\n' | '\t' | '\r' => {
-                    self.pos += 1;
-                    continue;
+                    while self.pos < self.input.len()
+                        && matches!(self.input[self.pos], ' ' | '\n' | '\t' | '\r')
+                    {
+                        self.pos += 1;
+                    }
+                    return Some(CssToken::Whitespace);
                 }
-                // CSS comment `/* ... */`. Skipping these is essential: a comment
-                // before an at-rule (e.g. `/* mobile */ @media { ... }`) would
-                // otherwise leave the `@media` un-detected, and its block body
-                // would be parsed as top-level rules — leaking mobile overrides
-                // (display:block, width:100%) that collapse desktop layouts.
+                // CSS comment `/* ... */` acts as whitespace. Emitting a token
+                // (not silently skipping) is essential twice over: a comment
+                // before an at-rule (e.g. `/* mobile */ @media { ... }`) must
+                // not hide the `@media` from the parser, and `.a/* */.b` must
+                // still separate selector tokens like whitespace does.
                 '/' if self.input.get(self.pos + 1) == Some(&'*') => {
                     self.pos += 2;
                     while self.pos + 1 < self.input.len()
@@ -179,7 +191,7 @@ impl Iterator for CssTokenizer {
                     }
                     // Skip past the closing `*/` (or to EOF if unterminated).
                     self.pos = (self.pos + 2).min(self.input.len());
-                    continue;
+                    return Some(CssToken::Whitespace);
                 }
                 '"' | '\'' => {
                     let value = self.consume_string_token();
@@ -244,6 +256,15 @@ impl Iterator for CssTokenizer {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+    use alloc::vec::Vec;
+
+    /// Tokens excluding whitespace — these tests verify the semantic stream;
+    /// whitespace tokens only matter to the selector parser.
+    fn semantic_tokens(style: &str) -> Vec<CssToken> {
+        CssTokenizer::new(style.to_string())
+            .filter(|t| *t != CssToken::Whitespace)
+            .collect()
+    }
 
     #[test]
     fn test_empty() {
@@ -254,8 +275,6 @@ mod tests {
 
     #[test]
     fn test_one_rule() {
-        let style = "p { color: red; }".to_string();
-        let mut t = CssTokenizer::new(style);
         let expected = [
             CssToken::Ident("p".to_string()),
             CssToken::OpenCurly,
@@ -265,16 +284,21 @@ mod tests {
             CssToken::SemiColon,
             CssToken::CloseCurly,
         ];
-        for e in expected {
-            assert_eq!(Some(e.clone()), t.next());
-        }
-        assert!(t.next().is_none());
+        assert_eq!(semantic_tokens("p { color: red; }"), expected.to_vec());
+    }
+
+    #[test]
+    fn test_descendant_whitespace_token() {
+        // `.a .b` and `.a.b` must tokenize differently: the descendant
+        // combinator is represented by a Whitespace token.
+        let with_ws: Vec<CssToken> = CssTokenizer::new(".a .b".to_string()).collect();
+        let without_ws: Vec<CssToken> = CssTokenizer::new(".a.b".to_string()).collect();
+        assert!(with_ws.contains(&CssToken::Whitespace));
+        assert!(!without_ws.contains(&CssToken::Whitespace));
     }
 
     #[test]
     fn test_id_selector() {
-        let style = "#id { color: red; }".to_string();
-        let mut t = CssTokenizer::new(style);
         let expected = [
             CssToken::HashToken("#id".to_string()),
             CssToken::OpenCurly,
@@ -284,16 +308,11 @@ mod tests {
             CssToken::SemiColon,
             CssToken::CloseCurly,
         ];
-        for e in expected {
-            assert_eq!(Some(e.clone()), t.next());
-        }
-        assert!(t.next().is_none());
+        assert_eq!(semantic_tokens("#id { color: red; }"), expected.to_vec());
     }
 
     #[test]
     fn test_class_selector() {
-        let style = ".class { color: red; }".to_string();
-        let mut t = CssTokenizer::new(style);
         let expected = [
             CssToken::Delim('.'),
             CssToken::Ident("class".to_string()),
@@ -304,16 +323,11 @@ mod tests {
             CssToken::SemiColon,
             CssToken::CloseCurly,
         ];
-        for e in expected {
-            assert_eq!(Some(e.clone()), t.next());
-        }
-        assert!(t.next().is_none());
+        assert_eq!(semantic_tokens(".class { color: red; }"), expected.to_vec());
     }
 
     #[test]
     fn test_multiple_rules() {
-        let style = "p { content: \"Hey\"; } h1 { font-size: 40; color: blue; }".to_string();
-        let mut t = CssTokenizer::new(style);
         let expected = [
             CssToken::Ident("p".to_string()),
             CssToken::OpenCurly,
@@ -334,16 +348,14 @@ mod tests {
             CssToken::SemiColon,
             CssToken::CloseCurly,
         ];
-        for e in expected {
-            assert_eq!(Some(e.clone()), t.next());
-        }
-        assert!(t.next().is_none());
+        assert_eq!(
+            semantic_tokens("p { content: \"Hey\"; } h1 { font-size: 40; color: blue; }"),
+            expected.to_vec()
+        );
     }
 
     #[test]
     fn test_dimension_tokens() {
-        let style = "body { width: 60vw; font-size: 1.5em; }".to_string();
-        let mut t = CssTokenizer::new(style);
         let expected = [
             CssToken::Ident("body".to_string()),
             CssToken::OpenCurly,
@@ -357,9 +369,9 @@ mod tests {
             CssToken::SemiColon,
             CssToken::CloseCurly,
         ];
-        for e in expected {
-            assert_eq!(Some(e.clone()), t.next());
-        }
-        assert!(t.next().is_none());
+        assert_eq!(
+            semantic_tokens("body { width: 60vw; font-size: 1.5em; }"),
+            expected.to_vec()
+        );
     }
 }

@@ -1756,6 +1756,50 @@ mod tests {
     }
 
     #[test]
+    fn test_selector_descendant_compound_list_pseudo() {
+        let html = concat!(
+            "<html><head><style>",
+            // Descendant: applies only to td under .admin.
+            ".admin td{color:#ff0000;}",
+            // Selector list: both h1 and h2.
+            "h1, h2{color:#00ff00;}",
+            // Compound: only div with BOTH classes.
+            "div.a.b{color:#0000ff;}",
+            // Child combinator.
+            "ul > li{color:#aa00aa;}",
+            // Interaction pseudo must never match statically.
+            "p:hover{color:#123456;}",
+            "</style></head><body>",
+            "<table class=\"admin\"><tr><td>in-admin</td></tr></table>",
+            "<table><tr><td>plain</td></tr></table>",
+            "<h1>H1</h1><h2>H2</h2>",
+            "<div class=\"a\">only-a</div>",
+            "<div class=\"a b extra\">a-and-b</div>",
+            "<ul><li>item</li></ul>",
+            "<p>para</p>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        // Map text -> color code.
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("in-admin"), 0xff0000, ".admin td matches");
+        assert_ne!(color_of("plain"), 0xff0000, ".admin td must not hit other tables");
+        assert_eq!(color_of("H1"), 0x00ff00, "selector list h1");
+        assert_eq!(color_of("H2"), 0x00ff00, "selector list h2");
+        assert_ne!(color_of("only-a"), 0x0000ff, "div.a.b must not match single class");
+        assert_eq!(color_of("a-and-b"), 0x0000ff, "compound matches multi-class attr");
+        assert_eq!(color_of("item"), 0xaa00aa, "child combinator");
+        assert_ne!(color_of("para"), 0x123456, ":hover never matches statically");
+    }
+
+    #[test]
     fn test_display_grid_three_columns_row_major() {
         let html = concat!(
             "<html><head><style>",

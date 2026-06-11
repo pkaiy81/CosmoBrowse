@@ -2215,6 +2215,15 @@ impl LayoutObject {
                             current_line_width = 0;
                             content_height += current_line_height + c_h;
                             current_line_height = 0;
+                            // The block child forms its own line: its outer
+                            // width (incl. margins) is part of this inline's
+                            // width. Without it, an <a> whose only child is a
+                            // sized block (HN's votearrow div) measures 0 wide
+                            // and centering math pushes the child out of the
+                            // cell.
+                            let c_metrics = compute_box_model_metrics(&c.borrow().style());
+                            max_line_width = max_line_width
+                                .max(c_w + c_metrics.margin.left + c_metrics.margin.right);
                         } else {
                             current_line_width += c_w;
                             current_line_height = current_line_height.max(c_h);
@@ -2463,18 +2472,60 @@ impl LayoutObject {
     }
 
     pub fn is_node_selected(&self, selector: &Selector) -> bool {
+        // Combinators and grouping first: they recurse into simple matching.
+        match selector {
+            Selector::List(alternatives) => {
+                return alternatives.iter().any(|s| self.is_node_selected(s));
+            }
+            Selector::Compound(parts) => {
+                return parts.iter().all(|s| self.is_node_selected(s));
+            }
+            Selector::Child(ancestor, this) => {
+                return self.is_node_selected(this)
+                    && self
+                        .parent
+                        .upgrade()
+                        .map(|p| p.borrow().is_node_selected(ancestor))
+                        .unwrap_or(false);
+            }
+            Selector::Descendant(ancestor, this) => {
+                if !self.is_node_selected(this) {
+                    return false;
+                }
+                let mut current = self.parent.upgrade();
+                while let Some(p) = current {
+                    if p.borrow().is_node_selected(ancestor) {
+                        return true;
+                    }
+                    let next = p.borrow().parent.upgrade();
+                    current = next;
+                }
+                return false;
+            }
+            Selector::Never => return false,
+            _ => {}
+        }
         match &self.node_kind() {
             NodeKind::Element(e) => match selector {
                 Selector::TypeSelector(type_name) => e.kind().to_string() == *type_name,
+                // An element may carry several space-separated class names;
+                // the selector matches any one of them.
+                // https://html.spec.whatwg.org/multipage/dom.html#classes
                 Selector::ClassSelector(class_name) => e
                     .attributes()
                     .iter()
-                    .any(|attr| attr.name() == "class" && attr.value() == *class_name),
+                    .any(|attr| {
+                        attr.name() == "class"
+                            && attr.value().split_ascii_whitespace().any(|c| c == class_name)
+                    }),
                 Selector::IdSelector(id_name) => e
                     .attributes()
                     .iter()
                     .any(|attr| attr.name() == "id" && attr.value() == *id_name),
+                Selector::Universal => true,
                 Selector::UnknownSelector => false,
+                // Handled above; unreachable here.
+                _ => false,
             },
             _ => false,
         }
