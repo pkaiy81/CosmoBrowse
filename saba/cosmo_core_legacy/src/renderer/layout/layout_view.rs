@@ -1756,6 +1756,46 @@ mod tests {
     }
 
     #[test]
+    fn test_selector_specificity_orders_cascade() {
+        let html = concat!(
+            "<html><head><style>",
+            // Class rule FIRST, type rule second: class must still win.
+            ".special{color:#ff0000;}",
+            "p{color:#0000ff;}",
+            // Id beats class regardless of order.
+            "#main{color:#00ff00;}",
+            ".idtest{color:#999999;}",
+            // Equal specificity: later rule wins.
+            ".eq{color:#111111;}",
+            ".eq{color:#222222;}",
+            // Descendant (0,0,2) beats bare type (0,0,1) even written first.
+            "div em{color:#cc00cc;}",
+            "em{color:#333333;}",
+            "</style></head><body>",
+            "<p class=\"special\">classy</p>",
+            "<p>plainp</p>",
+            "<p id=\"main\" class=\"idtest\">idwins</p>",
+            "<p class=\"eq\">latest</p>",
+            "<div><em>nested-em</em></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("classy"), 0xff0000, "class (0,1,0) beats later type (0,0,1)");
+        assert_eq!(color_of("plainp"), 0x0000ff, "type rule still applies to plain p");
+        assert_eq!(color_of("idwins"), 0x00ff00, "id (1,0,0) beats class");
+        assert_eq!(color_of("latest"), 0x222222, "equal specificity: later wins");
+        assert_eq!(color_of("nested-em"), 0xcc00cc, "div em (0,0,2) beats em (0,0,1)");
+    }
+
+    #[test]
     fn test_selector_descendant_compound_list_pseudo() {
         let html = concat!(
             "<html><head><style>",

@@ -13,6 +13,7 @@ use crate::display_item::DisplayItem;
 use crate::display_item::PaintOrder;
 use crate::renderer::css::cssom::ComponentValue;
 use crate::renderer::css::cssom::Declaration;
+use crate::renderer::css::cssom::QualifiedRule;
 use crate::renderer::css::cssom::Selector;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::dom::node::ElementKind;
@@ -431,12 +432,21 @@ pub fn create_layout_object(
             .map(|p| p.borrow().style().font_size())
             .unwrap_or(FontSize::Medium);
 
-        for rule in &cssom.rules {
-            if layout_object.borrow().is_node_selected(&rule.selector) {
-                layout_object
-                    .borrow_mut()
-                    .cascading_style(rule.declarations.clone(), parent_font_size);
-            }
+        // Cascade order: matching rules sorted by specificity (ascending) so a
+        // more specific selector wins even when it appears earlier in the
+        // document; the stable sort keeps document order for equal
+        // specificity (later rule wins). Spec: CSS Cascade §6.
+        // https://www.w3.org/TR/css-cascade-4/#cascade-specificity
+        let mut matched: Vec<&QualifiedRule> = cssom
+            .rules
+            .iter()
+            .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
+            .collect();
+        matched.sort_by_key(|rule| rule.selector.specificity());
+        for rule in matched {
+            layout_object
+                .borrow_mut()
+                .cascading_style(rule.declarations.clone(), parent_font_size);
         }
 
         // Inline `style="..."` attribute: applied after stylesheet rules so it

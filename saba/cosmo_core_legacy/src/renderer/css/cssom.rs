@@ -380,7 +380,25 @@ impl CssParser {
 
     pub fn parse_stylesheet(&mut self) -> StyleSheet {
         let mut sheet = StyleSheet::new();
-        sheet.set_rules(self.consume_list_of_rules());
+        // Flatten selector lists into one rule per alternative: specificity is
+        // a property of the individual complex selector, not the list, so
+        // `h1, .x { }` must cascade as a (0,0,1) rule AND a (0,1,0) rule.
+        // Document order within the list is preserved.
+        let mut rules = Vec::new();
+        for rule in self.consume_list_of_rules() {
+            match rule.selector {
+                Selector::List(alternatives) => {
+                    for alt in alternatives {
+                        let mut r = QualifiedRule::new();
+                        r.set_selector(alt);
+                        r.set_declarations(rule.declarations.clone());
+                        rules.push(r);
+                    }
+                }
+                _ => rules.push(rule),
+            }
+        }
+        sheet.set_rules(rules);
         sheet
     }
 }
@@ -546,6 +564,42 @@ pub enum Selector {
     /// (`::before`), and unsupported combinators are poisoned to this rather
     /// than over-matching.
     Never,
+}
+
+impl Selector {
+    /// Cascade specificity packed as a single sortable integer:
+    /// id count (high byte-pair), then class count, then type count, each
+    /// saturated at 255. Combinators sum both sides; `List` is flattened away
+    /// at parse time so its value here (max of alternatives) is only a
+    /// fallback. Spec: Selectors L4 §17.
+    /// https://www.w3.org/TR/selectors-4/#specificity
+    pub fn specificity(&self) -> u32 {
+        let (a, b, c) = self.specificity_abc();
+        (a.min(255) << 16) | (b.min(255) << 8) | c.min(255)
+    }
+
+    fn specificity_abc(&self) -> (u32, u32, u32) {
+        match self {
+            Selector::IdSelector(_) => (1, 0, 0),
+            Selector::ClassSelector(_) => (0, 1, 0),
+            Selector::TypeSelector(_) => (0, 0, 1),
+            Selector::Universal | Selector::UnknownSelector | Selector::Never => (0, 0, 0),
+            Selector::Compound(parts) => parts.iter().fold((0, 0, 0), |acc, p| {
+                let (a, b, c) = p.specificity_abc();
+                (acc.0 + a, acc.1 + b, acc.2 + c)
+            }),
+            Selector::Descendant(left, right) | Selector::Child(left, right) => {
+                let (la, lb, lc) = left.specificity_abc();
+                let (ra, rb, rc) = right.specificity_abc();
+                (la + ra, lb + rb, lc + rc)
+            }
+            Selector::List(alternatives) => alternatives
+                .iter()
+                .map(|s| s.specificity_abc())
+                .max()
+                .unwrap_or((0, 0, 0)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
