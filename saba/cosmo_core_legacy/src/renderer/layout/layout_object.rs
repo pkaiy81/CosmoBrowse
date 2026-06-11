@@ -275,13 +275,58 @@ fn assemble_bg_position(
     }
 }
 
-/// Scan a `background` shorthand for position components and `no-repeat`,
-/// skipping parenthesized groups (url/gradient arguments) and anything after
-/// a `/` (which starts background-size).
+/// One background-size component: (value, is_percent) — a negative value
+/// means `auto` for that axis. https://www.w3.org/TR/css-backgrounds-3/#the-background-size
+fn bg_size_component(v: &ComponentValue) -> Option<(f64, bool)> {
+    match v {
+        ComponentValue::Dimension(value, unit) if unit == "%" => Some((*value, true)),
+        ComponentValue::Dimension(value, unit) => {
+            length_to_px(*value, unit, FontSize::Medium).map(|px| (px, false))
+        }
+        ComponentValue::Number(value) => Some((*value, false)),
+        ComponentValue::Ident(name) if name.eq_ignore_ascii_case("auto") => Some((-1.0, false)),
+        _ => None,
+    }
+}
+
+/// Assemble up to two size components into the packed background-size tuple
+/// (mode 0 = explicit; a single component leaves the height `auto`).
+fn assemble_bg_size(comps: &[(f64, bool)]) -> Option<(u8, f64, bool, f64, bool)> {
+    match comps {
+        [] => None,
+        [(w, wp)] => Some((0, *w, *wp, -1.0, false)),
+        [(w, wp), (h, hp), ..] => Some((0, *w, *wp, *h, *hp)),
+    }
+}
+
+/// Parse a `background-size` value list: `cover`, `contain`, or 1–2
+/// length/percent/auto components.
+fn parse_background_size(values: &[ComponentValue]) -> Option<(u8, f64, bool, f64, bool)> {
+    if let Some(ComponentValue::Ident(name)) = values.first() {
+        if name.eq_ignore_ascii_case("cover") {
+            return Some((1, 0.0, false, 0.0, false));
+        }
+        if name.eq_ignore_ascii_case("contain") {
+            return Some((2, 0.0, false, 0.0, false));
+        }
+    }
+    let comps: Vec<(f64, bool)> = values.iter().filter_map(bg_size_component).take(2).collect();
+    assemble_bg_size(&comps)
+}
+
+/// Scan a `background` shorthand for position components, a `/ size` segment,
+/// and `no-repeat`, skipping parenthesized groups (url/gradient arguments).
+#[allow(clippy::type_complexity)]
 fn scan_background_shorthand(
     values: &[ComponentValue],
-) -> (Option<(f64, bool, f64, bool)>, bool) {
+) -> (
+    Option<(f64, bool, f64, bool)>,
+    bool,
+    Option<(u8, f64, bool, f64, bool)>,
+) {
     let mut comps: Vec<(f64, bool, Option<bool>)> = Vec::new();
+    let mut size_comps: Vec<(f64, bool)> = Vec::new();
+    let mut size_keyword: Option<(u8, f64, bool, f64, bool)> = None;
     let mut no_repeat = false;
     let mut after_slash = false;
     let mut i = 0;
@@ -305,8 +350,24 @@ fn scan_background_shorthand(
             ComponentValue::Ident(s) if s.eq_ignore_ascii_case("no-repeat") => {
                 no_repeat = true;
             }
+            ComponentValue::Ident(s)
+                if after_slash
+                    && (s.eq_ignore_ascii_case("cover") || s.eq_ignore_ascii_case("contain")) =>
+            {
+                size_keyword = Some(if s.eq_ignore_ascii_case("cover") {
+                    (1, 0.0, false, 0.0, false)
+                } else {
+                    (2, 0.0, false, 0.0, false)
+                });
+            }
             v => {
-                if !after_slash && comps.len() < 2 {
+                if after_slash {
+                    if size_comps.len() < 2 {
+                        if let Some(c) = bg_size_component(v) {
+                            size_comps.push(c);
+                        }
+                    }
+                } else if comps.len() < 2 {
                     if let Some(c) = bg_position_component(v) {
                         comps.push(c);
                     }
@@ -315,7 +376,8 @@ fn scan_background_shorthand(
         }
         i += 1;
     }
-    (assemble_bg_position(&comps), no_repeat)
+    let size = size_keyword.or_else(|| assemble_bg_size(&size_comps));
+    (assemble_bg_position(&comps), no_repeat, size)
 }
 
 /// Extract the first `url(...)` from a declaration's component values.
@@ -634,6 +696,63 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
             return false;
         }
         Selector::Never => return false,
+        Selector::PseudoClass(kind) => {
+            if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+                return false;
+            }
+            use crate::renderer::css::cssom::PseudoClassKind;
+            // `:root` is the <html> element (it has no element parent).
+            if matches!(kind, PseudoClassKind::Root) {
+                let parent_is_element = node
+                    .borrow()
+                    .parent()
+                    .upgrade()
+                    .map(|p| matches!(p.borrow().kind(), NodeKind::Element(_)))
+                    .unwrap_or(false);
+                return !parent_is_element;
+            }
+            // 1-based index of this element among its parent's ELEMENT
+            // children, and the total count.
+            let parent = match node.borrow().parent().upgrade() {
+                Some(p) => p,
+                None => return false,
+            };
+            let mut index = 0usize;
+            let mut total = 0usize;
+            let mut child = parent.borrow().first_child();
+            while let Some(c) = child {
+                if matches!(c.borrow().kind(), NodeKind::Element(_)) {
+                    total += 1;
+                    if Rc::ptr_eq(&c, node) {
+                        index = total;
+                    }
+                }
+                let next = c.borrow().next_sibling();
+                child = next;
+            }
+            if index == 0 {
+                return false;
+            }
+            // i matches An+B when i = A*n + B for some integer n ≥ 0.
+            let nth_matches = |a: i64, b: i64, i: i64| -> bool {
+                if a == 0 {
+                    i == b
+                } else {
+                    let d = i - b;
+                    d % a == 0 && d / a >= 0
+                }
+            };
+            return match kind {
+                PseudoClassKind::Root => unreachable!("handled above"),
+                PseudoClassKind::FirstChild => index == 1,
+                PseudoClassKind::LastChild => index == total,
+                PseudoClassKind::OnlyChild => total == 1,
+                PseudoClassKind::NthChild(a, b) => nth_matches(*a, *b, index as i64),
+                PseudoClassKind::NthLastChild(a, b) => {
+                    nth_matches(*a, *b, (total - index + 1) as i64)
+                }
+            };
+        }
         _ => {}
     }
     match node.borrow().kind() {
@@ -718,6 +837,66 @@ pub fn create_layout_object(
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+
+        // Custom-property cascade: inherit the parent's scope; the tree root
+        // seeds from the whole stylesheet (this also covers `:root`, which has
+        // no layout object — the layout tree is rooted at <body>). Element-
+        // level `--name` definitions from matched rules and the inline style
+        // copy-on-write into a fresh map, resolving nested var() against the
+        // scope built so far. Must be in place BEFORE normal declarations are
+        // applied, since their var() references substitute from this scope.
+        // https://www.w3.org/TR/css-variables-1/
+        {
+            use crate::renderer::css::cssom::substitute_vars;
+            let inherited = parent_obj
+                .as_ref()
+                .and_then(|p| p.borrow().style().custom_properties().cloned())
+                .unwrap_or_else(|| {
+                    // Layout-tree root (<body>): its DOM ancestors (<html>,
+                    // matched by `:root`) have no layout objects, so evaluate
+                    // their matching rules here to seed the scope.
+                    let mut map = alloc::collections::BTreeMap::new();
+                    let mut chain: Vec<Rc<RefCell<Node>>> = Vec::new();
+                    let mut current = n.borrow().parent().upgrade();
+                    while let Some(p) = current {
+                        if matches!(p.borrow().kind(), NodeKind::Element(_)) {
+                            chain.push(p.clone());
+                        }
+                        let next = p.borrow().parent().upgrade();
+                        current = next;
+                    }
+                    for ancestor in chain.iter().rev() {
+                        for rule in &cssom.rules {
+                            if dom_node_selected(ancestor, &rule.selector) {
+                                for d in rule
+                                    .declarations
+                                    .iter()
+                                    .filter(|d| d.property.starts_with("--"))
+                                {
+                                    let value = substitute_vars(&d.value, &map);
+                                    map.insert(d.property.clone(), value);
+                                }
+                            }
+                        }
+                    }
+                    Rc::new(map)
+                });
+            let mut own: Option<alloc::collections::BTreeMap<String, Vec<ComponentValue>>> =
+                None;
+            for declarations in matched
+                .iter()
+                .map(|rule| &rule.declarations)
+                .chain(core::iter::once(&inline_declarations))
+            {
+                for d in declarations.iter().filter(|d| d.property.starts_with("--")) {
+                    let map = own.get_or_insert_with(|| (*inherited).clone());
+                    let value = substitute_vars(&d.value, map);
+                    map.insert(d.property.clone(), value);
+                }
+            }
+            let scope = own.map(Rc::new).unwrap_or(inherited);
+            layout_object.borrow_mut().style.set_custom_properties(scope);
+        }
 
         // Importance tiers (weakest first; the last write wins in this
         // engine's cascade): normal stylesheet declarations, normal inline
@@ -2547,14 +2726,21 @@ impl LayoutObject {
                     max_line_width = max_line_width.max(current_line_width);
                     content_height += current_line_height;
 
-                    // Explicit CSS width/height take precedence (inline-block
-                    // approximation: e.g. a 16×16 sprite icon span has no
-                    // children, so the content-derived size would be 0×0 and
-                    // nothing would paint).
+
+                    // Explicit CSS width/height take precedence (e.g. a 16×16
+                    // sprite icon span has no children, so the content-derived
+                    // size would be 0×0 and nothing would paint).
                     let explicit_w = self.resolved_width(parent_size);
                     let explicit_h = self.resolved_height(parent_size);
                     let content_w = if explicit_w > 0 {
                         explicit_w
+                    } else if self.style.display() == DisplayType::InlineBlock {
+                        // inline-block shrink-wraps: preferred (max-content)
+                        // width capped by the containing block.
+                        // https://www.w3.org/TR/CSS22/visudet.html#shrink-to-fit-float
+                        self.max_content_width()
+                            .max(max_line_width)
+                            .min(parent_size.width().max(0))
                     } else {
                         max_line_width
                     };
@@ -2816,7 +3002,22 @@ impl LayoutObject {
     }
 
     pub fn cascading_style(&mut self, declarations: Vec<Declaration>, parent_font_size: FontSize) {
-        for declaration in declarations {
+        use crate::renderer::css::cssom::{substitute_vars, value_has_var};
+        let custom_scope = self.style.custom_properties().cloned();
+        for mut declaration in declarations {
+            // Custom-property definitions are collected into the element's
+            // scope before the cascade (create_layout_object); they are not
+            // style properties themselves.
+            if declaration.property.starts_with("--") {
+                continue;
+            }
+            // var() references resolve against this element's custom-property
+            // scope at computed-value time. CSS Variables §3.
+            if value_has_var(&declaration.value) {
+                if let Some(scope) = &custom_scope {
+                    declaration.value = substitute_vars(&declaration.value, scope);
+                }
+            }
             let first_value = declaration.first_value();
             match declaration.property.as_str() {
                 "background-color" | "background" => {
@@ -2838,12 +3039,16 @@ impl LayoutObject {
                         if let Some(url) = extract_css_url(&declaration.value) {
                             self.style.set_background_image(url);
                         }
-                        let (pos, no_repeat) = scan_background_shorthand(&declaration.value);
+                        let (pos, no_repeat, size) =
+                            scan_background_shorthand(&declaration.value);
                         if let Some((x, xp, y, yp)) = pos {
                             self.style.set_background_position(x, xp, y, yp);
                         }
                         if no_repeat {
                             self.style.set_background_no_repeat(true);
+                        }
+                        if let Some(size) = size {
+                            self.style.set_background_size(size);
                         }
                     }
                 }
@@ -2867,6 +3072,11 @@ impl LayoutObject {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         self.style
                             .set_background_no_repeat(value.eq_ignore_ascii_case("no-repeat"));
+                    }
+                }
+                "background-size" => {
+                    if let Some(size) = parse_background_size(&declaration.value) {
+                        self.style.set_background_size(size);
                     }
                 }
                 "color" => match first_value {
@@ -3109,7 +3319,11 @@ impl LayoutObject {
                 DisplayType::Block | DisplayType::Flex | DisplayType::Grid => {
                     self.kind = LayoutObjectKind::Block
                 }
-                DisplayType::Inline => self.kind = LayoutObjectKind::Inline,
+                // inline-block flows inline; its block-ish sizing is handled
+                // in the Inline compute_size arm.
+                DisplayType::Inline | DisplayType::InlineBlock => {
+                    self.kind = LayoutObjectKind::Inline
+                }
                 DisplayType::DisplayNone => {
                     panic!("should not create a layout object for a node with display:none")
                 }

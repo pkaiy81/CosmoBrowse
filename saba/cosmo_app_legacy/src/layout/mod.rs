@@ -4,7 +4,7 @@ use crate::model::{
 };
 use crate::security::{local_storage_snapshot, replace_local_storage};
 use cosmo_core::js_runtime::JsDomRuntimeBridge;
-use cosmo_core::nebula_renderer::css::cssom::{resolve_css_variables, CssParser};
+use cosmo_core::nebula_renderer::css::cssom::CssParser;
 use cosmo_core::nebula_renderer::css::token::CssTokenizer;
 use crate::loader::fetch_external_stylesheets;
 use cosmo_core::nebula_renderer::dom::api::{
@@ -152,9 +152,9 @@ pub fn build_layout_scene_with_script_runtime(
         format!("{external_css}\n{inline_css}")
     };
     let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
-    // Resolve `var(--token)` references against `:root`/document custom
-    // properties before the cascade so design-token colors/spacing apply.
-    let cssom = resolve_css_variables(cssom);
+    // var(--token) references are resolved per element during the cascade
+    // (custom properties inherit; the document root seeds from the whole
+    // stylesheet), so no global pre-substitution is needed here.
     let layout_view = LayoutView::new(dom, &cssom, rect.width.max(1));
 
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
@@ -219,6 +219,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     border_color,
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
+                    background_size: style.background_size(),
                 });
             }
             DisplayItem::Text {
@@ -371,6 +372,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
             display: match style.display() {
                 DisplayType::Block => "block",
                 DisplayType::Inline => "inline",
+                DisplayType::InlineBlock => "inline-block",
                 DisplayType::Flex => "flex",
                 DisplayType::Grid => "grid",
                 DisplayType::DisplayNone => "none",
@@ -440,6 +442,7 @@ mod diff_tests {
             border_color: String::new(),
             background_position: None,
             background_no_repeat: false,
+            background_size: None,
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -456,6 +459,7 @@ mod diff_tests {
             border_color: String::new(),
             background_position: None,
             background_no_repeat: false,
+            background_size: None,
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

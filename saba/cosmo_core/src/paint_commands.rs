@@ -79,6 +79,10 @@ pub struct DrawRect {
     /// `background-repeat: no-repeat` (false = repeat, the CSS default).
     #[serde(default, skip_serializing_if = "is_false")]
     pub background_no_repeat: bool,
+    /// CSS background-size as (mode, w, w_is_percent, h, h_is_percent):
+    /// mode 0 = explicit (negative dimension = auto), 1 = cover, 2 = contain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_size: Option<(u8, f64, bool, f64, bool)>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {

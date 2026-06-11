@@ -1394,6 +1394,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 border_color: rect.border_color.clone(),
                 background_position: rect.background_position,
                 background_no_repeat: rect.background_no_repeat,
+                background_size: rect.background_size,
             }),
             PaintCommand::DrawText(text) => items.push(SceneItem::Text {
                 x: text.x,

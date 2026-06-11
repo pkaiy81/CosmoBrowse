@@ -1756,6 +1756,71 @@ mod tests {
     }
 
     #[test]
+    fn test_css_variable_element_scope_inheritance() {
+        // --accent defined at :root, overridden inside .theme; var() must
+        // resolve against the nearest scope, inheriting into descendants.
+        let html = concat!(
+            "<html><head><style>",
+            ":root{--accent:#ff0000;}",
+            ".theme{--accent:#0000ff;}",
+            "p{color:var(--accent);}",
+            "span{color:var(--missing, #00ff00);}",
+            "</style></head><body>",
+            "<p>root-scope</p>",
+            "<div class=\"theme\"><p>themed</p><div><p>themed-nested</p></div></div>",
+            "<span>fallback</span>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("root-scope"), 0xff0000, ":root value outside .theme");
+        assert_eq!(color_of("themed"), 0x0000ff, ".theme override");
+        assert_eq!(color_of("themed-nested"), 0x0000ff, "override inherits to descendants");
+        assert_eq!(color_of("fallback"), 0x00ff00, "var() fallback for missing token");
+    }
+
+    #[test]
+    fn test_structural_pseudo_classes() {
+        let html = concat!(
+            "<html><head><style>",
+            "li:first-child{color:#ff0000;}",
+            "li:last-child{color:#00ff00;}",
+            "li:nth-child(even){color:#0000ff;}",
+            "p:nth-child(2n+1){color:#aa00aa;}",
+            "</style></head><body>",
+            "<ul>",
+            "<li>one</li><li>two</li><li>three</li><li>four</li><li>five</li>",
+            "</ul>",
+            "<div><p>p1</p><p>p2</p><p>p3</p></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("one"), 0xff0000, ":first-child");
+        assert_eq!(color_of("two"), 0x0000ff, ":nth-child(even) on 2nd");
+        assert_ne!(color_of("three"), 0x0000ff, "3rd is odd");
+        assert_eq!(color_of("four"), 0x0000ff, ":nth-child(even) on 4th");
+        assert_eq!(color_of("five"), 0x00ff00, ":last-child wins (specificity tie, later)");
+        assert_eq!(color_of("p1"), 0xaa00aa, "2n+1 matches 1st");
+        assert_ne!(color_of("p2"), 0xaa00aa, "2n+1 skips 2nd");
+        assert_eq!(color_of("p3"), 0xaa00aa, "2n+1 matches 3rd");
+    }
+
+    #[test]
     fn test_attribute_selectors_and_sibling_combinators() {
         let html = concat!(
             "<html><head><style>",

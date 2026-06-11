@@ -187,17 +187,26 @@ impl CssParser {
                         false
                     };
                     let name = self.consume_ident().to_lowercase();
-                    // Functional pseudo (`:not(...)`, `:nth-child(2)`):
-                    // discard the argument list with balanced parens.
+                    // Functional pseudo (`:not(...)`, `:nth-child(2n+1)`):
+                    // capture the argument tokens (balanced parens).
+                    let mut args: Vec<CssToken> = Vec::new();
                     if self.t.peek() == Some(&CssToken::OpenParenthesis) {
                         self.t.next();
                         let mut depth = 1;
                         while depth > 0 {
                             match self.t.next() {
                                 None => break,
-                                Some(CssToken::OpenParenthesis) => depth += 1,
-                                Some(CssToken::CloseParenthesis) => depth -= 1,
-                                _ => {}
+                                Some(CssToken::OpenParenthesis) => {
+                                    depth += 1;
+                                    args.push(CssToken::OpenParenthesis);
+                                }
+                                Some(CssToken::CloseParenthesis) => {
+                                    depth -= 1;
+                                    if depth > 0 {
+                                        args.push(CssToken::CloseParenthesis);
+                                    }
+                                }
+                                Some(t) => args.push(t),
                             }
                         }
                     }
@@ -215,9 +224,39 @@ impl CssParser {
                         matches!(name.as_str(), "before" | "after" | "selection" | "placeholder");
                     if interactive || pseudo_element || legacy_pseudo_element {
                         never = true;
+                    } else {
+                        match name.as_str() {
+                            "root" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Root))
+                            }
+                            "first-child" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::FirstChild))
+                            }
+                            "last-child" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::LastChild))
+                            }
+                            "only-child" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::OnlyChild))
+                            }
+                            "nth-child" | "nth-last-child" => match parse_nth_formula(&args) {
+                                Some((a, b)) => {
+                                    let kind = if name == "nth-child" {
+                                        PseudoClassKind::NthChild(a, b)
+                                    } else {
+                                        PseudoClassKind::NthLastChild(a, b)
+                                    };
+                                    parts.push(Selector::PseudoClass(kind));
+                                }
+                                // Unparsable formula: never match rather than
+                                // over-match.
+                                None => never = true,
+                            },
+                            // All other pseudo-classes (:link, :visited,
+                            // :root, :not(...) …) are approximated as
+                            // matching.
+                            _ => {}
+                        }
                     }
-                    // All other pseudo-classes (:link, :visited, :root,
-                    // :first-child, :not(...) …) are approximated as matching.
                 }
                 _ => break,
             }
@@ -486,6 +525,70 @@ impl CssParser {
     }
 }
 
+/// Parse an `An+B` micro-syntax formula from pseudo-class argument tokens.
+/// Returns (A, B). Handles `odd`/`even`, bare integers, and the `An±B`
+/// forms in their various tokenizations (`2n+1` → Dimension(2,"n") '+' 1;
+/// `2n-1` → Dimension(2,"n-1"); `n`/`-n` → Ident; `-n-3` → Ident("-n-3")).
+/// https://www.w3.org/TR/css-syntax-3/#anb-microsyntax
+fn parse_nth_formula(tokens: &[CssToken]) -> Option<(i64, i64)> {
+    let toks: Vec<&CssToken> = tokens
+        .iter()
+        .filter(|t| **t != CssToken::Whitespace)
+        .collect();
+    // Split an ident/unit like "n", "n-3", "-n-3" into (a, optional b).
+    fn n_part(s: &str, sign: i64) -> Option<(i64, Option<i64>)> {
+        let s = s.to_lowercase();
+        let (sign, rest) = if let Some(stripped) = s.strip_prefix('-') {
+            (-sign, stripped)
+        } else {
+            (sign, s.as_str())
+        };
+        let rest = rest.strip_prefix('n')?;
+        if rest.is_empty() {
+            return Some((sign, None));
+        }
+        // Trailing "-3": a negative B fused into the same token.
+        let b: i64 = rest.parse().ok()?;
+        Some((sign, Some(b)))
+    }
+    let (a, fused_b, mut i) = match toks.first() {
+        Some(CssToken::Ident(s)) if s.eq_ignore_ascii_case("odd") => return Some((2, 1)),
+        Some(CssToken::Ident(s)) if s.eq_ignore_ascii_case("even") => return Some((2, 0)),
+        Some(CssToken::Number(v)) => return Some((0, *v as i64)),
+        Some(CssToken::Dimension(v, unit)) => {
+            let (sign, b) = n_part(unit, 1)?;
+            ((*v as i64) * sign, b, 1)
+        }
+        Some(CssToken::Ident(s)) => {
+            let (a, b) = n_part(s, 1)?;
+            (a, b, 1)
+        }
+        _ => return None,
+    };
+    if let Some(b) = fused_b {
+        return Some((a, b));
+    }
+    // Optional `± B` tail.
+    let mut b = 0i64;
+    if i < toks.len() {
+        let sign = match toks.get(i) {
+            Some(CssToken::Delim('+')) => 1,
+            Some(CssToken::Delim('-')) => -1,
+            // Negative numbers tokenize with the sign attached.
+            Some(CssToken::Number(v)) => {
+                return Some((a, *v as i64));
+            }
+            _ => return None,
+        };
+        i += 1;
+        match toks.get(i) {
+            Some(CssToken::Number(v)) => b = sign * (*v as i64),
+            _ => return None,
+        }
+    }
+    Some((a, b))
+}
+
 /// Resolve CSS custom properties: collect every `--name: value` declaration
 /// into a document-level map, then substitute `var(--name[, fallback])` in all
 /// other declaration values. Modern sites place design tokens on `:root` and
@@ -495,7 +598,27 @@ impl CssParser {
 /// custom properties), which covers the common `:root` design-token pattern.
 /// Spec: https://www.w3.org/TR/css-variables-1/
 pub fn resolve_css_variables(mut sheet: StyleSheet) -> StyleSheet {
-    // 1. Collect raw custom properties (last definition wins).
+    let vars = collect_custom_properties(&sheet);
+    if vars.is_empty() {
+        return sheet;
+    }
+    // Substitute var() in every non-custom declaration value.
+    for rule in &mut sheet.rules {
+        for decl in &mut rule.declarations {
+            if !decl.property.starts_with("--") && value_has_var(&decl.value) {
+                decl.value = substitute_vars(&decl.value, &vars);
+            }
+        }
+    }
+    sheet
+}
+
+/// Collect every `--name: value` declaration in the stylesheet into one map
+/// (document order, last definition wins), with nested `var()` references
+/// inside custom-property values resolved to a fixpoint. This seeds the
+/// document root's custom-property scope; per-element rules then override it
+/// during the cascade.
+pub fn collect_custom_properties(sheet: &StyleSheet) -> BTreeMap<String, Vec<CssToken>> {
     let mut vars: BTreeMap<String, Vec<CssToken>> = BTreeMap::new();
     for rule in &sheet.rules {
         for decl in &rule.declarations {
@@ -504,11 +627,8 @@ pub fn resolve_css_variables(mut sheet: StyleSheet) -> StyleSheet {
             }
         }
     }
-    if vars.is_empty() {
-        return sheet;
-    }
-    // 2. Resolve var() within custom-property values (nested vars), to a
-    //    fixpoint with a small cap to avoid cycles spinning.
+    // Resolve var() within custom-property values (nested vars), to a
+    // fixpoint with a small cap to avoid cycles spinning.
     for _ in 0..5 {
         let snapshot = vars.clone();
         let mut changed = false;
@@ -522,18 +642,10 @@ pub fn resolve_css_variables(mut sheet: StyleSheet) -> StyleSheet {
             break;
         }
     }
-    // 3. Substitute var() in every non-custom declaration value.
-    for rule in &mut sheet.rules {
-        for decl in &mut rule.declarations {
-            if !decl.property.starts_with("--") && value_has_var(&decl.value) {
-                decl.value = substitute_vars(&decl.value, &vars);
-            }
-        }
-    }
-    sheet
+    vars
 }
 
-fn value_has_var(value: &[CssToken]) -> bool {
+pub fn value_has_var(value: &[CssToken]) -> bool {
     value
         .iter()
         .any(|t| matches!(t, CssToken::Ident(s) if s == "var"))
@@ -541,7 +653,7 @@ fn value_has_var(value: &[CssToken]) -> bool {
 
 /// Replace `var(--name[, fallback])` sequences in `value` using `vars`.
 /// Unknown variables fall back to the (optional) fallback tokens.
-fn substitute_vars(value: &[CssToken], vars: &BTreeMap<String, Vec<CssToken>>) -> Vec<CssToken> {
+pub fn substitute_vars(value: &[CssToken], vars: &BTreeMap<String, Vec<CssToken>>) -> Vec<CssToken> {
     let mut out: Vec<CssToken> = Vec::new();
     let mut i = 0;
     while i < value.len() {
@@ -660,6 +772,24 @@ pub enum Selector {
     /// Right side matches the element, left side matches SOME preceding
     /// sibling element (`a ~ b`).
     SubsequentSibling(Box<Selector>, Box<Selector>),
+    /// Structural pseudo-class testing the element's position among its
+    /// element siblings. https://www.w3.org/TR/selectors-4/#structural-pseudos
+    PseudoClass(PseudoClassKind),
+}
+
+/// Supported structural pseudo-classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoClassKind {
+    /// `:root` — the document's root element (`<html>`).
+    Root,
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    /// `:nth-child(An+B)` — matches the (An+B)-th element child for some
+    /// integer n ≥ 0 (1-based). `odd` = 2n+1, `even` = 2n.
+    NthChild(i64, i64),
+    /// `:nth-last-child(An+B)` — same, counting from the end.
+    NthLastChild(i64, i64),
 }
 
 /// Attribute selector operator.
@@ -696,8 +826,11 @@ impl Selector {
     fn specificity_abc(&self) -> (u32, u32, u32) {
         match self {
             Selector::IdSelector(_) => (1, 0, 0),
-            // Attribute selectors count like classes. Selectors L4 §17.
-            Selector::ClassSelector(_) | Selector::Attribute { .. } => (0, 1, 0),
+            // Attribute selectors and pseudo-classes count like classes.
+            // Selectors L4 §17.
+            Selector::ClassSelector(_)
+            | Selector::Attribute { .. }
+            | Selector::PseudoClass(_) => (0, 1, 0),
             Selector::TypeSelector(_) => (0, 0, 1),
             Selector::Universal | Selector::UnknownSelector | Selector::Never => (0, 0, 0),
             Selector::Compound(parts) => parts.iter().fold((0, 0, 0), |acc, p| {

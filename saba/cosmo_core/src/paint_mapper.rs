@@ -55,6 +55,7 @@ pub fn map_display_items_to_paint_commands(
                     border_color,
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
+                    background_size: style.background_size(),
                 }));
             }
             DisplayItem::Text {

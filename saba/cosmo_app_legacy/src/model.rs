@@ -280,6 +280,10 @@ pub enum SceneItem {
         /// `background-repeat: no-repeat` (false = repeat, the CSS default).
         #[serde(default)]
         background_no_repeat: bool,
+        /// CSS background-size as (mode, w, w_pct, h, h_pct): mode 0 explicit
+        /// (negative = auto), 1 cover, 2 contain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_size: Option<(u8, f64, bool, f64, bool)>,
     },
     Text {
         x: i64,

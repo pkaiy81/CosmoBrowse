@@ -404,9 +404,59 @@ fn draw_rect(
             let src_w = decoded.width as i64;
             let src_h = decoded.height as i64;
             if src_w > 0 && src_h > 0 {
+                // Resolve background-size into the painted image dimensions.
+                // Spec: CSS Backgrounds §3.9.
+                let (target_w, target_h) = match rect.background_size {
+                    // cover: fill the box, preserving ratio (crop overflow).
+                    Some((1, ..)) => {
+                        let s = (w as f64 / src_w as f64).max(h as f64 / src_h as f64);
+                        ((src_w as f64 * s) as i64, (src_h as f64 * s) as i64)
+                    }
+                    // contain: fit within the box, preserving ratio.
+                    Some((2, ..)) => {
+                        let s = (w as f64 / src_w as f64).min(h as f64 / src_h as f64);
+                        ((src_w as f64 * s) as i64, (src_h as f64 * s) as i64)
+                    }
+                    // Explicit dimensions; a negative value means auto, which
+                    // preserves the ratio against the other axis (both auto =
+                    // intrinsic size).
+                    Some((_, sw, swp, sh, shp)) => {
+                        let rw = if sw < 0.0 {
+                            None
+                        } else if swp {
+                            Some((w as f64 * sw / 100.0) as i64)
+                        } else {
+                            Some(sw as i64)
+                        };
+                        let rh = if sh < 0.0 {
+                            None
+                        } else if shp {
+                            Some((h as f64 * sh / 100.0) as i64)
+                        } else {
+                            Some(sh as i64)
+                        };
+                        match (rw, rh) {
+                            (Some(tw), Some(th)) => (tw, th),
+                            (Some(tw), None) => (tw, (src_h * tw) / src_w.max(1)),
+                            (None, Some(th)) => ((src_w * th) / src_h.max(1), th),
+                            (None, None) => (src_w, src_h),
+                        }
+                    }
+                    // No background-size: an image larger than the rect with
+                    // no explicit position is an icon — scale to fit (legacy
+                    // behavior); otherwise draw at intrinsic size.
+                    None => {
+                        if rect.background_position.is_none() && (src_w > w || src_h > h) {
+                            (w, h)
+                        } else {
+                            (src_w, src_h)
+                        }
+                    }
+                };
+                let (target_w, target_h) = (target_w.max(1), target_h.max(1));
                 // background-position: percentages resolve against
-                // (box − image), pixel offsets pass through (negative offsets
-                // crop into a sprite sheet). Spec: CSS Backgrounds §3.6.
+                // (box − painted image), pixel offsets pass through (negative
+                // offsets crop into a sprite sheet). Spec: CSS Backgrounds §3.6.
                 let resolve = |v: f64, is_pct: bool, box_dim: i64, img_dim: i64| -> i64 {
                     if is_pct {
                         ((box_dim - img_dim) as f64 * v / 100.0) as i64
@@ -416,19 +466,11 @@ fn draw_rect(
                 };
                 let (pos_x, pos_y) = match rect.background_position {
                     Some((px, pxp, py, pyp)) => {
-                        (resolve(px, pxp, w, src_w), resolve(py, pyp, h, src_h))
+                        (resolve(px, pxp, w, target_w), resolve(py, pyp, h, target_h))
                     }
                     None => (0, 0),
                 };
                 let no_repeat = rect.background_no_repeat;
-                // With no explicit position, an image larger than the rect is
-                // an icon drawn through background-size (not propagated):
-                // scale to fit, nearest-neighbor — regardless of no-repeat
-                // (HN's votearrow is `url(triangle.svg), ... no-repeat` with
-                // background-size:10px). With a position it's a sprite sheet:
-                // crop at the offset, never scale.
-                let scale_to_fit =
-                    rect.background_position.is_none() && (src_w > w || src_h > h);
                 let data = pixmap.data_mut();
                 for dy in 0..h {
                     let py = y + dy;
@@ -440,18 +482,19 @@ fn draw_rect(
                         if px_x < 0 || px_x >= pw {
                             continue;
                         }
-                        let (sx, sy) = if scale_to_fit {
-                            ((dx * src_w / w).min(src_w - 1), (dy * src_h / h).min(src_h - 1))
-                        } else {
-                            let sx = dx - pos_x;
-                            let sy = dy - pos_y;
-                            if no_repeat
-                                && (sx < 0 || sx >= src_w || sy < 0 || sy >= src_h)
-                            {
-                                continue;
-                            }
-                            (sx.rem_euclid(src_w), sy.rem_euclid(src_h))
-                        };
+                        // Position offset in painted-image space, then sample
+                        // the source scaled to the target dimensions.
+                        let rel_x = dx - pos_x;
+                        let rel_y = dy - pos_y;
+                        if no_repeat
+                            && (rel_x < 0 || rel_x >= target_w || rel_y < 0 || rel_y >= target_h)
+                        {
+                            continue;
+                        }
+                        let rel_x = rel_x.rem_euclid(target_w);
+                        let rel_y = rel_y.rem_euclid(target_h);
+                        let sx = (rel_x * src_w / target_w).min(src_w - 1);
+                        let sy = (rel_y * src_h / target_h).min(src_h - 1);
                         let si = (sy * src_w + sx) as usize * 4;
                         let sr = decoded.rgba[si];
                         let sg = decoded.rgba[si + 1];
@@ -606,6 +649,7 @@ fn draw_image(
         border_color: String::new(),
         background_position: None,
         background_no_repeat: false,
+        background_size: None,
     };
     draw_rect(
         pixmap,

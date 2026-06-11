@@ -2,12 +2,20 @@ use crate::error::Error;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+
+use crate::renderer::css::token::CssToken;
+
+/// Per-element CSS custom-property scope, shared copy-on-write between
+/// elements (children clone the Rc; an element that defines its own
+/// `--name` values gets a fresh map).
+pub type CustomProperties = Rc<BTreeMap<String, Vec<CssToken>>>;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct EdgeSize {
@@ -110,12 +118,20 @@ pub struct ComputedStyle {
     background_position: Option<(f64, bool, f64, bool)>,
     /// `background-repeat: no-repeat` (default false = repeat).
     background_no_repeat: bool,
+    /// `background-size` as (mode, w, w_is_percent, h, h_is_percent):
+    /// mode 0 = explicit (a negative dimension means `auto` for that axis),
+    /// mode 1 = `cover`, mode 2 = `contain` (w/h unused for 1 and 2).
+    background_size: Option<(u8, f64, bool, f64, bool)>,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
     grid_template_columns: Option<Vec<GridTrack>>,
     /// `column-gap` / `row-gap` (or the `gap` shorthand) in pixels.
     column_gap: Option<f64>,
     row_gap: Option<f64>,
+    /// CSS custom properties (`--name`) in scope for this element: inherited
+    /// from the parent, overridden by the element's own definitions.
+    /// https://www.w3.org/TR/css-variables-1/#cycles
+    custom_properties: Option<CustomProperties>,
 }
 
 /// One column track of a grid template.
@@ -162,9 +178,11 @@ impl ComputedStyle {
             flex_direction: None,
             background_position: None,
             background_no_repeat: false,
+            background_size: None,
             grid_template_columns: None,
             column_gap: None,
             row_gap: None,
+            custom_properties: None,
         }
     }
 
@@ -486,6 +504,22 @@ impl ComputedStyle {
 
     pub fn set_background_no_repeat(&mut self, no_repeat: bool) {
         self.background_no_repeat = no_repeat;
+    }
+
+    pub fn set_background_size(&mut self, size: (u8, f64, bool, f64, bool)) {
+        self.background_size = Some(size);
+    }
+
+    pub fn background_size(&self) -> Option<(u8, f64, bool, f64, bool)> {
+        self.background_size
+    }
+
+    pub fn custom_properties(&self) -> Option<&CustomProperties> {
+        self.custom_properties.as_ref()
+    }
+
+    pub fn set_custom_properties(&mut self, props: CustomProperties) {
+        self.custom_properties = Some(props);
     }
 
     pub fn background_no_repeat(&self) -> bool {
@@ -1013,6 +1047,9 @@ pub enum DisplayType {
     /// row-major into the equal-width column tracks declared by
     /// `grid-template-columns` (track count only; no named lines/areas).
     Grid,
+    /// `display:inline-block` — an atomic box that flows inline but
+    /// shrink-wraps its content like a block (explicit width/height honored).
+    InlineBlock,
     DisplayNone,
 }
 
@@ -1063,9 +1100,8 @@ impl DisplayType {
             "flex" | "inline-flex" => Ok(Self::Flex),
             // Grid containers get basic row-major track placement.
             "grid" => Ok(Self::Grid),
-            "inline" | "inline-block" | "inline-grid" | "inline-table" | "contents" => {
-                Ok(Self::Inline)
-            }
+            "inline-block" => Ok(Self::InlineBlock),
+            "inline" | "inline-grid" | "inline-table" | "contents" => Ok(Self::Inline),
             _ => Ok(Self::Block),
         }
     }
