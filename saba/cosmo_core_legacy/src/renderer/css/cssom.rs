@@ -135,18 +135,6 @@ impl CssParser {
         }
     }
 
-    /// True when the upcoming token can start a simple selector.
-    fn peek_starts_simple_selector(&mut self) -> bool {
-        matches!(
-            self.t.peek(),
-            Some(CssToken::Ident(_))
-                | Some(CssToken::HashToken(_))
-                | Some(CssToken::Delim('.'))
-                | Some(CssToken::Delim('*'))
-                | Some(CssToken::Colon)
-        )
-    }
-
     /// Consume one compound selector: a run of simple selectors with no
     /// separator between them (`div.card#main:hover`). Returns the matching
     /// model: a single simple selector, `Compound` for several, `Never` when
@@ -181,6 +169,13 @@ impl CssParser {
                 Some(CssToken::Delim('*')) => {
                     self.t.next();
                     saw_universal = true;
+                }
+                Some(CssToken::Delim('[')) => {
+                    self.t.next();
+                    match self.consume_attribute_selector() {
+                        Some(sel) => parts.push(sel),
+                        None => never = true,
+                    }
                 }
                 Some(CssToken::Colon) => {
                     // Pseudo-class or (with a second colon) pseudo-element.
@@ -238,10 +233,79 @@ impl CssParser {
         }
     }
 
+    /// Consume the remainder of an attribute selector after the `[`:
+    /// `name ]`, `name = value ]`, or `name ~^$*|= value ]`. Returns None on
+    /// malformed input (caller poisons the compound to Never) after skipping
+    /// to the closing bracket.
+    /// https://www.w3.org/TR/selectors-4/#attribute-selectors
+    fn consume_attribute_selector(&mut self) -> Option<Selector> {
+        self.skip_whitespace();
+        let name = self.consume_ident().to_lowercase();
+        self.skip_whitespace();
+        let mut result = None;
+        if !name.is_empty() {
+            match self.t.peek() {
+                Some(CssToken::Delim(']')) => {
+                    result = Some(Selector::Attribute {
+                        name,
+                        op: AttrOp::Exists,
+                        value: String::new(),
+                    });
+                }
+                Some(CssToken::Delim(c @ ('=' | '~' | '|' | '^' | '$' | '*'))) => {
+                    let c = *c;
+                    self.t.next();
+                    let op = if c == '=' {
+                        Some(AttrOp::Equals)
+                    } else if self.t.peek() == Some(&CssToken::Delim('=')) {
+                        self.t.next();
+                        Some(match c {
+                            '~' => AttrOp::Includes,
+                            '|' => AttrOp::DashMatch,
+                            '^' => AttrOp::Prefix,
+                            '$' => AttrOp::Suffix,
+                            _ => AttrOp::Substring,
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(op) = op {
+                        self.skip_whitespace();
+                        let value = match self.t.peek() {
+                            Some(CssToken::StringToken(s)) | Some(CssToken::Ident(s)) => {
+                                let v = s.clone();
+                                self.t.next();
+                                Some(v)
+                            }
+                            Some(CssToken::Number(n)) => {
+                                let v = alloc::format!("{}", n);
+                                self.t.next();
+                                Some(v)
+                            }
+                            _ => None,
+                        };
+                        if let Some(value) = value {
+                            result = Some(Selector::Attribute { name, op, value });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Skip to (and past) the closing bracket regardless of success; also
+        // drop a trailing case-insensitivity flag (`[x=y i]`) on the floor.
+        loop {
+            match self.t.next() {
+                None | Some(CssToken::Delim(']')) => break,
+                _ => {}
+            }
+        }
+        result
+    }
+
     /// Consume one complex selector: compound selectors joined by descendant
-    /// (whitespace) or child (`>`) combinators, e.g. `.admin td`, `ul > li`.
-    /// Sibling combinators (`+`, `~`) are not supported and poison the
-    /// selector to `Never` (matching too much is worse than not matching).
+    /// (whitespace), child (`>`), or sibling (`+`, `~`) combinators, e.g.
+    /// `.admin td`, `ul > li`, `h1 + p`.
     /// https://www.w3.org/TR/selectors-4/#complex
     fn consume_complex_selector(&mut self) -> Selector {
         let mut left = self.consume_compound_selector();
@@ -258,16 +322,22 @@ impl CssParser {
                     let right = self.consume_compound_selector();
                     left = Selector::Child(Box::new(left), Box::new(right));
                 }
-                Some(CssToken::Delim('+')) | Some(CssToken::Delim('~')) => {
+                Some(CssToken::Delim(c @ ('+' | '~'))) => {
+                    let next_sibling = *c == '+';
                     self.t.next();
                     self.skip_whitespace();
-                    let _ = self.consume_compound_selector();
-                    left = Selector::Never;
+                    let right = self.consume_compound_selector();
+                    left = if next_sibling {
+                        Selector::NextSibling(Box::new(left), Box::new(right))
+                    } else {
+                        Selector::SubsequentSibling(Box::new(left), Box::new(right))
+                    };
                 }
                 Some(CssToken::Ident(_))
                 | Some(CssToken::HashToken(_))
                 | Some(CssToken::Delim('.'))
                 | Some(CssToken::Delim('*'))
+                | Some(CssToken::Delim('['))
                 | Some(CssToken::Colon)
                     if saw_ws =>
                 {
@@ -574,9 +644,41 @@ pub enum Selector {
     /// Selector list (`h1, h2`) — any alternative matching suffices.
     List(Vec<Selector>),
     /// Never matches: interaction pseudo-classes (`:hover`), pseudo-elements
-    /// (`::before`), and unsupported combinators are poisoned to this rather
+    /// (`::before`), and unsupported constructs are poisoned to this rather
     /// than over-matching.
     Never,
+    /// Attribute selector `[name]` / `[name<op>value]`.
+    /// https://www.w3.org/TR/selectors-4/#attribute-selectors
+    Attribute {
+        name: String,
+        op: AttrOp,
+        value: String,
+    },
+    /// Right side matches the element, left side matches the immediately
+    /// preceding sibling element (`a + b`).
+    NextSibling(Box<Selector>, Box<Selector>),
+    /// Right side matches the element, left side matches SOME preceding
+    /// sibling element (`a ~ b`).
+    SubsequentSibling(Box<Selector>, Box<Selector>),
+}
+
+/// Attribute selector operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrOp {
+    /// `[name]` — the attribute exists.
+    Exists,
+    /// `[name=v]` — exact value match.
+    Equals,
+    /// `[name~=v]` — one of the space-separated words equals v.
+    Includes,
+    /// `[name|=v]` — value is v or starts with `v-`.
+    DashMatch,
+    /// `[name^=v]` — value starts with v.
+    Prefix,
+    /// `[name$=v]` — value ends with v.
+    Suffix,
+    /// `[name*=v]` — value contains v.
+    Substring,
 }
 
 impl Selector {
@@ -594,14 +696,18 @@ impl Selector {
     fn specificity_abc(&self) -> (u32, u32, u32) {
         match self {
             Selector::IdSelector(_) => (1, 0, 0),
-            Selector::ClassSelector(_) => (0, 1, 0),
+            // Attribute selectors count like classes. Selectors L4 §17.
+            Selector::ClassSelector(_) | Selector::Attribute { .. } => (0, 1, 0),
             Selector::TypeSelector(_) => (0, 0, 1),
             Selector::Universal | Selector::UnknownSelector | Selector::Never => (0, 0, 0),
             Selector::Compound(parts) => parts.iter().fold((0, 0, 0), |acc, p| {
                 let (a, b, c) = p.specificity_abc();
                 (acc.0 + a, acc.1 + b, acc.2 + c)
             }),
-            Selector::Descendant(left, right) | Selector::Child(left, right) => {
+            Selector::Descendant(left, right)
+            | Selector::Child(left, right)
+            | Selector::NextSibling(left, right)
+            | Selector::SubsequentSibling(left, right) => {
                 let (la, lb, lc) = left.specificity_abc();
                 let (ra, rb, rc) = right.specificity_abc();
                 (la + ra, lb + rb, lc + rc)

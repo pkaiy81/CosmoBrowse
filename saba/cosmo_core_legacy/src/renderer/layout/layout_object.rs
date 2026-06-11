@@ -24,6 +24,7 @@ use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::FlexDirection;
 use crate::renderer::layout::computed_style::FontSize;
+use crate::renderer::layout::computed_style::GridTrack;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::computed_style::TextDecoration;
@@ -98,45 +99,74 @@ fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64>
     }
 }
 
-/// Count the column tracks declared by a `grid-template-columns` value.
-/// Each top-level length/keyword is one track (`1fr 1fr 200px` → 3) and
-/// `repeat(N, ...)` contributes N tracks. Track sizes are ignored — the grid
-/// layout here gives every track equal width. Returns None when no track can
-/// be recognized.
-fn count_grid_template_tracks(values: &[ComponentValue]) -> Option<usize> {
-    let mut count = 0usize;
+/// Parse the column tracks declared by a `grid-template-columns` value.
+/// Lengths become fixed tracks, `Nfr` flexible tracks, keywords/functions
+/// `Auto` (≈1fr); `repeat(N, tracks)` expands to N copies of its track list.
+/// Returns an empty Vec when nothing can be recognized.
+fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridTrack> {
+    let mut tracks: Vec<GridTrack> = Vec::new();
     let mut i = 0;
     while i < values.len() {
         match &values[i] {
             ComponentValue::Ident(name) if name.eq_ignore_ascii_case("repeat") => {
-                // repeat(N, ...) — N from the first number inside the parens;
-                // skip to the matching close paren.
+                // repeat(N, tracks) — recurse on the inner track list.
                 if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
-                    let mut n: usize = 0;
                     let mut depth = 1;
                     let mut j = i + 2;
                     while j < values.len() && depth > 0 {
                         match &values[j] {
                             ComponentValue::OpenParenthesis => depth += 1,
                             ComponentValue::CloseParenthesis => depth -= 1,
-                            ComponentValue::Number(v) if n == 0 => n = *v as usize,
                             _ => {}
                         }
                         j += 1;
                     }
-                    // auto-fill/auto-fit have no fixed count; treat as 1 track.
-                    count += n.max(1);
+                    let inner = &values[(i + 2).min(values.len())..(j - 1).min(values.len())];
+                    let (n, rest) = match inner.first() {
+                        Some(ComponentValue::Number(v)) => (
+                            (*v as usize).max(1),
+                            inner
+                                .iter()
+                                .position(|t| *t == ComponentValue::Delim(','))
+                                .map(|p| &inner[p + 1..])
+                                .unwrap_or(&[]),
+                        ),
+                        // auto-fill / auto-fit have no fixed count: one copy.
+                        _ => (
+                            1,
+                            inner
+                                .iter()
+                                .position(|t| *t == ComponentValue::Delim(','))
+                                .map(|p| &inner[p + 1..])
+                                .unwrap_or(&[]),
+                        ),
+                    };
+                    let unit = parse_grid_template_tracks(rest);
+                    for _ in 0..n {
+                        tracks.extend(unit.iter().copied());
+                    }
                     i = j;
                     continue;
                 }
-                count += 1;
+                tracks.push(GridTrack::Auto);
             }
-            // A length (100px/1fr/10%), a number, or a keyword (auto,
-            // min-content, …) is one track.
-            ComponentValue::Dimension(..)
-            | ComponentValue::Number(_)
-            | ComponentValue::Ident(_) => {
-                count += 1;
+            ComponentValue::Dimension(v, unit) => {
+                if unit == "fr" {
+                    tracks.push(GridTrack::Fr((*v).max(0.0)));
+                } else if unit == "%" {
+                    // Percentage of the container ≈ flexible share.
+                    tracks.push(GridTrack::Fr((*v / 100.0).max(0.0)));
+                } else if let Some(px) = length_to_px(*v, unit, FontSize::Medium) {
+                    tracks.push(GridTrack::Px(px.max(0.0)));
+                } else {
+                    tracks.push(GridTrack::Auto);
+                }
+            }
+            ComponentValue::Number(v) => {
+                tracks.push(GridTrack::Px((*v).max(0.0)));
+            }
+            ComponentValue::Ident(_) => {
+                tracks.push(GridTrack::Auto);
                 // Skip a function's argument list (e.g. minmax(0, 1fr)) so its
                 // contents don't count as extra tracks.
                 if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
@@ -158,11 +188,134 @@ fn count_grid_template_tracks(values: &[ComponentValue]) -> Option<usize> {
         }
         i += 1;
     }
-    if count > 0 {
-        Some(count)
-    } else {
-        None
+    tracks
+}
+
+/// Resolve column tracks to pixel widths for the given content width:
+/// gaps and fixed tracks are reserved first, then the remainder is split
+/// among Fr/Auto tracks in proportion to their flex factors (Auto = 1fr).
+/// https://www.w3.org/TR/css-grid-1/#algo-track-sizing
+fn resolve_grid_tracks(tracks: &[GridTrack], available: i64, column_gap: i64) -> Vec<i64> {
+    let n = tracks.len().max(1) as i64;
+    let gaps = column_gap * (n - 1).max(0);
+    let mut remaining = (available - gaps).max(0);
+    let mut total_fr = 0.0f64;
+    for t in tracks {
+        match t {
+            GridTrack::Px(px) => remaining -= *px as i64,
+            GridTrack::Fr(f) => total_fr += f.max(0.0),
+            GridTrack::Auto => total_fr += 1.0,
+        }
     }
+    let remaining = remaining.max(0);
+    tracks
+        .iter()
+        .map(|t| match t {
+            GridTrack::Px(px) => *px as i64,
+            GridTrack::Fr(f) => {
+                if total_fr > 0.0 {
+                    (remaining as f64 * f.max(0.0) / total_fr) as i64
+                } else {
+                    0
+                }
+            }
+            GridTrack::Auto => {
+                if total_fr > 0.0 {
+                    (remaining as f64 / total_fr) as i64
+                } else {
+                    0
+                }
+            }
+        })
+        .collect()
+}
+
+/// One background-position component: (value, is_percent, axis) where axis is
+/// Some(true) for horizontal keywords, Some(false) for vertical, None when the
+/// component fits either axis. Keywords map to percentages per CSS Backgrounds
+/// §3.6 (left/top = 0%, center = 50%, right/bottom = 100%).
+fn bg_position_component(v: &ComponentValue) -> Option<(f64, bool, Option<bool>)> {
+    match v {
+        ComponentValue::Dimension(value, unit) if unit == "%" => Some((*value, true, None)),
+        ComponentValue::Dimension(value, unit) => {
+            length_to_px(*value, unit, FontSize::Medium).map(|px| (px, false, None))
+        }
+        ComponentValue::Number(value) => Some((*value, false, None)),
+        ComponentValue::Ident(name) => match name.to_lowercase().as_str() {
+            "left" => Some((0.0, true, Some(true))),
+            "right" => Some((100.0, true, Some(true))),
+            "top" => Some((0.0, true, Some(false))),
+            "bottom" => Some((100.0, true, Some(false))),
+            "center" => Some((50.0, true, None)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Assemble up to two position components into (x, x_pct, y, y_pct), honoring
+/// axis keywords in either order; a single component centers the other axis.
+fn assemble_bg_position(
+    comps: &[(f64, bool, Option<bool>)],
+) -> Option<(f64, bool, f64, bool)> {
+    match comps {
+        [] => None,
+        [(v, pct, axis)] => Some(if *axis == Some(false) {
+            (50.0, true, *v, *pct)
+        } else {
+            (*v, *pct, 50.0, true)
+        }),
+        [first, second, ..] => {
+            // "top left" order: a vertical keyword first (or horizontal
+            // second) swaps the components.
+            let swapped = first.2 == Some(false) || second.2 == Some(true);
+            let (x, y) = if swapped { (second, first) } else { (first, second) };
+            Some((x.0, x.1, y.0, y.1))
+        }
+    }
+}
+
+/// Scan a `background` shorthand for position components and `no-repeat`,
+/// skipping parenthesized groups (url/gradient arguments) and anything after
+/// a `/` (which starts background-size).
+fn scan_background_shorthand(
+    values: &[ComponentValue],
+) -> (Option<(f64, bool, f64, bool)>, bool) {
+    let mut comps: Vec<(f64, bool, Option<bool>)> = Vec::new();
+    let mut no_repeat = false;
+    let mut after_slash = false;
+    let mut i = 0;
+    while i < values.len() {
+        match &values[i] {
+            ComponentValue::OpenParenthesis => {
+                let mut depth = 1;
+                i += 1;
+                while i < values.len() && depth > 0 {
+                    match &values[i] {
+                        ComponentValue::OpenParenthesis => depth += 1,
+                        ComponentValue::CloseParenthesis => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            ComponentValue::Delim('/') => after_slash = true,
+            ComponentValue::Delim(',') => after_slash = false,
+            ComponentValue::Ident(s) if s.eq_ignore_ascii_case("no-repeat") => {
+                no_repeat = true;
+            }
+            v => {
+                if !after_slash && comps.len() < 2 {
+                    if let Some(c) = bg_position_component(v) {
+                        comps.push(c);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    (assemble_bg_position(&comps), no_repeat)
 }
 
 /// Extract the first `url(...)` from a declaration's component values.
@@ -416,6 +569,113 @@ fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
         result.push(line[line_start..].to_string());
     }
     result
+}
+
+/// Selector matching against a DOM node. Combinators walk DOM relationships
+/// (parent / preceding siblings); simple selectors test the element itself.
+fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
+    // Combinators and grouping first: they recurse into simple matching.
+    match selector {
+        Selector::List(alternatives) => {
+            return alternatives.iter().any(|s| dom_node_selected(node, s));
+        }
+        Selector::Compound(parts) => {
+            return parts.iter().all(|s| dom_node_selected(node, s));
+        }
+        Selector::Child(ancestor, this) => {
+            return dom_node_selected(node, this)
+                && node
+                    .borrow()
+                    .parent()
+                    .upgrade()
+                    .map(|p| dom_node_selected(&p, ancestor))
+                    .unwrap_or(false);
+        }
+        Selector::Descendant(ancestor, this) => {
+            if !dom_node_selected(node, this) {
+                return false;
+            }
+            let mut current = node.borrow().parent().upgrade();
+            while let Some(p) = current {
+                if dom_node_selected(&p, ancestor) {
+                    return true;
+                }
+                let next = p.borrow().parent().upgrade();
+                current = next;
+            }
+            return false;
+        }
+        Selector::NextSibling(prev, this) | Selector::SubsequentSibling(prev, this) => {
+            if !dom_node_selected(node, this) {
+                return false;
+            }
+            let adjacent_only = matches!(selector, Selector::NextSibling(..));
+            // Walk the parent's children up to this node, tracking preceding
+            // ELEMENT siblings (text nodes are not siblings for + / ~).
+            let parent = match node.borrow().parent().upgrade() {
+                Some(p) => p,
+                None => return false,
+            };
+            let mut matched_any = false;
+            let mut last_was_match = false;
+            let mut child = parent.borrow().first_child();
+            while let Some(c) = child {
+                if Rc::ptr_eq(&c, node) {
+                    return if adjacent_only { last_was_match } else { matched_any };
+                }
+                if matches!(c.borrow().kind(), NodeKind::Element(_)) {
+                    let m = dom_node_selected(&c, prev);
+                    last_was_match = m;
+                    matched_any |= m;
+                }
+                let next = c.borrow().next_sibling();
+                child = next;
+            }
+            return false;
+        }
+        Selector::Never => return false,
+        _ => {}
+    }
+    match node.borrow().kind() {
+        NodeKind::Element(ref e) => match selector {
+            Selector::TypeSelector(type_name) => e.kind().to_string() == *type_name,
+            // An element may carry several space-separated class names;
+            // the selector matches any one of them.
+            // https://html.spec.whatwg.org/multipage/dom.html#classes
+            Selector::ClassSelector(class_name) => e.attributes().iter().any(|attr| {
+                attr.name() == "class"
+                    && attr.value().split_ascii_whitespace().any(|c| c == class_name)
+            }),
+            Selector::IdSelector(id_name) => e
+                .attributes()
+                .iter()
+                .any(|attr| attr.name() == "id" && attr.value() == *id_name),
+            Selector::Attribute { name, op, value } => e
+                .attributes()
+                .iter()
+                .filter(|attr| attr.name().eq_ignore_ascii_case(name))
+                .any(|attr| {
+                    let v = attr.value();
+                    use crate::renderer::css::cssom::AttrOp;
+                    match op {
+                        AttrOp::Exists => true,
+                        AttrOp::Equals => v == *value,
+                        AttrOp::Includes => v.split_ascii_whitespace().any(|w| w == value),
+                        AttrOp::DashMatch => {
+                            v == *value || v.starts_with(&format!("{}-", value))
+                        }
+                        AttrOp::Prefix => !value.is_empty() && v.starts_with(value.as_str()),
+                        AttrOp::Suffix => !value.is_empty() && v.ends_with(value.as_str()),
+                        AttrOp::Substring => !value.is_empty() && v.contains(value.as_str()),
+                    }
+                }),
+            Selector::Universal => true,
+            Selector::UnknownSelector => false,
+            // Handled above; unreachable here.
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 pub fn create_layout_object(
@@ -771,13 +1031,17 @@ impl LayoutObject {
         self.style.display() == DisplayType::Flex
     }
 
-    /// If this object's parent is a grid container (`display:grid`), return its
-    /// column track count; otherwise `None`.
-    fn parent_grid_columns(&self) -> Option<usize> {
+    /// If this object's parent is a grid container (`display:grid`), return
+    /// its (column tracks, column gap, row gap); otherwise `None`.
+    fn parent_grid_info(&self) -> Option<(Vec<GridTrack>, i64, i64)> {
         let parent = self.parent.upgrade()?;
         let p = parent.borrow();
         if p.style.display() == DisplayType::Grid {
-            Some(p.style.grid_columns())
+            Some((
+                p.style.grid_template_columns(),
+                p.style.column_gap(),
+                p.style.row_gap(),
+            ))
         } else {
             None
         }
@@ -2069,11 +2333,14 @@ impl LayoutObject {
                         self.max_content_width()
                     };
                     w.min(available_width).max(0)
-                } else if let Some(n) = self.parent_grid_columns() {
-                    // Grid item: every column track is parent width / N; the
-                    // item's content box is the track minus its own margins.
+                } else if let Some((tracks, col_gap, _)) = self.parent_grid_info() {
+                    // Grid item: the width of its column track; the item's
+                    // content box is the track minus its own margins.
+                    let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
+                    let col = self.grid_item_index() % tracks.len().max(1);
                     let track =
-                        (parent_size.width() / n as i64 - metrics.outer_horizontal()).max(0);
+                        (widths.get(col).copied().unwrap_or(0) - metrics.outer_horizontal())
+                            .max(0);
                     if explicit_width > 0 {
                         explicit_width.min(track)
                     } else {
@@ -2137,7 +2404,9 @@ impl LayoutObject {
                 } else {
                     None
                 };
+                let grid_row_gap = self.style.row_gap();
                 let mut grid_idx = 0usize;
+                let mut grid_rows_done = 0usize;
                 let mut grid_row_height = 0i64;
                 let mut previous_child_kind = LayoutObjectKind::Block;
                 while child.is_some() {
@@ -2171,7 +2440,11 @@ impl LayoutObject {
                             );
                             grid_idx += 1;
                             if grid_idx % n == 0 {
+                                if grid_rows_done > 0 {
+                                    content_height += grid_row_gap;
+                                }
                                 content_height += grid_row_height;
+                                grid_rows_done += 1;
                                 grid_row_height = 0;
                             }
                         }
@@ -2194,7 +2467,12 @@ impl LayoutObject {
                     child = c.borrow().next_sibling();
                 }
                 // Final, possibly partial grid row.
-                content_height += grid_row_height;
+                if grid_row_height > 0 {
+                    if grid_rows_done > 0 {
+                        content_height += grid_row_gap;
+                    }
+                    content_height += grid_row_height;
+                }
 
                 // <br> and <hr> have intrinsic heights even without children.
                 let content_height = if self.element_kind() == Some(ElementKind::Br) {
@@ -2269,8 +2547,24 @@ impl LayoutObject {
                     max_line_width = max_line_width.max(current_line_width);
                     content_height += current_line_height;
 
-                    size.set_width((max_line_width + metrics.inner_horizontal()).max(0));
-                    size.set_height((content_height + metrics.inner_vertical()).max(0));
+                    // Explicit CSS width/height take precedence (inline-block
+                    // approximation: e.g. a 16×16 sprite icon span has no
+                    // children, so the content-derived size would be 0×0 and
+                    // nothing would paint).
+                    let explicit_w = self.resolved_width(parent_size);
+                    let explicit_h = self.resolved_height(parent_size);
+                    let content_w = if explicit_w > 0 {
+                        explicit_w
+                    } else {
+                        max_line_width
+                    };
+                    let content_h = if explicit_h > 0 {
+                        explicit_h
+                    } else {
+                        content_height
+                    };
+                    size.set_width((content_w + metrics.inner_horizontal()).max(0));
+                    size.set_height((content_h + metrics.inner_vertical()).max(0));
                 }
             }
             LayoutObjectKind::Text => {
@@ -2360,18 +2654,25 @@ impl LayoutObject {
                 point.set_x(parent_point.x() + rowspan_offset + metrics.margin.left + cs);
                 point.set_y(parent_point.y() + metrics.margin.top + v_offset);
             }
-        } else if let Some(n) = self.parent_grid_columns() {
-            // Grid item placement: row-major into N equal-width column tracks.
+        } else if let Some((tracks, col_gap, row_gap)) = self.parent_grid_info() {
+            // Grid item placement: row-major into the column tracks.
+            let n = tracks.len().max(1);
             let idx = self.grid_item_index();
             let col = idx % n;
-            let track = parent_size.width() / n as i64;
-            point.set_x(parent_point.x() + col as i64 * track + metrics.margin.left);
+            let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
+            let x_offset: i64 =
+                widths[..col.min(widths.len())].iter().sum::<i64>() + col as i64 * col_gap;
+            point.set_x(parent_point.x() + x_offset + metrics.margin.left);
             if col == 0 {
                 // First track: a new grid row below the previous sibling (which
-                // ended the previous row).
+                // ended the previous row), separated by the row gap.
                 if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
                     point.set_y(
-                        pos.y() + size.height() + metrics.margin.top + metrics.margin.bottom,
+                        pos.y()
+                            + size.height()
+                            + metrics.margin.top
+                            + metrics.margin.bottom
+                            + row_gap,
                     );
                 } else {
                     point.set_y(parent_point.y() + metrics.margin.top);
@@ -2507,63 +2808,11 @@ impl LayoutObject {
     }
 
     pub fn is_node_selected(&self, selector: &Selector) -> bool {
-        // Combinators and grouping first: they recurse into simple matching.
-        match selector {
-            Selector::List(alternatives) => {
-                return alternatives.iter().any(|s| self.is_node_selected(s));
-            }
-            Selector::Compound(parts) => {
-                return parts.iter().all(|s| self.is_node_selected(s));
-            }
-            Selector::Child(ancestor, this) => {
-                return self.is_node_selected(this)
-                    && self
-                        .parent
-                        .upgrade()
-                        .map(|p| p.borrow().is_node_selected(ancestor))
-                        .unwrap_or(false);
-            }
-            Selector::Descendant(ancestor, this) => {
-                if !self.is_node_selected(this) {
-                    return false;
-                }
-                let mut current = self.parent.upgrade();
-                while let Some(p) = current {
-                    if p.borrow().is_node_selected(ancestor) {
-                        return true;
-                    }
-                    let next = p.borrow().parent.upgrade();
-                    current = next;
-                }
-                return false;
-            }
-            Selector::Never => return false,
-            _ => {}
-        }
-        match &self.node_kind() {
-            NodeKind::Element(e) => match selector {
-                Selector::TypeSelector(type_name) => e.kind().to_string() == *type_name,
-                // An element may carry several space-separated class names;
-                // the selector matches any one of them.
-                // https://html.spec.whatwg.org/multipage/dom.html#classes
-                Selector::ClassSelector(class_name) => e
-                    .attributes()
-                    .iter()
-                    .any(|attr| {
-                        attr.name() == "class"
-                            && attr.value().split_ascii_whitespace().any(|c| c == class_name)
-                    }),
-                Selector::IdSelector(id_name) => e
-                    .attributes()
-                    .iter()
-                    .any(|attr| attr.name() == "id" && attr.value() == *id_name),
-                Selector::Universal => true,
-                Selector::UnknownSelector => false,
-                // Handled above; unreachable here.
-                _ => false,
-            },
-            _ => false,
-        }
+        // Matching runs against the DOM tree, not the layout tree: during the
+        // cascade this layout object is not yet linked into its parent's child
+        // list, so sibling combinators (and, in principle, ancestors) must be
+        // resolved through the fully-built DOM.
+        dom_node_selected(&self.node, selector)
     }
 
     pub fn cascading_style(&mut self, declarations: Vec<Declaration>, parent_font_size: FontSize) {
@@ -2583,16 +2832,41 @@ impl LayoutObject {
                         }
                         _ => {}
                     }
-                    // The background shorthand may also carry an image layer.
+                    // The background shorthand may also carry an image layer,
+                    // a position, and a repeat keyword.
                     if declaration.property == "background" {
                         if let Some(url) = extract_css_url(&declaration.value) {
                             self.style.set_background_image(url);
+                        }
+                        let (pos, no_repeat) = scan_background_shorthand(&declaration.value);
+                        if let Some((x, xp, y, yp)) = pos {
+                            self.style.set_background_position(x, xp, y, yp);
+                        }
+                        if no_repeat {
+                            self.style.set_background_no_repeat(true);
                         }
                     }
                 }
                 "background-image" => {
                     if let Some(url) = extract_css_url(&declaration.value) {
                         self.style.set_background_image(url);
+                    }
+                }
+                "background-position" => {
+                    let comps: Vec<(f64, bool, Option<bool>)> = declaration
+                        .value
+                        .iter()
+                        .filter_map(bg_position_component)
+                        .take(2)
+                        .collect();
+                    if let Some((x, xp, y, yp)) = assemble_bg_position(&comps) {
+                        self.style.set_background_position(x, xp, y, yp);
+                    }
+                }
+                "background-repeat" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style
+                            .set_background_no_repeat(value.eq_ignore_ascii_case("no-repeat"));
                     }
                 }
                 "color" => match first_value {
@@ -2619,8 +2893,41 @@ impl LayoutObject {
                     }
                 }
                 "grid-template-columns" => {
-                    if let Some(n) = count_grid_template_tracks(&declaration.value) {
-                        self.style.set_grid_columns(n);
+                    let tracks = parse_grid_template_tracks(&declaration.value);
+                    self.style.set_grid_template_columns(tracks);
+                }
+                // gap shorthand: one value = both axes, two = row then column.
+                // https://www.w3.org/TR/css-align-3/#gap-shorthand
+                "gap" | "grid-gap" => {
+                    let px: Vec<f64> = declaration
+                        .value
+                        .iter()
+                        .filter_map(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
+                        .collect();
+                    match px.as_slice() {
+                        [both] => {
+                            self.style.set_row_gap(*both);
+                            self.style.set_column_gap(*both);
+                        }
+                        [row, column, ..] => {
+                            self.style.set_row_gap(*row);
+                            self.style.set_column_gap(*column);
+                        }
+                        _ => {}
+                    }
+                }
+                "column-gap" | "grid-column-gap" => {
+                    if let Some(px) = first_value
+                        .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
+                    {
+                        self.style.set_column_gap(px);
+                    }
+                }
+                "row-gap" | "grid-row-gap" => {
+                    if let Some(px) = first_value
+                        .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
+                    {
+                        self.style.set_row_gap(px);
                     }
                 }
                 "width" => match first_value {

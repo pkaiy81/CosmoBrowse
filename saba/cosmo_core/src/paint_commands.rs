@@ -71,10 +71,22 @@ pub struct DrawRect {
     /// CSS color string for the border (e.g. "#808080"). Empty when no border.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub border_color: String,
+    /// CSS background-position as (x, x_is_percent, y, y_is_percent).
+    /// Percentages resolve against (box − image) at paint time; pixel offsets
+    /// may be negative (sprite sheets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_position: Option<(f64, bool, f64, bool)>,
+    /// `background-repeat: no-repeat` (false = repeat, the CSS default).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background_no_repeat: bool,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

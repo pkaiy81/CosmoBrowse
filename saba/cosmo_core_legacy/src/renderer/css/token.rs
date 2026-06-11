@@ -209,11 +209,27 @@ impl Iterator for CssTokenizer {
                     CssToken::HashToken(value)
                 }
                 '-' => {
-                    // we don't support negative number yet.
-                    // so we treat it as ident token.
-                    let t = CssToken::Ident(self.consume_ident_token());
-                    self.pos -= 1;
-                    t
+                    // `-` starting a number (`-16px`, `-.5em`) is a negative
+                    // numeric token; otherwise it begins an ident (`-webkit-x`,
+                    // custom properties `--x`).
+                    if self
+                        .input
+                        .get(self.pos + 1)
+                        .is_some_and(|c| c.is_ascii_digit() || *c == '.')
+                    {
+                        self.pos += 1; // consume the sign
+                        let t = match self.consume_numeric_token() {
+                            CssToken::Number(v) => CssToken::Number(-v),
+                            CssToken::Dimension(v, unit) => CssToken::Dimension(-v, unit),
+                            other => other,
+                        };
+                        self.pos -= 1;
+                        t
+                    } else {
+                        let t = CssToken::Ident(self.consume_ident_token());
+                        self.pos -= 1;
+                        t
+                    }
                 }
                 '@' => {
                     // If the next three characters are valid string token, create the <at-keyword-token> and return it.

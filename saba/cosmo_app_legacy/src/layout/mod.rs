@@ -217,6 +217,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     anchor_id,
                     border_width,
                     border_color,
+                    background_position: style.background_position(),
+                    background_no_repeat: style.background_no_repeat(),
                 });
             }
             DisplayItem::Text {
@@ -436,6 +438,8 @@ mod diff_tests {
             anchor_id: None,
             border_width: 0,
             border_color: String::new(),
+            background_position: None,
+            background_no_repeat: false,
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -450,6 +454,8 @@ mod diff_tests {
             anchor_id: None,
             border_width: 0,
             border_color: String::new(),
+            background_position: None,
+            background_no_repeat: false,
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

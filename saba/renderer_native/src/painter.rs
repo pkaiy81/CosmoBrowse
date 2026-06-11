@@ -396,7 +396,7 @@ fn draw_rect(
         }
     }
 
-    // Tile background image if present.
+    // Draw the background image if present.
     if let Some(ref bg_src) = rect.background_image {
         if let Some(decoded) = image_cache.get_or_fetch(bg_src, base_url) {
             let pw = pixmap.width() as i64;
@@ -404,65 +404,79 @@ fn draw_rect(
             let src_w = decoded.width as i64;
             let src_h = decoded.height as i64;
             if src_w > 0 && src_h > 0 {
+                // background-position: percentages resolve against
+                // (box − image), pixel offsets pass through (negative offsets
+                // crop into a sprite sheet). Spec: CSS Backgrounds §3.6.
+                let resolve = |v: f64, is_pct: bool, box_dim: i64, img_dim: i64| -> i64 {
+                    if is_pct {
+                        ((box_dim - img_dim) as f64 * v / 100.0) as i64
+                    } else {
+                        v as i64
+                    }
+                };
+                let (pos_x, pos_y) = match rect.background_position {
+                    Some((px, pxp, py, pyp)) => {
+                        (resolve(px, pxp, w, src_w), resolve(py, pyp, h, src_h))
+                    }
+                    None => (0, 0),
+                };
+                let no_repeat = rect.background_no_repeat;
+                // With no explicit position, an image larger than the rect is
+                // an icon drawn through background-size (not propagated):
+                // scale to fit, nearest-neighbor — regardless of no-repeat
+                // (HN's votearrow is `url(triangle.svg), ... no-repeat` with
+                // background-size:10px). With a position it's a sprite sheet:
+                // crop at the offset, never scale.
+                let scale_to_fit =
+                    rect.background_position.is_none() && (src_w > w || src_h > h);
                 let data = pixmap.data_mut();
-                // An image larger than the rect is an icon/sprite drawn through
-                // background-size (which isn't propagated here): scale it to
-                // fit the rect once, nearest-neighbor. Tile-cropping the
-                // top-left corner instead would show an arbitrary fragment
-                // (e.g. the empty corner of HN's votearrow triangle.svg).
-                let scale_to_fit = src_w > w || src_h > h;
-                // Tile the image across the rect area.
-                let mut ty = 0i64;
-                while ty < h {
-                    let mut tx = 0i64;
-                    while tx < w {
-                        let tile_w = if scale_to_fit { w } else { (src_w).min(w - tx) };
-                        let tile_h = if scale_to_fit { h } else { (src_h).min(h - ty) };
-                        for dy in 0..tile_h {
-                            let py = y + ty + dy;
-                            if py < 0 || py >= ph {
+                for dy in 0..h {
+                    let py = y + dy;
+                    if py < 0 || py >= ph {
+                        continue;
+                    }
+                    for dx in 0..w {
+                        let px_x = x + dx;
+                        if px_x < 0 || px_x >= pw {
+                            continue;
+                        }
+                        let (sx, sy) = if scale_to_fit {
+                            ((dx * src_w / w).min(src_w - 1), (dy * src_h / h).min(src_h - 1))
+                        } else {
+                            let sx = dx - pos_x;
+                            let sy = dy - pos_y;
+                            if no_repeat
+                                && (sx < 0 || sx >= src_w || sy < 0 || sy >= src_h)
+                            {
                                 continue;
                             }
-                            for dx in 0..tile_w {
-                                let px_x = x + tx + dx;
-                                if px_x < 0 || px_x >= pw {
-                                    continue;
-                                }
-                                let (sx, sy) = if scale_to_fit {
-                                    ((dx * src_w / w).min(src_w - 1), (dy * src_h / h).min(src_h - 1))
-                                } else {
-                                    (dx, dy)
-                                };
-                                let si = (sy * src_w + sx) as usize * 4;
-                                let sr = decoded.rgba[si];
-                                let sg = decoded.rgba[si + 1];
-                                let sb = decoded.rgba[si + 2];
-                                let sa = decoded.rgba[si + 3];
-                                let di = (py * pw + px_x) as usize * 4;
-                                if di + 3 >= data.len() {
-                                    continue;
-                                }
-                                if sa == 255 {
-                                    data[di] = sr;
-                                    data[di + 1] = sg;
-                                    data[di + 2] = sb;
-                                    data[di + 3] = 255;
-                                } else if sa > 0 {
-                                    let a = sa as u32;
-                                    let inv_a = 255 - a;
-                                    data[di] =
-                                        ((sr as u32 * a + data[di] as u32 * inv_a) / 255) as u8;
-                                    data[di + 1] =
-                                        ((sg as u32 * a + data[di + 1] as u32 * inv_a) / 255) as u8;
-                                    data[di + 2] =
-                                        ((sb as u32 * a + data[di + 2] as u32 * inv_a) / 255) as u8;
-                                    data[di + 3] = 255;
-                                }
-                            }
+                            (sx.rem_euclid(src_w), sy.rem_euclid(src_h))
+                        };
+                        let si = (sy * src_w + sx) as usize * 4;
+                        let sr = decoded.rgba[si];
+                        let sg = decoded.rgba[si + 1];
+                        let sb = decoded.rgba[si + 2];
+                        let sa = decoded.rgba[si + 3];
+                        let di = (py * pw + px_x) as usize * 4;
+                        if di + 3 >= data.len() {
+                            continue;
                         }
-                        tx += src_w;
+                        if sa == 255 {
+                            data[di] = sr;
+                            data[di + 1] = sg;
+                            data[di + 2] = sb;
+                            data[di + 3] = 255;
+                        } else if sa > 0 {
+                            let a = sa as u32;
+                            let inv_a = 255 - a;
+                            data[di] = ((sr as u32 * a + data[di] as u32 * inv_a) / 255) as u8;
+                            data[di + 1] =
+                                ((sg as u32 * a + data[di + 1] as u32 * inv_a) / 255) as u8;
+                            data[di + 2] =
+                                ((sb as u32 * a + data[di + 2] as u32 * inv_a) / 255) as u8;
+                            data[di + 3] = 255;
+                        }
                     }
-                    ty += src_h;
                 }
             }
         }
@@ -590,6 +604,8 @@ fn draw_image(
         anchor_id: None,
         border_width: 0,
         border_color: String::new(),
+        background_position: None,
+        background_no_repeat: false,
     };
     draw_rect(
         pixmap,

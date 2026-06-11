@@ -30,6 +30,8 @@ pub fn scene_items_to_paint_commands(
                 anchor_id,
                 border_width,
                 border_color,
+                background_position,
+                background_no_repeat,
             } => commands.push(PaintCommand::DrawRect(DrawRect {
                 x: *x,
                 y: *y,
@@ -43,6 +45,8 @@ pub fn scene_items_to_paint_commands(
                 anchor_id: anchor_id.clone(),
                 border_width: *border_width,
                 border_color: border_color.clone(),
+                background_position: *background_position,
+                background_no_repeat: *background_no_repeat,
             })),
             SceneItem::Text {
                 x,
@@ -121,6 +125,8 @@ pub fn scene_items_to_paint_commands(
                         anchor_id: None,
                         border_width: 0,
                         border_color: String::new(),
+                        background_position: None,
+                        background_no_repeat: false,
                     }));
                     commands.push(PaintCommand::fallback_text(
                         *x + 4,

@@ -1756,6 +1756,45 @@ mod tests {
     }
 
     #[test]
+    fn test_attribute_selectors_and_sibling_combinators() {
+        let html = concat!(
+            "<html><head><style>",
+            "[data-x]{color:#ff0000;}",
+            "a[href=\"https://exact.example\"]{color:#00ff00;}",
+            "[class~=\"tag\"]{color:#0000ff;}",
+            "[href^=\"https:\"]{color:#aa00aa;}",
+            "h1 + p{color:#ee8800;}",
+            "h2 ~ p{color:#118811;}",
+            "</style></head><body>",
+            "<div data-x=\"1\">has-attr</div>",
+            "<div>no-attr</div>",
+            "<a href=\"https://exact.example\">exact-href</a>",
+            "<span class=\"chip tag\">word-match</span>",
+            "<a href=\"https://other.example/x\">prefix-match</a>",
+            "<h1>head1</h1><p>adjacent-p</p><p>not-adjacent-p</p>",
+            "<h2>head2</h2><div>gap</div><p>subsequent-p</p>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("has-attr"), 0xff0000, "[data-x] presence");
+        assert_ne!(color_of("no-attr"), 0xff0000, "[data-x] absent");
+        assert_eq!(color_of("exact-href"), 0x00ff00, "[href=...] exact");
+        assert_eq!(color_of("word-match"), 0x0000ff, "[class~=tag] word");
+        assert_eq!(color_of("prefix-match"), 0xaa00aa, "[href^=https:] prefix");
+        assert_eq!(color_of("adjacent-p"), 0xee8800, "h1 + p adjacent");
+        assert_ne!(color_of("not-adjacent-p"), 0xee8800, "+ is adjacent-only");
+        assert_eq!(color_of("subsequent-p"), 0x118811, "h2 ~ p across a gap");
+    }
+
+    #[test]
     fn test_important_overrides_specificity_and_inline() {
         let html = concat!(
             "<html><head><style>",
@@ -1871,6 +1910,43 @@ mod tests {
         assert_eq!(color_of("a-and-b"), 0x0000ff, "compound matches multi-class attr");
         assert_eq!(color_of("item"), 0xaa00aa, "child combinator");
         assert_ne!(color_of("para"), 0x123456, ":hover never matches statically");
+    }
+
+    #[test]
+    fn test_grid_track_sizes_and_gap() {
+        // 200px fixed + 1fr + 2fr with 20px gaps in a 1000px container:
+        // remaining = 1000 - 2*20 - 200 = 760; 1fr = 253, 2fr = 506.
+        let html = concat!(
+            "<html><head><style>",
+            ".grid{display:grid;grid-template-columns:200px 1fr 2fr;gap:10px 20px;}",
+            ".item{height:40px;}",
+            "</style></head><body>",
+            "<div class=\"grid\">",
+            "<div class=\"item\">a</div><div class=\"item\">b</div><div class=\"item\">c</div>",
+            "<div class=\"item\">d</div>",
+            "</div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 1000);
+        let body = layout_view.root().expect("body");
+        let grid = body.borrow().first_child().expect("grid container");
+        let a = grid.borrow().first_child().expect("a");
+        let b = a.borrow().next_sibling().expect("b");
+        let c = b.borrow().next_sibling().expect("c");
+        let d = c.borrow().next_sibling().expect("d");
+        assert_eq!(a.borrow().size().width(), 200, "fixed 200px track");
+        assert_eq!(b.borrow().size().width(), 253, "1fr of remaining 760");
+        assert_eq!(c.borrow().size().width(), 506, "2fr of remaining 760");
+        let (ax, ay) = (a.borrow().point().x(), a.borrow().point().y());
+        let (bx, _) = (b.borrow().point().x(), b.borrow().point().y());
+        let (cx, _) = (c.borrow().point().x(), c.borrow().point().y());
+        let (dx, dy) = (d.borrow().point().x(), d.borrow().point().y());
+        assert_eq!(bx - ax, 220, "b starts after 200px track + 20px gap");
+        assert_eq!(cx - bx, 273, "c starts after 253px track + 20px gap");
+        assert_eq!(dx, ax, "d wraps to the first track");
+        assert_eq!(dy - ay, 50, "second row offset = 40px row + 10px row-gap");
+        // Container height: two rows + one row gap.
+        assert_eq!(grid.borrow().size().height(), 90, "40 + 10 + 40");
     }
 
     #[test]

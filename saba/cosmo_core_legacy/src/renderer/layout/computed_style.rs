@@ -6,6 +6,7 @@ use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -103,9 +104,30 @@ pub struct ComputedStyle {
     /// when `display` is `Flex`; controls whether children are laid out along
     /// the row (main = horizontal) or column (main = vertical) axis.
     flex_direction: Option<FlexDirection>,
-    /// Number of column tracks from `grid-template-columns` (track count only;
-    /// all tracks are equal width). Only meaningful when `display` is `Grid`.
-    grid_columns: Option<usize>,
+    /// `background-position` as (x, x_is_percent, y, y_is_percent). Percent
+    /// values resolve against (box size − image size) at paint time; pixel
+    /// values may be negative (sprite sheets).
+    background_position: Option<(f64, bool, f64, bool)>,
+    /// `background-repeat: no-repeat` (default false = repeat).
+    background_no_repeat: bool,
+    /// Column tracks from `grid-template-columns`. Only meaningful when
+    /// `display` is `Grid`.
+    grid_template_columns: Option<Vec<GridTrack>>,
+    /// `column-gap` / `row-gap` (or the `gap` shorthand) in pixels.
+    column_gap: Option<f64>,
+    row_gap: Option<f64>,
+}
+
+/// One column track of a grid template.
+/// https://www.w3.org/TR/css-grid-1/#track-sizing
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridTrack {
+    /// Fixed size in pixels (from px/pt/… lengths).
+    Px(f64),
+    /// Flexible fraction of the remaining space (`1fr`).
+    Fr(f64),
+    /// `auto` / unsupported sizes — treated as `1fr`.
+    Auto,
 }
 
 impl ComputedStyle {
@@ -138,7 +160,11 @@ impl ComputedStyle {
             z_index: None,
             overflow_clip: None,
             flex_direction: None,
-            grid_columns: None,
+            background_position: None,
+            background_no_repeat: false,
+            grid_template_columns: None,
+            column_gap: None,
+            row_gap: None,
         }
     }
 
@@ -450,6 +476,22 @@ impl ComputedStyle {
         self.background_image = Some(url);
     }
 
+    pub fn set_background_position(&mut self, x: f64, x_pct: bool, y: f64, y_pct: bool) {
+        self.background_position = Some((x, x_pct, y, y_pct));
+    }
+
+    pub fn background_position(&self) -> Option<(f64, bool, f64, bool)> {
+        self.background_position
+    }
+
+    pub fn set_background_no_repeat(&mut self, no_repeat: bool) {
+        self.background_no_repeat = no_repeat;
+    }
+
+    pub fn background_no_repeat(&self) -> bool {
+        self.background_no_repeat
+    }
+
     pub fn text_align(&self) -> TextAlign {
         self.text_align.unwrap_or(TextAlign::Left)
     }
@@ -486,14 +528,44 @@ impl ComputedStyle {
         self.flex_direction.unwrap_or(FlexDirection::Row)
     }
 
-    pub fn set_grid_columns(&mut self, n: usize) {
-        self.grid_columns = Some(n.max(1));
+    pub fn set_grid_template_columns(&mut self, tracks: Vec<GridTrack>) {
+        if !tracks.is_empty() {
+            self.grid_template_columns = Some(tracks);
+        }
     }
 
-    /// Column track count of a grid container; a grid without
-    /// `grid-template-columns` is a single column per CSS Grid §7.1.
+    /// Column tracks of a grid container; a grid without
+    /// `grid-template-columns` is a single auto column per CSS Grid §7.1.
+    pub fn grid_template_columns(&self) -> Vec<GridTrack> {
+        self.grid_template_columns.clone().unwrap_or_else(|| {
+            let mut v = Vec::with_capacity(1);
+            v.push(GridTrack::Auto);
+            v
+        })
+    }
+
+    /// Column track count of a grid container.
     pub fn grid_columns(&self) -> usize {
-        self.grid_columns.unwrap_or(1)
+        self.grid_template_columns
+            .as_ref()
+            .map(|t| t.len().max(1))
+            .unwrap_or(1)
+    }
+
+    pub fn set_column_gap(&mut self, px: f64) {
+        self.column_gap = Some(px.max(0.0));
+    }
+
+    pub fn column_gap(&self) -> i64 {
+        self.column_gap.unwrap_or(0.0) as i64
+    }
+
+    pub fn set_row_gap(&mut self, px: f64) {
+        self.row_gap = Some(px.max(0.0));
+    }
+
+    pub fn row_gap(&self) -> i64 {
+        self.row_gap.unwrap_or(0.0) as i64
     }
 
     pub fn set_font_family(&mut self, font_family: String) {

@@ -53,6 +53,8 @@ pub fn map_display_items_to_paint_commands(
                     anchor_id: anchor_id.clone(),
                     border_width,
                     border_color,
+                    background_position: style.background_position(),
+                    background_no_repeat: style.background_no_repeat(),
                 }));
             }
             DisplayItem::Text {

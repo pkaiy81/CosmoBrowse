@@ -272,6 +272,14 @@ pub enum SceneItem {
         border_width: i64,
         /// CSS color string for the border (e.g. "#808080"). Empty = no border.
         border_color: String,
+        /// CSS background-position as (x, x_is_percent, y, y_is_percent).
+        /// Percentages resolve against (box − image) at paint time; pixel
+        /// offsets may be negative (sprite sheets).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_position: Option<(f64, bool, f64, bool)>,
+        /// `background-repeat: no-repeat` (false = repeat, the CSS default).
+        #[serde(default)]
+        background_no_repeat: bool,
     },
     Text {
         x: i64,
