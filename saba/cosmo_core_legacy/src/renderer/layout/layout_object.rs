@@ -443,26 +443,51 @@ pub fn create_layout_object(
             .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
             .collect();
         matched.sort_by_key(|rule| rule.selector.specificity());
-        for rule in matched {
-            layout_object
-                .borrow_mut()
-                .cascading_style(rule.declarations.clone(), parent_font_size);
-        }
 
-        // Inline `style="..."` attribute: applied after stylesheet rules so it
-        // wins the cascade (highest author-origin specificity).
+        // Inline `style="..."` attribute declarations (parsed once, applied in
+        // the importance tiers below).
         // Spec: https://www.w3.org/TR/css-style-attr/#interpret
-        if let NodeKind::Element(ref element) = n.borrow().kind() {
-            if let Some(style_attr) = element.get_attribute("style") {
-                use crate::renderer::css::cssom::CssParser;
-                use crate::renderer::css::token::CssTokenizer;
-                let declarations =
-                    CssParser::new(CssTokenizer::new(style_attr)).parse_declaration_list();
-                if !declarations.is_empty() {
+        let inline_declarations: Vec<Declaration> = match n.borrow().kind() {
+            NodeKind::Element(ref element) => element
+                .get_attribute("style")
+                .map(|style_attr| {
+                    use crate::renderer::css::cssom::CssParser;
+                    use crate::renderer::css::token::CssTokenizer;
+                    CssParser::new(CssTokenizer::new(style_attr)).parse_declaration_list()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
+        // Importance tiers (weakest first; the last write wins in this
+        // engine's cascade): normal stylesheet declarations, normal inline
+        // declarations, !important stylesheet declarations, !important inline
+        // declarations. Spec: CSS Cascade §6.1 — declarations marked
+        // !important outrank all normal declarations of the same origin.
+        // https://www.w3.org/TR/css-cascade-4/#cascade-origin
+        for important in [false, true] {
+            for rule in &matched {
+                let tier: Vec<Declaration> = rule
+                    .declarations
+                    .iter()
+                    .filter(|d| d.important == important)
+                    .cloned()
+                    .collect();
+                if !tier.is_empty() {
                     layout_object
                         .borrow_mut()
-                        .cascading_style(declarations, parent_font_size);
+                        .cascading_style(tier, parent_font_size);
                 }
+            }
+            let tier: Vec<Declaration> = inline_declarations
+                .iter()
+                .filter(|d| d.important == important)
+                .cloned()
+                .collect();
+            if !tier.is_empty() {
+                layout_object
+                    .borrow_mut()
+                    .cascading_style(tier, parent_font_size);
             }
         }
 

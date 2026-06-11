@@ -1756,6 +1756,40 @@ mod tests {
     }
 
     #[test]
+    fn test_important_overrides_specificity_and_inline() {
+        let html = concat!(
+            "<html><head><style>",
+            // !important on a TYPE selector must beat a later id rule.
+            "p{color:#ff0000 !important;}",
+            "#strong{color:#0000ff;}",
+            // !important must also beat a normal inline style.
+            "em{color:#00aa00 !important;}",
+            // Inline !important beats stylesheet !important.
+            "b{color:#777777 !important;}",
+            "</style></head><body>",
+            "<p id=\"strong\">important-beats-id</p>",
+            "<em style=\"color:#123456\">important-beats-inline</em>",
+            "<b style=\"color:#abcdef !important\">inline-important-wins</b>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("important-beats-id"), 0xff0000,
+            "p !important beats #id normal rule");
+        assert_eq!(color_of("important-beats-inline"), 0x00aa00,
+            "stylesheet !important beats normal inline style");
+        assert_eq!(color_of("inline-important-wins"), 0xabcdef,
+            "inline !important beats stylesheet !important");
+    }
+
+    #[test]
     fn test_selector_specificity_orders_cascade() {
         let html = concat!(
             "<html><head><style>",

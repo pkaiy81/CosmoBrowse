@@ -80,7 +80,20 @@ impl CssParser {
         }
         self.skip_whitespace();
 
-        declaration.set_values(self.consume_component_values());
+        let mut values = self.consume_component_values();
+        // Trailing `!important` is a cascade flag, not part of the value.
+        // (Whitespace tokens are already filtered from values, so the two
+        // tokens are adjacent even for `! important`.)
+        // https://www.w3.org/TR/css-cascade-4/#importance
+        if values.len() >= 2
+            && values[values.len() - 2] == CssToken::Delim('!')
+            && matches!(&values[values.len() - 1],
+                CssToken::Ident(s) if s.eq_ignore_ascii_case("important"))
+        {
+            values.truncate(values.len() - 2);
+            declaration.important = true;
+        }
+        declaration.set_values(values);
 
         Some(declaration)
     }
@@ -606,6 +619,10 @@ impl Selector {
 pub struct Declaration {
     pub property: String,
     pub value: Vec<ComponentValue>,
+    /// `!important` — the declaration outranks every normal declaration in
+    /// the cascade, regardless of selector specificity.
+    /// https://www.w3.org/TR/css-cascade-4/#importance
+    pub important: bool,
 }
 
 impl Declaration {
@@ -613,6 +630,7 @@ impl Declaration {
         Self {
             property: String::new(),
             value: Vec::new(),
+            important: false,
         }
     }
 
