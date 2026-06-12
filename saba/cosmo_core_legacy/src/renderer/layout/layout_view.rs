@@ -724,6 +724,13 @@ impl LayoutView {
                     // still resolve against the surrounding context.
                     let lifted = content_base.unwrap_or(1_000_000);
                     (Some(lifted), (Some(lifted), context_base))
+                } else if b.style().opacity_or_default() < 1.0 || b.style().has_transform() {
+                    // opacity < 1 / transform form a stacking context AT the
+                    // box's normal paint position (CSS Color §3.2, Transforms
+                    // §6): the box doesn't lift, but descendant z-contexts
+                    // are trapped in its bucket instead of escaping to ±1M.
+                    let base = content_base.unwrap_or(0);
+                    (content_base, (content_base, Some(base)))
                 } else {
                     (content_base, (content_base, context_base))
                 }
@@ -2118,6 +2125,34 @@ mod tests {
         assert_eq!(style.width() as i64, 300, "inline width must override stylesheet");
         let bg = style.background_color();
         assert_eq!(bg.code_u32(), 0xff0000, "inline background-color must override stylesheet");
+    }
+
+    #[test]
+    fn test_opacity_transform_trap_descendant_contexts() {
+        let html = concat!(
+            "<html><head><style>",
+            ".faded{opacity:0.5;}",
+            ".spun{transform:rotate(3deg);}",
+            ".pop{position:absolute;z-index:50;}",
+            "</style></head><body>",
+            "<div class=\"faded\"><div class=\"pop\">in-faded</div></div>",
+            "<div class=\"spun\"><div class=\"pop\">in-spun</div></div>",
+            "<div><div class=\"pop\">free</div></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let body = layout_view.root().expect("body");
+        let faded = body.borrow().first_child().expect("faded");
+        let spun = faded.borrow().next_sibling().expect("spun");
+        let plain = spun.borrow().next_sibling().expect("plain");
+        // Children with z-index inside an opacity/transform context stay in
+        // its bucket (base 0 + clamped z), not at the global +1M level.
+        let in_faded = faded.borrow().first_child().expect("in-faded");
+        assert_eq!(in_faded.borrow().style().paint_z(), 50, "trapped in opacity context");
+        let in_spun = spun.borrow().first_child().expect("in-spun");
+        assert_eq!(in_spun.borrow().style().paint_z(), 50, "trapped in transform context");
+        let free = plain.borrow().first_child().expect("free");
+        assert_eq!(free.borrow().style().paint_z(), 1_000_050, "unwrapped context lifts to +1M");
     }
 
     #[test]

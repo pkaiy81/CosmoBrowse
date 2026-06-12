@@ -146,6 +146,9 @@ pub struct ComputedStyle {
     /// True when overflow is scroll/auto (an interactive scroll container);
     /// hidden/clip also clip but cannot be scrolled.
     overflow_scrollable: bool,
+    /// `transform` is declared with a non-none value. The transform itself is
+    /// not applied; the flag only triggers stacking-context formation.
+    has_transform: bool,
     /// Final clip rectangle (x, y, w, h) stamped by the post-layout pass:
     /// the intersection of every overflow-clipping ancestor box (and this
     /// box itself when it clips). Page coordinates.
@@ -229,6 +232,7 @@ impl ComputedStyle {
             fixed_subtree: false,
             paint_z: None,
             overflow_scrollable: false,
+            has_transform: false,
             final_clip: None,
             scroll_container: None,
             scroll_container_def: None,
@@ -617,6 +621,19 @@ impl ComputedStyle {
 
     pub fn overflow_scrollable(&self) -> bool {
         self.overflow_scrollable
+    }
+
+    pub fn set_has_transform(&mut self, v: bool) {
+        self.has_transform = v;
+    }
+
+    pub fn has_transform(&self) -> bool {
+        self.has_transform
+    }
+
+    /// Opacity without panicking on un-defaulted styles.
+    pub fn opacity_or_default(&self) -> f64 {
+        self.opacity.unwrap_or(1.0)
     }
 
     pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {

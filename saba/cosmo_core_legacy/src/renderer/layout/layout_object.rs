@@ -3379,6 +3379,15 @@ impl LayoutObject {
                         );
                     }
                 }
+                // transform values are not applied (no transform rendering),
+                // but a non-none transform forms a stacking context.
+                // https://www.w3.org/TR/css-transforms-1/#transform-rendering
+                "transform" => {
+                    let is_none = matches!(first_value,
+                        Some(ComponentValue::Ident(v)) if v.eq_ignore_ascii_case("none"));
+                    self.style
+                        .set_has_transform(!is_none && first_value.is_some());
+                }
                 "opacity" => {
                     if let Some(ComponentValue::Number(value)) = first_value {
                         self.style.set_opacity(*value);

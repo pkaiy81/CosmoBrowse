@@ -197,6 +197,32 @@ fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
 }
 
 
+/// Clip a hit region against a command's clip rect (screen space). Returns
+/// None when nothing remains — links hidden by an overflow container must
+/// not stay clickable.
+fn clip_hit_region(
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    clip: Option<(i64, i64, i64, i64)>,
+    chrome_height: i64,
+    scroll: i64,
+) -> Option<(i64, i64, i64, i64)> {
+    let Some((cx, cy, cw, ch)) = clip else {
+        return Some((x, y, w, h));
+    };
+    let cy = cy + chrome_height - scroll;
+    let nx = x.max(cx);
+    let ny = y.max(cy);
+    let right = (x + w).min(cx + cw);
+    let bottom = (y + h).min(cy + ch);
+    if right <= nx || bottom <= ny {
+        return None;
+    }
+    Some((nx, ny, right - nx, bottom - ny))
+}
+
 /// Inner scroll offset of the command's scroll container (0 when none).
 fn inner_offset(container: Option<u32>, offsets: &HashMap<u32, i64>) -> i64 {
     container
@@ -271,15 +297,25 @@ pub fn render_commands(
                 if let Some(href) = &text.href {
                     let text_width = end_x - text.x;
                     let font_height = text.font_px;
-                    hit_regions.push(HitRegion {
-                        x: text.x,
-                        y: text.y + chrome_height - scroll - inner,
-                        width: text_width.max(1),
-                        height: font_height + 4,
-                        href: href.clone(),
-                        target: text.target.clone(),
-                        frame_id: frame_id.to_string(),
-                    });
+                    if let Some((hx, hy, hw, hh)) = clip_hit_region(
+                        text.x,
+                        text.y + chrome_height - scroll - inner,
+                        text_width.max(1),
+                        font_height + 4,
+                        text.clip_rect,
+                        chrome_height,
+                        scroll,
+                    ) {
+                        hit_regions.push(HitRegion {
+                            x: hx,
+                            y: hy,
+                            width: hw,
+                            height: hh,
+                            href: href.clone(),
+                            target: text.target.clone(),
+                            frame_id: frame_id.to_string(),
+                        });
+                    }
                 }
             }
             PaintCommand::DrawImage(img) => {
@@ -296,21 +332,75 @@ pub fn render_commands(
                     inner,
                 );
                 if let Some(href) = &img.href {
-                    hit_regions.push(HitRegion {
-                        x: img.x,
-                        y: img.y + chrome_height - scroll - inner,
-                        width: img.width,
-                        height: img.height,
-                        href: href.clone(),
-                        target: img.target.clone(),
-                        frame_id: frame_id.to_string(),
-                    });
+                    if let Some((hx, hy, hw, hh)) = clip_hit_region(
+                        img.x,
+                        img.y + chrome_height - scroll - inner,
+                        img.width,
+                        img.height,
+                        img.clip_rect,
+                        chrome_height,
+                        scroll,
+                    ) {
+                        hit_regions.push(HitRegion {
+                            x: hx,
+                            y: hy,
+                            width: hw,
+                            height: hh,
+                            href: href.clone(),
+                            target: img.target.clone(),
+                            frame_id: frame_id.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Inner scrollbars: a slim track+thumb on the right edge of every scroll
+    // container whose content overflows, reflecting its inner offset.
+    for &(_, _, idx) in &sorted {
+        if let PaintCommand::DrawRect(rect) = &commands[idx] {
+            if let Some((id, content_h)) = rect.scroll_container_def {
+                if content_h > rect.height && rect.height > 0 {
+                    let scroll = effective_scroll(rect.fixed, rect.sticky, scroll_y);
+                    let inner = inner_offsets.get(&id).copied().unwrap_or(0);
+                    draw_inner_scrollbar(
+                        pixmap,
+                        rect.x + rect.width - 6,
+                        rect.y + chrome_height - scroll,
+                        rect.height,
+                        content_h,
+                        inner,
+                    );
                 }
             }
         }
     }
 
     hit_regions
+}
+
+/// Track + thumb for an overflow container (screen coordinates).
+fn draw_inner_scrollbar(
+    pixmap: &mut Pixmap,
+    x: i64,
+    y: i64,
+    box_h: i64,
+    content_h: i64,
+    inner: i64,
+) {
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(0xE0, 0xE0, 0xE0, 200));
+    if let Some(track) = Rect::from_xywh(x as f32, y as f32, 6.0, box_h as f32) {
+        pixmap.fill_rect(track, &paint, Transform::identity(), None);
+    }
+    let thumb_h = ((box_h * box_h) / content_h).max(12).min(box_h);
+    let max_inner = (content_h - box_h).max(1);
+    let thumb_y = y + (inner.clamp(0, max_inner) * (box_h - thumb_h)) / max_inner;
+    paint.set_color(Color::from_rgba8(0x90, 0x90, 0x90, 230));
+    if let Some(thumb) = Rect::from_xywh((x + 1) as f32, thumb_y as f32, 4.0, thumb_h as f32) {
+        pixmap.fill_rect(thumb, &paint, Transform::identity(), None);
+    }
 }
 
 fn apply_clip(
