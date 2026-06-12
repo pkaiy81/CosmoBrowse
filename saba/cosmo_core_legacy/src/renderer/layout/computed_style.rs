@@ -129,14 +129,20 @@ pub struct ComputedStyle {
     /// `line-height`. Inherited.
     line_height: Option<LineHeight>,
     /// Sticky scroll context stamped by the post-layout pass onto every node
-    /// of a sticky subtree: (top threshold, the sticky box's laid-out y).
-    /// The painter clamps the subtree's scroll so the box pins at the
-    /// threshold once the page scrolls past it.
-    sticky_context: Option<(f64, f64)>,
+    /// of a sticky subtree: (top threshold, the sticky box's laid-out y,
+    /// max pin delta). The painter clamps the subtree's scroll so the box
+    /// pins at the threshold once the page scrolls past it, releasing again
+    /// after `max_delta` (the containing block's bottom).
+    sticky_context: Option<(f64, f64, f64)>,
     /// True for every node inside a position:fixed subtree (stamped by the
     /// post-layout pass): descendants share the fixed box's scroll exemption
     /// and stacking level even though their own position is Static.
     fixed_subtree: bool,
+    /// Final paint-order key stamped by the post-layout pass: the root canvas
+    /// sits at −2M, normal flow at 0, stacking contexts at ±1M+z (nested
+    /// contexts offset within the parent's bucket). Mappers feed this to the
+    /// painter's z sort.
+    paint_z: Option<i32>,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
     grid_template_columns: Option<Vec<GridTrack>>,
@@ -208,6 +214,7 @@ impl ComputedStyle {
             line_height: None,
             sticky_context: None,
             fixed_subtree: false,
+            paint_z: None,
             grid_template_columns: None,
             column_gap: None,
             row_gap: None,
@@ -254,10 +261,10 @@ impl ComputedStyle {
         }
 
         if let Some(parent_style) = parent_style {
-            if self.background_color.is_none() && parent_style.background_color() != Color::white()
-            {
-                self.background_color = Some(parent_style.background_color());
-            }
+            // NOTE: background-color is NOT inherited in CSS. The transparent
+            // default lets the parent's background show through; inheriting a
+            // concrete color here created opaque copies on every descendant
+            // box, which then painted over negative-z-index layers.
             if self.color.is_none() && parent_style.color() != Color::black() {
                 self.color = Some(parent_style.color());
             }
@@ -501,9 +508,11 @@ impl ComputedStyle {
                 self.text_align = Some(TextAlign::Left);
             }
         }
-        if self.z_index.is_none() {
-            self.z_index = Some(0);
-        }
+        // z_index intentionally stays None when not declared: `auto` is
+        // distinguishable from an explicit 0 (auto-positioned boxes do not
+        // form stacking contexts; their children escape to the parent
+        // context). Use z_index_or_default() to read it.
+
         if self.overflow_clip.is_none() {
             self.overflow_clip = Some(false);
         }
@@ -551,11 +560,11 @@ impl ComputedStyle {
         self.line_height
     }
 
-    pub fn set_sticky_context(&mut self, top: f64, container_y: f64) {
-        self.sticky_context = Some((top, container_y));
+    pub fn set_sticky_context(&mut self, top: f64, container_y: f64, max_delta: f64) {
+        self.sticky_context = Some((top, container_y, max_delta));
     }
 
-    pub fn sticky_context(&self) -> Option<(f64, f64)> {
+    pub fn sticky_context(&self) -> Option<(f64, f64, f64)> {
         self.sticky_context
     }
 
@@ -565,6 +574,24 @@ impl ComputedStyle {
 
     pub fn fixed_subtree(&self) -> bool {
         self.fixed_subtree
+    }
+
+    pub fn set_paint_z(&mut self, z: i32) {
+        self.paint_z = Some(z);
+    }
+
+    pub fn paint_z(&self) -> i32 {
+        self.paint_z.unwrap_or(0)
+    }
+
+    /// z-index without panicking on un-defaulted styles.
+    pub fn z_index_or_default(&self) -> i32 {
+        self.z_index.unwrap_or(0)
+    }
+
+    /// True when z-index was declared (i.e. not `auto`).
+    pub fn z_index_specified(&self) -> bool {
+        self.z_index.is_some()
     }
 
     pub fn background_size(&self) -> Option<(u8, f64, bool, f64, bool)> {

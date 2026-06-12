@@ -2354,7 +2354,7 @@ impl LayoutObject {
                             layout_size: LayoutSize::new(self.size().width(), rect_h),
                             paint_order: PaintOrder {
                                 stacking_context: self.stacking_context_level(),
-                                z_index: self.style.z_index(),
+                                z_index: self.style.z_index_or_default(),
                             },
                             clip_rect: if self.style.overflow_clip() {
                                 Some(ClipRect {
@@ -2382,7 +2382,7 @@ impl LayoutObject {
                             layout_size: self.size(),
                             paint_order: PaintOrder {
                                 stacking_context: self.stacking_context_level(),
-                                z_index: self.style.z_index(),
+                                z_index: self.style.z_index_or_default(),
                             },
                             clip_rect: if self.style.overflow_clip() {
                                 Some(ClipRect {
@@ -2411,7 +2411,7 @@ impl LayoutObject {
                             target: self.link_target(),
                             paint_order: PaintOrder {
                                 stacking_context: self.stacking_context_level(),
-                                z_index: self.style.z_index(),
+                                z_index: self.style.z_index_or_default(),
                             },
                             clip_rect: if self.style.overflow_clip() {
                                 Some(ClipRect {
@@ -2446,7 +2446,7 @@ impl LayoutObject {
                             target: self.link_target(),
                             paint_order: PaintOrder {
                                 stacking_context: self.stacking_context_level(),
-                                z_index: self.style.z_index(),
+                                z_index: self.style.z_index_or_default(),
                             },
                             clip_rect: None,
                             bold: self.style.is_bold(),
@@ -2506,7 +2506,7 @@ impl LayoutObject {
                             target: target.clone(),
                             paint_order: PaintOrder {
                                 stacking_context: self.stacking_context_level(),
-                                z_index: self.style.z_index(),
+                                z_index: self.style.z_index_or_default(),
                             },
                             clip_rect: None,
                             bold,
@@ -3501,14 +3501,24 @@ impl LayoutObject {
 
     /// Stamp the sticky scroll context onto this node's style (see
     /// `LayoutView::stamp_sticky_contexts`).
-    pub fn set_sticky_context(&mut self, top: f64, container_y: f64) {
-        self.style.set_sticky_context(top, container_y);
+    pub fn set_sticky_context(&mut self, top: f64, container_y: f64, max_delta: f64) {
+        self.style.set_sticky_context(top, container_y, max_delta);
     }
 
     /// Mark this node as part of a position:fixed subtree (see
     /// `LayoutView::stamp_sticky_contexts`).
     pub fn set_fixed_subtree(&mut self) {
         self.style.set_fixed_subtree();
+    }
+
+    /// Upgraded parent layout object, when still alive.
+    pub fn parent_object(&self) -> Option<Rc<RefCell<LayoutObject>>> {
+        self.parent.upgrade()
+    }
+
+    /// Stamp the final paint-order key (see `LayoutView::stamp_sticky_contexts`).
+    pub fn set_paint_z(&mut self, z: i32) {
+        self.style.set_paint_z(z);
     }
 
     pub fn size(&self) -> LayoutSize {

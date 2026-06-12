@@ -597,7 +597,7 @@ impl LayoutView {
         );
         Self::align_inline_baselines(&self.root);
         self.reposition_fixed_far_edges(&self.root.clone());
-        Self::stamp_sticky_contexts(&self.root, None, false);
+        Self::stamp_sticky_contexts(&self.root, None, false, (None, None), true);
     }
 
     /// Post-layout pass: stamp the sticky scroll context — (top threshold,
@@ -606,22 +606,83 @@ impl LayoutView {
     /// pin the whole subtree once the page scrolls past the threshold.
     fn stamp_sticky_contexts(
         node: &Option<Rc<RefCell<LayoutObject>>>,
-        inherited: Option<(f64, f64)>,
+        inherited: Option<(f64, f64, f64)>,
         in_fixed: bool,
+        // (content layer for non-context descendants, base for descendants
+        // that form their own stacking context). They differ under a
+        // positioned z:auto box: its content rides at the elevated layer,
+        // but child contexts still resolve against the SURROUNDING context
+        // (a z:-1 child paints below normal flow, like Chrome).
+        inherited_paint_z: (Option<i32>, Option<i32>),
+        is_root: bool,
     ) {
         if let Some(n) = node {
+            // Paint-order key. Spec model (CSS2 App. E, approximated):
+            // the root canvas paints first (−2M), negative-z stacking
+            // contexts next (−1M+z), normal flow at 0, positive contexts at
+            // +1M+z. A context nested inside another stays within its
+            // parent's bucket (children cannot escape their stacking
+            // context), offset by its own clamped z-index.
+            let (content_base, context_base) = inherited_paint_z;
+            let (own_paint_z, child_paint_z) = {
+                let b = n.borrow();
+                let positioned = b.style().position_or_default() != PositionType::Static;
+                if is_root {
+                    // The root's own key is for its canvas rect only; its
+                    // normal-flow children stay at the default 0.
+                    (Some(-2_000_000), (None, None))
+                } else if positioned && b.style().z_index_specified() {
+                    // A positioned box with an explicit z-index forms a
+                    // stacking context: children are trapped in its bucket.
+                    let z = b.style().z_index_or_default();
+                    let eff = match context_base {
+                        Some(base) => base.saturating_add(z.clamp(-999, 999)),
+                        None => {
+                            if z >= 0 {
+                                1_000_000_i32.saturating_add(z)
+                            } else {
+                                (-1_000_000_i32).saturating_add(z)
+                            }
+                        }
+                    };
+                    (Some(eff), (Some(eff), Some(eff)))
+                } else if positioned {
+                    // z-index:auto — painted above normal flow together with
+                    // its content, but NOT a stacking context: descendants
+                    // that form their own context (e.g. a z:-1 deco layer)
+                    // still resolve against the surrounding context.
+                    let lifted = content_base.unwrap_or(1_000_000);
+                    (Some(lifted), (Some(lifted), context_base))
+                } else {
+                    (content_base, (content_base, context_base))
+                }
+            };
+            if let Some(z) = own_paint_z {
+                n.borrow_mut().set_paint_z(z);
+            }
             let (own, is_fixed) = {
                 let b = n.borrow();
                 let own = if b.style().position_or_default() == PositionType::Sticky {
-                    Some((b.style().offset_top(), b.point().y() as f64))
+                    // Bound: the pin releases when the containing block's
+                    // bottom edge reaches the sticky box's bottom.
+                    let max_delta = b
+                        .parent_object()
+                        .map(|p| {
+                            let pb = p.borrow();
+                            (pb.point().y() + pb.size().height()) as f64
+                                - (b.point().y() + b.size().height()) as f64
+                        })
+                        .unwrap_or(f64::MAX)
+                        .max(0.0);
+                    Some((b.style().offset_top(), b.point().y() as f64, max_delta))
                 } else {
                     None
                 };
                 (own, b.style().position_or_default() == PositionType::Fixed)
             };
             let context = own.or(inherited);
-            if let Some((top, container_y)) = context {
-                n.borrow_mut().set_sticky_context(top, container_y);
+            if let Some((top, container_y, max_delta)) = context {
+                n.borrow_mut().set_sticky_context(top, container_y, max_delta);
             }
             let in_fixed_for_siblings = in_fixed;
             let in_fixed = in_fixed || is_fixed;
@@ -631,10 +692,16 @@ impl LayoutView {
                 n.borrow_mut().set_fixed_subtree();
             }
             let first_child = n.borrow().first_child();
-            Self::stamp_sticky_contexts(&first_child, context, in_fixed);
+            Self::stamp_sticky_contexts(&first_child, context, in_fixed, child_paint_z, false);
             let next_sibling = n.borrow().next_sibling();
             // Siblings inherit the CALLER's contexts, not this node's.
-            Self::stamp_sticky_contexts(&next_sibling, inherited, in_fixed_for_siblings);
+            Self::stamp_sticky_contexts(
+                &next_sibling,
+                inherited,
+                in_fixed_for_siblings,
+                inherited_paint_z,
+                false,
+            );
         }
     }
 
@@ -1968,6 +2035,65 @@ mod tests {
         assert_eq!(style.width() as i64, 300, "inline width must override stylesheet");
         let bg = style.background_color();
         assert_eq!(bg.code_u32(), 0xff0000, "inline background-color must override stylesheet");
+    }
+
+    #[test]
+    fn test_paint_z_stacking_keys() {
+        let html = concat!(
+            "<html><head><style>",
+            ".behind{position:absolute;z-index:-1;width:50px;height:50px;}",
+            ".front{position:relative;z-index:3;}",
+            ".inner{position:relative;z-index:-5;}",
+            "</style></head><body>",
+            "<div class=\"behind\">b</div>",
+            "<p>normal</p>",
+            "<div class=\"front\">f<span class=\"inner\">nested</span></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let body = layout_view.root().expect("body");
+        assert_eq!(body.borrow().style().paint_z(), -2_000_000, "root canvas");
+        let behind = body.borrow().first_child().expect("behind");
+        assert_eq!(behind.borrow().style().paint_z(), -1_000_001,
+            "negative z context: above canvas, below normal flow");
+        let p = behind.borrow().next_sibling().expect("p");
+        assert_eq!(p.borrow().style().paint_z(), 0, "normal flow");
+        let front = p.borrow().next_sibling().expect("front");
+        assert_eq!(front.borrow().style().paint_z(), 1_000_003, "positive context");
+        // Nested context stays within the parent bucket (cannot escape).
+        let f_text = front.borrow().first_child().expect("f text");
+        assert_eq!(f_text.borrow().style().paint_z(), 1_000_003, "child inherits context");
+        let inner = f_text.borrow().next_sibling().expect("inner");
+        assert_eq!(inner.borrow().style().paint_z(), 1_000_003 - 5,
+            "nested context offsets within the parent bucket");
+    }
+
+    #[test]
+    fn test_sticky_context_bound_to_containing_block() {
+        let html = concat!(
+            "<html><head><style>",
+            ".section{height:260px;}",
+            ".sbar{position:sticky;top:0;height:40px;}",
+            "</style></head><body>",
+            "<div class=\"section\"><div class=\"sbar\">bar</div><p>content</p></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 640);
+        let body = layout_view.root().expect("body");
+        let section = body.borrow().first_child().expect("section");
+        let sbar = section.borrow().first_child().expect("sbar");
+        let (top, container_y, max_delta) = sbar
+            .borrow()
+            .style()
+            .sticky_context()
+            .expect("sticky context stamped");
+        assert_eq!(top, 0.0);
+        assert_eq!(container_y, 0.0, "bar laid out at the section top");
+        // Pin releases at the containing block's bottom: 260 - 40 = 220.
+        assert_eq!(max_delta, 220.0);
+        // The child content of the sticky bar carries the same context.
+        let bar_text = sbar.borrow().first_child().expect("bar text");
+        assert_eq!(bar_text.borrow().style().sticky_context(), Some((0.0, 0.0, 220.0)));
     }
 
     #[test]

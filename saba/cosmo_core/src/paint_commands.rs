@@ -91,7 +91,7 @@ pub struct DrawRect {
     /// position:sticky context (top threshold, sticky box's laid-out y):
     /// the painter pins the subtree once scrolling passes the threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sticky: Option<(i64, i64)>,
+    pub sticky: Option<(i64, i64, i64)>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -109,7 +109,7 @@ pub struct DrawText {
     pub fixed: bool,
     /// position:sticky context (top threshold, container y).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sticky: Option<(i64, i64)>,
+    pub sticky: Option<(i64, i64, i64)>,
     pub x: i64,
     pub y: i64,
     pub text: String,
@@ -133,7 +133,7 @@ pub struct DrawImage {
     pub fixed: bool,
     /// position:sticky context (top threshold, container y).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sticky: Option<(i64, i64)>,
+    pub sticky: Option<(i64, i64, i64)>,
     pub x: i64,
     pub y: i64,
     pub width: i64,

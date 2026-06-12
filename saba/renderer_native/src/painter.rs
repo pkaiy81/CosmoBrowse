@@ -200,12 +200,14 @@ fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
 /// Per-command scroll offset: fixed boxes never scroll; sticky boxes scroll
 /// until their box would pass the `top` threshold, then pin there (the whole
 /// subtree shares the container's context so it pins together).
-fn effective_scroll(fixed: bool, sticky: Option<(i64, i64)>, scroll_y: i64) -> i64 {
+fn effective_scroll(fixed: bool, sticky: Option<(i64, i64, i64)>, scroll_y: i64) -> i64 {
     if fixed {
         return 0;
     }
-    if let Some((top, container_y)) = sticky {
-        let delta = (scroll_y + top - container_y).max(0);
+    if let Some((top, container_y, max_delta)) = sticky {
+        // Pin once the box would scroll past `top`, but release again after
+        // max_delta (the containing block's bottom passes the box).
+        let delta = (scroll_y + top - container_y).clamp(0, max_delta.max(0));
         return scroll_y - delta;
     }
     scroll_y
@@ -338,14 +340,12 @@ fn draw_rect(
     // We therefore only check y=0 and large-width, not x=0.
     // Use 1/8 of viewport width as threshold to also cover narrow frames
     // (e.g. 18% nav frames) while still excluding small element backgrounds.
-    // A position:fixed box is never the page canvas, even when it sits at
-    // y=0 spanning the viewport (a fixed nav bar would be stretched into a
-    // full-screen slab by this propagation).
-    let effective_height = if rect.y == 0
-        && !rect.fixed
-        && rect.clip_rect.is_none()
-        && rect.width >= pixmap.width() as i64 / 8
-    {
+    // Only the ROOT element's background propagates to the viewport canvas.
+    // The layout engine stamps the root box with the canvas paint key
+    // (−2_000_000), so the old positional heuristic (y=0 + wide) is no
+    // longer needed — it mis-fired on ordinary full-width rows at the top
+    // of the page (HN's orange header bar became a full-screen slab).
+    let effective_height = if rect.z_index <= -1_500_000 && rect.clip_rect.is_none() {
         let min_fill = pixmap.height() as i64 + scroll_y - chrome_height;
         rect.height.max(min_fill)
     } else {

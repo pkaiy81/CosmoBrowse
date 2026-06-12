@@ -188,7 +188,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 style,
                 layout_point,
                 layout_size,
-                paint_order,
+                paint_order: _,
                 clip_rect,
                 anchor_id,
             } => {
@@ -213,10 +213,9 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
-                    // Fold the stacking context into the sortable z so positioned
-                    // boxes (sticky bars, etc.) paint above normal-flow content
-                    // even after the painter's per-z phase sort.
-                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
+                    // Final paint-order key from the engine's stacking pass
+                    // (root canvas −2M, normal flow 0, contexts ±1M+z).
+                    z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                     anchor_id,
                     border_width,
@@ -225,7 +224,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
-                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
+                    sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                 });
             }
             DisplayItem::Text {
@@ -234,7 +233,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 layout_point,
                 href,
                 target,
-                paint_order,
+                paint_order: _,
                 clip_rect,
                 bold,
             } => {
@@ -246,7 +245,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 max_height = max_height.max(layout_point.y() + height_estimate);
                 scene_items.push(SceneItem::Text {
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
-                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
+                    sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     x,
                     y,
                     text,
@@ -258,10 +257,9 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     opacity: style.opacity(),
                     href,
                     target,
-                    // Fold the stacking context into the sortable z so positioned
-                    // boxes (sticky bars, etc.) paint above normal-flow content
-                    // even after the painter's per-z phase sort.
-                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
+                    // Final paint-order key from the engine's stacking pass
+                    // (root canvas −2M, normal flow 0, contexts ±1M+z).
+                    z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                 });
             }
@@ -273,7 +271,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 style,
                 href,
                 target,
-                paint_order,
+                paint_order: _,
                 clip_rect,
             } => {
                 let x = rect.x + layout_point.x();
@@ -282,7 +280,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 max_height = max_height.max(layout_point.y() + layout_size.height());
                 scene_items.push(SceneItem::Image {
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
-                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
+                    sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     x,
                     y,
                     width: layout_size.width(),
@@ -292,10 +290,9 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     opacity: style.opacity(),
                     href,
                     target,
-                    // Fold the stacking context into the sortable z so positioned
-                    // boxes (sticky bars, etc.) paint above normal-flow content
-                    // even after the painter's per-z phase sort.
-                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
+                    // Final paint-order key from the engine's stacking pass
+                    // (root canvas −2M, normal flow 0, contexts ±1M+z).
+                    z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                 });
             }
@@ -407,7 +404,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
             font_px: style.font_size().px(),
             font_family: style.font_family(),
             opacity: style.opacity(),
-            z_index: style.z_index(),
+            z_index: style.z_index_or_default(),
         },
         children,
     }
