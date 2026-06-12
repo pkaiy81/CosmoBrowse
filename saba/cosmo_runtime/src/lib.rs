@@ -35,6 +35,8 @@ pub fn scene_items_to_paint_commands(
                 background_size,
                 fixed,
                 sticky,
+                scroll_container,
+                scroll_container_def,
             } => commands.push(PaintCommand::DrawRect(DrawRect {
                 x: *x,
                 y: *y,
@@ -53,10 +55,14 @@ pub fn scene_items_to_paint_commands(
                 background_size: *background_size,
                 fixed: *fixed,
                 sticky: *sticky,
+                scroll_container: *scroll_container,
+                scroll_container_def: *scroll_container_def,
             })),
             SceneItem::Text {
                 fixed,
                 sticky,
+                scroll_container,
+                scroll_container_def: _,
                 x,
                 y,
                 text,
@@ -84,6 +90,7 @@ pub fn scene_items_to_paint_commands(
                 commands.push(PaintCommand::DrawText(DrawText {
                     fixed: *fixed,
                     sticky: *sticky,
+                    scroll_container: *scroll_container,
                     x: *x,
                     y: *y,
                     text: text.clone(),
@@ -102,6 +109,8 @@ pub fn scene_items_to_paint_commands(
             SceneItem::Image {
                 fixed,
                 sticky,
+                scroll_container,
+                scroll_container_def: _,
                 x,
                 y,
                 width,
@@ -142,6 +151,8 @@ pub fn scene_items_to_paint_commands(
                         background_size: None,
                         fixed: *fixed,
                         sticky: *sticky,
+                        scroll_container: *scroll_container,
+                        scroll_container_def: None,
                     }));
                     commands.push(PaintCommand::fallback_text(
                         *x + 4,
@@ -158,6 +169,7 @@ pub fn scene_items_to_paint_commands(
                     commands.push(PaintCommand::DrawImage(DrawImage {
                         fixed: *fixed,
                         sticky: *sticky,
+                        scroll_container: *scroll_container,
                         x: *x,
                         y: *y,
                         width: *width,

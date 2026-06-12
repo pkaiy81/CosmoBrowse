@@ -1397,10 +1397,14 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 background_size: rect.background_size,
                 fixed: rect.fixed,
                 sticky: rect.sticky,
+                scroll_container: rect.scroll_container,
+                scroll_container_def: rect.scroll_container_def,
             }),
             PaintCommand::DrawText(text) => items.push(SceneItem::Text {
                 fixed: text.fixed,
                 sticky: text.sticky,
+                scroll_container: text.scroll_container,
+                scroll_container_def: None,
                 x: text.x,
                 y: text.y,
                 text: text.text.clone(),
@@ -1418,6 +1422,8 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
             PaintCommand::DrawImage(image) => items.push(SceneItem::Image {
                 fixed: image.fixed,
                 sticky: image.sticky,
+                scroll_container: image.scroll_container,
+                scroll_container_def: None,
                 x: image.x,
                 y: image.y,
                 width: image.width,

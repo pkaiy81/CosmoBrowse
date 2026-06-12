@@ -597,7 +597,17 @@ impl LayoutView {
         );
         Self::align_inline_baselines(&self.root);
         self.reposition_fixed_far_edges(&self.root.clone());
-        Self::stamp_sticky_contexts(&self.root, None, false, (None, None), true);
+        let mut next_scroll_id: u32 = 1;
+        Self::stamp_sticky_contexts(
+            &self.root,
+            None,
+            false,
+            (None, None),
+            true,
+            None,
+            None,
+            &mut next_scroll_id,
+        );
     }
 
     /// Post-layout pass: stamp the sticky scroll context — (top threshold,
@@ -615,8 +625,69 @@ impl LayoutView {
         // (a z:-1 child paints below normal flow, like Chrome).
         inherited_paint_z: (Option<i32>, Option<i32>),
         is_root: bool,
+        inherited_clip: Option<(f64, f64, f64, f64)>,
+        scroll_id: Option<u32>,
+        next_scroll_id: &mut u32,
     ) {
         if let Some(n) = node {
+            // Clip inheritance: an overflow-clipping box clips ITSELF and all
+            // descendants to its border box, intersected with outer clips.
+            // Scroll containers (overflow scroll/auto) also get an id; their
+            // CONTENT (not their own box) is offset by the renderer's
+            // per-container inner scroll.
+            let (own_box_clip, is_scrollable) = {
+                let b = n.borrow();
+                if b.style().overflow_clip() {
+                    let bx = b.point().x() as f64;
+                    let by = b.point().y() as f64;
+                    let bw = b.size().width() as f64;
+                    let bh = b.size().height() as f64;
+                    (Some((bx, by, bw, bh)), b.style().overflow_scrollable())
+                } else {
+                    (None, false)
+                }
+            };
+            let effective_clip = match (inherited_clip, own_box_clip) {
+                (Some((ax, ay, aw, ah)), Some((bx, by, bw, bh))) => {
+                    let x = ax.max(bx);
+                    let y = ay.max(by);
+                    let r = (ax + aw).min(bx + bw);
+                    let btm = (ay + ah).min(by + bh);
+                    Some((x, y, (r - x).max(0.0), (btm - y).max(0.0)))
+                }
+                (a, b) => a.or(b),
+            };
+            if let Some(clip) = effective_clip {
+                n.borrow_mut().set_final_clip(clip);
+            }
+            if let Some(id) = scroll_id {
+                n.borrow_mut().set_scroll_container(id);
+            }
+            let child_scroll_id = if is_scrollable {
+                let id = *next_scroll_id;
+                *next_scroll_id += 1;
+                // Content height: how far the children extend below the
+                // container's top edge (for the renderer's scroll clamp).
+                let content_h = {
+                    let b = n.borrow();
+                    let top = b.point().y() as f64;
+                    let mut max_bottom = top;
+                    let mut child = b.first_child();
+                    while let Some(c) = child {
+                        let cb = c.borrow();
+                        max_bottom =
+                            max_bottom.max((cb.point().y() + cb.size().height()) as f64);
+                        let next = cb.next_sibling();
+                        drop(cb);
+                        child = next;
+                    }
+                    max_bottom - top
+                };
+                n.borrow_mut().set_scroll_container_def(id, content_h);
+                Some(id)
+            } else {
+                scroll_id
+            };
             // Paint-order key. Spec model (CSS2 App. E, approximated):
             // the root canvas paints first (−2M), negative-z stacking
             // contexts next (−1M+z), normal flow at 0, positive contexts at
@@ -692,7 +763,16 @@ impl LayoutView {
                 n.borrow_mut().set_fixed_subtree();
             }
             let first_child = n.borrow().first_child();
-            Self::stamp_sticky_contexts(&first_child, context, in_fixed, child_paint_z, false);
+            Self::stamp_sticky_contexts(
+                &first_child,
+                context,
+                in_fixed,
+                child_paint_z,
+                false,
+                effective_clip,
+                child_scroll_id,
+                next_scroll_id,
+            );
             let next_sibling = n.borrow().next_sibling();
             // Siblings inherit the CALLER's contexts, not this node's.
             Self::stamp_sticky_contexts(
@@ -701,6 +781,9 @@ impl LayoutView {
                 in_fixed_for_siblings,
                 inherited_paint_z,
                 false,
+                inherited_clip,
+                scroll_id,
+                next_scroll_id,
             );
         }
     }

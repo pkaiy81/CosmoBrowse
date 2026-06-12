@@ -61,6 +61,8 @@ pub fn map_display_items_to_paint_commands(
                     background_size: style.background_size(),
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
+                    scroll_container: style.scroll_container(),
+                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
                 }));
             }
             DisplayItem::Text {
@@ -92,6 +94,7 @@ pub fn map_display_items_to_paint_commands(
                 commands.push(PaintCommand::DrawText(DrawText {
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
+                    scroll_container: style.scroll_container(),
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
                     text: text.clone(),
@@ -123,6 +126,7 @@ pub fn map_display_items_to_paint_commands(
                 commands.push(PaintCommand::DrawImage(DrawImage {
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
+                    scroll_container: style.scroll_container(),
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
                     width: layout_size.width(),

@@ -25,6 +25,7 @@ impl PaintCommand {
         Self::DrawText(DrawText {
             fixed: false,
             sticky: None,
+            scroll_container: None,
             x,
             y,
             text: text.into(),
@@ -92,6 +93,12 @@ pub struct DrawRect {
     /// the painter pins the subtree once scrolling passes the threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky: Option<(i64, i64, i64)>,
+    /// Nearest scroll container this content belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_container: Option<u32>,
+    /// Set on a scroll container's own box: (id, content height).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_container_def: Option<(u32, i64)>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -110,6 +117,9 @@ pub struct DrawText {
     /// position:sticky context (top threshold, container y).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky: Option<(i64, i64, i64)>,
+    /// Nearest scroll container this content belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_container: Option<u32>,
     pub x: i64,
     pub y: i64,
     pub text: String,
@@ -134,6 +144,9 @@ pub struct DrawImage {
     /// position:sticky context (top threshold, container y).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky: Option<(i64, i64, i64)>,
+    /// Nearest scroll container this content belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_container: Option<u32>,
     pub x: i64,
     pub y: i64,
     pub width: i64,

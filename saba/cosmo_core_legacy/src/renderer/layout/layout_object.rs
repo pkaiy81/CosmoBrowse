@@ -2356,16 +2356,12 @@ impl LayoutObject {
                                 stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index_or_default(),
                             },
-                            clip_rect: if self.style.overflow_clip() {
-                                Some(ClipRect {
-                                    x: self.point().x(),
-                                    y: rect_y,
-                                    width: self.size().width(),
-                                    height: rect_h,
-                                })
-                            } else {
-                                None
-                            },
+                            clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
+                                x: x as i64,
+                                y: y as i64,
+                                width: w as i64,
+                                height: h as i64,
+                            }),
                             anchor_id,
                         }];
                     }
@@ -2384,16 +2380,12 @@ impl LayoutObject {
                                 stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index_or_default(),
                             },
-                            clip_rect: if self.style.overflow_clip() {
-                                Some(ClipRect {
-                                    x: self.point().x(),
-                                    y: self.point().y(),
-                                    width: self.size().width(),
-                                    height: self.size().height(),
-                                })
-                            } else {
-                                None
-                            },
+                            clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
+                                x: x as i64,
+                                y: y as i64,
+                                width: w as i64,
+                                height: h as i64,
+                            }),
                             anchor_id,
                         });
                     }
@@ -2413,26 +2405,28 @@ impl LayoutObject {
                                 stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index_or_default(),
                             },
-                            clip_rect: if self.style.overflow_clip() {
-                                Some(ClipRect {
-                                    x: self.point().x(),
-                                    y: self.point().y(),
-                                    width: self.size().width(),
-                                    height: self.size().height(),
+                            clip_rect: self
+                                .style
+                                .final_clip()
+                                .map(|(x, y, w, h)| ClipRect {
+                                    x: x as i64,
+                                    y: y as i64,
+                                    width: w as i64,
+                                    height: h as i64,
                                 })
-                            } else {
-                                // Clip to ancestor cell so oversized images don't
-                                // overflow their cell boundary.
-                                self.nearest_ancestor_cell().map(|cell| {
-                                    let cb = cell.borrow();
-                                    ClipRect {
-                                        x: cb.point().x(),
-                                        y: cb.point().y(),
-                                        width: cb.size().width(),
-                                        height: cb.size().height(),
-                                    }
-                                })
-                            },
+                                .or_else(|| {
+                                    // Clip to ancestor cell so oversized images
+                                    // don't overflow their cell boundary.
+                                    self.nearest_ancestor_cell().map(|cell| {
+                                        let cb = cell.borrow();
+                                        ClipRect {
+                                            x: cb.point().x(),
+                                            y: cb.point().y(),
+                                            width: cb.size().width(),
+                                            height: cb.size().height(),
+                                        }
+                                    })
+                                }),
                         });
                     } else if let Some(text) = self.placeholder_text() {
                         items.push(DisplayItem::Text {
@@ -2448,7 +2442,12 @@ impl LayoutObject {
                                 stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index_or_default(),
                             },
-                            clip_rect: None,
+                            clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
+                                x: x as i64,
+                                y: y as i64,
+                                width: w as i64,
+                                height: h as i64,
+                            }),
                             bold: self.style.is_bold(),
                         });
                     }
@@ -2508,7 +2507,12 @@ impl LayoutObject {
                                 stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index_or_default(),
                             },
-                            clip_rect: None,
+                            clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
+                                x: x as i64,
+                                y: y as i64,
+                                width: w as i64,
+                                height: h as i64,
+                            }),
                             bold,
                         };
                         v.push(item);
@@ -3324,6 +3328,10 @@ impl LayoutObject {
                             value.as_str(),
                             "hidden" | "clip" | "scroll" | "auto"
                         ));
+                        self.style.set_overflow_scrollable(matches!(
+                            value.as_str(),
+                            "scroll" | "auto"
+                        ));
                     }
                 }
                 "margin" => {
@@ -3519,6 +3527,21 @@ impl LayoutObject {
     /// Stamp the final paint-order key (see `LayoutView::stamp_sticky_contexts`).
     pub fn set_paint_z(&mut self, z: i32) {
         self.style.set_paint_z(z);
+    }
+
+    /// Stamp the final clip rectangle (intersection of overflow ancestors).
+    pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {
+        self.style.set_final_clip(clip);
+    }
+
+    /// Stamp the nearest scroll-container id for this box's content.
+    pub fn set_scroll_container(&mut self, id: u32) {
+        self.style.set_scroll_container(id);
+    }
+
+    /// Mark this box as a scroll container (id + scrollable content height).
+    pub fn set_scroll_container_def(&mut self, id: u32, content_height: f64) {
+        self.style.set_scroll_container_def(id, content_height);
     }
 
     pub fn size(&self) -> LayoutSize {

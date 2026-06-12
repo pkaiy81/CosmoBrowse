@@ -55,6 +55,11 @@ struct App {
     status_message: String,
     pending_url: Option<String>,
     save_screenshot: bool,
+    /// Per-scroll-container inner offsets (overflow:scroll/auto content).
+    inner_scroll_offsets: std::collections::HashMap<u32, i64>,
+    /// Scroll containers visible in the last paint: (id, x, y, w, h,
+    /// content_h) in page coordinates.
+    scroll_containers: Vec<(u32, i64, i64, i64, i64, i64)>,
 }
 
 impl App {
@@ -74,6 +79,8 @@ impl App {
             status_message: String::new(),
             pending_url: None,
             save_screenshot: false,
+            inner_scroll_offsets: std::collections::HashMap::new(),
+            scroll_containers: Vec::new(),
         }
     }
 
@@ -153,6 +160,18 @@ impl App {
         // Draw page content.
         let mut all_hit_regions = Vec::new();
         let frame_commands = self.bridge.collect_paint_commands();
+        // Refresh the scroll-container registry from the fresh commands.
+        self.scroll_containers.clear();
+        for (_, _, commands) in &frame_commands {
+            for cmd in commands {
+                if let cosmo_core::paint_commands::PaintCommand::DrawRect(r) = cmd {
+                    if let Some((id, content_h)) = r.scroll_container_def {
+                        self.scroll_containers
+                            .push((id, r.x, r.y, r.width, r.height, content_h));
+                    }
+                }
+            }
+        }
         for (frame_id, frame_url, commands) in &frame_commands {
             let regions = render_commands(
                 &mut pixmap,
@@ -163,6 +182,7 @@ impl App {
                 self.scroll_y,
                 CHROME_HEIGHT,
                 frame_id,
+                &self.inner_scroll_offsets,
             );
             all_hit_regions.extend(regions);
         }
@@ -418,10 +438,40 @@ impl App {
     }
 
     fn handle_scroll(&mut self, delta_y: f64) {
+        let step = delta_y as i64 * 40;
+        // Route the wheel to the topmost scroll container under the cursor
+        // (overflow:scroll/auto with overflowing content); otherwise scroll
+        // the page. Containers were collected from the last paint.
+        let (mx, my) = self.mouse_pos;
+        let page_x = mx;
+        let page_y = my - CHROME_HEIGHT + self.scroll_y;
+        let target = self
+            .scroll_containers
+            .iter()
+            .rev()
+            .find(|(_, x, y, w, h, content_h)| {
+                content_h > h
+                    && page_x >= *x
+                    && page_x < x + w
+                    && page_y >= *y
+                    && page_y < y + h
+            })
+            .copied();
+        if let Some((id, _, _, _, h, content_h)) = target {
+            let max_inner = (content_h - h).max(0);
+            let entry = self.inner_scroll_offsets.entry(id).or_insert(0);
+            let next = (*entry - step).clamp(0, max_inner);
+            if next != *entry {
+                *entry = next;
+                self.needs_redraw = true;
+                return;
+            }
+            // At the container's end: fall through to page scrolling.
+        }
         let page_height = self.viewport_height as i64 - CHROME_HEIGHT;
         let content_height = self.bridge.content_height();
         let max_scroll = (content_height - page_height).max(0);
-        self.scroll_y = (self.scroll_y - delta_y as i64 * 40).max(0).min(max_scroll);
+        self.scroll_y = (self.scroll_y - step).max(0).min(max_scroll);
         self.needs_redraw = true;
     }
 
@@ -547,6 +597,22 @@ fn is_ctrl_pressed(event: &KeyEvent) -> bool {
 
 /// Headless screenshot mode: render `url` to a PNG at `out_path` without opening a window.
 
+/// Inner scroll offsets for headless screenshots, from
+/// `COSMO_INNER_SCROLL` ("id:px[,id:px...]"). Verifies overflow containers.
+fn headless_inner_offsets() -> std::collections::HashMap<u32, i64> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(v) = std::env::var("COSMO_INNER_SCROLL") {
+        for part in v.split(',') {
+            if let Some((id, px)) = part.split_once(':') {
+                if let (Ok(id), Ok(px)) = (id.trim().parse(), px.trim().parse()) {
+                    map.insert(id, px);
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Scroll offset for headless screenshots, from `COSMO_SCREENSHOT_SCROLL`
 /// (pixels). Lets sticky/fixed behavior be verified without a window.
 fn headless_scroll() -> i64 {
@@ -595,9 +661,10 @@ fn headless_screenshot(url: &str, out_path: &str) {
             &mut text_renderer,
             &mut image_cache,
             frame_url,
-            0,
+            headless_scroll(),
             CHROME_HEIGHT,
             frame_id,
+            &headless_inner_offsets(),
         );
     }
 
@@ -657,7 +724,7 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
     }
     for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
-            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id);
+            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id, &headless_inner_offsets());
     }
     let content_height = bridge.content_height();
     ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
@@ -713,7 +780,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     }
     for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
-            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id);
+            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id, &headless_inner_offsets());
     }
     let content_height = bridge.content_height();
     ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);

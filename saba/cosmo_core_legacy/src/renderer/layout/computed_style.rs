@@ -143,6 +143,19 @@ pub struct ComputedStyle {
     /// contexts offset within the parent's bucket). Mappers feed this to the
     /// painter's z sort.
     paint_z: Option<i32>,
+    /// True when overflow is scroll/auto (an interactive scroll container);
+    /// hidden/clip also clip but cannot be scrolled.
+    overflow_scrollable: bool,
+    /// Final clip rectangle (x, y, w, h) stamped by the post-layout pass:
+    /// the intersection of every overflow-clipping ancestor box (and this
+    /// box itself when it clips). Page coordinates.
+    final_clip: Option<(f64, f64, f64, f64)>,
+    /// Nearest scroll-container id this box's CONTENT belongs to (stamped):
+    /// the renderer offsets these commands by the container's inner scroll.
+    scroll_container: Option<u32>,
+    /// Set on the scroll container's own box: (id, content height) — lets
+    /// the renderer register the scrollable region and clamp its offset.
+    scroll_container_def: Option<(u32, f64)>,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
     grid_template_columns: Option<Vec<GridTrack>>,
@@ -215,6 +228,10 @@ impl ComputedStyle {
             sticky_context: None,
             fixed_subtree: false,
             paint_z: None,
+            overflow_scrollable: false,
+            final_clip: None,
+            scroll_container: None,
+            scroll_container_def: None,
             grid_template_columns: None,
             column_gap: None,
             row_gap: None,
@@ -592,6 +609,38 @@ impl ComputedStyle {
     /// True when z-index was declared (i.e. not `auto`).
     pub fn z_index_specified(&self) -> bool {
         self.z_index.is_some()
+    }
+
+    pub fn set_overflow_scrollable(&mut self, v: bool) {
+        self.overflow_scrollable = v;
+    }
+
+    pub fn overflow_scrollable(&self) -> bool {
+        self.overflow_scrollable
+    }
+
+    pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {
+        self.final_clip = Some(clip);
+    }
+
+    pub fn final_clip(&self) -> Option<(f64, f64, f64, f64)> {
+        self.final_clip
+    }
+
+    pub fn set_scroll_container(&mut self, id: u32) {
+        self.scroll_container = Some(id);
+    }
+
+    pub fn scroll_container(&self) -> Option<u32> {
+        self.scroll_container
+    }
+
+    pub fn set_scroll_container_def(&mut self, id: u32, content_height: f64) {
+        self.scroll_container_def = Some((id, content_height));
+    }
+
+    pub fn scroll_container_def(&self) -> Option<(u32, f64)> {
+        self.scroll_container_def
     }
 
     pub fn background_size(&self) -> Option<(u8, f64, bool, f64, bool)> {

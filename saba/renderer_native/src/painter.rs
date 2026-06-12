@@ -197,6 +197,14 @@ fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
 }
 
 
+/// Inner scroll offset of the command's scroll container (0 when none).
+fn inner_offset(container: Option<u32>, offsets: &HashMap<u32, i64>) -> i64 {
+    container
+        .and_then(|id| offsets.get(&id))
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Per-command scroll offset: fixed boxes never scroll; sticky boxes scroll
 /// until their box would pass the `top` threshold, then pin there (the whole
 /// subtree shares the container's context so it pins together).
@@ -224,6 +232,7 @@ pub fn render_commands(
     scroll_y: i64,
     chrome_height: i64,
     frame_id: &str,
+    inner_offsets: &HashMap<u32, i64>,
 ) -> Vec<HitRegion> {
     let mut hit_regions = Vec::new();
 
@@ -251,17 +260,20 @@ pub fn render_commands(
         match &commands[idx] {
             PaintCommand::DrawRect(rect) => {
                 let scroll = effective_scroll(rect.fixed, rect.sticky, scroll_y);
-                draw_rect(pixmap, rect, scroll, chrome_height, image_cache, base_url);
+                let inner = inner_offset(rect.scroll_container, inner_offsets);
+                draw_rect(pixmap, rect, scroll, chrome_height, image_cache, base_url, inner);
             }
             PaintCommand::DrawText(text) => {
                 let scroll = effective_scroll(text.fixed, text.sticky, scroll_y);
-                let end_x = draw_text(pixmap, text, text_renderer, scroll, chrome_height);
+                let inner = inner_offset(text.scroll_container, inner_offsets);
+                let end_x =
+                    draw_text(pixmap, text, text_renderer, scroll, chrome_height, inner);
                 if let Some(href) = &text.href {
                     let text_width = end_x - text.x;
                     let font_height = text.font_px;
                     hit_regions.push(HitRegion {
                         x: text.x,
-                        y: text.y + chrome_height - scroll,
+                        y: text.y + chrome_height - scroll - inner,
                         width: text_width.max(1),
                         height: font_height + 4,
                         href: href.clone(),
@@ -272,6 +284,7 @@ pub fn render_commands(
             }
             PaintCommand::DrawImage(img) => {
                 let scroll = effective_scroll(img.fixed, img.sticky, scroll_y);
+                let inner = inner_offset(img.scroll_container, inner_offsets);
                 draw_image(
                     pixmap,
                     img,
@@ -280,11 +293,12 @@ pub fn render_commands(
                     base_url,
                     scroll,
                     chrome_height,
+                    inner,
                 );
                 if let Some(href) = &img.href {
                     hit_regions.push(HitRegion {
                         x: img.x,
-                        y: img.y + chrome_height - scroll,
+                        y: img.y + chrome_height - scroll - inner,
                         width: img.width,
                         height: img.height,
                         href: href.clone(),
@@ -328,6 +342,7 @@ fn draw_rect(
     chrome_height: i64,
     image_cache: &mut ImageCache,
     base_url: &str,
+    inner_y: i64,
 ) {
     // Spec: CSS Backgrounds §2.11.2 — the background of the root element is
     // propagated to the viewport canvas, and must cover the entire viewport
@@ -352,7 +367,9 @@ fn draw_rect(
         rect.height
     };
 
-    let ry = rect.y + chrome_height - scroll_y;
+    // The inner (scroll-container) offset moves the CONTENT but not the
+    // clip: the container's window stays put while its content slides.
+    let ry = rect.y + chrome_height - scroll_y - inner_y;
     let screen_clip = rect
         .clip_rect
         .map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
@@ -559,16 +576,31 @@ fn draw_text(
     text_renderer: &mut TextRenderer,
     scroll_y: i64,
     chrome_height: i64,
+    inner_y: i64,
 ) -> i64 {
     let (r, g, b, a) = parse_css_color(&text.color);
     let alpha = (text.opacity * a as f64).round().clamp(0.0, 255.0) as u8;
     let font_px = text.font_px.max(8) as u32;
     // Layout y is the top of the line box; text_renderer expects the baseline.
     // Approximate baseline = top + font_size (ascent ≈ font_size for most fonts).
-    let ty = text.y + chrome_height + font_px as i64;
+    let ty = text.y + chrome_height + font_px as i64 - inner_y;
 
-    let end_x = text_renderer.draw_text(
-        pixmap, &text.text, text.x, ty, font_px, r, g, b, alpha, scroll_y, text.bold,
+    let screen_clip = text
+        .clip_rect
+        .map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
+    let end_x = text_renderer.draw_text_clipped(
+        pixmap,
+        &text.text,
+        text.x,
+        ty,
+        font_px,
+        r,
+        g,
+        b,
+        alpha,
+        scroll_y,
+        text.bold,
+        screen_clip,
     );
 
     // Draw underline for links.
@@ -603,8 +635,9 @@ fn draw_image(
     base_url: &str,
     scroll_y: i64,
     chrome_height: i64,
+    inner_y: i64,
 ) {
-    let iy = img.y + chrome_height - scroll_y;
+    let iy = img.y + chrome_height - scroll_y - inner_y;
 
     // Try to fetch and render the actual image.
     if !img.src.is_empty() {
@@ -679,6 +712,8 @@ fn draw_image(
         background_size: None,
         fixed: img.fixed,
         sticky: img.sticky,
+        scroll_container: img.scroll_container,
+        scroll_container_def: None,
     };
     draw_rect(
         pixmap,
@@ -687,6 +722,7 @@ fn draw_image(
         chrome_height,
         image_cache,
         base_url,
+        inner_y,
     );
 
     let label = if img.alt.is_empty() {
@@ -698,7 +734,7 @@ fn draw_image(
         pixmap,
         label,
         img.x + 4,
-        img.y + 14 + chrome_height,
+        img.y + 14 + chrome_height - inner_y,
         12,
         0x44,
         0x44,

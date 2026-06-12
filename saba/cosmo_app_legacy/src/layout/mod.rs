@@ -225,6 +225,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_size: style.background_size(),
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
+                    scroll_container: style.scroll_container(),
+                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
                 });
             }
             DisplayItem::Text {
@@ -246,6 +248,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 scene_items.push(SceneItem::Text {
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
+                    scroll_container: style.scroll_container(),
+                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
                     x,
                     y,
                     text,
@@ -281,6 +285,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 scene_items.push(SceneItem::Image {
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
+                    scroll_container: style.scroll_container(),
+                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
                     x,
                     y,
                     width: layout_size.width(),
@@ -460,6 +466,8 @@ mod diff_tests {
             background_size: None,
             fixed: false,
             sticky: None,
+            scroll_container: None,
+            scroll_container_def: None,
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -479,6 +487,8 @@ mod diff_tests {
             background_size: None,
             fixed: false,
             sticky: None,
+            scroll_container: None,
+            scroll_container_def: None,
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

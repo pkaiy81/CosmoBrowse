@@ -35,6 +35,26 @@ impl TextRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         text: &str,
+        x: i64,
+        y: i64,
+        font_px: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+        alpha: u8,
+        scroll_y: i64,
+        bold: bool,
+    ) -> i64 {
+        self.draw_text_clipped(pixmap, text, x, y, font_px, r, g, b, alpha, scroll_y, bold, None)
+    }
+
+    /// Like `draw_text`, but glyph pixels outside `clip` (screen-space
+    /// x, y, w, h) are skipped — overflow containers clip their text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_clipped(
+        &mut self,
+        pixmap: &mut Pixmap,
+        text: &str,
         mut x: i64,
         y: i64,
         font_px: u32,
@@ -44,6 +64,7 @@ impl TextRenderer {
         alpha: u8,
         scroll_y: i64,
         bold: bool,
+        clip: Option<(i64, i64, i64, i64)>,
     ) -> i64 {
         let baseline_y = y - scroll_y;
 
@@ -58,6 +79,11 @@ impl TextRenderer {
                     let py = gy + row;
                     if px < 0 || py < 0 || px >= pixmap.width() as i64 || py >= pixmap.height() as i64 {
                         continue;
+                    }
+                    if let Some((cx, cy, cw, ch_)) = clip {
+                        if px < cx || px >= cx + cw || py < cy || py >= cy + ch_ {
+                            continue;
+                        }
                     }
                     let coverage = glyph.bitmap[(row * glyph.width as i64 + col) as usize];
                     if coverage == 0 {
