@@ -55,11 +55,11 @@ struct App {
     status_message: String,
     pending_url: Option<String>,
     save_screenshot: bool,
-    /// Per-scroll-container inner offsets (overflow:scroll/auto content).
-    inner_scroll_offsets: std::collections::HashMap<u32, i64>,
+    /// Per-scroll-container inner offsets (x, y).
+    inner_scroll_offsets: std::collections::HashMap<u32, (i64, i64)>,
     /// Scroll containers visible in the last paint: (id, x, y, w, h,
-    /// content_h) in page coordinates.
-    scroll_containers: Vec<(u32, i64, i64, i64, i64, i64)>,
+    /// content_w, content_h) in page coordinates.
+    scroll_containers: Vec<(u32, i64, i64, i64, i64, i64, i64)>,
 }
 
 impl App {
@@ -165,9 +165,9 @@ impl App {
         for (_, _, commands) in &frame_commands {
             for cmd in commands {
                 if let cosmo_core::paint_commands::PaintCommand::DrawRect(r) = cmd {
-                    if let Some((id, content_h)) = r.scroll_container_def {
+                    if let Some((id, content_w, content_h)) = r.scroll_container_def {
                         self.scroll_containers
-                            .push((id, r.x, r.y, r.width, r.height, content_h));
+                            .push((id, r.x, r.y, r.width, r.height, content_w, content_h));
                     }
                 }
             }
@@ -437,8 +437,9 @@ impl App {
         }
     }
 
-    fn handle_scroll(&mut self, delta_y: f64) {
-        let step = delta_y as i64 * 40;
+    fn handle_scroll(&mut self, delta_x: f64, delta_y: f64) {
+        let step_x = delta_x as i64 * 40;
+        let step_y = delta_y as i64 * 40;
         // Route the wheel to the topmost scroll container under the cursor
         // (overflow:scroll/auto with overflowing content); otherwise scroll
         // the page. Containers were collected from the last paint.
@@ -449,18 +450,22 @@ impl App {
             .scroll_containers
             .iter()
             .rev()
-            .find(|(_, x, y, w, h, content_h)| {
-                content_h > h
+            .find(|(_, x, y, w, h, content_w, content_h)| {
+                (content_h > h || content_w > w)
                     && page_x >= *x
                     && page_x < x + w
                     && page_y >= *y
                     && page_y < y + h
             })
             .copied();
-        if let Some((id, _, _, _, h, content_h)) = target {
-            let max_inner = (content_h - h).max(0);
-            let entry = self.inner_scroll_offsets.entry(id).or_insert(0);
-            let next = (*entry - step).clamp(0, max_inner);
+        if let Some((id, _, _, w, h, content_w, content_h)) = target {
+            let max_y = (content_h - h).max(0);
+            let max_x = (content_w - w).max(0);
+            let entry = self.inner_scroll_offsets.entry(id).or_insert((0, 0));
+            let next = (
+                (entry.0 - step_x).clamp(0, max_x),
+                (entry.1 - step_y).clamp(0, max_y),
+            );
             if next != *entry {
                 *entry = next;
                 self.needs_redraw = true;
@@ -471,7 +476,7 @@ impl App {
         let page_height = self.viewport_height as i64 - CHROME_HEIGHT;
         let content_height = self.bridge.content_height();
         let max_scroll = (content_height - page_height).max(0);
-        self.scroll_y = (self.scroll_y - step).max(0).min(max_scroll);
+        self.scroll_y = (self.scroll_y - step_y).max(0).min(max_scroll);
         self.needs_redraw = true;
     }
 
@@ -578,11 +583,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_cursor();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(PhysicalPosition { y, .. }) => y / 40.0,
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                    MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
+                        (x / 40.0, y / 40.0)
+                    }
                 };
-                self.handle_scroll(dy);
+                self.handle_scroll(dx, dy);
                 self.request_redraw();
             }
             _ => {}
@@ -599,14 +606,25 @@ fn is_ctrl_pressed(event: &KeyEvent) -> bool {
 
 /// Inner scroll offsets for headless screenshots, from
 /// `COSMO_INNER_SCROLL` ("id:px[,id:px...]"). Verifies overflow containers.
-fn headless_inner_offsets() -> std::collections::HashMap<u32, i64> {
+fn headless_inner_offsets() -> std::collections::HashMap<u32, (i64, i64)> {
     let mut map = std::collections::HashMap::new();
     if let Ok(v) = std::env::var("COSMO_INNER_SCROLL") {
         for part in v.split(',') {
-            if let Some((id, px)) = part.split_once(':') {
-                if let (Ok(id), Ok(px)) = (id.trim().parse(), px.trim().parse()) {
-                    map.insert(id, px);
+            let fields: Vec<&str> = part.split(':').collect();
+            match fields.as_slice() {
+                [id, dy] => {
+                    if let (Ok(id), Ok(dy)) = (id.trim().parse(), dy.trim().parse()) {
+                        map.insert(id, (0, dy));
+                    }
                 }
+                [id, dx, dy] => {
+                    if let (Ok(id), Ok(dx), Ok(dy)) =
+                        (id.trim().parse(), dx.trim().parse(), dy.trim().parse())
+                    {
+                        map.insert(id, (dx, dy));
+                    }
+                }
+                _ => {}
             }
         }
     }

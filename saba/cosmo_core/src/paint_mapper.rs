@@ -6,6 +6,26 @@ use crate::nebula_renderer::layout::computed_style::PositionType;
 use crate::nebula_renderer::layout::computed_style::TextDecoration;
 use crate::stardust_display::DisplayItem;
 
+
+/// Apply a stamped scale context to a layout point.
+fn scaled_point(ctx: Option<(f64, f64, f64)>, x: i64, y: i64) -> (i64, i64) {
+    match ctx {
+        Some((ox, oy, s)) => (
+            (ox + (x as f64 - ox) * s) as i64,
+            (oy + (y as f64 - oy) * s) as i64,
+        ),
+        None => (x, y),
+    }
+}
+
+/// Apply a stamped scale context to a length.
+fn scaled_len(ctx: Option<(f64, f64, f64)>, v: i64) -> i64 {
+    match ctx {
+        Some((_, _, s)) => (v as f64 * s) as i64,
+        None => v,
+    }
+}
+
 /// Maps layout paint records into backend-neutral paint commands.
 ///
 /// Spec alignment:
@@ -41,11 +61,13 @@ pub fn map_display_items_to_paint_commands(
                 let border_color = style.border_color()
                     .map(|c| c.code().to_string())
                     .unwrap_or_default();
+                let ctx = style.scale_context();
+                let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
                 commands.push(PaintCommand::DrawRect(DrawRect {
-                    x: origin_x + layout_point.x(),
-                    y: origin_y + layout_point.y(),
-                    width: layout_size.width(),
-                    height: layout_size.height(),
+                    x: origin_x + lx,
+                    y: origin_y + ly,
+                    width: scaled_len(ctx, layout_size.width()),
+                    height: scaled_len(ctx, layout_size.height()),
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
@@ -59,10 +81,12 @@ pub fn map_display_items_to_paint_commands(
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
+                    border_radius: scaled_len(ctx, style.border_radius() as i64),
+                    box_shadow: style.box_shadow().map(|(dx, dy, b, c)| (dx as i64, dy as i64, b as i64, c.code().to_string())),
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
-                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
+                    scroll_container_def: style.scroll_container_def().map(|(i, w, h)| (i, w as i64, h as i64)),
                 }));
             }
             DisplayItem::Text {
@@ -91,15 +115,17 @@ pub fn map_display_items_to_paint_commands(
                     continue;
                 }
 
+                let ctx = style.scale_context();
+                let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
                 commands.push(PaintCommand::DrawText(DrawText {
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
-                    x: origin_x + layout_point.x(),
-                    y: origin_y + layout_point.y(),
+                    x: origin_x + lx,
+                    y: origin_y + ly,
                     text: text.clone(),
                     color: style.color().code().to_string(),
-                    font_px: style.font_size().px(),
+                    font_px: scaled_len(ctx, style.font_size().px()).max(1),
                     font_family,
                     underline: style.text_decoration() == TextDecoration::Underline,
                     bold: *bold,
@@ -123,14 +149,16 @@ pub fn map_display_items_to_paint_commands(
                 paint_order: _,
                 clip_rect,
             } => {
+                let ctx = style.scale_context();
+                let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
                 commands.push(PaintCommand::DrawImage(DrawImage {
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
-                    x: origin_x + layout_point.x(),
-                    y: origin_y + layout_point.y(),
-                    width: layout_size.width(),
-                    height: layout_size.height(),
+                    x: origin_x + lx,
+                    y: origin_y + ly,
+                    width: scaled_len(ctx, layout_size.width()),
+                    height: scaled_len(ctx, layout_size.height()),
                     src: src.clone(),
                     alt: alt.clone(),
                     opacity: style.opacity(),

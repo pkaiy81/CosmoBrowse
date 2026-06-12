@@ -177,6 +177,26 @@ pub fn build_layout_scene(html: &str, rect: &FrameRect) -> LayoutScene {
     build_layout_scene_with_script_runtime("about:blank", html, rect).layout_scene
 }
 
+
+/// Apply a stamped scale context to a layout point (page coordinates).
+fn scaled_point(ctx: Option<(f64, f64, f64)>, x: i64, y: i64) -> (i64, i64) {
+    match ctx {
+        Some((ox, oy, s)) => (
+            (ox + (x as f64 - ox) * s) as i64,
+            (oy + (y as f64 - oy) * s) as i64,
+        ),
+        None => (x, y),
+    }
+}
+
+/// Apply a stamped scale context to a length.
+fn scaled_len(ctx: Option<(f64, f64, f64)>, v: i64) -> i64 {
+    match ctx {
+        Some((_, _, s)) => (v as f64 * s) as i64,
+        None => v,
+    }
+}
+
 fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> LayoutScene {
     let mut scene_items = Vec::with_capacity(display_items.len());
     let mut max_width = 0;
@@ -192,10 +212,16 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 clip_rect,
                 anchor_id,
             } => {
-                let x = rect.x + layout_point.x();
-                let y = rect.y + layout_point.y();
-                max_width = max_width.max(layout_point.x() + layout_size.width());
-                max_height = max_height.max(layout_point.y() + layout_size.height());
+                let ctx = style.scale_context();
+                let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
+                let (lw, lh) = (
+                    scaled_len(ctx, layout_size.width()),
+                    scaled_len(ctx, layout_size.height()),
+                );
+                let x = rect.x + lx;
+                let y = rect.y + ly;
+                max_width = max_width.max(lx + lw);
+                max_height = max_height.max(ly + lh);
                 let border = style.border_or_zero();
                 let border_width = border.top()
                     .max(border.right())
@@ -208,8 +234,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 scene_items.push(SceneItem::Rect {
                     x,
                     y,
-                    width: layout_size.width(),
-                    height: layout_size.height(),
+                    width: lw,
+                    height: lh,
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
@@ -223,10 +249,12 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
+                    border_radius: scaled_len(ctx, style.border_radius() as i64),
+                    box_shadow: style.box_shadow().map(|(dx, dy, b, c)| (dx as i64, dy as i64, b as i64, c.code().to_string())),
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
-                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
+                    scroll_container_def: style.scroll_container_def().map(|(i, w, h)| (i, w as i64, h as i64)),
                 });
             }
             DisplayItem::Text {
@@ -239,22 +267,25 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 clip_rect,
                 bold,
             } => {
-                let x = rect.x + layout_point.x();
-                let y = rect.y + layout_point.y();
-                let width_estimate = text.len() as i64 * 8 * (style.font_size().px() / 16).max(1);
-                let height_estimate = style.font_size().px() + 4;
-                max_width = max_width.max(layout_point.x() + width_estimate);
-                max_height = max_height.max(layout_point.y() + height_estimate);
+                let ctx = style.scale_context();
+                let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
+                let x = rect.x + lx;
+                let y = rect.y + ly;
+                let font_px_scaled = scaled_len(ctx, style.font_size().px()).max(1);
+                let width_estimate = text.len() as i64 * 8 * (font_px_scaled / 16).max(1);
+                let height_estimate = font_px_scaled + 4;
+                max_width = max_width.max(lx + width_estimate);
+                max_height = max_height.max(ly + height_estimate);
                 scene_items.push(SceneItem::Text {
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
-                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
+                    scroll_container_def: style.scroll_container_def().map(|(i, w, h)| (i, w as i64, h as i64)),
                     x,
                     y,
                     text,
                     color: style.color().code().to_string(),
-                    font_px: style.font_size().px(),
+                    font_px: font_px_scaled,
                     font_family: style.font_family(),
                     underline: style.text_decoration() == TextDecoration::Underline,
                     bold,
@@ -278,19 +309,25 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 paint_order: _,
                 clip_rect,
             } => {
-                let x = rect.x + layout_point.x();
-                let y = rect.y + layout_point.y();
-                max_width = max_width.max(layout_point.x() + layout_size.width());
-                max_height = max_height.max(layout_point.y() + layout_size.height());
+                let ctx = style.scale_context();
+                let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
+                let (lw, lh) = (
+                    scaled_len(ctx, layout_size.width()),
+                    scaled_len(ctx, layout_size.height()),
+                );
+                let x = rect.x + lx;
+                let y = rect.y + ly;
+                max_width = max_width.max(lx + lw);
+                max_height = max_height.max(ly + lh);
                 scene_items.push(SceneItem::Image {
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
-                    scroll_container_def: style.scroll_container_def().map(|(i, h)| (i, h as i64)),
+                    scroll_container_def: style.scroll_container_def().map(|(i, w, h)| (i, w as i64, h as i64)),
                     x,
                     y,
-                    width: layout_size.width(),
-                    height: layout_size.height(),
+                    width: lw,
+                    height: lh,
                     src,
                     alt,
                     opacity: style.opacity(),
@@ -464,6 +501,8 @@ mod diff_tests {
             background_position: None,
             background_no_repeat: false,
             background_size: None,
+            border_radius: 0,
+            box_shadow: None,
             fixed: false,
             sticky: None,
             scroll_container: None,
@@ -485,6 +524,8 @@ mod diff_tests {
             background_position: None,
             background_no_repeat: false,
             background_size: None,
+            border_radius: 0,
+            box_shadow: None,
             fixed: false,
             sticky: None,
             scroll_container: None,

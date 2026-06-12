@@ -597,6 +597,7 @@ impl LayoutView {
         );
         Self::align_inline_baselines(&self.root);
         self.reposition_fixed_far_edges(&self.root.clone());
+        Self::apply_transforms(&self.root);
         let mut next_scroll_id: u32 = 1;
         Self::stamp_sticky_contexts(
             &self.root,
@@ -666,24 +667,28 @@ impl LayoutView {
             let child_scroll_id = if is_scrollable {
                 let id = *next_scroll_id;
                 *next_scroll_id += 1;
-                // Content height: how far the children extend below the
-                // container's top edge (for the renderer's scroll clamp).
-                let content_h = {
+                // Content extent: how far the children reach beyond the
+                // container's top-left (for the renderer's scroll clamps).
+                let (content_w, content_h) = {
                     let b = n.borrow();
                     let top = b.point().y() as f64;
+                    let left = b.point().x() as f64;
                     let mut max_bottom = top;
+                    let mut max_right = left;
                     let mut child = b.first_child();
                     while let Some(c) = child {
                         let cb = c.borrow();
                         max_bottom =
                             max_bottom.max((cb.point().y() + cb.size().height()) as f64);
+                        max_right =
+                            max_right.max((cb.point().x() + cb.size().width()) as f64);
                         let next = cb.next_sibling();
                         drop(cb);
                         child = next;
                     }
-                    max_bottom - top
+                    (max_right - left, max_bottom - top)
                 };
-                n.borrow_mut().set_scroll_container_def(id, content_h);
+                n.borrow_mut().set_scroll_container_def(id, content_w, content_h);
                 Some(id)
             } else {
                 scroll_id
@@ -792,6 +797,50 @@ impl LayoutView {
                 scroll_id,
                 next_scroll_id,
             );
+        }
+    }
+
+    /// Post-layout pass: apply parsed transforms. Translation moves the
+    /// subtree geometry directly (percentages resolve against the box's own
+    /// size — the translate(-50%,-50%) centering idiom). A uniform scale
+    /// factor is stamped as a scale context (origin = the box's top-left
+    /// after translation) for the mappers to scale command geometry.
+    fn apply_transforms(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        if let Some(n) = node {
+            let op = n.borrow().style().transform_op();
+            if let Some((tx, tx_pct, ty, ty_pct, scale)) = op {
+                let (w, h) = {
+                    let b = n.borrow();
+                    (b.size().width() as f64, b.size().height() as f64)
+                };
+                let dx = if tx_pct { w * tx / 100.0 } else { tx } as i64;
+                let dy = if ty_pct { h * ty / 100.0 } else { ty } as i64;
+                if dx != 0 || dy != 0 {
+                    Self::translate_subtree(n, dx, dy);
+                }
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    let (ox, oy) = {
+                        let b = n.borrow();
+                        (b.point().x() as f64, b.point().y() as f64)
+                    };
+                    Self::stamp_scale_context(n, ox, oy, scale);
+                }
+            }
+            let first_child = n.borrow().first_child();
+            Self::apply_transforms(&first_child);
+            let next_sibling = n.borrow().next_sibling();
+            Self::apply_transforms(&next_sibling);
+        }
+    }
+
+    /// Stamp a scale context onto a node and all its descendants.
+    fn stamp_scale_context(node: &Rc<RefCell<LayoutObject>>, ox: f64, oy: f64, s: f64) {
+        node.borrow_mut().set_scale_context(ox, oy, s);
+        let mut child = node.borrow().first_child();
+        while let Some(c) = child {
+            Self::stamp_scale_context(&c, ox, oy, s);
+            let next = c.borrow().next_sibling();
+            child = next;
         }
     }
 

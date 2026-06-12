@@ -223,12 +223,12 @@ fn clip_hit_region(
     Some((nx, ny, right - nx, bottom - ny))
 }
 
-/// Inner scroll offset of the command's scroll container (0 when none).
-fn inner_offset(container: Option<u32>, offsets: &HashMap<u32, i64>) -> i64 {
+/// Inner scroll offsets (x, y) of the command's scroll container.
+fn inner_offset(container: Option<u32>, offsets: &HashMap<u32, (i64, i64)>) -> (i64, i64) {
     container
         .and_then(|id| offsets.get(&id))
         .copied()
-        .unwrap_or(0)
+        .unwrap_or((0, 0))
 }
 
 /// Per-command scroll offset: fixed boxes never scroll; sticky boxes scroll
@@ -258,7 +258,7 @@ pub fn render_commands(
     scroll_y: i64,
     chrome_height: i64,
     frame_id: &str,
-    inner_offsets: &HashMap<u32, i64>,
+    inner_offsets: &HashMap<u32, (i64, i64)>,
 ) -> Vec<HitRegion> {
     let mut hit_regions = Vec::new();
 
@@ -286,20 +286,20 @@ pub fn render_commands(
         match &commands[idx] {
             PaintCommand::DrawRect(rect) => {
                 let scroll = effective_scroll(rect.fixed, rect.sticky, scroll_y);
-                let inner = inner_offset(rect.scroll_container, inner_offsets);
-                draw_rect(pixmap, rect, scroll, chrome_height, image_cache, base_url, inner);
+                let (ix, iy) = inner_offset(rect.scroll_container, inner_offsets);
+                draw_rect(pixmap, rect, scroll, chrome_height, image_cache, base_url, ix, iy);
             }
             PaintCommand::DrawText(text) => {
                 let scroll = effective_scroll(text.fixed, text.sticky, scroll_y);
-                let inner = inner_offset(text.scroll_container, inner_offsets);
+                let (ix, iy) = inner_offset(text.scroll_container, inner_offsets);
                 let end_x =
-                    draw_text(pixmap, text, text_renderer, scroll, chrome_height, inner);
+                    draw_text(pixmap, text, text_renderer, scroll, chrome_height, ix, iy);
                 if let Some(href) = &text.href {
                     let text_width = end_x - text.x;
                     let font_height = text.font_px;
                     if let Some((hx, hy, hw, hh)) = clip_hit_region(
-                        text.x,
-                        text.y + chrome_height - scroll - inner,
+                        text.x - ix,
+                        text.y + chrome_height - scroll - iy,
                         text_width.max(1),
                         font_height + 4,
                         text.clip_rect,
@@ -320,7 +320,7 @@ pub fn render_commands(
             }
             PaintCommand::DrawImage(img) => {
                 let scroll = effective_scroll(img.fixed, img.sticky, scroll_y);
-                let inner = inner_offset(img.scroll_container, inner_offsets);
+                let (ix, iy) = inner_offset(img.scroll_container, inner_offsets);
                 draw_image(
                     pixmap,
                     img,
@@ -329,12 +329,13 @@ pub fn render_commands(
                     base_url,
                     scroll,
                     chrome_height,
-                    inner,
+                    ix,
+                    iy,
                 );
                 if let Some(href) = &img.href {
                     if let Some((hx, hy, hw, hh)) = clip_hit_region(
-                        img.x,
-                        img.y + chrome_height - scroll - inner,
+                        img.x - ix,
+                        img.y + chrome_height - scroll - iy,
                         img.width,
                         img.height,
                         img.clip_rect,
@@ -360,17 +361,29 @@ pub fn render_commands(
     // container whose content overflows, reflecting its inner offset.
     for &(_, _, idx) in &sorted {
         if let PaintCommand::DrawRect(rect) = &commands[idx] {
-            if let Some((id, content_h)) = rect.scroll_container_def {
+            if let Some((id, content_w, content_h)) = rect.scroll_container_def {
+                let scroll = effective_scroll(rect.fixed, rect.sticky, scroll_y);
+                let (ix, iy) = inner_offsets.get(&id).copied().unwrap_or((0, 0));
                 if content_h > rect.height && rect.height > 0 {
-                    let scroll = effective_scroll(rect.fixed, rect.sticky, scroll_y);
-                    let inner = inner_offsets.get(&id).copied().unwrap_or(0);
                     draw_inner_scrollbar(
                         pixmap,
                         rect.x + rect.width - 6,
                         rect.y + chrome_height - scroll,
                         rect.height,
                         content_h,
-                        inner,
+                        iy,
+                        false,
+                    );
+                }
+                if content_w > rect.width && rect.width > 0 {
+                    draw_inner_scrollbar(
+                        pixmap,
+                        rect.x,
+                        rect.y + chrome_height - scroll + rect.height - 6,
+                        rect.width,
+                        content_w,
+                        ix,
+                        true,
                     );
                 }
             }
@@ -380,26 +393,73 @@ pub fn render_commands(
     hit_regions
 }
 
-/// Track + thumb for an overflow container (screen coordinates).
+/// Fill a rounded rectangle via a path with circular-arc corners
+/// (approximated by cubic Beziers, kappa = 0.5523).
+fn fill_rounded_rect(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    paint: &Paint,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    if r <= 0.5 {
+        if let Some(rect) = Rect::from_xywh(x, y, w, h) {
+            pixmap.fill_rect(rect, paint, Transform::identity(), None);
+        }
+        return;
+    }
+    const K: f32 = 0.5523;
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + K * r, y, x + w, y + r - K * r, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + K * r, x + w - r + K * r, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - K * r, y + h, x, y + h - r + K * r, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - K * r, x + r - K * r, y, x + r, y);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Track + thumb for an overflow container (screen coordinates). With
+/// `horizontal`, (x, y) is the track's top-left and `box_extent` runs along
+/// the x axis instead.
 fn draw_inner_scrollbar(
     pixmap: &mut Pixmap,
     x: i64,
     y: i64,
-    box_h: i64,
-    content_h: i64,
+    box_extent: i64,
+    content_extent: i64,
     inner: i64,
+    horizontal: bool,
 ) {
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(0xE0, 0xE0, 0xE0, 200));
-    if let Some(track) = Rect::from_xywh(x as f32, y as f32, 6.0, box_h as f32) {
+    let (tw, th) = if horizontal { (box_extent as f32, 6.0) } else { (6.0, box_extent as f32) };
+    if let Some(track) = Rect::from_xywh(x as f32, y as f32, tw, th) {
         pixmap.fill_rect(track, &paint, Transform::identity(), None);
     }
-    let thumb_h = ((box_h * box_h) / content_h).max(12).min(box_h);
-    let max_inner = (content_h - box_h).max(1);
-    let thumb_y = y + (inner.clamp(0, max_inner) * (box_h - thumb_h)) / max_inner;
+    let thumb_len = ((box_extent * box_extent) / content_extent).max(12).min(box_extent);
+    let max_inner = (content_extent - box_extent).max(1);
+    let thumb_pos = (inner.clamp(0, max_inner) * (box_extent - thumb_len)) / max_inner;
     paint.set_color(Color::from_rgba8(0x90, 0x90, 0x90, 230));
-    if let Some(thumb) = Rect::from_xywh((x + 1) as f32, thumb_y as f32, 4.0, thumb_h as f32) {
-        pixmap.fill_rect(thumb, &paint, Transform::identity(), None);
+    let thumb = if horizontal {
+        Rect::from_xywh((x + thumb_pos) as f32, (y + 1) as f32, thumb_len as f32, 4.0)
+    } else {
+        Rect::from_xywh((x + 1) as f32, (y + thumb_pos) as f32, 4.0, thumb_len as f32)
+    };
+    if let Some(t) = thumb {
+        pixmap.fill_rect(t, &paint, Transform::identity(), None);
     }
 }
 
@@ -432,6 +492,7 @@ fn draw_rect(
     chrome_height: i64,
     image_cache: &mut ImageCache,
     base_url: &str,
+    inner_x: i64,
     inner_y: i64,
 ) {
     // Spec: CSS Backgrounds §2.11.2 — the background of the root element is
@@ -460,18 +521,48 @@ fn draw_rect(
     // The inner (scroll-container) offset moves the CONTENT but not the
     // clip: the container's window stays put while its content slides.
     let ry = rect.y + chrome_height - scroll_y - inner_y;
+    let rx = rect.x - inner_x;
     let screen_clip = rect
         .clip_rect
         .map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
-    let clipped = apply_clip(rect.x, ry, rect.width, effective_height, &screen_clip);
+
+    // box-shadow: a layered fake blur painted behind the box (cheap
+    // approximation: concentric expansions with falling alpha).
+    if let Some((sdx, sdy, blur, ref color)) = rect.box_shadow {
+        let (sr, sg, sb, sa) = parse_css_color(color);
+        let layers = (blur / 2).clamp(1, 6);
+        for i in 0..layers {
+            let grow = blur * (layers - i) / layers;
+            let alpha =
+                ((sa as f64 / 255.0) * rect.opacity * 0.35 / layers as f64).clamp(0.0, 1.0);
+            let mut sp = Paint::default();
+            sp.set_color(
+                Color::from_rgba(
+                    sr as f32 / 255.0,
+                    sg as f32 / 255.0,
+                    sb as f32 / 255.0,
+                    alpha as f32,
+                )
+                .unwrap_or(Color::BLACK),
+            );
+            sp.anti_alias = true;
+            fill_rounded_rect(
+                pixmap,
+                (rx + sdx - grow) as f32,
+                (ry + sdy - grow) as f32,
+                (rect.width + 2 * grow) as f32,
+                (effective_height + 2 * grow) as f32,
+                (rect.border_radius + grow) as f32,
+                &sp,
+            );
+        }
+    }
+
+    let clipped = apply_clip(rx, ry, rect.width, effective_height, &screen_clip);
     let Some((x, y, w, h)) = clipped else { return };
 
     let (r, g, b, a) = parse_css_color(&rect.background_color);
     let opacity = (rect.opacity * a as f64 / 255.0).clamp(0.0, 1.0) as f32;
-
-    let Some(skia_rect) = Rect::from_xywh(x as f32, y as f32, w as f32, h as f32) else {
-        return;
-    };
 
     let mut paint = Paint::default();
     paint.set_color(
@@ -483,9 +574,28 @@ fn draw_rect(
         )
         .unwrap_or(Color::BLACK),
     );
-    paint.anti_alias = false;
 
-    pixmap.fill_rect(skia_rect, &paint, Transform::identity(), None);
+    // Rounded corners only when the whole box survived clipping (a clipped
+    // edge is the clip boundary, not a corner).
+    if rect.border_radius > 0 && x == rx && y == ry && w == rect.width && h == effective_height
+    {
+        paint.anti_alias = true;
+        fill_rounded_rect(
+            pixmap,
+            x as f32,
+            y as f32,
+            w as f32,
+            h as f32,
+            rect.border_radius as f32,
+            &paint,
+        );
+    } else {
+        paint.anti_alias = false;
+        let Some(skia_rect) = Rect::from_xywh(x as f32, y as f32, w as f32, h as f32) else {
+            return;
+        };
+        pixmap.fill_rect(skia_rect, &paint, Transform::identity(), None);
+    }
 
     // Draw border strokes (CSS box-model: border inside the element's box).
     if rect.border_width > 0 && !rect.border_color.is_empty() {
@@ -666,6 +776,7 @@ fn draw_text(
     text_renderer: &mut TextRenderer,
     scroll_y: i64,
     chrome_height: i64,
+    inner_x: i64,
     inner_y: i64,
 ) -> i64 {
     let (r, g, b, a) = parse_css_color(&text.color);
@@ -674,6 +785,7 @@ fn draw_text(
     // Layout y is the top of the line box; text_renderer expects the baseline.
     // Approximate baseline = top + font_size (ascent ≈ font_size for most fonts).
     let ty = text.y + chrome_height + font_px as i64 - inner_y;
+    let tx = text.x - inner_x;
 
     let screen_clip = text
         .clip_rect
@@ -681,7 +793,7 @@ fn draw_text(
     let end_x = text_renderer.draw_text_clipped(
         pixmap,
         &text.text,
-        text.x,
+        tx,
         ty,
         font_px,
         r,
@@ -725,9 +837,11 @@ fn draw_image(
     base_url: &str,
     scroll_y: i64,
     chrome_height: i64,
+    inner_x: i64,
     inner_y: i64,
 ) {
     let iy = img.y + chrome_height - scroll_y - inner_y;
+    let ix_pos = img.x - inner_x;
 
     // Try to fetch and render the actual image.
     if !img.src.is_empty() {
@@ -746,7 +860,7 @@ fn draw_image(
                     continue;
                 }
                 for dx in 0..dst_w {
-                    let px = img.x + dx;
+                    let px = ix_pos + dx;
                     if px < 0 || px >= pw {
                         continue;
                     }
@@ -800,6 +914,8 @@ fn draw_image(
         background_position: None,
         background_no_repeat: false,
         background_size: None,
+        border_radius: 0,
+        box_shadow: None,
         fixed: img.fixed,
         sticky: img.sticky,
         scroll_container: img.scroll_container,
@@ -812,6 +928,7 @@ fn draw_image(
         chrome_height,
         image_cache,
         base_url,
+        inner_x,
         inner_y,
     );
 
@@ -823,7 +940,7 @@ fn draw_image(
     text_renderer.draw_text(
         pixmap,
         label,
-        img.x + 4,
+        img.x + 4 - inner_x,
         img.y + 14 + chrome_height - inner_y,
         12,
         0x44,

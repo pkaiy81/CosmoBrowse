@@ -103,6 +103,10 @@ pub struct ComputedStyle {
     /// against the viewport's far edges.
     offset_right: Option<f64>,
     offset_bottom: Option<f64>,
+    /// Percentage forms of top/left (fraction of the containing block),
+    /// resolved at positioning time.
+    offset_top_ratio: Option<f64>,
+    offset_left_ratio: Option<f64>,
     text_align: Option<TextAlign>,
     /// True when `text_align` originates from a legacy presentational center
     /// hint (a `<center>` element or `align="center"` attribute) rather than a
@@ -146,9 +150,19 @@ pub struct ComputedStyle {
     /// True when overflow is scroll/auto (an interactive scroll container);
     /// hidden/clip also clip but cannot be scrolled.
     overflow_scrollable: bool,
-    /// `transform` is declared with a non-none value. The transform itself is
-    /// not applied; the flag only triggers stacking-context formation.
+    /// `transform` is declared with a non-none value (stacking trigger).
     has_transform: bool,
+    /// Parsed transform: (tx, tx_is_percent, ty, ty_is_percent, scale).
+    /// Percentages resolve against the box's own size at the post-layout
+    /// pass; scale is uniform (anisotropic scale uses the x factor).
+    transform_op: Option<(f64, bool, f64, bool, f64)>,
+    /// Scale context stamped on a scaled subtree: (origin_x, origin_y,
+    /// factor). Mappers scale command geometry and font sizes through it.
+    scale_context: Option<(f64, f64, f64)>,
+    /// `border-radius` in pixels (single radius, all corners).
+    border_radius: Option<f64>,
+    /// `box-shadow`: (dx, dy, blur, color).
+    box_shadow: Option<(f64, f64, f64, Color)>,
     /// Final clip rectangle (x, y, w, h) stamped by the post-layout pass:
     /// the intersection of every overflow-clipping ancestor box (and this
     /// box itself when it clips). Page coordinates.
@@ -156,9 +170,10 @@ pub struct ComputedStyle {
     /// Nearest scroll-container id this box's CONTENT belongs to (stamped):
     /// the renderer offsets these commands by the container's inner scroll.
     scroll_container: Option<u32>,
-    /// Set on the scroll container's own box: (id, content height) — lets
-    /// the renderer register the scrollable region and clamp its offset.
-    scroll_container_def: Option<(u32, f64)>,
+    /// Set on the scroll container's own box: (id, content width, content
+    /// height) — lets the renderer register the scrollable region and clamp
+    /// its offsets on both axes.
+    scroll_container_def: Option<(u32, f64, f64)>,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
     grid_template_columns: Option<Vec<GridTrack>>,
@@ -219,6 +234,8 @@ impl ComputedStyle {
             offset_left: None,
             offset_right: None,
             offset_bottom: None,
+            offset_top_ratio: None,
+            offset_left_ratio: None,
             text_align: None,
             text_align_legacy: false,
             z_index: None,
@@ -233,6 +250,10 @@ impl ComputedStyle {
             paint_z: None,
             overflow_scrollable: false,
             has_transform: false,
+            transform_op: None,
+            scale_context: None,
+            border_radius: None,
+            box_shadow: None,
             final_clip: None,
             scroll_container: None,
             scroll_container_def: None,
@@ -631,6 +652,38 @@ impl ComputedStyle {
         self.has_transform
     }
 
+    pub fn set_transform_op(&mut self, op: (f64, bool, f64, bool, f64)) {
+        self.transform_op = Some(op);
+    }
+
+    pub fn transform_op(&self) -> Option<(f64, bool, f64, bool, f64)> {
+        self.transform_op
+    }
+
+    pub fn set_scale_context(&mut self, ox: f64, oy: f64, factor: f64) {
+        self.scale_context = Some((ox, oy, factor));
+    }
+
+    pub fn scale_context(&self) -> Option<(f64, f64, f64)> {
+        self.scale_context
+    }
+
+    pub fn set_border_radius(&mut self, r: f64) {
+        self.border_radius = Some(r.max(0.0));
+    }
+
+    pub fn border_radius(&self) -> f64 {
+        self.border_radius.unwrap_or(0.0)
+    }
+
+    pub fn set_box_shadow(&mut self, dx: f64, dy: f64, blur: f64, color: Color) {
+        self.box_shadow = Some((dx, dy, blur, color));
+    }
+
+    pub fn box_shadow(&self) -> Option<(f64, f64, f64, Color)> {
+        self.box_shadow.clone()
+    }
+
     /// Opacity without panicking on un-defaulted styles.
     pub fn opacity_or_default(&self) -> f64 {
         self.opacity.unwrap_or(1.0)
@@ -652,11 +705,11 @@ impl ComputedStyle {
         self.scroll_container
     }
 
-    pub fn set_scroll_container_def(&mut self, id: u32, content_height: f64) {
-        self.scroll_container_def = Some((id, content_height));
+    pub fn set_scroll_container_def(&mut self, id: u32, content_w: f64, content_h: f64) {
+        self.scroll_container_def = Some((id, content_w, content_h));
     }
 
-    pub fn scroll_container_def(&self) -> Option<(u32, f64)> {
+    pub fn scroll_container_def(&self) -> Option<(u32, f64, f64)> {
         self.scroll_container_def
     }
 
@@ -938,6 +991,22 @@ impl ComputedStyle {
     pub fn offset_left(&self) -> f64 {
         self.offset_left
             .expect("failed to access CSS property: left")
+    }
+
+    pub fn set_offset_top_ratio(&mut self, r: f64) {
+        self.offset_top_ratio = Some(r);
+    }
+
+    pub fn offset_top_ratio(&self) -> Option<f64> {
+        self.offset_top_ratio
+    }
+
+    pub fn set_offset_left_ratio(&mut self, r: f64) {
+        self.offset_left_ratio = Some(r);
+    }
+
+    pub fn offset_left_ratio(&self) -> Option<f64> {
+        self.offset_left_ratio
     }
 
     pub fn set_offset_right(&mut self, right: f64) {

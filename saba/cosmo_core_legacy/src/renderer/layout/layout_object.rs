@@ -243,6 +243,99 @@ fn resolve_grid_tracks(tracks: &[GridTrack], available: i64, column_gap: i64) ->
         .collect()
 }
 
+/// Parse a `transform` value list into (tx, tx_pct, ty, ty_pct, scale).
+/// Supports translate/translateX/translateY (px and %) and
+/// scale/scaleX/scaleY (uniform: the x factor wins); other functions are
+/// ignored (they still set the stacking trigger via has_transform).
+/// https://www.w3.org/TR/css-transforms-1/
+fn parse_transform_ops(values: &[ComponentValue]) -> Option<(f64, bool, f64, bool, f64)> {
+    let mut tx = 0.0f64;
+    let mut tx_pct = false;
+    let mut ty = 0.0f64;
+    let mut ty_pct = false;
+    let mut scale = 1.0f64;
+    let mut found = false;
+    let mut i = 0;
+    while i < values.len() {
+        let (name, has_args) = match &values[i] {
+            ComponentValue::Ident(n)
+                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) =>
+            {
+                (n.to_lowercase(), true)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if !has_args {
+            i += 1;
+            continue;
+        }
+        // Collect argument components up to the matching close paren.
+        let mut args: Vec<(f64, bool)> = Vec::new();
+        let mut depth = 1;
+        let mut j = i + 2;
+        while j < values.len() && depth > 0 {
+            match &values[j] {
+                ComponentValue::OpenParenthesis => depth += 1,
+                ComponentValue::CloseParenthesis => depth -= 1,
+                ComponentValue::Number(v) => args.push((*v, false)),
+                ComponentValue::Dimension(v, unit) if unit == "%" => args.push((*v, true)),
+                ComponentValue::Dimension(v, unit) => {
+                    if let Some(px) = length_to_px(*v, unit, FontSize::Medium) {
+                        args.push((px, false));
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        match name.as_str() {
+            "translate" => {
+                if let Some((v, p)) = args.first() {
+                    tx = *v;
+                    tx_pct = *p;
+                    found = true;
+                }
+                if let Some((v, p)) = args.get(1) {
+                    ty = *v;
+                    ty_pct = *p;
+                }
+            }
+            "translatex" => {
+                if let Some((v, p)) = args.first() {
+                    tx = *v;
+                    tx_pct = *p;
+                    found = true;
+                }
+            }
+            "translatey" => {
+                if let Some((v, p)) = args.first() {
+                    ty = *v;
+                    ty_pct = *p;
+                    found = true;
+                }
+            }
+            "scale" | "scalex" | "scaley" => {
+                if let Some((v, _)) = args.first() {
+                    if *v > 0.0 {
+                        scale = *v;
+                        found = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i = j;
+    }
+    if found {
+        Some((tx, tx_pct, ty, ty_pct, scale))
+    } else {
+        None
+    }
+}
+
 /// One background-position component: (value, is_percent, axis) where axis is
 /// Some(true) for horizontal keywords, Some(false) for vertical, None when the
 /// component fits either axis. Keywords map to percentages per CSS Backgrounds
@@ -2600,7 +2693,19 @@ impl LayoutObject {
                         track
                     }
                 } else if explicit_width > 0 {
-                    explicit_width.min(available_width)
+                    // Inside an overflow container the explicit width stands
+                    // even when wider than the box — that overflow is exactly
+                    // what the container clips/scrolls. Elsewhere, clamp to
+                    // the available width as an overflow guard.
+                    let parent_clips = self
+                        .parent_object()
+                        .map(|p| p.borrow().style().overflow_clip())
+                        .unwrap_or(false);
+                    if parent_clips {
+                        explicit_width
+                    } else {
+                        explicit_width.min(available_width)
+                    }
                 } else if let Some(w) = html_width {
                     w.min(available_width)
                 } else if self.element_kind() == Some(ElementKind::Table) {
@@ -3064,8 +3169,18 @@ impl LayoutObject {
                 point.set_y(point.y() + edge_to_i64(self.style.offset_top()));
             }
             PositionType::Absolute => {
-                point.set_x(parent_point.x() + edge_to_i64(self.style.offset_left()));
-                point.set_y(parent_point.y() + edge_to_i64(self.style.offset_top()));
+                let dx = self
+                    .style
+                    .offset_left_ratio()
+                    .map(|r| (parent_size.width() as f64 * r) as i64)
+                    .unwrap_or_else(|| edge_to_i64(self.style.offset_left()));
+                let dy = self
+                    .style
+                    .offset_top_ratio()
+                    .map(|r| (parent_size.height() as f64 * r) as i64)
+                    .unwrap_or_else(|| edge_to_i64(self.style.offset_top()));
+                point.set_x(parent_point.x() + dx);
+                point.set_y(parent_point.y() + dy);
             }
             // Fixed: anchored to the viewport origin; the painter additionally
             // exempts it from the scroll offset.
@@ -3291,12 +3406,18 @@ impl LayoutObject {
                     Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
                         self.style.set_offset_top(*value)
                     }
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
+                        self.style.set_offset_top_ratio(*value / 100.0)
+                    }
                     _ => {}
                 },
                 "left" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_left(*value),
                     Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
                         self.style.set_offset_left(*value)
+                    }
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
+                        self.style.set_offset_left_ratio(*value / 100.0)
                     }
                     _ => {}
                 },
@@ -3379,6 +3500,54 @@ impl LayoutObject {
                         );
                     }
                 }
+                "border-radius" => {
+                    if let Some(px) = first_value
+                        .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
+                    {
+                        self.style.set_border_radius(px);
+                    }
+                }
+                // box-shadow: <dx> <dy> [blur] [spread] <color> (single
+                // shadow; inset and shadow lists are ignored).
+                "box-shadow" => {
+                    let mut lengths: Vec<f64> = Vec::new();
+                    let mut color: Option<Color> = None;
+                    for v in &declaration.value {
+                        match v {
+                            ComponentValue::Ident(name)
+                                if name.eq_ignore_ascii_case("none")
+                                    || name.eq_ignore_ascii_case("inset") =>
+                            {
+                                lengths.clear();
+                                color = None;
+                                break;
+                            }
+                            ComponentValue::HashToken(code) => {
+                                color = Color::from_code(code).ok();
+                            }
+                            ComponentValue::Ident(name) => {
+                                if let Ok(c) = Color::from_name(name) {
+                                    color = Some(c);
+                                }
+                            }
+                            other => {
+                                if lengths.len() < 4 {
+                                    if let Some(px) = spacing_component_to_px(
+                                        other,
+                                        self.style.font_size_or_default(),
+                                    ) {
+                                        lengths.push(px);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if lengths.len() >= 2 {
+                        let blur = lengths.get(2).copied().unwrap_or(0.0);
+                        let c = color.unwrap_or_else(Color::gray);
+                        self.style.set_box_shadow(lengths[0], lengths[1], blur, c);
+                    }
+                }
                 // transform values are not applied (no transform rendering),
                 // but a non-none transform forms a stacking context.
                 // https://www.w3.org/TR/css-transforms-1/#transform-rendering
@@ -3387,6 +3556,11 @@ impl LayoutObject {
                         Some(ComponentValue::Ident(v)) if v.eq_ignore_ascii_case("none"));
                     self.style
                         .set_has_transform(!is_none && first_value.is_some());
+                    if !is_none {
+                        if let Some(op) = parse_transform_ops(&declaration.value) {
+                            self.style.set_transform_op(op);
+                        }
+                    }
                 }
                 "opacity" => {
                     if let Some(ComponentValue::Number(value)) = first_value {
@@ -3538,6 +3712,11 @@ impl LayoutObject {
         self.style.set_paint_z(z);
     }
 
+    /// Stamp a scale context (see `LayoutView::apply_transforms`).
+    pub fn set_scale_context(&mut self, ox: f64, oy: f64, factor: f64) {
+        self.style.set_scale_context(ox, oy, factor);
+    }
+
     /// Stamp the final clip rectangle (intersection of overflow ancestors).
     pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {
         self.style.set_final_clip(clip);
@@ -3548,9 +3727,9 @@ impl LayoutObject {
         self.style.set_scroll_container(id);
     }
 
-    /// Mark this box as a scroll container (id + scrollable content height).
-    pub fn set_scroll_container_def(&mut self, id: u32, content_height: f64) {
-        self.style.set_scroll_container_def(id, content_height);
+    /// Mark this box as a scroll container (id + scrollable content size).
+    pub fn set_scroll_container_def(&mut self, id: u32, content_w: f64, content_h: f64) {
+        self.style.set_scroll_container_def(id, content_w, content_h);
     }
 
     pub fn size(&self) -> LayoutSize {

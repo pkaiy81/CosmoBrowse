@@ -284,6 +284,12 @@ pub enum SceneItem {
         /// (negative = auto), 1 cover, 2 contain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         background_size: Option<(u8, f64, bool, f64, bool)>,
+        /// border-radius in pixels (all corners).
+        #[serde(default)]
+        border_radius: i64,
+        /// box-shadow (dx, dy, blur, css color).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        box_shadow: Option<(i64, i64, i64, String)>,
         /// position:fixed — exempt from scrolling.
         #[serde(default)]
         fixed: bool,
@@ -295,7 +301,7 @@ pub enum SceneItem {
         scroll_container: Option<u32>,
         /// Scroll-container definition (id, content height) on its own box.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scroll_container_def: Option<(u32, i64)>,
+        scroll_container_def: Option<(u32, i64, i64)>,
     },
     Text {
         /// position:fixed — exempt from scrolling.
@@ -309,7 +315,7 @@ pub enum SceneItem {
         scroll_container: Option<u32>,
         /// Scroll-container definition (id, content height) on its own box.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scroll_container_def: Option<(u32, i64)>,
+        scroll_container_def: Option<(u32, i64, i64)>,
         x: i64,
         y: i64,
         text: String,
@@ -336,7 +342,7 @@ pub enum SceneItem {
         scroll_container: Option<u32>,
         /// Scroll-container definition (id, content height) on its own box.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scroll_container_def: Option<(u32, i64)>,
+        scroll_container_def: Option<(u32, i64, i64)>,
         x: i64,
         y: i64,
         width: i64,

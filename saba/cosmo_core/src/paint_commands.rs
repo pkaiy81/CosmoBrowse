@@ -96,9 +96,15 @@ pub struct DrawRect {
     /// Nearest scroll container this content belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll_container: Option<u32>,
-    /// Set on a scroll container's own box: (id, content height).
+    /// Set on a scroll container's own box: (id, content width, content height).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scroll_container_def: Option<(u32, i64)>,
+    pub scroll_container_def: Option<(u32, i64, i64)>,
+    /// `border-radius` in pixels (all corners).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub border_radius: i64,
+    /// `box-shadow`: (dx, dy, blur, css color).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_shadow: Option<(i64, i64, i64, String)>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
