@@ -748,6 +748,10 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
             return false;
         }
         Selector::Never => return false,
+        Selector::Not(inner) => {
+            return matches!(node.borrow().kind(), NodeKind::Element(_))
+                && !dom_node_selected(node, inner);
+        }
         Selector::PseudoClass(kind) => {
             if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
                 return false;
@@ -764,19 +768,31 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
                 return !parent_is_element;
             }
             // 1-based index of this element among its parent's ELEMENT
-            // children, and the total count.
+            // children (and, for the *-of-type family, among element children
+            // with the SAME tag), plus the respective totals.
+            let own_tag = match node.borrow().kind() {
+                NodeKind::Element(ref e) => e.kind().to_string(),
+                _ => return false,
+            };
             let parent = match node.borrow().parent().upgrade() {
                 Some(p) => p,
                 None => return false,
             };
             let mut index = 0usize;
             let mut total = 0usize;
+            let mut index_of_type = 0usize;
+            let mut total_of_type = 0usize;
             let mut child = parent.borrow().first_child();
             while let Some(c) = child {
-                if matches!(c.borrow().kind(), NodeKind::Element(_)) {
+                if let NodeKind::Element(ref e) = c.borrow().kind() {
                     total += 1;
+                    let same_type = e.kind().to_string() == own_tag;
+                    if same_type {
+                        total_of_type += 1;
+                    }
                     if Rc::ptr_eq(&c, node) {
                         index = total;
+                        index_of_type = total_of_type;
                     }
                 }
                 let next = c.borrow().next_sibling();
@@ -802,6 +818,13 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
                 PseudoClassKind::NthChild(a, b) => nth_matches(*a, *b, index as i64),
                 PseudoClassKind::NthLastChild(a, b) => {
                     nth_matches(*a, *b, (total - index + 1) as i64)
+                }
+                PseudoClassKind::FirstOfType => index_of_type == 1,
+                PseudoClassKind::LastOfType => index_of_type == total_of_type,
+                PseudoClassKind::OnlyOfType => total_of_type == 1,
+                PseudoClassKind::NthOfType(a, b) => nth_matches(*a, *b, index_of_type as i64),
+                PseudoClassKind::NthLastOfType(a, b) => {
+                    nth_matches(*a, *b, (total_of_type - index_of_type + 1) as i64)
                 }
             };
         }
@@ -1194,7 +1217,7 @@ impl LayoutObject {
         None
     }
 
-    fn element_kind(&self) -> Option<ElementKind> {
+    pub fn element_kind(&self) -> Option<ElementKind> {
         self.node.borrow().element_kind()
     }
 
@@ -2266,6 +2289,21 @@ impl LayoutObject {
         edge_to_i64(self.style.height())
     }
 
+    /// Stacking-context level for paint ordering: 1 when this box is
+    /// positioned OR belongs to a sticky subtree (the sticky context is
+    /// stamped onto every descendant, whose own position is Static — without
+    /// this, a pinned bar's background would paint over its own text).
+    fn stacking_context_level(&self) -> i32 {
+        if self.style.position() != PositionType::Static
+            || self.style.sticky_context().is_some()
+            || self.style.fixed_subtree()
+        {
+            1
+        } else {
+            0
+        }
+    }
+
     pub fn paint(&mut self) -> Vec<DisplayItem> {
         if self.style.display() == DisplayType::DisplayNone {
             return vec![];
@@ -2315,11 +2353,7 @@ impl LayoutObject {
                             layout_point: LayoutPoint::new(self.point().x(), rect_y),
                             layout_size: LayoutSize::new(self.size().width(), rect_h),
                             paint_order: PaintOrder {
-                                stacking_context: if self.style.position() != PositionType::Static {
-                                    1
-                                } else {
-                                    0
-                                },
+                                stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: if self.style.overflow_clip() {
@@ -2347,11 +2381,7 @@ impl LayoutObject {
                             layout_point: self.point(),
                             layout_size: self.size(),
                             paint_order: PaintOrder {
-                                stacking_context: if self.style.position() != PositionType::Static {
-                                    1
-                                } else {
-                                    0
-                                },
+                                stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: if self.style.overflow_clip() {
@@ -2380,11 +2410,7 @@ impl LayoutObject {
                             href: self.link_href(),
                             target: self.link_target(),
                             paint_order: PaintOrder {
-                                stacking_context: if self.style.position() != PositionType::Static {
-                                    1
-                                } else {
-                                    0
-                                },
+                                stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: if self.style.overflow_clip() {
@@ -2419,11 +2445,7 @@ impl LayoutObject {
                             href: self.link_href(),
                             target: self.link_target(),
                             paint_order: PaintOrder {
-                                stacking_context: if self.style.position() != PositionType::Static {
-                                    1
-                                } else {
-                                    0
-                                },
+                                stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: None,
@@ -2483,11 +2505,7 @@ impl LayoutObject {
                             href: href.clone(),
                             target: target.clone(),
                             paint_order: PaintOrder {
-                                stacking_context: if self.style.position() != PositionType::Static {
-                                    1
-                                } else {
-                                    0
-                                },
+                                stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index(),
                             },
                             clip_rect: None,
@@ -3035,7 +3053,8 @@ impl LayoutObject {
         } // end if !table_cell
 
         match self.style.position() {
-            PositionType::Static => {}
+            // Sticky flows normally; the painter pins it at scroll time.
+            PositionType::Static | PositionType::Sticky => {}
             PositionType::Relative => {
                 point.set_x(point.x() + edge_to_i64(self.style.offset_left()));
                 point.set_y(point.y() + edge_to_i64(self.style.offset_top()));
@@ -3478,6 +3497,18 @@ impl LayoutObject {
     /// fixed-position far-edge anchoring).
     pub fn set_point(&mut self, point: LayoutPoint) {
         self.point = point;
+    }
+
+    /// Stamp the sticky scroll context onto this node's style (see
+    /// `LayoutView::stamp_sticky_contexts`).
+    pub fn set_sticky_context(&mut self, top: f64, container_y: f64) {
+        self.style.set_sticky_context(top, container_y);
+    }
+
+    /// Mark this node as part of a position:fixed subtree (see
+    /// `LayoutView::stamp_sticky_contexts`).
+    pub fn set_fixed_subtree(&mut self) {
+        self.style.set_fixed_subtree();
     }
 
     pub fn size(&self) -> LayoutSize {

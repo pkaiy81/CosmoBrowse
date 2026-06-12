@@ -196,6 +196,21 @@ fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
     })
 }
 
+
+/// Per-command scroll offset: fixed boxes never scroll; sticky boxes scroll
+/// until their box would pass the `top` threshold, then pin there (the whole
+/// subtree shares the container's context so it pins together).
+fn effective_scroll(fixed: bool, sticky: Option<(i64, i64)>, scroll_y: i64) -> i64 {
+    if fixed {
+        return 0;
+    }
+    if let Some((top, container_y)) = sticky {
+        let delta = (scroll_y + top - container_y).max(0);
+        return scroll_y - delta;
+    }
+    scroll_y
+}
+
 /// Render a list of paint commands to the pixmap.
 /// Returns hit regions for clickable elements (links).
 pub fn render_commands(
@@ -233,11 +248,11 @@ pub fn render_commands(
         // scrolls underneath.
         match &commands[idx] {
             PaintCommand::DrawRect(rect) => {
-                let scroll = if rect.fixed { 0 } else { scroll_y };
+                let scroll = effective_scroll(rect.fixed, rect.sticky, scroll_y);
                 draw_rect(pixmap, rect, scroll, chrome_height, image_cache, base_url);
             }
             PaintCommand::DrawText(text) => {
-                let scroll = if text.fixed { 0 } else { scroll_y };
+                let scroll = effective_scroll(text.fixed, text.sticky, scroll_y);
                 let end_x = draw_text(pixmap, text, text_renderer, scroll, chrome_height);
                 if let Some(href) = &text.href {
                     let text_width = end_x - text.x;
@@ -254,7 +269,7 @@ pub fn render_commands(
                 }
             }
             PaintCommand::DrawImage(img) => {
-                let scroll = if img.fixed { 0 } else { scroll_y };
+                let scroll = effective_scroll(img.fixed, img.sticky, scroll_y);
                 draw_image(
                     pixmap,
                     img,
@@ -663,6 +678,7 @@ fn draw_image(
         background_no_repeat: false,
         background_size: None,
         fixed: img.fixed,
+        sticky: img.sticky,
     };
     draw_rect(
         pixmap,

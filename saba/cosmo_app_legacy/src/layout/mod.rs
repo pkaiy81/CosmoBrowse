@@ -213,7 +213,10 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
-                    z_index: paint_order.z_index,
+                    // Fold the stacking context into the sortable z so positioned
+                    // boxes (sticky bars, etc.) paint above normal-flow content
+                    // even after the painter's per-z phase sort.
+                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                     anchor_id,
                     border_width,
@@ -221,7 +224,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
-                    fixed: style.position() == PositionType::Fixed,
+                    fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
+                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
                 });
             }
             DisplayItem::Text {
@@ -241,7 +245,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 max_width = max_width.max(layout_point.x() + width_estimate);
                 max_height = max_height.max(layout_point.y() + height_estimate);
                 scene_items.push(SceneItem::Text {
-                    fixed: style.position() == PositionType::Fixed,
+                    fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
+                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
                     x,
                     y,
                     text,
@@ -253,7 +258,10 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     opacity: style.opacity(),
                     href,
                     target,
-                    z_index: paint_order.z_index,
+                    // Fold the stacking context into the sortable z so positioned
+                    // boxes (sticky bars, etc.) paint above normal-flow content
+                    // even after the painter's per-z phase sort.
+                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                 });
             }
@@ -273,7 +281,8 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 max_width = max_width.max(layout_point.x() + layout_size.width());
                 max_height = max_height.max(layout_point.y() + layout_size.height());
                 scene_items.push(SceneItem::Image {
-                    fixed: style.position() == PositionType::Fixed,
+                    fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
+                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
                     x,
                     y,
                     width: layout_size.width(),
@@ -283,7 +292,10 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     opacity: style.opacity(),
                     href,
                     target,
-                    z_index: paint_order.z_index,
+                    // Fold the stacking context into the sortable z so positioned
+                    // boxes (sticky bars, etc.) paint above normal-flow content
+                    // even after the painter's per-z phase sort.
+                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                 });
             }
@@ -387,6 +399,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
                 PositionType::Relative => "relative",
                 PositionType::Absolute => "absolute",
                 PositionType::Fixed => "fixed",
+                PositionType::Sticky => "sticky",
             }
             .to_string(),
             color: style.color().code().to_string(),
@@ -449,6 +462,7 @@ mod diff_tests {
             background_no_repeat: false,
             background_size: None,
             fixed: false,
+            sticky: None,
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -467,6 +481,7 @@ mod diff_tests {
             background_no_repeat: false,
             background_size: None,
             fixed: false,
+            sticky: None,
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

@@ -595,7 +595,130 @@ impl LayoutView {
             None,
             None,
         );
+        Self::align_inline_baselines(&self.root);
         self.reposition_fixed_far_edges(&self.root.clone());
+        Self::stamp_sticky_contexts(&self.root, None, false);
+    }
+
+    /// Post-layout pass: stamp the sticky scroll context — (top threshold,
+    /// the sticky box's laid-out y) — onto every node of a sticky subtree.
+    /// Paint commands inherit it via the per-node style, letting the painter
+    /// pin the whole subtree once the page scrolls past the threshold.
+    fn stamp_sticky_contexts(
+        node: &Option<Rc<RefCell<LayoutObject>>>,
+        inherited: Option<(f64, f64)>,
+        in_fixed: bool,
+    ) {
+        if let Some(n) = node {
+            let (own, is_fixed) = {
+                let b = n.borrow();
+                let own = if b.style().position_or_default() == PositionType::Sticky {
+                    Some((b.style().offset_top(), b.point().y() as f64))
+                } else {
+                    None
+                };
+                (own, b.style().position_or_default() == PositionType::Fixed)
+            };
+            let context = own.or(inherited);
+            if let Some((top, container_y)) = context {
+                n.borrow_mut().set_sticky_context(top, container_y);
+            }
+            let in_fixed_for_siblings = in_fixed;
+            let in_fixed = in_fixed || is_fixed;
+            if in_fixed {
+                // Descendants of a fixed box share its scroll exemption and
+                // stacking level even though their own position is Static.
+                n.borrow_mut().set_fixed_subtree();
+            }
+            let first_child = n.borrow().first_child();
+            Self::stamp_sticky_contexts(&first_child, context, in_fixed);
+            let next_sibling = n.borrow().next_sibling();
+            // Siblings inherit the CALLER's contexts, not this node's.
+            Self::stamp_sticky_contexts(&next_sibling, inherited, in_fixed_for_siblings);
+        }
+    }
+
+    /// Estimated distance from a box's top edge to its first text baseline.
+    /// Text: the renderer draws the baseline at top + font_px. Inline
+    /// elements: their first-line text sits below the top padding. Images
+    /// (replaced content) sit ON the baseline, so the whole height counts.
+    /// https://www.w3.org/TR/CSS22/visudet.html#leading
+    fn baseline_ascent(n: &Rc<RefCell<LayoutObject>>) -> i64 {
+        let b = n.borrow();
+        if b.element_kind() == Some(ElementKind::Img) {
+            return b.size().height();
+        }
+        let font_px = b.style().font_size_or_default().px();
+        let padding_top = b.style().padding().top() as i64;
+        padding_top + font_px
+    }
+
+    /// Post-layout pass: align the baselines of inline-level boxes that share
+    /// a line (consecutive inline/text siblings with the same top edge).
+    /// Each box is shifted down by the difference between the line's deepest
+    /// baseline and its own — a font-size-mix line no longer top-aligns its
+    /// runs (small text floating high next to big text).
+    fn align_inline_baselines(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        if let Some(n) = node {
+            // Collect this node's children once.
+            let mut children: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+            let mut child = n.borrow().first_child();
+            while let Some(c) = child {
+                let next = c.borrow().next_sibling();
+                children.push(c);
+                child = next;
+            }
+            // Group consecutive inline-level children sharing a top edge.
+            let mut line: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+            let mut line_y: Option<i64> = None;
+            let flush = |line: &mut Vec<Rc<RefCell<LayoutObject>>>| {
+                if line.len() >= 2 {
+                    let max_baseline = line
+                        .iter()
+                        .map(|c| c.borrow().point().y() + Self::baseline_ascent(c))
+                        .max()
+                        .unwrap_or(0);
+                    for c in line.iter() {
+                        let shift =
+                            max_baseline - (c.borrow().point().y() + Self::baseline_ascent(c));
+                        // Sanity bound: a wildly large shift means the ascent
+                        // estimate is wrong for this box; leave it alone.
+                        if shift > 0 && shift <= 32 {
+                            Self::translate_subtree(c, 0, shift);
+                        }
+                    }
+                }
+                line.clear();
+            };
+            for c in &children {
+                let kind = c.borrow().kind();
+                let is_inline =
+                    matches!(kind, LayoutObjectKind::Inline | LayoutObjectKind::Text);
+                let zero = {
+                    let b = c.borrow();
+                    b.size().width() == 0 && b.size().height() == 0
+                };
+                if is_inline && !zero {
+                    let y = c.borrow().point().y();
+                    if line_y == Some(y) {
+                        line.push(c.clone());
+                    } else {
+                        flush(&mut line);
+                        line_y = Some(y);
+                        line.push(c.clone());
+                    }
+                } else if !zero {
+                    flush(&mut line);
+                    line_y = None;
+                }
+            }
+            flush(&mut line);
+
+            let first_child = n.borrow().first_child();
+            Self::align_inline_baselines(&first_child);
+            let next_sibling = n.borrow().next_sibling();
+            Self::align_inline_baselines(&next_sibling);
+        }
     }
 
     /// Post-layout pass: a fixed box anchored with `right`/`bottom` resolves
@@ -1955,6 +2078,63 @@ mod tests {
         assert_eq!(color_of("themed"), 0x0000ff, ".theme override");
         assert_eq!(color_of("themed-nested"), 0x0000ff, "override inherits to descendants");
         assert_eq!(color_of("fallback"), 0x00ff00, "var() fallback for missing token");
+    }
+
+    #[test]
+    fn test_inline_baseline_alignment_mixed_font_sizes() {
+        let html = concat!(
+            "<html><head><style>",
+            ".big{font-size:32px;}",
+            ".small{font-size:12px;}",
+            "</style></head><body>",
+            "<p><span class=\"big\">BIG</span><span class=\"small\">small</span></p>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let body = layout_view.root().expect("body");
+        let p = body.borrow().first_child().expect("p");
+        let big = p.borrow().first_child().expect("big span");
+        let small = big.borrow().next_sibling().expect("small span");
+        // Baselines coincide: top + font_px equal for both runs.
+        let big_baseline = big.borrow().point().y() + 32;
+        let small_baseline = small.borrow().point().y() + 12;
+        assert_eq!(
+            big_baseline, small_baseline,
+            "small text must sit on the big text's baseline (big y={} small y={})",
+            big.borrow().point().y(), small.borrow().point().y(),
+        );
+    }
+
+    #[test]
+    fn test_not_and_of_type_pseudo_classes() {
+        let html = concat!(
+            "<html><head><style>",
+            "p:not(.skip){color:#ff0000;}",
+            "span:nth-of-type(2){color:#00ff00;}",
+            "em:first-of-type{color:#0000ff;}",
+            "em:last-of-type{color:#aa00aa;}",
+            "</style></head><body>",
+            "<p>plain-p</p><p class=\"skip\">skipped-p</p>",
+            // Mixed siblings: b, span, b, span — of-type counts only spans.
+            "<div><b>bold-one</b><span>span-one</span><b>bold-two</b><span>span-two</span></div>",
+            "<div><em>em-first</em><i>mid</i><em>em-last</em></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let display_items = layout_view.paint();
+        let color_of = |needle: &str| -> u32 {
+            display_items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("text {:?} not painted", needle))
+        };
+        assert_eq!(color_of("plain-p"), 0xff0000, ":not(.skip) matches plain p");
+        assert_ne!(color_of("skipped-p"), 0xff0000, ":not(.skip) excludes .skip");
+        assert_ne!(color_of("span-one"), 0x00ff00, "1st span (3rd child) is not nth-of-type(2)");
+        assert_eq!(color_of("span-two"), 0x00ff00, "2nd span matches nth-of-type(2)");
+        assert_eq!(color_of("em-first"), 0x0000ff, ":first-of-type");
+        assert_eq!(color_of("em-last"), 0xaa00aa, ":last-of-type");
     }
 
     #[test]

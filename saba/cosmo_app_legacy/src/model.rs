@@ -287,11 +287,17 @@ pub enum SceneItem {
         /// position:fixed — exempt from scrolling.
         #[serde(default)]
         fixed: bool,
+        /// position:sticky context (top threshold, container y).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sticky: Option<(i64, i64)>,
     },
     Text {
         /// position:fixed — exempt from scrolling.
         #[serde(default)]
         fixed: bool,
+        /// position:sticky context (top threshold, container y).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sticky: Option<(i64, i64)>,
         x: i64,
         y: i64,
         text: String,
@@ -310,6 +316,9 @@ pub enum SceneItem {
         /// position:fixed — exempt from scrolling.
         #[serde(default)]
         fixed: bool,
+        /// position:sticky context (top threshold, container y).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sticky: Option<(i64, i64)>,
         x: i64,
         y: i64,
         width: i64,

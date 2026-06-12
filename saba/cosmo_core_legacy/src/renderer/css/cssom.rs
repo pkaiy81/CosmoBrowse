@@ -187,8 +187,25 @@ impl CssParser {
                         false
                     };
                     let name = self.consume_ident().to_lowercase();
-                    // Functional pseudo (`:not(...)`, `:nth-child(2n+1)`):
-                    // capture the argument tokens (balanced parens).
+                    // `:not(...)` takes a real selector argument: parse it
+                    // inline with the selector machinery, then expect `)`.
+                    if name == "not" && self.t.peek() == Some(&CssToken::OpenParenthesis) {
+                        self.t.next();
+                        self.skip_whitespace();
+                        let inner = self.consume_selector_list();
+                        self.skip_whitespace();
+                        // Error recovery: skip to the closing paren.
+                        loop {
+                            match self.t.next() {
+                                None | Some(CssToken::CloseParenthesis) => break,
+                                _ => {}
+                            }
+                        }
+                        parts.push(Selector::Not(Box::new(inner)));
+                        continue;
+                    }
+                    // Other functional pseudos (`:nth-child(2n+1)`): capture
+                    // the argument tokens (balanced parens).
                     let mut args: Vec<CssToken> = Vec::new();
                     if self.t.peek() == Some(&CssToken::OpenParenthesis) {
                         self.t.next();
@@ -238,12 +255,23 @@ impl CssParser {
                             "only-child" => {
                                 parts.push(Selector::PseudoClass(PseudoClassKind::OnlyChild))
                             }
-                            "nth-child" | "nth-last-child" => match parse_nth_formula(&args) {
+                            "first-of-type" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::FirstOfType))
+                            }
+                            "last-of-type" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::LastOfType))
+                            }
+                            "only-of-type" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::OnlyOfType))
+                            }
+                            "nth-child" | "nth-last-child" | "nth-of-type"
+                            | "nth-last-of-type" => match parse_nth_formula(&args) {
                                 Some((a, b)) => {
-                                    let kind = if name == "nth-child" {
-                                        PseudoClassKind::NthChild(a, b)
-                                    } else {
-                                        PseudoClassKind::NthLastChild(a, b)
+                                    let kind = match name.as_str() {
+                                        "nth-child" => PseudoClassKind::NthChild(a, b),
+                                        "nth-last-child" => PseudoClassKind::NthLastChild(a, b),
+                                        "nth-of-type" => PseudoClassKind::NthOfType(a, b),
+                                        _ => PseudoClassKind::NthLastOfType(a, b),
                                     };
                                     parts.push(Selector::PseudoClass(kind));
                                 }
@@ -775,6 +803,9 @@ pub enum Selector {
     /// Structural pseudo-class testing the element's position among its
     /// element siblings. https://www.w3.org/TR/selectors-4/#structural-pseudos
     PseudoClass(PseudoClassKind),
+    /// `:not(...)` — matches when the inner selector does NOT match.
+    /// https://www.w3.org/TR/selectors-4/#negation
+    Not(Box<Selector>),
 }
 
 /// Supported structural pseudo-classes.
@@ -790,6 +821,13 @@ pub enum PseudoClassKind {
     NthChild(i64, i64),
     /// `:nth-last-child(An+B)` — same, counting from the end.
     NthLastChild(i64, i64),
+    /// `*-of-type` family: like the child variants but counting only siblings
+    /// with the SAME tag name.
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+    NthOfType(i64, i64),
+    NthLastOfType(i64, i64),
 }
 
 /// Attribute selector operator.
@@ -850,6 +888,8 @@ impl Selector {
                 .map(|s| s.specificity_abc())
                 .max()
                 .unwrap_or((0, 0, 0)),
+            // :not() takes the specificity of its argument (Selectors L4 §17).
+            Selector::Not(inner) => inner.specificity_abc(),
         }
     }
 }

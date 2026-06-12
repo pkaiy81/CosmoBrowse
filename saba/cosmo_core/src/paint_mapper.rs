@@ -49,7 +49,10 @@ pub fn map_display_items_to_paint_commands(
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     opacity: style.opacity(),
-                    z_index: paint_order.z_index,
+                    // Fold the stacking context into the sortable z so positioned
+                    // boxes (sticky bars, etc.) paint above normal-flow content
+                    // even after the painter's per-z phase sort.
+                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                     anchor_id: anchor_id.clone(),
                     border_width,
@@ -57,7 +60,8 @@ pub fn map_display_items_to_paint_commands(
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
-                    fixed: style.position_or_default() == PositionType::Fixed,
+                    fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
+                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
                 }));
             }
             DisplayItem::Text {
@@ -87,7 +91,8 @@ pub fn map_display_items_to_paint_commands(
                 }
 
                 commands.push(PaintCommand::DrawText(DrawText {
-                    fixed: style.position_or_default() == PositionType::Fixed,
+                    fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
+                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
                     text: text.clone(),
@@ -99,7 +104,10 @@ pub fn map_display_items_to_paint_commands(
                     opacity: style.opacity(),
                     href: href.clone(),
                     target: target.clone(),
-                    z_index: paint_order.z_index,
+                    // Fold the stacking context into the sortable z so positioned
+                    // boxes (sticky bars, etc.) paint above normal-flow content
+                    // even after the painter's per-z phase sort.
+                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 }));
             }
@@ -115,7 +123,8 @@ pub fn map_display_items_to_paint_commands(
                 clip_rect,
             } => {
                 commands.push(PaintCommand::DrawImage(DrawImage {
-                    fixed: style.position_or_default() == PositionType::Fixed,
+                    fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
+                    sticky: style.sticky_context().map(|(t, y)| (t as i64, y as i64)),
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
                     width: layout_size.width(),
@@ -125,7 +134,10 @@ pub fn map_display_items_to_paint_commands(
                     opacity: style.opacity(),
                     href: href.clone(),
                     target: target.clone(),
-                    z_index: paint_order.z_index,
+                    // Fold the stacking context into the sortable z so positioned
+                    // boxes (sticky bars, etc.) paint above normal-flow content
+                    // even after the painter's per-z phase sort.
+                    z_index: paint_order.stacking_context.saturating_mul(1_000_000).saturating_add(paint_order.z_index),
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                 }));
             }

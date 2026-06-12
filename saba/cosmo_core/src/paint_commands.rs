@@ -24,6 +24,7 @@ impl PaintCommand {
     ) -> Self {
         Self::DrawText(DrawText {
             fixed: false,
+            sticky: None,
             x,
             y,
             text: text.into(),
@@ -87,6 +88,10 @@ pub struct DrawRect {
     /// position:fixed — anchored to the viewport, exempt from scrolling.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fixed: bool,
+    /// position:sticky context (top threshold, sticky box's laid-out y):
+    /// the painter pins the subtree once scrolling passes the threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<(i64, i64)>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -102,6 +107,9 @@ pub struct DrawText {
     /// position:fixed — exempt from scrolling.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fixed: bool,
+    /// position:sticky context (top threshold, container y).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<(i64, i64)>,
     pub x: i64,
     pub y: i64,
     pub text: String,
@@ -123,6 +131,9 @@ pub struct DrawImage {
     /// position:fixed — exempt from scrolling.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fixed: bool,
+    /// position:sticky context (top threshold, container y).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<(i64, i64)>,
     pub x: i64,
     pub y: i64,
     pub width: i64,

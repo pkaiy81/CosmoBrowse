@@ -546,6 +546,16 @@ fn is_ctrl_pressed(event: &KeyEvent) -> bool {
 }
 
 /// Headless screenshot mode: render `url` to a PNG at `out_path` without opening a window.
+
+/// Scroll offset for headless screenshots, from `COSMO_SCREENSHOT_SCROLL`
+/// (pixels). Lets sticky/fixed behavior be verified without a window.
+fn headless_scroll() -> i64 {
+    std::env::var("COSMO_SCREENSHOT_SCROLL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn headless_screenshot(url: &str, out_path: &str) {
     let url = if url.contains("://") {
         url.to_string()
@@ -647,7 +657,7 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
     }
     for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
-            frame_url, 0, CHROME_HEIGHT, frame_id);
+            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id);
     }
     let content_height = bridge.content_height();
     ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
@@ -703,7 +713,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     }
     for (frame_id, frame_url, commands) in &frame_commands {
         render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
-            frame_url, 0, CHROME_HEIGHT, frame_id);
+            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id);
     }
     let content_height = bridge.content_height();
     ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);

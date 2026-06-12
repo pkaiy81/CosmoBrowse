@@ -128,6 +128,15 @@ pub struct ComputedStyle {
     background_size: Option<(u8, f64, bool, f64, bool)>,
     /// `line-height`. Inherited.
     line_height: Option<LineHeight>,
+    /// Sticky scroll context stamped by the post-layout pass onto every node
+    /// of a sticky subtree: (top threshold, the sticky box's laid-out y).
+    /// The painter clamps the subtree's scroll so the box pins at the
+    /// threshold once the page scrolls past it.
+    sticky_context: Option<(f64, f64)>,
+    /// True for every node inside a position:fixed subtree (stamped by the
+    /// post-layout pass): descendants share the fixed box's scroll exemption
+    /// and stacking level even though their own position is Static.
+    fixed_subtree: bool,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
     grid_template_columns: Option<Vec<GridTrack>>,
@@ -197,6 +206,8 @@ impl ComputedStyle {
             background_no_repeat: false,
             background_size: None,
             line_height: None,
+            sticky_context: None,
+            fixed_subtree: false,
             grid_template_columns: None,
             column_gap: None,
             row_gap: None,
@@ -538,6 +549,22 @@ impl ComputedStyle {
 
     pub fn line_height(&self) -> Option<LineHeight> {
         self.line_height
+    }
+
+    pub fn set_sticky_context(&mut self, top: f64, container_y: f64) {
+        self.sticky_context = Some((top, container_y));
+    }
+
+    pub fn sticky_context(&self) -> Option<(f64, f64)> {
+        self.sticky_context
+    }
+
+    pub fn set_fixed_subtree(&mut self) {
+        self.fixed_subtree = true;
+    }
+
+    pub fn fixed_subtree(&self) -> bool {
+        self.fixed_subtree
     }
 
     pub fn background_size(&self) -> Option<(u8, f64, bool, f64, bool)> {
@@ -1073,6 +1100,9 @@ pub enum PositionType {
     Absolute,
     /// Anchored to the viewport via top/left and exempt from scrolling.
     Fixed,
+    /// Normal flow until its box would scroll past the `top` threshold, then
+    /// pinned there (painter-side clamping via the sticky context).
+    Sticky,
 }
 
 impl PositionType {
@@ -1082,9 +1112,7 @@ impl PositionType {
             "relative" => Ok(Self::Relative),
             "absolute" => Ok(Self::Absolute),
             "fixed" => Ok(Self::Fixed),
-            // sticky behaves like static until a scroll threshold; for the
-            // initial (unscrolled) view, normal flow is the correct picture.
-            "sticky" => Ok(Self::Static),
+            "sticky" => Ok(Self::Sticky),
             _ => Err(Error::UnexpectedInput(format!(
                 "position {:?} is not supported yet",
                 value
