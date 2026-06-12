@@ -2,6 +2,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use crate::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList};
 
+use crate::nebula_renderer::layout::computed_style::PositionType;
 use crate::nebula_renderer::layout::computed_style::TextDecoration;
 use crate::stardust_display::DisplayItem;
 
@@ -56,6 +57,7 @@ pub fn map_display_items_to_paint_commands(
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
+                    fixed: style.position_or_default() == PositionType::Fixed,
                 }));
             }
             DisplayItem::Text {
@@ -85,6 +87,7 @@ pub fn map_display_items_to_paint_commands(
                 }
 
                 commands.push(PaintCommand::DrawText(DrawText {
+                    fixed: style.position_or_default() == PositionType::Fixed,
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
                     text: text.clone(),
@@ -112,6 +115,7 @@ pub fn map_display_items_to_paint_commands(
                 clip_rect,
             } => {
                 commands.push(PaintCommand::DrawImage(DrawImage {
+                    fixed: style.position_or_default() == PositionType::Fixed,
                     x: origin_x + layout_point.x(),
                     y: origin_y + layout_point.y(),
                     width: layout_size.width(),

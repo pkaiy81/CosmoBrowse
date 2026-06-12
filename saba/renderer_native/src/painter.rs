@@ -228,18 +228,23 @@ pub fn render_commands(
     sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     for &(_, _, idx) in &sorted {
+        // position:fixed boxes are viewport-anchored: paint (and hit-test)
+        // them with a zero scroll offset so they stay put while the page
+        // scrolls underneath.
         match &commands[idx] {
             PaintCommand::DrawRect(rect) => {
-                draw_rect(pixmap, rect, scroll_y, chrome_height, image_cache, base_url);
+                let scroll = if rect.fixed { 0 } else { scroll_y };
+                draw_rect(pixmap, rect, scroll, chrome_height, image_cache, base_url);
             }
             PaintCommand::DrawText(text) => {
-                let end_x = draw_text(pixmap, text, text_renderer, scroll_y, chrome_height);
+                let scroll = if text.fixed { 0 } else { scroll_y };
+                let end_x = draw_text(pixmap, text, text_renderer, scroll, chrome_height);
                 if let Some(href) = &text.href {
                     let text_width = end_x - text.x;
                     let font_height = text.font_px;
                     hit_regions.push(HitRegion {
                         x: text.x,
-                        y: text.y + chrome_height - scroll_y,
+                        y: text.y + chrome_height - scroll,
                         width: text_width.max(1),
                         height: font_height + 4,
                         href: href.clone(),
@@ -249,19 +254,20 @@ pub fn render_commands(
                 }
             }
             PaintCommand::DrawImage(img) => {
+                let scroll = if img.fixed { 0 } else { scroll_y };
                 draw_image(
                     pixmap,
                     img,
                     text_renderer,
                     image_cache,
                     base_url,
-                    scroll_y,
+                    scroll,
                     chrome_height,
                 );
                 if let Some(href) = &img.href {
                     hit_regions.push(HitRegion {
                         x: img.x,
-                        y: img.y + chrome_height - scroll_y,
+                        y: img.y + chrome_height - scroll,
                         width: img.width,
                         height: img.height,
                         href: href.clone(),
@@ -317,13 +323,19 @@ fn draw_rect(
     // We therefore only check y=0 and large-width, not x=0.
     // Use 1/8 of viewport width as threshold to also cover narrow frames
     // (e.g. 18% nav frames) while still excluding small element backgrounds.
-    let effective_height =
-        if rect.y == 0 && rect.clip_rect.is_none() && rect.width >= pixmap.width() as i64 / 8 {
-            let min_fill = pixmap.height() as i64 + scroll_y - chrome_height;
-            rect.height.max(min_fill)
-        } else {
-            rect.height
-        };
+    // A position:fixed box is never the page canvas, even when it sits at
+    // y=0 spanning the viewport (a fixed nav bar would be stretched into a
+    // full-screen slab by this propagation).
+    let effective_height = if rect.y == 0
+        && !rect.fixed
+        && rect.clip_rect.is_none()
+        && rect.width >= pixmap.width() as i64 / 8
+    {
+        let min_fill = pixmap.height() as i64 + scroll_y - chrome_height;
+        rect.height.max(min_fill)
+    } else {
+        rect.height
+    };
 
     let ry = rect.y + chrome_height - scroll_y;
     let screen_clip = rect
@@ -650,6 +662,7 @@ fn draw_image(
         background_position: None,
         background_no_repeat: false,
         background_size: None,
+        fixed: img.fixed,
     };
     draw_rect(
         pixmap,

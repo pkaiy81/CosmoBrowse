@@ -1395,8 +1395,10 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 background_position: rect.background_position,
                 background_no_repeat: rect.background_no_repeat,
                 background_size: rect.background_size,
+                fixed: rect.fixed,
             }),
             PaintCommand::DrawText(text) => items.push(SceneItem::Text {
+                fixed: text.fixed,
                 x: text.x,
                 y: text.y,
                 text: text.text.clone(),
@@ -1412,6 +1414,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 clip_rect: text.clip_rect,
             }),
             PaintCommand::DrawImage(image) => items.push(SceneItem::Image {
+                fixed: image.fixed,
                 x: image.x,
                 y: image.y,
                 width: image.width,

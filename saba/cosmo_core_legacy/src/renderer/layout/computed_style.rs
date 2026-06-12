@@ -122,6 +122,8 @@ pub struct ComputedStyle {
     /// mode 0 = explicit (a negative dimension means `auto` for that axis),
     /// mode 1 = `cover`, mode 2 = `contain` (w/h unused for 1 and 2).
     background_size: Option<(u8, f64, bool, f64, bool)>,
+    /// `line-height`. Inherited.
+    line_height: Option<LineHeight>,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
     grid_template_columns: Option<Vec<GridTrack>>,
@@ -132,6 +134,15 @@ pub struct ComputedStyle {
     /// from the parent, overridden by the element's own definitions.
     /// https://www.w3.org/TR/css-variables-1/#cycles
     custom_properties: Option<CustomProperties>,
+}
+
+/// `line-height` value. https://www.w3.org/TR/CSS22/visudet.html#line-height
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// Fixed pixel height (from a length).
+    Px(f64),
+    /// Multiplier of the element's own font size (from a number or %).
+    Factor(f64),
 }
 
 /// One column track of a grid template.
@@ -179,6 +190,7 @@ impl ComputedStyle {
             background_position: None,
             background_no_repeat: false,
             background_size: None,
+            line_height: None,
             grid_template_columns: None,
             column_gap: None,
             row_gap: None,
@@ -246,6 +258,10 @@ impl ComputedStyle {
             // font-weight (bold) is inherited.
             if self.bold.is_none() && parent_style.bold == Some(true) {
                 self.bold = Some(true);
+            }
+            // line-height is inherited.
+            if self.line_height.is_none() {
+                self.line_height = parent_style.line_height;
             }
             // text-align is inherited.
             if self.text_align.is_none() && parent_style.text_align != Some(TextAlign::Left) {
@@ -510,6 +526,14 @@ impl ComputedStyle {
         self.background_size = Some(size);
     }
 
+    pub fn set_line_height(&mut self, lh: LineHeight) {
+        self.line_height = Some(lh);
+    }
+
+    pub fn line_height(&self) -> Option<LineHeight> {
+        self.line_height
+    }
+
     pub fn background_size(&self) -> Option<(u8, f64, bool, f64, bool)> {
         self.background_size
     }
@@ -769,6 +793,10 @@ impl ComputedStyle {
             .expect("failed to access CSS property: position")
     }
 
+    pub fn position_or_default(&self) -> PositionType {
+        self.position.unwrap_or(PositionType::Static)
+    }
+
     pub fn set_offset_top(&mut self, top: f64) {
         self.offset_top = Some(top);
     }
@@ -1019,6 +1047,8 @@ pub enum PositionType {
     Static,
     Relative,
     Absolute,
+    /// Anchored to the viewport via top/left and exempt from scrolling.
+    Fixed,
 }
 
 impl PositionType {
@@ -1027,6 +1057,10 @@ impl PositionType {
             "static" => Ok(Self::Static),
             "relative" => Ok(Self::Relative),
             "absolute" => Ok(Self::Absolute),
+            "fixed" => Ok(Self::Fixed),
+            // sticky behaves like static until a scroll threshold; for the
+            // initial (unscrolled) view, normal flow is the correct picture.
+            "sticky" => Ok(Self::Static),
             _ => Err(Error::UnexpectedInput(format!(
                 "position {:?} is not supported yet",
                 value

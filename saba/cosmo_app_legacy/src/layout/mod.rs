@@ -220,6 +220,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
+                    fixed: style.position() == PositionType::Fixed,
                 });
             }
             DisplayItem::Text {
@@ -239,6 +240,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 max_width = max_width.max(layout_point.x() + width_estimate);
                 max_height = max_height.max(layout_point.y() + height_estimate);
                 scene_items.push(SceneItem::Text {
+                    fixed: style.position() == PositionType::Fixed,
                     x,
                     y,
                     text,
@@ -270,6 +272,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 max_width = max_width.max(layout_point.x() + layout_size.width());
                 max_height = max_height.max(layout_point.y() + layout_size.height());
                 scene_items.push(SceneItem::Image {
+                    fixed: style.position() == PositionType::Fixed,
                     x,
                     y,
                     width: layout_size.width(),
@@ -382,6 +385,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
                 PositionType::Static => "static",
                 PositionType::Relative => "relative",
                 PositionType::Absolute => "absolute",
+                PositionType::Fixed => "fixed",
             }
             .to_string(),
             color: style.color().code().to_string(),
@@ -443,6 +447,7 @@ mod diff_tests {
             background_position: None,
             background_no_repeat: false,
             background_size: None,
+            fixed: false,
         }];
         let next = vec![SceneItem::Rect {
             x: 0,
@@ -460,6 +465,7 @@ mod diff_tests {
             background_position: None,
             background_no_repeat: false,
             background_size: None,
+            fixed: false,
         }];
         let diff = diff_scene_items(&prev, &next);
         assert!(diff.added.is_empty());

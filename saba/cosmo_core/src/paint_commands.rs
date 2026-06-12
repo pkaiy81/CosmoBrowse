@@ -23,6 +23,7 @@ impl PaintCommand {
         clip_rect: Option<(i64, i64, i64, i64)>,
     ) -> Self {
         Self::DrawText(DrawText {
+            fixed: false,
             x,
             y,
             text: text.into(),
@@ -83,6 +84,9 @@ pub struct DrawRect {
     /// mode 0 = explicit (negative dimension = auto), 1 = cover, 2 = contain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_size: Option<(u8, f64, bool, f64, bool)>,
+    /// position:fixed — anchored to the viewport, exempt from scrolling.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixed: bool,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -95,6 +99,9 @@ fn is_false(v: &bool) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DrawText {
+    /// position:fixed — exempt from scrolling.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixed: bool,
     pub x: i64,
     pub y: i64,
     pub text: String,
@@ -113,6 +120,9 @@ pub struct DrawText {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DrawImage {
+    /// position:fixed — exempt from scrolling.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixed: bool,
     pub x: i64,
     pub y: i64,
     pub width: i64,

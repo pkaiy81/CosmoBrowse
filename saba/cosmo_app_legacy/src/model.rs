@@ -284,8 +284,14 @@ pub enum SceneItem {
         /// (negative = auto), 1 cover, 2 contain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         background_size: Option<(u8, f64, bool, f64, bool)>,
+        /// position:fixed — exempt from scrolling.
+        #[serde(default)]
+        fixed: bool,
     },
     Text {
+        /// position:fixed — exempt from scrolling.
+        #[serde(default)]
+        fixed: bool,
         x: i64,
         y: i64,
         text: String,
@@ -301,6 +307,9 @@ pub enum SceneItem {
         clip_rect: Option<(i64, i64, i64, i64)>,
     },
     Image {
+        /// position:fixed — exempt from scrolling.
+        #[serde(default)]
+        fixed: bool,
         x: i64,
         y: i64,
         width: i64,

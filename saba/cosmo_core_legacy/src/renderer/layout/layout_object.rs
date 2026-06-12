@@ -25,6 +25,7 @@ use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::FlexDirection;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
+use crate::renderer::layout::computed_style::LineHeight;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::computed_style::TextDecoration;
@@ -71,6 +72,18 @@ fn line_height_px(font_size: FontSize) -> i64 {
     match font_size {
         FontSize::Px(n) => (CHAR_HEIGHT_WITH_PADDING * n / FontSize::Medium.px()).max(1),
         legacy => CHAR_HEIGHT_WITH_PADDING * font_ratio(legacy),
+    }
+}
+
+/// Line box height honoring an explicit `line-height`; falls back to the
+/// default leading for the font size.
+fn styled_line_height(style: &ComputedStyle) -> i64 {
+    match style.line_height() {
+        Some(LineHeight::Px(px)) => (px as i64).max(1),
+        Some(LineHeight::Factor(f)) => {
+            ((style.font_size_or_default().px() as f64 * f) as i64).max(1)
+        }
+        None => line_height_px(style.font_size_or_default()),
     }
 }
 
@@ -545,9 +558,45 @@ fn is_wide_char(c: char) -> bool {
         || (0xAC00..=0xD7AF).contains(&cp) // Hangul
 }
 
-fn estimate_text_width_chars(text: &str) -> i64 {
-    // Count width units: wide (CJK) chars = 2, narrow chars = 1
-    text.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum::<i64>()
+/// Estimated advance of one character in pixels at the 16px base size,
+/// approximating the DejaVu Sans metrics the native renderer draws with
+/// (narrow i/l ≈ 4.5, average lowercase ≈ 9.6, m ≈ 15.6). A character-class
+/// table beats the old uniform 8px: the flat value underestimated lowercase
+/// runs (next inline box overlapped the drawn text) and overestimated
+/// punctuation-heavy ones.
+fn char_advance_16(c: char) -> i64 {
+    if is_wide_char(c) {
+        return 16;
+    }
+    match c {
+        'i' | 'j' | 'l' | '\'' | '.' | ',' | ':' | ';' | '!' | '|' => 5,
+        'f' | 'I' | ' ' | '(' | ')' | '[' | ']' | '"' | '`' | '*' => 6,
+        't' | 'r' | '-' | '/' | '\\' => 7,
+        's' | 'J' => 8,
+        'm' => 16,
+        'M' | 'W' | '@' | '%' => 15,
+        'w' | 'O' | 'Q' | 'G' | 'H' | 'N' | 'U' | 'D' | '+' | '=' | '<' | '>' | '~' => 12,
+        'A'..='Z' | '0'..='9' | '&' | '#' | '$' | '?' | '_' => 11,
+        _ => 10,
+    }
+}
+
+/// Scale a 16px-base advance to the effective per-character width `cw`
+/// (which already carries the font-size scaling and any bold adjustment;
+/// `cw == CHAR_WIDTH` means scale 1). Rounds up so layout never reserves
+/// less than the renderer draws.
+fn scale_advance(advance_16: i64, cw: i64) -> i64 {
+    (advance_16 * cw + CHAR_WIDTH - 1) / CHAR_WIDTH
+}
+
+/// Estimated width of `text` at the effective per-character width `cw`,
+/// accumulating PER-CHARACTER rounded advances — the exact accounting
+/// `split_text` uses, so a box sized from this never wraps its own content
+/// (a one-shot total scale rounds lower and "login" wrapped as "logi/n").
+fn text_width_px(text: &str, cw: i64) -> i64 {
+    text.chars()
+        .map(|c| scale_advance(char_advance_16(c), cw))
+        .sum()
 }
 
 /// Bold faces draw roughly 10% wider than the regular face at the same size.
@@ -561,7 +610,8 @@ fn bold_width_adjust(width: i64, bold: bool) -> i64 {
 }
 
 fn measure_text_width(text: &str, font_size: FontSize, bold: bool) -> i64 {
-    bold_width_adjust(estimate_text_width_chars(text) * char_width_px(font_size), bold)
+    let cw = bold_width_adjust(char_width_px(font_size), bold);
+    text_width_px(text, cw)
 }
 fn is_break_space(c: char) -> bool {
     c == ' ' || c == '\u{3000}'
@@ -579,10 +629,12 @@ fn is_break_space(c: char) -> bool {
 /// Breaking prefers the last space that still fits on the line (the space is
 /// consumed, not rendered); if a single run has no space it is hard-broken at
 /// the character that would overflow. Wide (CJK) characters count as two units,
-/// matching [`estimate_text_width_chars`].
+/// matching [`char_advance_16`].
 fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
     let safe_width = max_width.max(char_width).max(1);
-    let max_units = (safe_width / char_width).max(1);
+    // Line capacity in pixels; per-character advances come from the same
+    // class table as measurement so wrapping and sizing agree.
+    let max_units = safe_width;
 
     let mut result: Vec<String> = vec![];
     let mut line_start = 0usize; // byte offset where the current visual line starts
@@ -595,7 +647,7 @@ fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
     let mut units_after_space = 0i64;
 
     for (idx, c) in line.char_indices() {
-        let w = if is_wide_char(c) { 2 } else { 1 };
+        let w = scale_advance(char_advance_16(c), char_width);
 
         if started && cur_units + w > max_units {
             match last_space {
@@ -2389,7 +2441,7 @@ impl LayoutObject {
                     let mut v = vec![];
                     let cw =
                         bold_width_adjust(char_width_px(self.style.font_size()), self.style.is_bold());
-                    let lh = line_height_px(self.style.font_size());
+                    let lh = styled_line_height(&self.style);
                     let plain_text = self.collapse_text_whitespace(&t);
                     // Use the max_width that was established during compute_size so
                     // that the line-break boundaries are identical between the sizing
@@ -2655,7 +2707,7 @@ impl LayoutObject {
 
                 // <br> and <hr> have intrinsic heights even without children.
                 let content_height = if self.element_kind() == Some(ElementKind::Br) {
-                    line_height_px(self.style.font_size())
+                    styled_line_height(&self.style)
                 } else if self.element_kind() == Some(ElementKind::Hr) {
                     // <hr> renders as a 2px line with 8px margin above/below.
                     2
@@ -2757,7 +2809,7 @@ impl LayoutObject {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let cw =
                         bold_width_adjust(char_width_px(self.style.font_size()), self.style.is_bold());
-                    let lh = line_height_px(self.style.font_size());
+                    let lh = styled_line_height(&self.style);
                     let plain_text = self.collapse_text_whitespace(&t);
                     // max_width is the available horizontal space for this text
                     // node within its containing block.  Use the nearest block/cell
@@ -2776,7 +2828,7 @@ impl LayoutObject {
                     let lines = split_text(plain_text.clone(), cw, max_width);
                     let width = lines
                         .iter()
-                        .map(|line| estimate_text_width_chars(line) * cw)
+                        .map(|line| text_width_px(line, cw))
                         .max()
                         .unwrap_or(0);
                     let height = if lines.is_empty() {
@@ -2988,6 +3040,12 @@ impl LayoutObject {
                 point.set_x(parent_point.x() + edge_to_i64(self.style.offset_left()));
                 point.set_y(parent_point.y() + edge_to_i64(self.style.offset_top()));
             }
+            // Fixed: anchored to the viewport origin; the painter additionally
+            // exempts it from the scroll offset.
+            PositionType::Fixed => {
+                point.set_x(edge_to_i64(self.style.offset_left()));
+                point.set_y(edge_to_i64(self.style.offset_top()));
+            }
         }
 
         self.point = point;
@@ -3079,6 +3137,30 @@ impl LayoutObject {
                         self.style.set_background_size(size);
                     }
                 }
+                "line-height" => match first_value {
+                    // A bare number is a factor of the element's own font size.
+                    Some(ComponentValue::Number(v)) if *v > 0.0 => {
+                        self.style.set_line_height(LineHeight::Factor(*v));
+                    }
+                    Some(ComponentValue::Dimension(v, unit)) => {
+                        if unit == "%" {
+                            if *v > 0.0 {
+                                self.style.set_line_height(LineHeight::Factor(*v / 100.0));
+                            }
+                        } else if let Some(px) =
+                            length_to_px(*v, unit, self.style.font_size_or_default())
+                        {
+                            if px > 0.0 {
+                                self.style.set_line_height(LineHeight::Px(px));
+                            }
+                        }
+                    }
+                    // `normal` resets to the default leading.
+                    Some(ComponentValue::Ident(v)) if v.eq_ignore_ascii_case("normal") => {
+                        self.style.set_line_height(LineHeight::Factor(1.25));
+                    }
+                    _ => {}
+                },
                 "color" => match first_value {
                     Some(ComponentValue::Ident(value)) => {
                         let color = Color::from_name(value).unwrap_or_else(|_| Color::black());

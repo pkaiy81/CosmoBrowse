@@ -648,6 +648,7 @@ mod tests {
     use crate::renderer::dom::node::NodeKind;
     use crate::renderer::html::parser::HtmlParser;
     use crate::renderer::html::token::HtmlTokenizer;
+    use crate::renderer::layout::computed_style::PositionType;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -1436,7 +1437,9 @@ mod tests {
         let title_a_x = items.iter().find(|(t, _)| t.contains("Title A"))
             .map(|(_, x)| *x)
             .expect(&alloc::format!("Title A missing, items: {:?}", debug));
-        let date_a_x = items.iter().find(|(t, _)| t.contains("〜9月25日"))
+        // Match the line START of the col-2 date — the tail may wrap to a
+        // second line within the cell depending on advance estimates.
+        let date_a_x = items.iter().find(|(t, _)| t.contains("2022年9月16日"))
             .map(|(_, x)| *x)
             .expect(&alloc::format!("date A missing, items: {:?}", debug));
 
@@ -1753,6 +1756,56 @@ mod tests {
         assert_eq!(style.width() as i64, 300, "inline width must override stylesheet");
         let bg = style.background_color();
         assert_eq!(bg.code_u32(), 0xff0000, "inline background-color must override stylesheet");
+    }
+
+    #[test]
+    fn test_position_fixed_anchors_to_viewport() {
+        let html = concat!(
+            "<html><head><style>",
+            ".banner{position:fixed;top:10px;left:20px;width:200px;height:30px;background-color:#333333;}",
+            ".filler{height:500px;}",
+            "</style></head><body>",
+            "<div class=\"filler\">content</div>",
+            "<div class=\"banner\">fixed banner</div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let body = layout_view.root().expect("body");
+        let filler = body.borrow().first_child().expect("filler");
+        let banner = filler.borrow().next_sibling().expect("banner");
+        // Anchored at the viewport offsets, NOT below the 500px filler.
+        assert_eq!(banner.borrow().point().x(), 20, "left:20px from viewport");
+        assert_eq!(banner.borrow().point().y(), 10, "top:10px from viewport");
+        assert_eq!(banner.borrow().style().position(), PositionType::Fixed);
+    }
+
+    #[test]
+    fn test_line_height_property() {
+        let html = concat!(
+            "<html><head><style>",
+            "p{font-size:16px;}",
+            ".tall{line-height:2;}",     // factor: 32px lines
+            ".px{line-height:30px;}",    // fixed
+            ".pct{line-height:150%;}",   // 24px lines
+            "</style></head><body>",
+            "<p class=\"tall\">first line of tall paragraph text first line of tall paragraph text</p>",
+            "<p class=\"px\">x</p>",
+            "<p class=\"pct\">y</p>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 400);
+        let body = layout_view.root().expect("body");
+        let tall = body.borrow().first_child().expect("tall p");
+        let px = tall.borrow().next_sibling().expect("px p");
+        let pct = px.borrow().next_sibling().expect("pct p");
+        // The tall paragraph wraps to 2+ lines of 32px each.
+        let tall_text = tall.borrow().first_child().expect("text");
+        let lines = tall_text.borrow().size().height() / 32;
+        assert!(lines >= 2, "tall paragraph should wrap");
+        assert_eq!(tall_text.borrow().size().height() % 32, 0,
+            "line boxes are 32px (factor 2 × 16px font)");
+        assert_eq!(px.borrow().size().height(), 30, "line-height:30px");
+        assert_eq!(pct.borrow().size().height(), 24, "line-height:150% of 16px");
     }
 
     #[test]

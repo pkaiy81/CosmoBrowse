@@ -33,6 +33,7 @@ pub fn scene_items_to_paint_commands(
                 background_position,
                 background_no_repeat,
                 background_size,
+                fixed,
             } => commands.push(PaintCommand::DrawRect(DrawRect {
                 x: *x,
                 y: *y,
@@ -49,8 +50,10 @@ pub fn scene_items_to_paint_commands(
                 background_position: *background_position,
                 background_no_repeat: *background_no_repeat,
                 background_size: *background_size,
+                fixed: *fixed,
             })),
             SceneItem::Text {
+                fixed,
                 x,
                 y,
                 text,
@@ -76,6 +79,7 @@ pub fn scene_items_to_paint_commands(
                     font_family.clone()
                 };
                 commands.push(PaintCommand::DrawText(DrawText {
+                    fixed: *fixed,
                     x: *x,
                     y: *y,
                     text: text.clone(),
@@ -92,6 +96,7 @@ pub fn scene_items_to_paint_commands(
                 }));
             }
             SceneItem::Image {
+                fixed,
                 x,
                 y,
                 width,
@@ -130,6 +135,7 @@ pub fn scene_items_to_paint_commands(
                         background_position: None,
                         background_no_repeat: false,
                         background_size: None,
+                        fixed: *fixed,
                     }));
                     commands.push(PaintCommand::fallback_text(
                         *x + 4,
@@ -144,6 +150,7 @@ pub fn scene_items_to_paint_commands(
                     ));
                 } else {
                     commands.push(PaintCommand::DrawImage(DrawImage {
+                        fixed: *fixed,
                         x: *x,
                         y: *y,
                         width: *width,
