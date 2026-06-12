@@ -155,7 +155,8 @@ pub fn build_layout_scene_with_script_runtime(
     // var(--token) references are resolved per element during the cascade
     // (custom properties inherit; the document root seeds from the whole
     // stylesheet), so no global pre-substitution is needed here.
-    let layout_view = LayoutView::new(dom, &cssom, rect.width.max(1));
+    let layout_view =
+        LayoutView::new_with_viewport(dom, &cssom, rect.width.max(1), rect.height.max(0));
 
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
     let render_tree = render_tree_snapshot(&layout_view, rect);

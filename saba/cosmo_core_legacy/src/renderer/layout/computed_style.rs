@@ -99,6 +99,10 @@ pub struct ComputedStyle {
     position: Option<PositionType>,
     offset_top: Option<f64>,
     offset_left: Option<f64>,
+    /// CSS `right`/`bottom` — used by the fixed-position pass to anchor a box
+    /// against the viewport's far edges.
+    offset_right: Option<f64>,
+    offset_bottom: Option<f64>,
     text_align: Option<TextAlign>,
     /// True when `text_align` originates from a legacy presentational center
     /// hint (a `<center>` element or `align="center"` attribute) rather than a
@@ -182,6 +186,8 @@ impl ComputedStyle {
             position: None,
             offset_top: None,
             offset_left: None,
+            offset_right: None,
+            offset_bottom: None,
             text_align: None,
             text_align_legacy: false,
             z_index: None,
@@ -812,6 +818,24 @@ impl ComputedStyle {
     pub fn offset_left(&self) -> f64 {
         self.offset_left
             .expect("failed to access CSS property: left")
+    }
+
+    pub fn set_offset_right(&mut self, right: f64) {
+        self.offset_right = Some(right);
+    }
+
+    /// `right`, when declared (no defaulting — None means "not specified").
+    pub fn offset_right(&self) -> Option<f64> {
+        self.offset_right
+    }
+
+    pub fn set_offset_bottom(&mut self, bottom: f64) {
+        self.offset_bottom = Some(bottom);
+    }
+
+    /// `bottom`, when declared (no defaulting — None means "not specified").
+    pub fn offset_bottom(&self) -> Option<f64> {
+        self.offset_bottom
     }
 
     pub fn set_z_index(&mut self, z_index: i32) {

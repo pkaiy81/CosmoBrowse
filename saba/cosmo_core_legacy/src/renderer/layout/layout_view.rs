@@ -7,6 +7,7 @@ use crate::renderer::layout::layout_object::compute_box_model_metrics;
 use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
+use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
 use alloc::rc::Rc;
@@ -97,15 +98,28 @@ fn build_layout_tree(
 pub struct LayoutView {
     root: Option<Rc<RefCell<LayoutObject>>>,
     viewport_width: i64,
+    /// Viewport height — only needed to resolve `bottom` on fixed boxes;
+    /// 0 means unknown (bottom anchoring disabled).
+    viewport_height: i64,
 }
 
 impl LayoutView {
     pub fn new(root: Rc<RefCell<Node>>, cssom: &StyleSheet, viewport_width: i64) -> Self {
+        Self::new_with_viewport(root, cssom, viewport_width, 0)
+    }
+
+    pub fn new_with_viewport(
+        root: Rc<RefCell<Node>>,
+        cssom: &StyleSheet,
+        viewport_width: i64,
+        viewport_height: i64,
+    ) -> Self {
         let body_root = get_target_element_node(Some(root), ElementKind::Body);
 
         let mut tree = Self {
             root: build_layout_tree(&body_root, &None, cssom),
             viewport_width: viewport_width.max(1),
+            viewport_height: viewport_height.max(0),
         };
 
         tree.update_layout();
@@ -177,14 +191,34 @@ impl LayoutView {
             );
 
             let next_sibling = n.borrow().next_sibling();
-            Self::calculate_node_position(
-                &next_sibling,
-                parent_point,
-                parent_size,
-                n.borrow().kind(),
-                Some(n.borrow().point()),
-                Some(n.borrow().size()),
-            );
+            // A zero-size node (e.g. a whitespace-only text node collapsed to
+            // nothing at a block boundary) must not become the next sibling's
+            // flow anchor: stacking below its meaningless y=…,h=0 point pulled
+            // following blocks up over the real previous line. Pass through
+            // the anchor we were given instead.
+            let zero_sized = {
+                let b = n.borrow();
+                b.size().width() == 0 && b.size().height() == 0
+            };
+            if zero_sized {
+                Self::calculate_node_position(
+                    &next_sibling,
+                    parent_point,
+                    parent_size,
+                    previous_sibling_kind,
+                    previous_sibling_point,
+                    previous_sibling_size,
+                );
+            } else {
+                Self::calculate_node_position(
+                    &next_sibling,
+                    parent_point,
+                    parent_size,
+                    n.borrow().kind(),
+                    Some(n.borrow().point()),
+                    Some(n.borrow().size()),
+                );
+            }
         }
     }
 
@@ -561,6 +595,61 @@ impl LayoutView {
             None,
             None,
         );
+        self.reposition_fixed_far_edges(&self.root.clone());
+    }
+
+    /// Post-layout pass: a fixed box anchored with `right`/`bottom` resolves
+    /// against the viewport's far edges, which requires its final size —
+    /// so it (and its whole subtree) is translated here, after positioning.
+    /// `bottom` needs a known viewport height (0 = headless default width-only
+    /// layout → bottom anchoring is skipped).
+    fn reposition_fixed_far_edges(&self, node: &Option<Rc<RefCell<LayoutObject>>>) {
+        if let Some(n) = node {
+            let (is_fixed, right, bottom, size, point) = {
+                let b = n.borrow();
+                (
+                    b.style().position_or_default() == PositionType::Fixed,
+                    b.style().offset_right(),
+                    b.style().offset_bottom(),
+                    b.size(),
+                    b.point(),
+                )
+            };
+            if is_fixed {
+                let mut dx = 0i64;
+                let mut dy = 0i64;
+                if let Some(r) = right {
+                    dx = (self.viewport_width - size.width() - r as i64) - point.x();
+                }
+                if let Some(bm) = bottom {
+                    if self.viewport_height > 0 {
+                        dy = (self.viewport_height - size.height() - bm as i64) - point.y();
+                    }
+                }
+                if dx != 0 || dy != 0 {
+                    Self::translate_subtree(n, dx, dy);
+                }
+            }
+            let first_child = n.borrow().first_child();
+            self.reposition_fixed_far_edges(&first_child);
+            let next_sibling = n.borrow().next_sibling();
+            self.reposition_fixed_far_edges(&next_sibling);
+        }
+    }
+
+    /// Translate a node and all its descendants by (dx, dy).
+    fn translate_subtree(node: &Rc<RefCell<LayoutObject>>, dx: i64, dy: i64) {
+        {
+            let mut b = node.borrow_mut();
+            let p = b.point();
+            b.set_point(LayoutPoint::new(p.x() + dx, p.y() + dy));
+        }
+        let mut child = node.borrow().first_child();
+        while let Some(c) = child {
+            Self::translate_subtree(&c, dx, dy);
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
     }
 
     fn paint_node(node: &Option<Rc<RefCell<LayoutObject>>>, display_items: &mut Vec<DisplayItem>) {
@@ -1756,6 +1845,35 @@ mod tests {
         assert_eq!(style.width() as i64, 300, "inline width must override stylesheet");
         let bg = style.background_color();
         assert_eq!(bg.code_u32(), 0xff0000, "inline background-color must override stylesheet");
+    }
+
+    #[test]
+    fn test_position_fixed_right_bottom_anchoring() {
+        let html = concat!(
+            "<html><head><style>",
+            ".fab{position:fixed;right:10px;bottom:20px;width:60px;height:40px;background-color:#ee4444;}",
+            ".filler{height:900px;}",
+            "</style></head><body>",
+            "<div class=\"filler\">content</div>",
+            "<div class=\"fab\">go</div>",
+            "</body></html>",
+        ).to_string();
+        // Viewport 800×600 (the height enables bottom anchoring).
+        let t = HtmlTokenizer::new(html);
+        let window = HtmlParser::new(t).construct_tree();
+        let dom = window.borrow().document();
+        let style = get_style_content(dom.clone());
+        let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+        let layout_view = LayoutView::new_with_viewport(dom, &cssom, 800, 600);
+        let body = layout_view.root().expect("body");
+        let filler = body.borrow().first_child().expect("filler");
+        let fab = filler.borrow().next_sibling().expect("fab");
+        assert_eq!(fab.borrow().point().x(), 800 - 60 - 10, "right:10px");
+        assert_eq!(fab.borrow().point().y(), 600 - 40 - 20, "bottom:20px");
+        // The child text moved with the subtree.
+        let text = fab.borrow().first_child().expect("text");
+        assert_eq!(text.borrow().point().x(), fab.borrow().point().x(),
+            "descendants translate with the fixed box");
     }
 
     #[test]

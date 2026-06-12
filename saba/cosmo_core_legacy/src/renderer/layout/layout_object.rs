@@ -2999,7 +2999,11 @@ impl LayoutObject {
                         point.set_y(pos.y() + size.height() + metrics.margin.top);
                     } else {
                         point.set_x(candidate_x);
-                        point.set_y(pos.y() + metrics.margin.top);
+                        // Same line: top-align with the previous inline box.
+                        // (pos.y() already sits below ITS margin-top; adding
+                        // our own margin-top on top of that made every
+                        // successive sibling creep downward.)
+                        point.set_y(pos.y());
                     }
                 } else {
                     // First inline child: apply text-align centering if set.
@@ -3273,14 +3277,34 @@ impl LayoutObject {
                     }
                     _ => {}
                 },
+                "right" => match first_value {
+                    Some(ComponentValue::Number(value)) => self.style.set_offset_right(*value),
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
+                        self.style.set_offset_right(*value)
+                    }
+                    _ => {}
+                },
+                "bottom" => match first_value {
+                    Some(ComponentValue::Number(value)) => self.style.set_offset_bottom(*value),
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
+                        self.style.set_offset_bottom(*value)
+                    }
+                    _ => {}
+                },
                 "z-index" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_z_index(*value as i32),
                     _ => {}
                 },
-                "overflow" => {
+                // overflow: scroll/auto clip like hidden — without interactive
+                // inner scrolling (a renderer-side feature), clipping at the
+                // box edge is exactly what an unscrolled scroll container
+                // shows. `visible` (or unknown values) leaves content unclipped.
+                "overflow" | "overflow-x" | "overflow-y" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
-                        self.style
-                            .set_overflow_clip(value == "hidden" || value == "clip");
+                        self.style.set_overflow_clip(matches!(
+                            value.as_str(),
+                            "hidden" | "clip" | "scroll" | "auto"
+                        ));
                     }
                 }
                 "margin" => {
@@ -3448,6 +3472,12 @@ impl LayoutObject {
 
     pub fn point(&self) -> LayoutPoint {
         self.point
+    }
+
+    /// Overwrite the computed position (used by post-layout passes such as
+    /// fixed-position far-edge anchoring).
+    pub fn set_point(&mut self, point: LayoutPoint) {
+        self.point = point;
     }
 
     pub fn size(&self) -> LayoutSize {
