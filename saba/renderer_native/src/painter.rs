@@ -414,6 +414,14 @@ fn fill_rounded_rect(
         }
         return;
     }
+    if let Some(path) = rounded_rect_path(x, y, w, h, r) {
+        pixmap.fill_path(&path, paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Build a rounded-rectangle path with circular-arc corners (cubic Béziers,
+/// kappa ≈ 0.5523).
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
     const K: f32 = 0.5523;
     let mut pb = tiny_skia::PathBuilder::new();
     pb.move_to(x + r, y);
@@ -426,8 +434,30 @@ fn fill_rounded_rect(
     pb.line_to(x, y + r);
     pb.cubic_to(x, y + r - K * r, x + r - K * r, y, x + r, y);
     pb.close();
-    if let Some(path) = pb.finish() {
-        pixmap.fill_path(&path, paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+    pb.finish()
+}
+
+/// Stroke a rounded rectangle (used for rounded borders).
+fn stroke_rounded_rect(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    stroke_width: f32,
+    paint: &Paint,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    if let Some(path) = rounded_rect_path(x, y, w, h, r) {
+        let stroke = tiny_skia::Stroke {
+            width: stroke_width.max(1.0),
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, paint, &stroke, Transform::identity(), None);
     }
 }
 
@@ -612,30 +642,53 @@ fn draw_rect(
             )
             .unwrap_or(Color::BLACK),
         );
-        bp.anti_alias = false;
-
-        // Top border
-        if let Some((cx, cy, cw, ch)) = apply_clip(x, y, w, bw, &screen_clip) {
-            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+        // Rounded border: stroke the rounded-rect path (centered on the box
+        // edge) instead of four straight bars, so corners follow the radius.
+        // Only when the whole box survived clipping (a clipped edge isn't a
+        // corner).
+        let rounded = rect.border_radius > 0
+            && x == rx
+            && y == ry
+            && w == rect.width
+            && h == effective_height;
+        if rounded {
+            bp.anti_alias = true;
+            let inset = bw as f32 / 2.0;
+            stroke_rounded_rect(
+                pixmap,
+                x as f32 + inset,
+                y as f32 + inset,
+                (w - bw) as f32,
+                (h - bw) as f32,
+                (rect.border_radius as f32 - inset).max(0.0),
+                bw as f32,
+                &bp,
+            );
+        } else {
+            bp.anti_alias = false;
+            // Top border
+            if let Some((cx, cy, cw, ch)) = apply_clip(x, y, w, bw, &screen_clip) {
+                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+                }
             }
-        }
-        // Bottom border
-        if let Some((cx, cy, cw, ch)) = apply_clip(x, y + h - bw, w, bw, &screen_clip) {
-            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            // Bottom border
+            if let Some((cx, cy, cw, ch)) = apply_clip(x, y + h - bw, w, bw, &screen_clip) {
+                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+                }
             }
-        }
-        // Left border
-        if let Some((cx, cy, cw, ch)) = apply_clip(x, y, bw, h, &screen_clip) {
-            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            // Left border
+            if let Some((cx, cy, cw, ch)) = apply_clip(x, y, bw, h, &screen_clip) {
+                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+                }
             }
-        }
-        // Right border
-        if let Some((cx, cy, cw, ch)) = apply_clip(x + w - bw, y, bw, h, &screen_clip) {
-            if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            // Right border
+            if let Some((cx, cy, cw, ch)) = apply_clip(x + w - bw, y, bw, h, &screen_clip) {
+                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+                }
             }
         }
     }

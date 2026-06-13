@@ -692,6 +692,28 @@ fn text_width_px(text: &str, cw: i64) -> i64 {
         .sum()
 }
 
+/// Truncate `text` so it plus a trailing `…` fits within `max_width` px.
+/// Returns the original text when it already fits.
+fn truncate_with_ellipsis(text: &str, cw: i64, max_width: i64) -> String {
+    if text_width_px(text, cw) <= max_width {
+        return text.to_string();
+    }
+    let ellipsis_w = scale_advance(char_advance_16('…'), cw);
+    let budget = (max_width - ellipsis_w).max(0);
+    let mut acc = 0i64;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = scale_advance(char_advance_16(c), cw);
+        if acc + w > budget {
+            break;
+        }
+        acc += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 /// Bold faces draw roughly 10% wider than the regular face at the same size.
 /// Round up so a following inline box never overlaps the bold run's tail.
 fn bold_width_adjust(width: i64, bold: bool) -> i64 {
@@ -1350,6 +1372,27 @@ impl LayoutObject {
                 let cm = compute_box_model_metrics(&b.style);
                 let w = b.size().width() - cm.inner_horizontal();
                 return if w > 0 { Some(w) } else { None };
+            }
+            let next = b.parent.upgrade();
+            drop(b);
+            current = next;
+        }
+        None
+    }
+
+    /// If an ancestor declares `text-overflow: ellipsis`, return the px width
+    /// available to this text node before the ancestor's right content edge.
+    /// `text-overflow` only takes effect on a clipping container, so the
+    /// ancestor must also clip overflow.
+    fn ellipsis_clip_width(&self) -> Option<i64> {
+        let mut current = self.parent.upgrade();
+        while let Some(node) = current {
+            let b = node.borrow();
+            if b.style().text_overflow_ellipsis() && b.style().overflow_clip() {
+                let cm = compute_box_model_metrics(&b.style);
+                let right = b.point().x() + b.size().width() - cm.border.right - cm.padding.right;
+                let avail = right - self.point().x();
+                return Some(avail.max(0));
             }
             let next = b.parent.upgrade();
             drop(b);
@@ -2581,7 +2624,19 @@ impl LayoutObject {
                                 self.size().width().max(cw)
                             }
                         });
-                    let lines = split_text(plain_text, cw, max_width);
+                    let mut lines = if self.style.white_space_nowrap() {
+                        // nowrap: a single line (the collapser already turned
+                        // newlines into spaces). text-overflow:ellipsis on a
+                        // clipping ancestor then truncates it to fit.
+                        let mut line = plain_text;
+                        if let Some(clip_w) = self.ellipsis_clip_width() {
+                            line = truncate_with_ellipsis(&line, cw, clip_w);
+                        }
+                        vec![line]
+                    } else {
+                        split_text(plain_text, cw, max_width)
+                    };
+                    let _ = &mut lines;
                     let href = self.link_href();
                     let target = self.link_target();
 
@@ -2952,7 +3007,11 @@ impl LayoutObject {
                         );
                     // Cache so paint() uses the identical boundary (see paint Text arm).
                     self.text_line_max_width = max_width;
-                    let lines = split_text(plain_text.clone(), cw, max_width);
+                    let lines = if self.style.white_space_nowrap() {
+                        vec![plain_text.clone()]
+                    } else {
+                        split_text(plain_text.clone(), cw, max_width)
+                    };
                     let width = lines
                         .iter()
                         .map(|line| text_width_px(line, cw))
@@ -3499,12 +3558,56 @@ impl LayoutObject {
                             ),
                         );
                     }
+                    // The `border` shorthand also carries a color (and style):
+                    // pull a color token so the stroke is visible.
+                    if declaration.property == "border" {
+                        for v in &declaration.value {
+                            let c = match v {
+                                ComponentValue::HashToken(code) => Color::from_code(code).ok(),
+                                ComponentValue::Ident(name) => Color::from_name(name).ok(),
+                                _ => None,
+                            };
+                            if let Some(color) = c {
+                                self.style.set_border_color(color);
+                                break;
+                            }
+                        }
+                    }
                 }
+                "border-color" => match first_value {
+                    Some(ComponentValue::HashToken(code)) => {
+                        if let Ok(c) = Color::from_code(code) {
+                            self.style.set_border_color(c);
+                        }
+                    }
+                    Some(ComponentValue::Ident(name)) => {
+                        if let Ok(c) = Color::from_name(name) {
+                            self.style.set_border_color(c);
+                        }
+                    }
+                    _ => {}
+                },
                 "border-radius" => {
                     if let Some(px) = first_value
                         .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
                     {
                         self.style.set_border_radius(px);
+                    }
+                }
+                "white-space" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        // nowrap and pre suppress automatic wrapping at spaces;
+                        // normal/pre-wrap/pre-line wrap.
+                        self.style.set_white_space_nowrap(matches!(
+                            value.as_str(),
+                            "nowrap" | "pre"
+                        ));
+                    }
+                }
+                "text-overflow" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style
+                            .set_text_overflow_ellipsis(value.eq_ignore_ascii_case("ellipsis"));
                     }
                 }
                 // box-shadow: <dx> <dy> [blur] [spread] <color> (single

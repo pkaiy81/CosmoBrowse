@@ -2374,6 +2374,44 @@ mod tests {
     }
 
     #[test]
+    fn test_nowrap_and_ellipsis() {
+        // A nowrap + overflow:hidden + text-overflow:ellipsis box truncates a
+        // long line; a plain nowrap line stays on one line; a normal box wraps.
+        let html = concat!(
+            "<html><head><style>",
+            ".ell{width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}",
+            ".nw{width:120px;white-space:nowrap;}",
+            ".wrap{width:120px;}",
+            "</style></head><body>",
+            "<div class=\"ell\">This is a very long line that should be truncated</div>",
+            "<div class=\"nw\">This is a very long line that should be truncated</div>",
+            "<div class=\"wrap\">This is a very long line that should be truncated</div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let items = layout_view.paint();
+        let texts: Vec<(String, i64)> = items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, layout_point, .. } => Some((text.clone(), layout_point.y())),
+            _ => None,
+        }).collect();
+        // Ellipsis line is truncated and ends with the ellipsis char.
+        let ell = texts.iter().find(|(t, _)| t.contains("This is") && t.contains('…'))
+            .expect("ellipsis line must be truncated with …");
+        assert!(ell.0.chars().count() < 49, "truncated shorter than the full text");
+        // The nowrap (no ellipsis) text stays a single line: only one text
+        // item carries its full content.
+        let nowrap_lines = texts.iter().filter(|(t, _)| t == "This is a very long line that should be truncated").count();
+        assert_eq!(nowrap_lines, 1, "nowrap keeps one line");
+        // The wrapping div (below the two single-line divs at y=0 and y=20)
+        // breaks into multiple lines at distinct y values.
+        let wrap_ys: alloc::collections::BTreeSet<i64> = texts.iter()
+            .filter(|(_, y)| *y >= 40)
+            .map(|(_, y)| *y)
+            .collect();
+        assert!(wrap_ys.len() >= 2, "the wrapping div breaks into multiple lines");
+    }
+
+    #[test]
     fn test_inline_baseline_alignment_mixed_font_sizes() {
         let html = concat!(
             "<html><head><style>",

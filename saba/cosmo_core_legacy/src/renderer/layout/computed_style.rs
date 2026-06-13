@@ -163,6 +163,10 @@ pub struct ComputedStyle {
     border_radius: Option<f64>,
     /// `box-shadow`: (dx, dy, blur, color).
     box_shadow: Option<(f64, f64, f64, Color)>,
+    /// `white-space: nowrap` — suppress line wrapping. Inherited.
+    white_space_nowrap: Option<bool>,
+    /// `text-overflow: ellipsis` — truncate a clipped single line with `…`.
+    text_overflow_ellipsis: bool,
     /// Final clip rectangle (x, y, w, h) stamped by the post-layout pass:
     /// the intersection of every overflow-clipping ancestor box (and this
     /// box itself when it clips). Page coordinates.
@@ -254,6 +258,8 @@ impl ComputedStyle {
             scale_context: None,
             border_radius: None,
             box_shadow: None,
+            white_space_nowrap: None,
+            text_overflow_ellipsis: false,
             final_clip: None,
             scroll_container: None,
             scroll_container_def: None,
@@ -328,6 +334,10 @@ impl ComputedStyle {
             // line-height is inherited.
             if self.line_height.is_none() {
                 self.line_height = parent_style.line_height;
+            }
+            // white-space is inherited.
+            if self.white_space_nowrap.is_none() {
+                self.white_space_nowrap = parent_style.white_space_nowrap;
             }
             // text-align is inherited.
             if self.text_align.is_none() && parent_style.text_align != Some(TextAlign::Left) {
@@ -682,6 +692,22 @@ impl ComputedStyle {
 
     pub fn box_shadow(&self) -> Option<(f64, f64, f64, Color)> {
         self.box_shadow.clone()
+    }
+
+    pub fn set_white_space_nowrap(&mut self, v: bool) {
+        self.white_space_nowrap = Some(v);
+    }
+
+    pub fn white_space_nowrap(&self) -> bool {
+        self.white_space_nowrap.unwrap_or(false)
+    }
+
+    pub fn set_text_overflow_ellipsis(&mut self, v: bool) {
+        self.text_overflow_ellipsis = v;
+    }
+
+    pub fn text_overflow_ellipsis(&self) -> bool {
+        self.text_overflow_ellipsis
     }
 
     /// Opacity without panicking on un-defaulted styles.
