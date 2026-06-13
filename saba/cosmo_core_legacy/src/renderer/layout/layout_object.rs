@@ -16,6 +16,7 @@ use crate::renderer::css::cssom::Declaration;
 use crate::renderer::css::cssom::QualifiedRule;
 use crate::renderer::css::cssom::Selector;
 use crate::renderer::css::cssom::StyleSheet;
+use crate::renderer::dom::node::Element;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
@@ -863,6 +864,10 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
             return false;
         }
         Selector::Never => return false,
+        // A pseudo-element rule never matches the host element itself (its
+        // declarations would otherwise leak); the layout tree builder applies
+        // it to a synthesized generated box via pseudo_element_target.
+        Selector::PseudoElement(..) => return false,
         Selector::Not(inner) => {
             return matches!(node.borrow().kind(), NodeKind::Element(_))
                 && !dom_node_selected(node, inner);
@@ -1131,6 +1136,126 @@ pub fn create_layout_object(
         return Some(layout_object);
     }
     None
+}
+
+/// Build a `::before` / `::after` generated-content box for `host`, if a
+/// matching pseudo-element rule supplies a non-empty `content` string.
+/// The synthesized box is an inline element (carrying the pseudo rules'
+/// styles, inheriting the host's) wrapping a text node with the content.
+/// Spec: CSS Generated Content §2. https://www.w3.org/TR/css-content-3/
+pub fn build_pseudo_element(
+    host_node: &Rc<RefCell<Node>>,
+    host_obj: &Rc<RefCell<LayoutObject>>,
+    cssom: &StyleSheet,
+    pe: crate::renderer::css::cssom::PseudoElement,
+) -> Option<Rc<RefCell<LayoutObject>>> {
+    use crate::renderer::css::cssom::Selector;
+    // Collect matching pseudo-element rules (host part matches host_node),
+    // sorted by specificity.
+    let mut matched: Vec<&QualifiedRule> = cssom
+        .rules
+        .iter()
+        .filter(|rule| match &rule.selector {
+            Selector::PseudoElement(host_sel, kind) => {
+                *kind == pe && dom_node_selected(host_node, host_sel)
+            }
+            _ => false,
+        })
+        .collect();
+    matched.sort_by_key(|rule| rule.selector.specificity());
+
+    // Resolve the `content` string (last declaration wins). `none`/`normal`
+    // suppress the box.
+    let mut content: Option<String> = None;
+    for rule in &matched {
+        for d in &rule.declarations {
+            if d.property == "content" {
+                content = pseudo_content_string(&d.value);
+            }
+        }
+    }
+    let content = content?;
+
+    // Synthesize an inline element node + text child, parented (in the DOM
+    // sense) under the host so selector matching of nested rules behaves.
+    let span_node = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+        "span",
+        Vec::new(),
+    )))));
+    span_node
+        .borrow_mut()
+        .set_parent(Rc::downgrade(host_node));
+    let text_node = Rc::new(RefCell::new(Node::new(NodeKind::Text(content))));
+    text_node
+        .borrow_mut()
+        .set_parent(Rc::downgrade(&span_node));
+    span_node
+        .borrow_mut()
+        .set_first_child(Some(text_node.clone()));
+
+    let parent_obj = Some(host_obj.clone());
+    let span_obj = Rc::new(RefCell::new(LayoutObject::new(span_node.clone(), &parent_obj)));
+    let parent_font_size = host_obj.borrow().style().font_size();
+
+    // Apply the pseudo rules' declarations (skip `content`, not a property).
+    for important in [false, true] {
+        for rule in &matched {
+            let tier: Vec<Declaration> = rule
+                .declarations
+                .iter()
+                .filter(|d| d.important == important && d.property != "content")
+                .cloned()
+                .collect();
+            if !tier.is_empty() {
+                span_obj.borrow_mut().cascading_style(tier, parent_font_size);
+            }
+        }
+    }
+    let host_style = Some(host_obj.borrow().style());
+    span_obj.borrow_mut().defaulting_style(&span_node, host_style);
+    if span_obj.borrow().style().display() == DisplayType::DisplayNone {
+        return None;
+    }
+    span_obj.borrow_mut().update_kind();
+
+    // Text child.
+    let text_obj = Rc::new(RefCell::new(LayoutObject::new(
+        text_node.clone(),
+        &Some(span_obj.clone()),
+    )));
+    let span_style = Some(span_obj.borrow().style());
+    text_obj.borrow_mut().defaulting_style(&text_node, span_style);
+    text_obj.borrow_mut().update_kind();
+    span_obj.borrow_mut().set_first_child(Some(text_obj));
+
+    Some(span_obj)
+}
+
+/// Extract the string literal from a `content` value. Returns None for
+/// `none`/`normal` or non-string values (url()/counters aren't supported).
+fn pseudo_content_string(values: &[ComponentValue]) -> Option<String> {
+    let mut out = String::new();
+    let mut saw = false;
+    for v in values {
+        match v {
+            ComponentValue::StringToken(s) => {
+                out.push_str(s);
+                saw = true;
+            }
+            ComponentValue::Ident(name)
+                if name.eq_ignore_ascii_case("none")
+                    || name.eq_ignore_ascii_case("normal") =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    if saw {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

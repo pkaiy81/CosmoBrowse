@@ -3,6 +3,7 @@ use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::dom::api::get_target_element_node;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
+use crate::renderer::dom::node::NodeKind;
 use crate::renderer::layout::layout_object::compute_box_model_metrics;
 use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
@@ -87,11 +88,50 @@ fn build_layout_tree(
         let obj = layout_object
             .as_ref()
             .expect("render object should exist here");
+
+        // CSS generated content: a ::before box becomes the first child and a
+        // ::after box the last child of the element.
+        // https://www.w3.org/TR/css-content-3/
+        if matches!(n.borrow().kind(), NodeKind::Element(_)) {
+            use crate::renderer::css::cssom::PseudoElement;
+            if let Some(before) =
+                crate::renderer::layout::layout_object::build_pseudo_element(
+                    &n, obj, cssom, PseudoElement::Before,
+                )
+            {
+                before.borrow_mut().set_next_sibling(first_child.take());
+                first_child = Some(before);
+            }
+            if let Some(after) =
+                crate::renderer::layout::layout_object::build_pseudo_element(
+                    &n, obj, cssom, PseudoElement::After,
+                )
+            {
+                match &first_child {
+                    Some(fc) => append_layout_sibling(fc, after),
+                    None => first_child = Some(after),
+                }
+            }
+        }
+
         obj.borrow_mut().set_first_child(first_child);
         obj.borrow_mut().set_next_sibling(next_sibling);
     }
 
     layout_object
+}
+
+/// Append `tail` after the last sibling in the chain starting at `head`.
+fn append_layout_sibling(head: &Rc<RefCell<LayoutObject>>, tail: Rc<RefCell<LayoutObject>>) {
+    let mut cur = head.clone();
+    loop {
+        let next = cur.borrow().next_sibling();
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    cur.borrow_mut().set_next_sibling(Some(tail));
 }
 
 #[derive(Debug, Clone)]
@@ -2371,6 +2411,43 @@ mod tests {
         assert_eq!(color_of("themed"), 0x0000ff, ".theme override");
         assert_eq!(color_of("themed-nested"), 0x0000ff, "override inherits to descendants");
         assert_eq!(color_of("fallback"), 0x00ff00, "var() fallback for missing token");
+    }
+
+    #[test]
+    fn test_generated_content_before_after() {
+        let html = concat!(
+            "<html><head><style>",
+            ".req::before{content:\"* \";color:#ff0000;}",
+            ".price::after{content:\" USD\";color:#008800;}",
+            "</style></head><body>",
+            "<span class=\"req\">Name</span>",
+            "<span class=\"price\">42</span>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 800);
+        let items = layout_view.paint();
+        let text_with = |needle: &str| -> Option<u32> {
+            items.iter().find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text.contains(needle) =>
+                    Some(style.color().code_u32()),
+                _ => None,
+            })
+        };
+        // ::before content rendered in red; ::after content in green.
+        assert_eq!(text_with("*"), Some(0xff0000), "::before content present and styled");
+        assert_eq!(text_with("USD"), Some(0x008800), "::after content present and styled");
+        // Ordering: the '*' (before) paints before "Name"; "USD" (after) at the
+        // end. Collect all text in paint order.
+        let order: Vec<String> = items.iter().filter_map(|item| match item {
+            DisplayItem::Text { text, .. } => Some(text.trim().to_string()),
+            _ => None,
+        }).filter(|t| !t.is_empty()).collect();
+        let star = order.iter().position(|t| t.contains('*')).unwrap();
+        let name = order.iter().position(|t| t == "Name").unwrap();
+        let usd = order.iter().position(|t| t.contains("USD")).unwrap();
+        let price = order.iter().position(|t| t == "42").unwrap();
+        assert!(star < name, "::before precedes host text");
+        assert!(price < usd, "::after follows host text");
     }
 
     #[test]

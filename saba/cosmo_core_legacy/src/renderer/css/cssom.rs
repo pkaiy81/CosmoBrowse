@@ -145,6 +145,7 @@ impl CssParser {
         let mut parts: Vec<Selector> = Vec::new();
         let mut never = false;
         let mut saw_universal = false;
+        let mut pseudo_el: Option<PseudoElement> = None;
         loop {
             match self.t.peek() {
                 Some(CssToken::Ident(ident)) => {
@@ -237,8 +238,22 @@ impl CssParser {
                         name.as_str(),
                         "hover" | "active" | "focus" | "focus-within" | "focus-visible"
                     );
+                    // ::before / ::after generate content boxes; capture the
+                    // kind (the rule is realized by the layout-tree builder).
+                    // Legacy single-colon `:before`/`:after` count too.
+                    if (pseudo_element || name == "before" || name == "after")
+                        && matches!(name.as_str(), "before" | "after")
+                    {
+                        pseudo_el = Some(if name == "before" {
+                            PseudoElement::Before
+                        } else {
+                            PseudoElement::After
+                        });
+                        continue;
+                    }
                     let legacy_pseudo_element =
-                        matches!(name.as_str(), "before" | "after" | "selection" | "placeholder");
+                        matches!(name.as_str(), "selection" | "placeholder" | "first-line"
+                            | "first-letter" | "marker" | "backdrop");
                     if interactive || pseudo_element || legacy_pseudo_element {
                         never = true;
                     } else {
@@ -292,11 +307,17 @@ impl CssParser {
         if never {
             return Selector::Never;
         }
-        match parts.len() {
+        let host = match parts.len() {
             0 if saw_universal => Selector::Universal,
+            // A bare `::before` (no host compound) targets any element.
+            0 if pseudo_el.is_some() => Selector::Universal,
             0 => Selector::UnknownSelector,
             1 => parts.pop().expect("len checked"),
             _ => Selector::Compound(parts),
+        };
+        match pseudo_el {
+            Some(pe) => Selector::PseudoElement(Box::new(host), pe),
+            None => host,
         }
     }
 
@@ -806,6 +827,17 @@ pub enum Selector {
     /// `:not(...)` — matches when the inner selector does NOT match.
     /// https://www.w3.org/TR/selectors-4/#negation
     Not(Box<Selector>),
+    /// `host::before` / `host::after` — never matches a real element (so its
+    /// declarations don't leak onto the host); the layout tree builder uses
+    /// `pseudo_element_target` to find these and synthesize a generated box.
+    PseudoElement(Box<Selector>, PseudoElement),
+}
+
+/// `::before` / `::after` generated-content pseudo-elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoElement {
+    Before,
+    After,
 }
 
 /// Supported structural pseudo-classes.
@@ -890,6 +922,11 @@ impl Selector {
                 .unwrap_or((0, 0, 0)),
             // :not() takes the specificity of its argument (Selectors L4 §17).
             Selector::Not(inner) => inner.specificity_abc(),
+            // A pseudo-element counts as a type selector, added to the host.
+            Selector::PseudoElement(host, _) => {
+                let (a, b, c) = host.specificity_abc();
+                (a, b, c + 1)
+            }
         }
     }
 }
