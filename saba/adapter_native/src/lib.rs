@@ -1397,6 +1397,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 background_size: rect.background_size,
                 border_radius: rect.border_radius,
                 box_shadow: rect.box_shadow.clone(),
+                rotate: rect.rotate,
                 fixed: rect.fixed,
                 sticky: rect.sticky,
                 scroll_container: rect.scroll_container,

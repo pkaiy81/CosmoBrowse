@@ -26,6 +26,40 @@ fn scaled_len(ctx: Option<(f64, f64, f64)>, v: i64) -> i64 {
     }
 }
 
+/// Rotate a point about a rotation context's center (degrees, clockwise).
+/// Used so text/image anchors travel with a rotated box (glyphs stay upright).
+fn rotated_point(ctx: Option<(f64, f64, f64)>, x: i64, y: i64) -> (i64, i64) {
+    match ctx {
+        Some((cx, cy, deg)) => {
+            let r = deg * core::f64::consts::PI / 180.0;
+            let (sin, cos) = (libm_sin(r), libm_cos(r));
+            let dx = x as f64 - cx;
+            let dy = y as f64 - cy;
+            ((cx + dx * cos - dy * sin) as i64, (cy + dx * sin + dy * cos) as i64)
+        }
+        None => (x, y),
+    }
+}
+
+// no_std: small Taylor/range-reduced sin/cos (good enough for layout angles).
+fn libm_sin(mut x: f64) -> f64 {
+    use core::f64::consts::PI;
+    // Range-reduce to [-PI, PI].
+    while x > PI {
+        x -= 2.0 * PI;
+    }
+    while x < -PI {
+        x += 2.0 * PI;
+    }
+    let x2 = x * x;
+    // 7th-order Taylor series.
+    x * (1.0 - x2 / 6.0 + x2 * x2 / 120.0 - x2 * x2 * x2 / 5040.0)
+}
+
+fn libm_cos(x: f64) -> f64 {
+    libm_sin(x + core::f64::consts::FRAC_PI_2)
+}
+
 /// Maps layout paint records into backend-neutral paint commands.
 ///
 /// Spec alignment:
@@ -83,6 +117,9 @@ pub fn map_display_items_to_paint_commands(
                     background_size: style.background_size(),
                     border_radius: scaled_len(ctx, style.border_radius() as i64),
                     box_shadow: style.box_shadow().map(|(dx, dy, b, c)| (dx as i64, dy as i64, b as i64, c.code().to_string())),
+                    rotate: style.rotate_context().map(|(cx, cy, deg)| {
+                        (origin_x + cx as i64, origin_y + cy as i64, deg)
+                    }),
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
@@ -117,6 +154,9 @@ pub fn map_display_items_to_paint_commands(
 
                 let ctx = style.scale_context();
                 let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
+                // Rotate the text anchor about the box center so it travels
+                // with a rotated box (glyphs stay axis-aligned).
+                let (lx, ly) = rotated_point(style.rotate_context(), lx, ly);
                 commands.push(PaintCommand::DrawText(DrawText {
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
@@ -151,6 +191,7 @@ pub fn map_display_items_to_paint_commands(
             } => {
                 let ctx = style.scale_context();
                 let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
+                let (lx, ly) = rotated_point(style.rotate_context(), lx, ly);
                 commands.push(PaintCommand::DrawImage(DrawImage {
                     fixed: style.position_or_default() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),

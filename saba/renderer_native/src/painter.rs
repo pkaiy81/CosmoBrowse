@@ -419,6 +419,21 @@ fn fill_rounded_rect(
     }
 }
 
+/// A solid-color paint (straight-alpha RGBA, 0–255 channels + 0–1 opacity).
+fn paint_solid(r: u8, g: u8, b: u8, opacity: f32) -> Paint<'static> {
+    let mut p = Paint::default();
+    p.set_color(
+        Color::from_rgba(
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+            opacity,
+        )
+        .unwrap_or(Color::BLACK),
+    );
+    p
+}
+
 /// Build a rounded-rectangle path with circular-arc corners (cubic Béziers,
 /// kappa ≈ 0.5523).
 fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
@@ -588,11 +603,49 @@ fn draw_rect(
         }
     }
 
-    let clipped = apply_clip(rx, ry, rect.width, effective_height, &screen_clip);
-    let Some((x, y, w, h)) = clipped else { return };
-
     let (r, g, b, a) = parse_css_color(&rect.background_color);
     let opacity = (rect.opacity * a as f64 / 255.0).clamp(0.0, 1.0) as f32;
+
+    // transform: rotate(deg) — fill the (axis-aligned) box through a rotation
+    // about its center. Clipping a rotated box would need a rotated clip
+    // region, so this path only handles the unclipped case (the common one
+    // for rotated badges/banners).
+    if let Some((rcx, rcy, deg)) = rect.rotate {
+        if screen_clip.is_none() {
+            let cx = (rcx - inner_x) as f32;
+            let cy = (rcy + chrome_height - scroll_y - inner_y) as f32;
+            let xf = Transform::from_rotate_at(deg as f32, cx, cy);
+            let mut p = paint_solid(r, g, b, opacity);
+            p.anti_alias = true;
+            if let Some(skia_rect) =
+                Rect::from_xywh(rx as f32, ry as f32, rect.width as f32, effective_height as f32)
+            {
+                pixmap.fill_rect(skia_rect, &p, xf, None);
+            }
+            // Rotated border stroke.
+            if rect.border_width > 0 && !rect.border_color.is_empty() {
+                let (br, bg_c, bb, _) = parse_css_color(&rect.border_color);
+                let mut bp = paint_solid(br, bg_c, bb, opacity);
+                bp.anti_alias = true;
+                let inset = rect.border_width as f32 / 2.0;
+                let bw = rect.border_width as f32;
+                if let Some(path) = rounded_rect_path(
+                    rx as f32 + inset,
+                    ry as f32 + inset,
+                    (rect.width as f32 - bw).max(0.0),
+                    (effective_height as f32 - bw).max(0.0),
+                    (rect.border_radius as f32 - inset).max(0.0),
+                ) {
+                    let stroke = tiny_skia::Stroke { width: bw.max(1.0), ..Default::default() };
+                    pixmap.stroke_path(&path, &bp, &stroke, xf, None);
+                }
+            }
+            return;
+        }
+    }
+
+    let clipped = apply_clip(rx, ry, rect.width, effective_height, &screen_clip);
+    let Some((x, y, w, h)) = clipped else { return };
 
     let mut paint = Paint::default();
     paint.set_color(
@@ -969,6 +1022,7 @@ fn draw_image(
         background_size: None,
         border_radius: 0,
         box_shadow: None,
+        rotate: None,
         fixed: img.fixed,
         sticky: img.sticky,
         scroll_container: img.scroll_container,

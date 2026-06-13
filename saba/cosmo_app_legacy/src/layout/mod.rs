@@ -197,6 +197,21 @@ fn scaled_len(ctx: Option<(f64, f64, f64)>, v: i64) -> i64 {
     }
 }
 
+/// Rotate a point about a rotation context's center (degrees, clockwise) so
+/// text/image anchors travel with a rotated box (glyphs stay upright).
+fn rotated_point(ctx: Option<(f64, f64, f64)>, x: i64, y: i64) -> (i64, i64) {
+    match ctx {
+        Some((cx, cy, deg)) => {
+            let r = deg * std::f64::consts::PI / 180.0;
+            let (sin, cos) = (r.sin(), r.cos());
+            let dx = x as f64 - cx;
+            let dy = y as f64 - cy;
+            ((cx + dx * cos - dy * sin) as i64, (cy + dx * sin + dy * cos) as i64)
+        }
+        None => (x, y),
+    }
+}
+
 fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> LayoutScene {
     let mut scene_items = Vec::with_capacity(display_items.len());
     let mut max_width = 0;
@@ -251,6 +266,9 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_size: style.background_size(),
                     border_radius: scaled_len(ctx, style.border_radius() as i64),
                     box_shadow: style.box_shadow().map(|(dx, dy, b, c)| (dx as i64, dy as i64, b as i64, c.code().to_string())),
+                    rotate: style.rotate_context().map(|(cx, cy, deg)| {
+                        (rect.x + cx as i64, rect.y + cy as i64, deg)
+                    }),
                     fixed: style.position() == PositionType::Fixed || style.fixed_subtree(),
                     sticky: style.sticky_context().map(|(t, y, m)| (t as i64, y as i64, m.min(i64::MAX as f64) as i64)),
                     scroll_container: style.scroll_container(),
@@ -269,6 +287,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
             } => {
                 let ctx = style.scale_context();
                 let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
+                let (lx, ly) = rotated_point(style.rotate_context(), lx, ly);
                 let x = rect.x + lx;
                 let y = rect.y + ly;
                 let font_px_scaled = scaled_len(ctx, style.font_size().px()).max(1);
@@ -315,6 +334,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     scaled_len(ctx, layout_size.width()),
                     scaled_len(ctx, layout_size.height()),
                 );
+                let (lx, ly) = rotated_point(style.rotate_context(), lx, ly);
                 let x = rect.x + lx;
                 let y = rect.y + ly;
                 max_width = max_width.max(lx + lw);
@@ -503,6 +523,7 @@ mod diff_tests {
             background_size: None,
             border_radius: 0,
             box_shadow: None,
+            rotate: None,
             fixed: false,
             sticky: None,
             scroll_container: None,
@@ -526,6 +547,7 @@ mod diff_tests {
             background_size: None,
             border_radius: 0,
             box_shadow: None,
+            rotate: None,
             fixed: false,
             sticky: None,
             scroll_container: None,

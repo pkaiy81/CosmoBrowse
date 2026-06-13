@@ -866,6 +866,20 @@ impl LayoutView {
                     Self::stamp_scale_context(n, ox, oy, scale);
                 }
             }
+            // Rotation: stamp the box's center + angle on the subtree.
+            let rotate_deg = n.borrow().style().transform_rotate();
+            if let Some(deg) = rotate_deg {
+                if deg.abs() > f64::EPSILON {
+                    let (cx, cy) = {
+                        let b = n.borrow();
+                        (
+                            (b.point().x() + b.size().width() / 2) as f64,
+                            (b.point().y() + b.size().height() / 2) as f64,
+                        )
+                    };
+                    Self::stamp_rotate_context(n, cx, cy, deg);
+                }
+            }
             let first_child = n.borrow().first_child();
             Self::apply_transforms(&first_child);
             let next_sibling = n.borrow().next_sibling();
@@ -879,6 +893,17 @@ impl LayoutView {
         let mut child = node.borrow().first_child();
         while let Some(c) = child {
             Self::stamp_scale_context(&c, ox, oy, s);
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
+    }
+
+    /// Stamp a rotation context onto a node and all its descendants.
+    fn stamp_rotate_context(node: &Rc<RefCell<LayoutObject>>, cx: f64, cy: f64, deg: f64) {
+        node.borrow_mut().set_rotate_context(cx, cy, deg);
+        let mut child = node.borrow().first_child();
+        while let Some(c) = child {
+            Self::stamp_rotate_context(&c, cx, cy, deg);
             let next = c.borrow().next_sibling();
             child = next;
         }
@@ -2411,6 +2436,34 @@ mod tests {
         assert_eq!(color_of("themed"), 0x0000ff, ".theme override");
         assert_eq!(color_of("themed-nested"), 0x0000ff, "override inherits to descendants");
         assert_eq!(color_of("fallback"), 0x00ff00, "var() fallback for missing token");
+    }
+
+    #[test]
+    fn test_transform_rotate_context() {
+        let html = concat!(
+            "<html><head><style>",
+            ".frame{position:relative;height:200px;}",
+            ".badge{position:absolute;top:50px;left:50px;width:80px;height:40px;",
+            "transform:rotate(45deg);}",
+            "</style></head><body>",
+            "<div class=\"frame\"><div class=\"badge\">x</div></div>",
+            "</body></html>",
+        ).to_string();
+        let layout_view = create_layout_view(html, 400);
+        let body = layout_view.root().expect("body");
+        let frame = body.borrow().first_child().expect("frame");
+        let badge = frame.borrow().first_child().expect("badge");
+        // The badge's center (50+40, 50+20) = (90, 70) and 45° are stamped on
+        // it and inherited by its child.
+        let (cx, cy, deg) = badge.borrow().style().rotate_context().expect("rotate context");
+        assert_eq!((cx as i64, cy as i64), (90, 70));
+        assert_eq!(deg, 45.0);
+        let text = badge.borrow().first_child().expect("badge text");
+        assert_eq!(
+            text.borrow().style().rotate_context().map(|(_, _, d)| d),
+            Some(45.0),
+            "child inherits the rotation context",
+        );
     }
 
     #[test]

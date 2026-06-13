@@ -337,6 +337,39 @@ fn parse_transform_ops(values: &[ComponentValue]) -> Option<(f64, bool, f64, boo
     }
 }
 
+/// Parse the `rotate(<angle>)` function from a `transform` value list, in
+/// degrees (clockwise). Supports deg/rad/turn/grad units.
+fn parse_transform_rotate(values: &[ComponentValue]) -> Option<f64> {
+    let mut i = 0;
+    while i < values.len() {
+        let is_rotate = matches!(&values[i],
+            ComponentValue::Ident(n) if n.eq_ignore_ascii_case("rotate"))
+            && matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
+        if is_rotate {
+            // First numeric/dimension argument is the angle.
+            let mut j = i + 2;
+            while j < values.len() {
+                match &values[j] {
+                    ComponentValue::CloseParenthesis => break,
+                    ComponentValue::Dimension(v, unit) => {
+                        return Some(match unit.to_lowercase().as_str() {
+                            "rad" => v * 180.0 / core::f64::consts::PI,
+                            "turn" => v * 360.0,
+                            "grad" => v * 0.9,
+                            _ => *v,
+                        });
+                    }
+                    ComponentValue::Number(v) => return Some(*v),
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// One background-position component: (value, is_percent, axis) where axis is
 /// Some(true) for horizontal keywords, Some(false) for vertical, None when the
 /// component fits either axis. Keywords map to percentages per CSS Backgrounds
@@ -3788,6 +3821,9 @@ impl LayoutObject {
                         if let Some(op) = parse_transform_ops(&declaration.value) {
                             self.style.set_transform_op(op);
                         }
+                        if let Some(deg) = parse_transform_rotate(&declaration.value) {
+                            self.style.set_transform_rotate(deg);
+                        }
                     }
                 }
                 "opacity" => {
@@ -3943,6 +3979,11 @@ impl LayoutObject {
     /// Stamp a scale context (see `LayoutView::apply_transforms`).
     pub fn set_scale_context(&mut self, ox: f64, oy: f64, factor: f64) {
         self.style.set_scale_context(ox, oy, factor);
+    }
+
+    /// Stamp a rotation context (see `LayoutView::apply_transforms`).
+    pub fn set_rotate_context(&mut self, cx: f64, cy: f64, deg: f64) {
+        self.style.set_rotate_context(cx, cy, deg);
     }
 
     /// Stamp the final clip rectangle (intersection of overflow ancestors).

@@ -290,6 +290,9 @@ pub enum SceneItem {
         /// box-shadow (dx, dy, blur, css color).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         box_shadow: Option<(i64, i64, i64, String)>,
+        /// transform rotate (center_x, center_y, degrees).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotate: Option<(i64, i64, f64)>,
         /// position:fixed — exempt from scrolling.
         #[serde(default)]
         fixed: bool,

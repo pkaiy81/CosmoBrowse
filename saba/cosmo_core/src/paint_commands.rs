@@ -105,6 +105,9 @@ pub struct DrawRect {
     /// `box-shadow`: (dx, dy, blur, css color).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_shadow: Option<(i64, i64, i64, String)>,
+    /// `transform: rotate(deg)`: (center_x, center_y, degrees) in page coords.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<(i64, i64, f64)>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {

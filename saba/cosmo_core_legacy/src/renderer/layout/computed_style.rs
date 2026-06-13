@@ -156,9 +156,16 @@ pub struct ComputedStyle {
     /// Percentages resolve against the box's own size at the post-layout
     /// pass; scale is uniform (anisotropic scale uses the x factor).
     transform_op: Option<(f64, bool, f64, bool, f64)>,
+    /// Parsed `rotate(<deg>)` in degrees (clockwise), if any.
+    transform_rotate: Option<f64>,
     /// Scale context stamped on a scaled subtree: (origin_x, origin_y,
     /// factor). Mappers scale command geometry and font sizes through it.
     scale_context: Option<(f64, f64, f64)>,
+    /// Rotation context stamped on a rotated subtree: (center_x, center_y,
+    /// degrees) in page coordinates. The painter rotates DrawRect fills about
+    /// the center; text/image anchors are rotated about it so they travel
+    /// with the box (glyphs stay axis-aligned — an approximation).
+    rotate_context: Option<(f64, f64, f64)>,
     /// `border-radius` in pixels (single radius, all corners).
     border_radius: Option<f64>,
     /// `box-shadow`: (dx, dy, blur, color).
@@ -255,7 +262,9 @@ impl ComputedStyle {
             overflow_scrollable: false,
             has_transform: false,
             transform_op: None,
+            transform_rotate: None,
             scale_context: None,
+            rotate_context: None,
             border_radius: None,
             box_shadow: None,
             white_space_nowrap: None,
@@ -668,6 +677,22 @@ impl ComputedStyle {
 
     pub fn transform_op(&self) -> Option<(f64, bool, f64, bool, f64)> {
         self.transform_op
+    }
+
+    pub fn set_transform_rotate(&mut self, deg: f64) {
+        self.transform_rotate = Some(deg);
+    }
+
+    pub fn transform_rotate(&self) -> Option<f64> {
+        self.transform_rotate
+    }
+
+    pub fn set_rotate_context(&mut self, cx: f64, cy: f64, deg: f64) {
+        self.rotate_context = Some((cx, cy, deg));
+    }
+
+    pub fn rotate_context(&self) -> Option<(f64, f64, f64)> {
+        self.rotate_context
     }
 
     pub fn set_scale_context(&mut self, ox: f64, oy: f64, factor: f64) {
