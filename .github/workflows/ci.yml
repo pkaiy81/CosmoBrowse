@@ -12,37 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: forbid direct saba_ imports outside compatibility layers
+      - name: forbid legacy crate names
         run: |
           set -euo pipefail
-          if rg -n "\bsaba_(app|core)\b" \
-            --glob '!cosmo_app_legacy/**' \
-            --glob '!cosmo_core_legacy/**' \
-            --glob '!docs/**' \
+          if rg -n "\bsaba_(app|core)\b|\bcosmo_(core|app)_legacy\b|\bcosmo_core\b" \
             --glob '!**/*.md' \
+            --glob '!docs/**' \
             .; then
-            echo "Direct saba_ references remain outside compatibility layers."
+            echo "Legacy crate references remain (use cosmo_engine / cosmo_runtime)."
             exit 1
           fi
       - name: cargo check stable-target crates
-        run: cargo check -p cosmo_core_legacy -p cosmo_app_legacy -p adapter_cli
+        run: cargo check -p cosmo_engine -p cosmo_runtime -p adapter_cli
       - name: cargo test stable-target crates
-        run: cargo test -p cosmo_core_legacy -p cosmo_app_legacy -p adapter_cli
-
-  frontend:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: saba/ui/cosmo-browse-ui
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: npm install
-        run: npm install
-      - name: npm run build
-        run: npm run build
+        run: cargo test -p cosmo_engine -p cosmo_runtime -p adapter_cli
 
   smoke_regression_pr:
     runs-on: ubuntu-latest

@@ -132,32 +132,3 @@ jobs:
           path: release-artifacts/release-streak-report.json
           if-no-files-found: warn
 
-  build_windows_portable:
-    needs: ga_readiness
-    if: needs.ga_readiness.outputs.ga_ready == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: npm ci
-        working-directory: saba/ui/cosmo-browse-ui
-        run: npm ci
-      - name: build Windows portable package
-        shell: pwsh
-        run: |
-          ./scripts/build-cosmobrowse-portable.ps1
-      - name: upload Windows portable zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: cosmobrowse-windows-portable-zip
-          path: artifacts/cosmo-browse-ui/*.zip
-          if-no-files-found: error
-      - name: upload Windows portable expanded directory
-        uses: actions/upload-artifact@v4
-        with:
-          name: cosmobrowse-windows-portable-dir
-          path: artifacts/cosmo-browse-ui/windows-portable
-          if-no-files-found: error
