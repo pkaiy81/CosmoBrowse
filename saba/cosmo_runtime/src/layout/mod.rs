@@ -3,31 +3,31 @@ use crate::model::{
     ResolvedStyle, SceneItem,
 };
 use crate::security::{local_storage_snapshot, replace_local_storage};
-use cosmo_core::js_runtime::JsDomRuntimeBridge;
-use cosmo_core::nebula_renderer::css::cssom::CssParser;
-use cosmo_core::nebula_renderer::css::token::CssTokenizer;
+use cosmo_engine::js_runtime::JsDomRuntimeBridge;
+use cosmo_engine::renderer::css::cssom::CssParser;
+use cosmo_engine::renderer::css::token::CssTokenizer;
 use crate::loader::fetch_external_stylesheets;
-use cosmo_core::nebula_renderer::dom::api::{
+use cosmo_engine::renderer::dom::api::{
     get_js_content, get_style_content, get_stylesheet_links,
 };
-use cosmo_core::nebula_renderer::dom::node::NodeKind;
-use cosmo_core::nebula_renderer::html::parser::HtmlParser;
-use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
-use cosmo_core::nebula_renderer::js::ast::JsParser;
-use cosmo_core::nebula_renderer::js::runtime::JsRuntime;
-use cosmo_core::nebula_renderer::js::token::JsLexer;
-use cosmo_core::nebula_renderer::layout::computed_style::{
+use cosmo_engine::renderer::dom::node::NodeKind;
+use cosmo_engine::renderer::html::parser::HtmlParser;
+use cosmo_engine::renderer::html::token::HtmlTokenizer;
+use cosmo_engine::renderer::js::ast::JsParser;
+use cosmo_engine::renderer::js::runtime::JsRuntime;
+use cosmo_engine::renderer::js::token::JsLexer;
+use cosmo_engine::renderer::layout::computed_style::{
     DisplayType, PositionType, TextDecoration,
 };
-use cosmo_core::nebula_renderer::layout::layout_object::{
+use cosmo_engine::renderer::layout::layout_object::{
     compute_box_model_metrics, LayoutObject, LayoutObjectKind,
 };
-use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
-use cosmo_core::stardust_display::DisplayItem;
+use cosmo_engine::renderer::layout::layout_view::LayoutView;
+use cosmo_engine::display_item::DisplayItem;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Re-layout triggers used by `saba_app` when deciding whether the scene tree must be rebuilt.
+/// Re-layout triggers used by the app layer when deciding whether the scene tree must be rebuilt.
 ///
 /// Spec notes:
 /// - DOM tree order: layout traversal consumes DOM nodes in tree order (pre-order), so trigger granularity is document/frame scoped.

@@ -3,9 +3,7 @@ resolver = "2"
 members = [
     "adapter_cli",
     "adapter_native",
-    "cosmo_core_legacy",
-    "cosmo_app_legacy",
-    "cosmo_core",
+    "cosmo_engine",
     "cosmo_runtime",
     "renderer_native",
 ]

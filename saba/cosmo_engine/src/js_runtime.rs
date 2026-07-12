@@ -1,8 +1,8 @@
-use alloc::string::String;
-use alloc::vec::Vec;
-use cosmo_core_legacy::renderer::js::runtime::JsRuntime;
+use std::string::String;
+use std::vec::Vec;
+use crate::renderer::js::runtime::JsRuntime;
 
-/// JS runtime integration boundary exposed by `cosmo_core`.
+/// JS runtime integration boundary exposed by `cosmo_engine`.
 ///
 /// Spec alignment:
 /// - HTML LS defines that scripting integrates with DOM via event dispatch and task queue processing.
@@ -30,7 +30,7 @@ impl DomRuntimeEvent {
 
 /// Bridge trait for DOM-facing runtime engines.
 ///
-/// This keeps the boundary explicit while allowing `cosmo_core_legacy` runtime internals
+/// This keeps the boundary explicit while allowing `cosmo_engine` runtime internals
 /// to evolve independently from app/runtime callers.
 pub trait JsDomRuntimeBridge {
     fn execute_bootstrap(&mut self);

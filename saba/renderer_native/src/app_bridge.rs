@@ -1,6 +1,6 @@
 /// Bridge between the native renderer and the browser engine (NativeAdapter).
 use adapter_native::{BrowserFrameDto, BrowserPageDto, NativeAdapter};
-use cosmo_core::paint_commands::PaintCommand;
+use cosmo_engine::paint_commands::PaintCommand;
 
 pub struct AppBridge {
     adapter: NativeAdapter,

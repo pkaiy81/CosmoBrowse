@@ -368,10 +368,10 @@ pub enum RenderBackendKind {
     NativeScene,
 }
 
-/// Rendering adapter contract used by `cosmo_app_legacy` to keep backend-specific code replaceable.
+/// Rendering adapter contract used by `cosmo_runtime` to keep backend-specific code replaceable.
 ///
 /// ```rust
-/// use cosmo_app_legacy::{FrameViewModel, RenderBackend, RenderBackendKind};
+/// use cosmo_runtime::{FrameViewModel, RenderBackend, RenderBackendKind};
 ///
 /// struct CompatBackend;
 ///
@@ -402,10 +402,10 @@ pub trait RenderBackend {
     }
 }
 
-/// Script execution contract exposed by `cosmo_app_legacy`.
+/// Script execution contract exposed by `cosmo_runtime`.
 ///
 /// ```rust
-/// use cosmo_app_legacy::{FrameViewModel, ScriptEngine};
+/// use cosmo_runtime::{FrameViewModel, ScriptEngine};
 ///
 /// struct NoopScriptEngine;
 ///
@@ -426,7 +426,7 @@ pub trait ScriptEngine {
 /// Security policy contract for navigation and content handling decisions.
 ///
 /// ```rust
-/// use cosmo_app_legacy::SecurityPolicy;
+/// use cosmo_runtime::SecurityPolicy;
 ///
 /// struct AllowAllPolicy;
 ///

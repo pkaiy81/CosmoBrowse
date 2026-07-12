@@ -34,7 +34,7 @@ impl ScriptEngine for MinimumScriptEngine {
 }
 
 #[derive(Debug)]
-pub struct SabaApp {
+pub struct BrowserApp {
     tabs: Vec<Tab>,
     active_tab_id: u32,
     next_tab_id: u32,
@@ -42,7 +42,7 @@ pub struct SabaApp {
     downloads: DownloadManager,
 }
 
-impl Default for SabaApp {
+impl Default for BrowserApp {
     fn default() -> Self {
         Self {
             tabs: vec![Tab::new(1)],
@@ -54,7 +54,7 @@ impl Default for SabaApp {
     }
 }
 
-impl AppService for SabaApp {
+impl AppService for BrowserApp {
     fn open_url(&mut self, url: &str) -> AppResult<PageViewModel> {
         self.execute_navigation("open_url", Some(url.to_string()), |session| {
             session.open_url(url)
@@ -245,11 +245,11 @@ impl AppService for SabaApp {
     }
 
     fn export_session_snapshot(&self) -> SessionSnapshot {
-        SabaApp::export_session_snapshot(self)
+        BrowserApp::export_session_snapshot(self)
     }
 
     fn import_session_snapshot(&mut self, snapshot: SessionSnapshot) -> AppResult<()> {
-        SabaApp::import_session_snapshot(self, snapshot)
+        BrowserApp::import_session_snapshot(self, snapshot)
     }
 
     fn update_scroll_positions(
@@ -316,7 +316,7 @@ impl AppService for SabaApp {
     }
 }
 
-impl SabaApp {
+impl BrowserApp {
     pub fn register_tls_exception(&mut self, url: &str) -> AppResult<()> {
         register_tls_exception_for_url(url)?;
         Ok(())
@@ -1795,7 +1795,7 @@ mod tests {
 
     #[test]
     fn session_snapshot_round_trips_history_and_scroll_positions() {
-        let mut app = SabaApp::default();
+        let mut app = BrowserApp::default();
         let first = app
             .open_url("fixture://abehiroshi/index")
             .expect("fixture should load");
@@ -1817,7 +1817,7 @@ mod tests {
 
         let snapshot = app.export_session_snapshot();
 
-        let mut restored = SabaApp::default();
+        let mut restored = BrowserApp::default();
         restored
             .import_session_snapshot(snapshot)
             .expect("snapshot should restore");
@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn tab_operations_round_trip_pin_mute_duplicate_and_order() {
-        let mut app = SabaApp::default();
+        let mut app = BrowserApp::default();
         app.open_url("fixture://abehiroshi/index")
             .expect("fixture should load");
         let second = app.new_tab();
@@ -1868,7 +1868,7 @@ mod tests {
         assert!(tabs[1].is_muted);
 
         let snapshot = app.export_session_snapshot();
-        let mut restored = SabaApp::default();
+        let mut restored = BrowserApp::default();
         restored
             .import_session_snapshot(snapshot)
             .expect("snapshot should restore");
@@ -1885,7 +1885,7 @@ mod tests {
 
     #[test]
     fn download_policy_settings_round_trip_in_session_snapshot() {
-        let mut app = SabaApp::default();
+        let mut app = BrowserApp::default();
         app.set_download_default_policy(DownloadSavePolicy {
             directory: "/tmp/default-policy".to_string(),
             conflict_policy: "uniquify".to_string(),
@@ -1903,7 +1903,7 @@ mod tests {
         .expect("set site policy");
 
         let snapshot = app.export_session_snapshot();
-        let mut restored = SabaApp::default();
+        let mut restored = BrowserApp::default();
         restored
             .import_session_snapshot(snapshot)
             .expect("snapshot should restore");

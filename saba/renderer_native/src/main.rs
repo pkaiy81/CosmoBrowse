@@ -164,7 +164,7 @@ impl App {
         self.scroll_containers.clear();
         for (_, _, commands) in &frame_commands {
             for cmd in commands {
-                if let cosmo_core::paint_commands::PaintCommand::DrawRect(r) = cmd {
+                if let cosmo_engine::paint_commands::PaintCommand::DrawRect(r) = cmd {
                     if let Some((id, content_w, content_h)) = r.scroll_container_def {
                         self.scroll_containers
                             .push((id, r.x, r.y, r.width, r.height, content_w, content_h));
@@ -722,18 +722,18 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
         for (_fid, _furl, commands) in &frame_commands {
             for cmd in commands {
                 match cmd {
-                    cosmo_core::paint_commands::PaintCommand::DrawText(t) => {
+                    cosmo_engine::paint_commands::PaintCommand::DrawText(t) => {
                         let s: String = t.text.chars().take(48).collect();
                         eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
                     }
-                    cosmo_core::paint_commands::PaintCommand::DrawRect(r) => {
+                    cosmo_engine::paint_commands::PaintCommand::DrawRect(r) => {
                         eprintln!(
                             "RECT x={} y={} w={} h={} bg={}{}",
                             r.x, r.y, r.width, r.height, r.background_color,
                             r.background_image.as_deref().map(|s| format!(" img={}", s)).unwrap_or_default(),
                         );
                     }
-                    cosmo_core::paint_commands::PaintCommand::DrawImage(i) => {
+                    cosmo_engine::paint_commands::PaintCommand::DrawImage(i) => {
                         eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
                     }
                 }
@@ -778,18 +778,18 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
         for (_fid, _furl, commands) in &frame_commands {
             for cmd in commands {
                 match cmd {
-                    cosmo_core::paint_commands::PaintCommand::DrawText(t) => {
+                    cosmo_engine::paint_commands::PaintCommand::DrawText(t) => {
                         let s: String = t.text.chars().take(48).collect();
                         eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
                     }
-                    cosmo_core::paint_commands::PaintCommand::DrawRect(r) => {
+                    cosmo_engine::paint_commands::PaintCommand::DrawRect(r) => {
                         eprintln!(
                             "RECT x={} y={} w={} h={} bg={}{}",
                             r.x, r.y, r.width, r.height, r.background_color,
                             r.background_image.as_deref().map(|s| format!(" img={}", s)).unwrap_or_default(),
                         );
                     }
-                    cosmo_core::paint_commands::PaintCommand::DrawImage(i) => {
+                    cosmo_engine::paint_commands::PaintCommand::DrawImage(i) => {
                         eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
                     }
                 }

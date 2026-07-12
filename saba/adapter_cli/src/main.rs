@@ -1,13 +1,13 @@
-use cosmo_core::nebula_renderer::css::cssom::CssParser;
-use cosmo_core::nebula_renderer::css::token::CssTokenizer;
-use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
-use cosmo_core::nebula_renderer::html::parser::HtmlParser;
-use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
-use cosmo_core::nebula_renderer::js::ast::JsParser;
-use cosmo_core::nebula_renderer::js::runtime::JsRuntime;
-use cosmo_core::nebula_renderer::js::token::JsLexer;
-use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
-use cosmo_runtime::{AppService, PageViewModel, StarshipApp};
+use cosmo_engine::renderer::css::cssom::CssParser;
+use cosmo_engine::renderer::css::token::CssTokenizer;
+use cosmo_engine::renderer::dom::api::{get_js_content, get_style_content};
+use cosmo_engine::renderer::html::parser::HtmlParser;
+use cosmo_engine::renderer::html::token::HtmlTokenizer;
+use cosmo_engine::renderer::js::ast::JsParser;
+use cosmo_engine::renderer::js::runtime::JsRuntime;
+use cosmo_engine::renderer::js::token::JsLexer;
+use cosmo_engine::renderer::layout::layout_view::LayoutView;
+use cosmo_runtime::{AppService, PageViewModel, BrowserApp};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -101,7 +101,7 @@ fn optional_arg(args: &[String], index: usize) -> Option<String> {
 }
 
 fn open_url(url: &str) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     match app.open_url(url) {
         Ok(view) => {
             print_page_summary(&view);
@@ -115,7 +115,7 @@ fn open_url(url: &str) -> Result<(), ()> {
 }
 
 fn get_snapshot(url: &str) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -127,7 +127,7 @@ fn get_snapshot(url: &str) -> Result<(), ()> {
 }
 
 fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -146,7 +146,7 @@ fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) ->
 }
 
 fn show_metrics(url: &str) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());

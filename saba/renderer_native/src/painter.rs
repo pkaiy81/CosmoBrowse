@@ -4,7 +4,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use cosmo_core::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
+use cosmo_engine::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
 use winit::event_loop::EventLoopProxy;
 

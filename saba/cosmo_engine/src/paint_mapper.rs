@@ -1,10 +1,10 @@
-use alloc::string::ToString;
-use alloc::vec::Vec;
+use std::string::ToString;
+use std::vec::Vec;
 use crate::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList};
 
-use crate::nebula_renderer::layout::computed_style::PositionType;
-use crate::nebula_renderer::layout::computed_style::TextDecoration;
-use crate::stardust_display::DisplayItem;
+use crate::renderer::layout::computed_style::PositionType;
+use crate::renderer::layout::computed_style::TextDecoration;
+use crate::display_item::DisplayItem;
 
 
 /// Apply a stamped scale context to a layout point.
@@ -31,7 +31,7 @@ fn scaled_len(ctx: Option<(f64, f64, f64)>, v: i64) -> i64 {
 fn rotated_point(ctx: Option<(f64, f64, f64)>, x: i64, y: i64) -> (i64, i64) {
     match ctx {
         Some((cx, cy, deg)) => {
-            let r = deg * core::f64::consts::PI / 180.0;
+            let r = deg * std::f64::consts::PI / 180.0;
             let (sin, cos) = (libm_sin(r), libm_cos(r));
             let dx = x as f64 - cx;
             let dy = y as f64 - cy;
@@ -43,7 +43,7 @@ fn rotated_point(ctx: Option<(f64, f64, f64)>, x: i64, y: i64) -> (i64, i64) {
 
 // no_std: small Taylor/range-reduced sin/cos (good enough for layout angles).
 fn libm_sin(mut x: f64) -> f64 {
-    use core::f64::consts::PI;
+    use std::f64::consts::PI;
     // Range-reduce to [-PI, PI].
     while x > PI {
         x -= 2.0 * PI;
@@ -57,7 +57,7 @@ fn libm_sin(mut x: f64) -> f64 {
 }
 
 fn libm_cos(x: f64) -> f64 {
-    libm_sin(x + core::f64::consts::FRAC_PI_2)
+    libm_sin(x + std::f64::consts::FRAC_PI_2)
 }
 
 /// Maps layout paint records into backend-neutral paint commands.
@@ -223,10 +223,10 @@ pub fn map_display_items_to_paint_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
-    use crate::nebula_renderer::layout::computed_style::{Color, ComputedStyle, FontSize, TextDecoration};
-    use crate::nebula_renderer::layout::layout_object::{LayoutPoint, LayoutSize};
-    use crate::stardust_display::PaintOrder;
+    use std::vec;
+    use crate::renderer::layout::computed_style::{Color, ComputedStyle, FontSize, TextDecoration};
+    use crate::renderer::layout::layout_object::{LayoutPoint, LayoutSize};
+    use crate::display_item::PaintOrder;
 
     #[test]
     fn paint_commands_snapshot_is_stable() {

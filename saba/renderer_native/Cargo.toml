@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 adapter_native = { path = "../adapter_native" }
 cosmo_runtime = { path = "../cosmo_runtime" }
-cosmo_core = { path = "../cosmo_core" }
+cosmo_engine = { path = "../cosmo_engine" }
 winit = "0.30"
 softbuffer = "0.4"
 tiny-skia = "0.11"

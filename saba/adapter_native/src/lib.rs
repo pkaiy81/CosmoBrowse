@@ -1,8 +1,8 @@
 use cosmo_runtime::{
     scene_items_to_paint_commands, AppError, AppMetricsSnapshot, AppService, DownloadEntry,
     DownloadPolicySettings, DownloadSavePolicy, FrameScrollPositionSnapshot, NavigationState,
-    OmniboxSuggestionSet, OrbitSnapshot, PaintCommand, SceneItem, SearchResult, SessionSnapshot,
-    StarshipApp, TabSummary,
+    OmniboxSuggestionSet, PageViewModel, PaintCommand, SceneItem, SearchResult, SessionSnapshot,
+    BrowserApp, TabSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const IPC_SCHEMA_VERSION: u32 = 1;
 
 pub struct NativeAdapter {
-    app: Mutex<StarshipApp>,
+    app: Mutex<BrowserApp>,
     renderer: Mutex<RendererProcessManager>,
 }
 
@@ -806,7 +806,7 @@ impl NativeAdapter {
         self.persist_session_snapshot(crash_session_snapshot_path())
     }
 
-    fn lock_app(&self) -> Result<std::sync::MutexGuard<'_, StarshipApp>, AppError> {
+    fn lock_app(&self) -> Result<std::sync::MutexGuard<'_, BrowserApp>, AppError> {
         self.app
             .lock()
             .map_err(|_| AppError::state("Failed to lock app state"))
@@ -862,8 +862,8 @@ impl Drop for NativeAdapter {
     }
 }
 
-impl From<OrbitSnapshot> for BrowserPageDto {
-    fn from(page: OrbitSnapshot) -> Self {
+impl From<PageViewModel> for BrowserPageDto {
+    fn from(page: PageViewModel) -> Self {
         let mut dom_snapshot = Vec::new();
         collect_dom_snapshots(&page.root_frame, &mut dom_snapshot);
         let network_log = page
@@ -1018,22 +1018,22 @@ fn is_console_log_entry(entry: &str) -> bool {
     lower.contains("script") || lower.contains("unsupported browser api") || lower.contains("dom")
 }
 
-fn load_startup_app() -> StarshipApp {
+fn load_startup_app() -> BrowserApp {
     match read_session_snapshot(session_snapshot_path()) {
         Ok(Some(snapshot)) => {
-            let mut app = StarshipApp::default();
+            let mut app = BrowserApp::default();
             match app.import_session_snapshot(snapshot) {
                 Ok(()) => app,
                 Err(error) => {
                     log_recovery_event("session_snapshot_restore_failed", None, &error.message);
-                    StarshipApp::default()
+                    BrowserApp::default()
                 }
             }
         }
-        Ok(None) => StarshipApp::default(),
+        Ok(None) => BrowserApp::default(),
         Err(error) => {
             log_recovery_event("session_snapshot_read_failed", None, &error.message);
-            StarshipApp::default()
+            BrowserApp::default()
         }
     }
 }
@@ -1274,7 +1274,7 @@ mod tests {
         std::env::set_var("COSMO_SESSION_SNAPSHOT_PATH", &session_path);
         std::env::set_var("COSMO_CRASH_SESSION_SNAPSHOT_PATH", &crash_path);
 
-        let mut app = StarshipApp::default();
+        let mut app = BrowserApp::default();
         let view = app
             .open_url("fixture://abehiroshi/index")
             .expect("fixture should load");
