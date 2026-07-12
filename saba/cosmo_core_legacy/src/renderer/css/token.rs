@@ -1,5 +1,5 @@
-use alloc::string::String;
-use alloc::vec::Vec;
+use std::string::String;
+use std::vec::Vec;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CssToken {
@@ -271,8 +271,8 @@ impl Iterator for CssTokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::ToString;
-    use alloc::vec::Vec;
+    use std::string::ToString;
+    use std::vec::Vec;
 
     /// Tokens excluding whitespace — these tests verify the semantic stream;
     /// whitespace tokens only matter to the selector parser.

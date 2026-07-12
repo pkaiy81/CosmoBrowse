@@ -30,14 +30,14 @@ use crate::renderer::layout::computed_style::LineHeight;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::computed_style::TextDecoration;
-use alloc::format;
-use alloc::rc::Rc;
-use alloc::rc::Weak;
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec;
-use alloc::vec::Vec;
-use core::cell::RefCell;
+use std::format;
+use std::rc::Rc;
+use std::rc::Weak;
+use std::string::String;
+use std::string::ToString;
+use std::vec;
+use std::vec::Vec;
+use std::cell::RefCell;
 
 fn font_ratio(font_size: FontSize) -> i64 {
     match font_size {
@@ -353,7 +353,7 @@ fn parse_transform_rotate(values: &[ComponentValue]) -> Option<f64> {
                     ComponentValue::CloseParenthesis => break,
                     ComponentValue::Dimension(v, unit) => {
                         return Some(match unit.to_lowercase().as_str() {
-                            "rad" => v * 180.0 / core::f64::consts::PI,
+                            "rad" => v * 180.0 / std::f64::consts::PI,
                             "turn" => v * 360.0,
                             "grad" => v * 0.9,
                             _ => *v,
@@ -1083,7 +1083,7 @@ pub fn create_layout_object(
                     // Layout-tree root (<body>): its DOM ancestors (<html>,
                     // matched by `:root`) have no layout objects, so evaluate
                     // their matching rules here to seed the scope.
-                    let mut map = alloc::collections::BTreeMap::new();
+                    let mut map = std::collections::BTreeMap::new();
                     let mut chain: Vec<Rc<RefCell<Node>>> = Vec::new();
                     let mut current = n.borrow().parent().upgrade();
                     while let Some(p) = current {
@@ -1109,12 +1109,12 @@ pub fn create_layout_object(
                     }
                     Rc::new(map)
                 });
-            let mut own: Option<alloc::collections::BTreeMap<String, Vec<ComponentValue>>> =
+            let mut own: Option<std::collections::BTreeMap<String, Vec<ComponentValue>>> =
                 None;
             for declarations in matched
                 .iter()
                 .map(|rule| &rule.declarations)
-                .chain(core::iter::once(&inline_declarations))
+                .chain(std::iter::once(&inline_declarations))
             {
                 for d in declarations.iter().filter(|d| d.property.starts_with("--")) {
                     let map = own.get_or_insert_with(|| (*inherited).clone());
@@ -1618,7 +1618,7 @@ impl LayoutObject {
         let mut idx = 0;
         let mut child = parent.borrow().first_child();
         while let Some(c) = child {
-            if core::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
+            if std::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
                 return idx;
             }
             let b = c.borrow();
@@ -2378,7 +2378,7 @@ impl LayoutObject {
             let mut prev_kind: Option<LayoutObjectKind> = None;
             let mut child = parent.borrow().first_child();
             while let Some(c) = child {
-                if core::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
+                if std::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
                     prev_inline = matches!(
                         prev_kind,
                         Some(LayoutObjectKind::Inline) | Some(LayoutObjectKind::Text)

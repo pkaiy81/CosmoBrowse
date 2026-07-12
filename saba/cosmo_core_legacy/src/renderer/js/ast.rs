@@ -1,9 +1,9 @@
 use crate::renderer::js::token::JsLexer;
 use crate::renderer::js::token::Token;
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::iter::Peekable;
+use std::rc::Rc;
+use std::string::String;
+use std::vec::Vec;
+use std::iter::Peekable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
@@ -573,7 +573,7 @@ impl JsParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::ToString;
+    use std::string::ToString;
 
     #[test]
     fn test_empty() {

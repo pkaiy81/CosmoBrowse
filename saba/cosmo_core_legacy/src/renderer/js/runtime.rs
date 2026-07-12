@@ -3,17 +3,17 @@ use crate::renderer::dom::api::DomEventType;
 use crate::renderer::dom::node::Node as DomNode;
 use crate::renderer::js::ast::Node;
 use crate::renderer::js::ast::Program;
-use alloc::format;
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec::Vec;
-use core::borrow::Borrow;
-use core::cell::RefCell;
-use core::fmt::Display;
-use core::fmt::Formatter;
-use core::ops::Add;
-use core::ops::Sub;
+use std::format;
+use std::rc::Rc;
+use std::string::String;
+use std::string::ToString;
+use std::vec::Vec;
+use std::borrow::Borrow;
+use std::cell::RefCell;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::ops::Add;
+use std::ops::Sub;
 
 type VariableMap = Vec<(String, Option<RuntimeValue>)>;
 
@@ -806,7 +806,7 @@ impl Sub<RuntimeValue> for RuntimeValue {
 }
 
 impl Display for RuntimeValue {
-    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let s = match self {
             RuntimeValue::Number(value) => format!("{}", value),
             RuntimeValue::Null => "null".to_string(),
@@ -908,7 +908,7 @@ mod tests {
         }
         assert_eq!(
             runtime.local_storage_entries(),
-            alloc::vec![("theme".to_string(), "dark".to_string())]
+            std::vec![("theme".to_string(), "dark".to_string())]
         );
     }
 

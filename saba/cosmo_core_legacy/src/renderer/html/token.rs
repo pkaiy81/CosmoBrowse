@@ -1,7 +1,7 @@
 use crate::renderer::html::attribute::Attribute;
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HtmlToken {
@@ -841,8 +841,8 @@ fn decode_named_entity(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::string::ToString;
-    use alloc::vec;
+    use std::string::ToString;
+    use std::vec;
 
     #[test]
     fn test_empty() {

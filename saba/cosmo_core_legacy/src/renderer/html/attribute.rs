@@ -1,4 +1,4 @@
-use alloc::string::String;
+use std::string::String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute {

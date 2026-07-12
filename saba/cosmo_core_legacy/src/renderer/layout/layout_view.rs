@@ -11,9 +11,9 @@ use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
-use alloc::rc::Rc;
-use alloc::vec::Vec;
-use core::cell::RefCell;
+use std::rc::Rc;
+use std::vec::Vec;
+use std::cell::RefCell;
 
 // Spec: DOM tree order drives layout-tree construction.
 // The traversal keeps preorder semantics so siblings are laid out in document order.
@@ -1122,7 +1122,7 @@ impl LayoutView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::string::ToString;
+    use std::string::ToString;
     use crate::display_item::DisplayItem;
     use crate::renderer::css::cssom::CssParser;
     use crate::renderer::css::token::CssTokenizer;
@@ -1132,9 +1132,9 @@ mod tests {
     use crate::renderer::html::parser::HtmlParser;
     use crate::renderer::html::token::HtmlTokenizer;
     use crate::renderer::layout::computed_style::PositionType;
-    use alloc::format;
-    use alloc::string::String;
-    use alloc::vec::Vec;
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
 
     fn create_layout_view(html: String, viewport_width: i64) -> LayoutView {
         let t = HtmlTokenizer::new(html);
@@ -1695,13 +1695,13 @@ mod tests {
             .collect();
 
         let debug: Vec<String> = text_items.iter()
-            .map(|(t, x, y)| alloc::format!("{}@({},{})", t, x, y))
+            .map(|(t, x, y)| std::format!("{}@({},{})", t, x, y))
             .collect();
 
         let latest = text_items.iter().find(|(t, _, _)| t.contains("LatestNews"))
-            .expect(&alloc::format!("LatestNews missing, items: {:?}", debug));
+            .expect(&std::format!("LatestNews missing, items: {:?}", debug));
         let drama = text_items.iter().find(|(t, _, _)| t.contains("DramaInfo"))
-            .expect(&alloc::format!("DramaInfo missing, items: {:?}", debug));
+            .expect(&std::format!("DramaInfo missing, items: {:?}", debug));
 
         // LatestNews should be to the right of left column (x > 350).
         assert!(latest.1 > 350,
@@ -1913,18 +1913,18 @@ mod tests {
             })
             .collect();
         let debug: Vec<_> = items.iter()
-            .map(|(t, x)| alloc::format!("{}@x={}", t, x))
+            .map(|(t, x)| std::format!("{}@x={}", t, x))
             .collect();
 
         // Col-2 content (dates) must be to the RIGHT of col-1 content (titles).
         let title_a_x = items.iter().find(|(t, _)| t.contains("Title A"))
             .map(|(_, x)| *x)
-            .expect(&alloc::format!("Title A missing, items: {:?}", debug));
+            .expect(&std::format!("Title A missing, items: {:?}", debug));
         // Match the line START of the col-2 date — the tail may wrap to a
         // second line within the cell depending on advance estimates.
         let date_a_x = items.iter().find(|(t, _)| t.contains("2022年9月16日"))
             .map(|(_, x)| *x)
-            .expect(&alloc::format!("date A missing, items: {:?}", debug));
+            .expect(&std::format!("date A missing, items: {:?}", debug));
 
         assert!(
             date_a_x > title_a_x,
@@ -2534,7 +2534,7 @@ mod tests {
         assert_eq!(nowrap_lines, 1, "nowrap keeps one line");
         // The wrapping div (below the two single-line divs at y=0 and y=20)
         // breaks into multiple lines at distinct y values.
-        let wrap_ys: alloc::collections::BTreeSet<i64> = texts.iter()
+        let wrap_ys: std::collections::BTreeSet<i64> = texts.iter()
             .filter(|(_, y)| *y >= 40)
             .map(|(_, y)| *y)
             .collect();
@@ -3256,7 +3256,7 @@ mod tests {
         // The actual table cell rects (not their inner content rects) have
         // h=24 (line height + cell padding + border). Filter just those.
         // Group by Y: cells of the same row share Y.
-        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64)>> = alloc::collections::BTreeMap::new();
+        let mut cells_by_row: std::collections::BTreeMap<i64, std::vec::Vec<(i64, i64)>> = std::collections::BTreeMap::new();
         for (x, y, w, h) in &rects {
             if *w < 700 && *w > 0 && *h == 24 && *y >= first_movie.2 - 5 {
                 cells_by_row.entry(*y).or_default().push((*x, *w));
@@ -3348,24 +3348,24 @@ mod tests {
         // taller than one line when the cell wraps — so we must compare only
         // outer cell rects. We identify the canonical column X-positions from
         // the top row (which never wraps) and compare only rects at those Xs.
-        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64, i64)>> = alloc::collections::BTreeMap::new();
+        let mut cells_by_row: std::collections::BTreeMap<i64, std::vec::Vec<(i64, i64, i64)>> = std::collections::BTreeMap::new();
         for (x, y, w, h) in &rects {
             if *w < 700 && *w > 30 && *h >= 24 && *h < table_rect.3 {
                 cells_by_row.entry(*y).or_default().push((*x, *w, *h));
             }
         }
         // Canonical column X-positions: the top-most row's two outer cells.
-        let col_xs: alloc::collections::BTreeSet<i64> = cells_by_row
+        let col_xs: std::collections::BTreeSet<i64> = cells_by_row
             .values()
             .find(|v| v.len() == 2)
             .map(|v| v.iter().map(|(x, _, _)| *x).collect())
             .unwrap_or_default();
         // Restrict every row to cells sitting at a canonical column X; this
         // drops inner content rects, which are offset by the cell border.
-        let rows: Vec<alloc::vec::Vec<(i64, i64, i64)>> = cells_by_row
+        let rows: Vec<std::vec::Vec<(i64, i64, i64)>> = cells_by_row
             .values()
             .map(|v| {
-                let mut cells: alloc::vec::Vec<(i64, i64, i64)> =
+                let mut cells: std::vec::Vec<(i64, i64, i64)> =
                     v.iter().filter(|(x, _, _)| col_xs.contains(x)).copied().collect();
                 cells.sort_by_key(|(x, _, _)| *x);
                 cells
@@ -3474,8 +3474,8 @@ mod tests {
         let view = create_layout_view(html, 600);
         let items = view.paint();
         // Collect cell rects grouped by Y position (each row).
-        let mut cells_by_y: alloc::collections::BTreeMap<i64, Vec<(i64, i64)>> =
-            alloc::collections::BTreeMap::new();
+        let mut cells_by_y: std::collections::BTreeMap<i64, Vec<(i64, i64)>> =
+            std::collections::BTreeMap::new();
         for item in &items {
             if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
                 let w = layout_size.width();
@@ -3516,8 +3516,8 @@ mod tests {
         }).collect();
         assert!(!rects.is_empty(), "thead/tbody/tfoot table should produce rect display items");
         // All 4 rows should appear: 1 header + 2 body + 1 footer.
-        let mut cells_by_y: alloc::collections::BTreeMap<i64, usize> =
-            alloc::collections::BTreeMap::new();
+        let mut cells_by_y: std::collections::BTreeMap<i64, usize> =
+            std::collections::BTreeMap::new();
         for item in &items {
             if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
                 let w = layout_size.width();
@@ -3589,8 +3589,8 @@ mod tests {
             }
 
             // Column widths must be consistent across rows.
-            let mut cells_by_y: alloc::collections::BTreeMap<i64, Vec<(i64, i64)>> =
-                alloc::collections::BTreeMap::new();
+            let mut cells_by_y: std::collections::BTreeMap<i64, Vec<(i64, i64)>> =
+                std::collections::BTreeMap::new();
             // Minimum cell height: text(20) + border_top(1) + border_bottom(1) +
             // 2*cellpadding(2) = 24. Inline elements (e.g. <strong>) have height 20
             // for single-line text — filter them out with ch >= 24.
@@ -3644,7 +3644,7 @@ mod tests {
         let view = create_layout_view(html, 760);
         let items = view.paint();
 
-        let text_items: Vec<(alloc::string::String, i64)> = items.iter().filter_map(|item| {
+        let text_items: Vec<(std::string::String, i64)> = items.iter().filter_map(|item| {
             if let crate::display_item::DisplayItem::Text { text, layout_point, .. } = item {
                 Some((text.clone(), layout_point.x()))
             } else {
@@ -3700,8 +3700,8 @@ mod tests {
         let items = view.paint();
 
         // Find all rects that look like cells (h==24, w < 700, w > 5).
-        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64)>> =
-            alloc::collections::BTreeMap::new();
+        let mut cells_by_row: std::collections::BTreeMap<i64, std::vec::Vec<(i64, i64)>> =
+            std::collections::BTreeMap::new();
         for item in &items {
             if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
                 let w = layout_size.width();
@@ -3712,7 +3712,7 @@ mod tests {
             }
         }
         // Both rows must have at least 2 measurable cells (col0 and col1).
-        let rows: alloc::vec::Vec<_> = cells_by_row.values()
+        let rows: std::vec::Vec<_> = cells_by_row.values()
             .filter(|v| v.len() >= 2)
             .collect();
         assert!(rows.len() >= 2, "expected at least 2 rows with 2 cells each, got {:?}", cells_by_row);
@@ -3764,8 +3764,8 @@ mod tests {
 
         // Cell rects only: filter to rects whose height matches one text-line.
         // The table has border="1" so each cell has h = line_height + 2*border ≈ 24.
-        let mut cells_by_row: alloc::collections::BTreeMap<i64, alloc::vec::Vec<(i64, i64)>> =
-            alloc::collections::BTreeMap::new();
+        let mut cells_by_row: std::collections::BTreeMap<i64, std::vec::Vec<(i64, i64)>> =
+            std::collections::BTreeMap::new();
         for item in &items {
             if let crate::display_item::DisplayItem::Rect { layout_point, layout_size, .. } = item {
                 let w = layout_size.width();
@@ -3775,7 +3775,7 @@ mod tests {
                 }
             }
         }
-        let rows: alloc::vec::Vec<_> = cells_by_row
+        let rows: std::vec::Vec<_> = cells_by_row
             .values()
             .filter(|v| v.len() >= 3)
             .collect();
@@ -3858,7 +3858,7 @@ mod tests {
 
         // Find the "連続ドラマ" text — it must be rendered at an x position
         // significantly to the right of the rowspan column (x > 350).
-        let texts: alloc::vec::Vec<(alloc::string::String, i64)> = items.iter().filter_map(|item| {
+        let texts: std::vec::Vec<(std::string::String, i64)> = items.iter().filter_map(|item| {
             if let crate::display_item::DisplayItem::Text { text, layout_point, .. } = item {
                 Some((text.clone(), layout_point.x()))
             } else {

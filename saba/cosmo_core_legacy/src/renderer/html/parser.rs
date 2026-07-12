@@ -6,11 +6,11 @@ use crate::renderer::dom::node::Window;
 use crate::renderer::html::attribute::Attribute;
 use crate::renderer::html::token::HtmlToken;
 use crate::renderer::html::token::HtmlTokenizer;
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cell::RefCell;
-use core::str::FromStr;
+use std::rc::Rc;
+use std::string::String;
+use std::vec::Vec;
+use std::cell::RefCell;
+use std::str::FromStr;
 
 /// https://html.spec.whatwg.org/multipage/parsing.html#the-insertion-mode
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -684,8 +684,8 @@ impl HtmlParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::string::ToString;
-    use alloc::vec;
+    use std::string::ToString;
+    use std::vec;
 
     #[test]
     fn test_empty() {

@@ -1,6 +1,6 @@
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec::Vec;
+use std::string::String;
+use std::string::ToString;
+use std::vec::Vec;
 
 static RESERVED_WORDS: [&str; 3] = ["var", "function", "return"];
 

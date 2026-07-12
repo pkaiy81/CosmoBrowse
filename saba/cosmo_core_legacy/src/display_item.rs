@@ -1,7 +1,7 @@
 use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
-use alloc::string::String;
+use std::string::String;
 
 // Spec: Paint records map CSS visual formatting output into a backend-neutral display list.
 // z-order follows CSS2 painting order + CSS Positioned Layout z-index buckets.

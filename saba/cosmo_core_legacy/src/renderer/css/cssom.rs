@@ -1,11 +1,11 @@
-use crate::alloc::string::ToString;
+use std::string::ToString;
 use crate::renderer::css::token::CssToken;
 use crate::renderer::css::token::CssTokenizer;
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::iter::Peekable;
+use std::boxed::Box;
+use std::collections::BTreeMap;
+use std::string::String;
+use std::vec::Vec;
+use std::iter::Peekable;
 
 #[derive(Debug, Clone)]
 pub struct CssParser {
@@ -366,7 +366,7 @@ impl CssParser {
                                 Some(v)
                             }
                             Some(CssToken::Number(n)) => {
-                                let v = alloc::format!("{}", n);
+                                let v = std::format!("{}", n);
                                 self.t.next();
                                 Some(v)
                             }
@@ -968,7 +968,7 @@ pub type ComponentValue = CssToken;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    use std::vec;
 
     #[test]
     fn test_empty() {
@@ -1144,10 +1144,10 @@ mod tests {
         let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
         // Only the two top-level rules (td, p) should survive; the @media block
         // and its inner rules must be discarded, not mangled into rules.
-        let selectors: alloc::vec::Vec<_> = cssom.rules.iter().map(|r| r.selector.clone()).collect();
+        let selectors: std::vec::Vec<_> = cssom.rules.iter().map(|r| r.selector.clone()).collect();
         assert_eq!(
             selectors,
-            alloc::vec![
+            std::vec![
                 Selector::TypeSelector("td".to_string()),
                 Selector::TypeSelector("p".to_string()),
             ],

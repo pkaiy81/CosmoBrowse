@@ -2,13 +2,13 @@ use crate::error::Error;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
-use alloc::collections::BTreeMap;
-use alloc::format;
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec::Vec;
-use core::cell::RefCell;
+use std::collections::BTreeMap;
+use std::format;
+use std::rc::Rc;
+use std::string::String;
+use std::string::ToString;
+use std::vec::Vec;
+use std::cell::RefCell;
 
 use crate::renderer::css::token::CssToken;
 
@@ -1291,9 +1291,7 @@ impl FontSize {
     pub fn from_px(value: f64) -> Self {
         // Clamp to a sane range: tiny fonts stay legible (and avoid zero/negative
         // sizes), huge fonts don't blow up layout estimates.
-        // (`f64::round` is unavailable in no_std; +0.5-truncate is fine for
-        // the positive values that survive the clamp.)
-        Self::Px(((value + 0.5) as i64).clamp(6, 128))
+        Self::Px((value.round() as i64).clamp(6, 128))
     }
 
     pub fn px(&self) -> i64 {

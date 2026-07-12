@@ -1,6 +1,5 @@
 use crate::browser::Browser;
 use crate::display_item::DisplayItem;
-use crate::http::HttpResponse;
 use crate::renderer::css::cssom::CssParser;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::css::token::CssTokenizer;
@@ -19,11 +18,11 @@ use crate::renderer::js::runtime::JsRuntime;
 use crate::renderer::js::token::JsLexer;
 use crate::renderer::layout::layout_object::LayoutSize;
 use crate::renderer::layout::layout_view::LayoutView;
-use alloc::rc::Rc;
-use alloc::rc::Weak;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cell::RefCell;
+use std::rc::Rc;
+use std::rc::Weak;
+use std::string::String;
+use std::vec::Vec;
+use std::cell::RefCell;
 
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -49,13 +48,8 @@ impl Page {
         self.browser = browser;
     }
 
-    pub fn receive_response(
-        &mut self,
-        response: HttpResponse,
-        extra_style: String,
-        viewport_width: i64,
-    ) {
-        self.create_frame(response.body(), extra_style);
+    pub fn load_html(&mut self, html: String, extra_style: String, viewport_width: i64) {
+        self.create_frame(html, extra_style);
         self.execute_js();
         self.set_layout_view(viewport_width);
         self.paint_tree();

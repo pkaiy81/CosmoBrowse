@@ -1,8 +1,8 @@
 use crate::renderer::dom::node::Node;
-use alloc::format;
-use alloc::rc::Rc;
-use alloc::string::String;
-use core::cell::RefCell;
+use std::format;
+use std::rc::Rc;
+use std::string::String;
+use std::cell::RefCell;
 
 pub fn convert_dom_to_string(root: &Option<Rc<RefCell<Node>>>) -> String {
     let mut result = String::from("\n");
