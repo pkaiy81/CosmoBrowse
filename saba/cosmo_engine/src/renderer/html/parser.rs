@@ -81,6 +81,52 @@ impl HtmlParser {
         }
     }
 
+    // Tag-name variants of the stack helpers: work for every element,
+    // including tags without a dedicated ElementKind variant.
+    fn contain_in_stack_tag(&self, tag: &str) -> bool {
+        self.stack_of_open_elements
+            .iter()
+            .any(|n| n.borrow().element_tag_name().as_deref() == Some(tag))
+    }
+
+    fn pop_until_tag(&mut self, tag: &str) {
+        if !self.contain_in_stack_tag(tag) {
+            return;
+        }
+        loop {
+            let current = match self.stack_of_open_elements.pop() {
+                Some(n) => n,
+                None => return,
+            };
+            if current.borrow().element_tag_name().as_deref() == Some(tag) {
+                return;
+            }
+        }
+    }
+
+    fn pop_current_node_tag(&mut self, tag: &str) -> bool {
+        let matches = self
+            .stack_of_open_elements
+            .last()
+            .map(|n| n.borrow().element_tag_name().as_deref() == Some(tag))
+            .unwrap_or(false);
+        if matches {
+            self.stack_of_open_elements.pop();
+        }
+        matches
+    }
+
+    /// HTML void elements: no content, never pushed onto the open-element
+    /// stack past their own start tag.
+    /// https://html.spec.whatwg.org/multipage/syntax.html#void-elements
+    fn is_void_element(tag: &str) -> bool {
+        matches!(
+            tag,
+            "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link"
+                | "meta" | "param" | "source" | "track" | "wbr"
+        )
+    }
+
     /// Check if an element kind is in the stack, but only within the innermost
     /// scope boundary (e.g., don't look past <table> for table-internal tags).
     fn contain_in_scope(&self, target: ElementKind, boundary: ElementKind) -> bool {
@@ -527,25 +573,31 @@ impl HtmlParser {
                         self_closing: _,
                         ref attributes,
                     }) => match tag.as_str() {
-                        "a" | "button" | "div" | "form" | "h1" | "h2" | "h3" | "header" | "li"
-                        | "main" | "p" | "section" | "span" | "ul" | "center" | "table" | "tr"
-                        | "td" | "th" | "font" | "b" | "i" | "strong" | "em" | "pre"
-                        | "blockquote" | "dl" | "dt" | "dd" | "caption" => {
+                        // Raw-content elements appearing in <body>: capture
+                        // their text via the Text insertion mode (mirrors the
+                        // InHead handling) instead of leaking it as page text.
+                        "style" | "script" | "title" => {
+                            self.insert_element(tag, attributes.to_vec());
+                            self.original_insertion_mode = self.mode;
+                            self.mode = InsertionMode::Text;
+                            token = self.t.next();
+                            continue;
+                        }
+                        t if Self::is_void_element(t) => {
+                            self.insert_element(tag, attributes.to_vec());
+                            self.pop_current_node_tag(tag);
+                            token = self.t.next();
+                            continue;
+                        }
+                        // Every other element — known or unknown — enters the
+                        // DOM with its real tag name. Unknown elements used to
+                        // be dropped here, which broke selector matching and
+                        // default styling for all HTML5 semantic tags.
+                        _ => {
                             self.close_implicit(tag);
                             self.insert_element(tag, attributes.to_vec());
                             token = self.t.next();
                             continue;
-                        }
-                        "img" | "input" | "br" | "hr" => {
-                            self.insert_element(tag, attributes.to_vec());
-                            let element_kind = ElementKind::from_str(tag)
-                                .expect("failed to convert string to ElementKind");
-                            self.pop_current_node(element_kind);
-                            token = self.t.next();
-                            continue;
-                        }
-                        _ => {
-                            token = self.t.next();
                         }
                     },
                     Some(HtmlToken::EndTag { ref tag }) => match tag.as_str() {
@@ -567,18 +619,11 @@ impl HtmlParser {
                             }
                             continue;
                         }
-                        "a" | "button" | "div" | "form" | "h1" | "h2" | "h3" | "header" | "li"
-                        | "main" | "p" | "section" | "span" | "ul" | "center" | "table" | "tr"
-                        | "td" | "th" | "font" | "b" | "i" | "strong" | "em" | "pre"
-                        | "blockquote" | "dl" | "dt" | "dd" | "caption" => {
-                            let element_kind = ElementKind::from_str(tag)
-                                .expect("failed to convert string to ElementKind");
-                            token = self.t.next();
-                            self.pop_until(element_kind);
-                            continue;
-                        }
                         _ => {
+                            let tag = tag.clone();
                             token = self.t.next();
+                            self.pop_until_tag(&tag);
+                            continue;
                         }
                     },
                     Some(HtmlToken::Eof) | None => {
@@ -892,6 +937,89 @@ mod tests {
             .next_sibling()
             .expect("image should exist");
         assert_eq!(image.borrow().element_kind(), Some(ElementKind::Img));
+    }
+
+    #[test]
+    fn test_unknown_and_html5_elements_enter_dom_with_real_tags() {
+        let html = "<html><head></head><body><nav>menu</nav><article><wix-image>x</wix-image></article></body></html>"
+            .to_string();
+        let t = HtmlTokenizer::new(html);
+        let window = HtmlParser::new(t).construct_tree();
+        let document = window.borrow().document();
+
+        let body = document
+            .borrow()
+            .first_child()
+            .expect("html should exist")
+            .borrow()
+            .first_child()
+            .expect("head should exist")
+            .borrow()
+            .next_sibling()
+            .expect("body should exist");
+
+        let nav = body.borrow().first_child().expect("nav should exist");
+        assert_eq!(
+            nav.borrow().element_tag_name(),
+            Some("nav".to_string())
+        );
+        assert_eq!(nav.borrow().element_kind(), Some(ElementKind::Unknown));
+
+        let article = nav.borrow().next_sibling().expect("article should exist");
+        assert_eq!(
+            article.borrow().element_tag_name(),
+            Some("article".to_string())
+        );
+
+        // The custom element nests inside <article>: its end tag pops it, so
+        // following content would go back to article, and the element keeps
+        // its author-given name.
+        let custom = article
+            .borrow()
+            .first_child()
+            .expect("custom element should exist");
+        assert_eq!(
+            custom.borrow().element_tag_name(),
+            Some("wix-image".to_string())
+        );
+        let text = custom.borrow().first_child().expect("text should exist");
+        assert!(matches!(text.borrow().kind(), NodeKind::Text(ref s) if s == "x"));
+    }
+
+    #[test]
+    fn test_unknown_end_tag_pops_matching_element_only() {
+        // </b> must not close the unknown element; </my-tag> must.
+        let html =
+            "<html><head></head><body><my-tag><b>bold</b>tail</my-tag>after</body></html>"
+                .to_string();
+        let t = HtmlTokenizer::new(html);
+        let window = HtmlParser::new(t).construct_tree();
+        let document = window.borrow().document();
+
+        let body = document
+            .borrow()
+            .first_child()
+            .expect("html should exist")
+            .borrow()
+            .first_child()
+            .expect("head should exist")
+            .borrow()
+            .next_sibling()
+            .expect("body should exist");
+
+        let my_tag = body.borrow().first_child().expect("my-tag should exist");
+        assert_eq!(
+            my_tag.borrow().element_tag_name(),
+            Some("my-tag".to_string())
+        );
+
+        let b = my_tag.borrow().first_child().expect("b should exist");
+        assert_eq!(b.borrow().element_kind(), Some(ElementKind::B));
+        // "tail" is still inside my-tag, "after" is a sibling of my-tag.
+        let tail = b.borrow().next_sibling().expect("tail text should exist");
+        assert!(matches!(tail.borrow().kind(), NodeKind::Text(ref s) if s == "tail"));
+        let after = my_tag.borrow().next_sibling().expect("after text");
+        assert!(matches!(after.borrow().kind(), NodeKind::Text(ref s) if s == "after"));
     }
 }
 

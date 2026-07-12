@@ -924,7 +924,7 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
             // children (and, for the *-of-type family, among element children
             // with the SAME tag), plus the respective totals.
             let own_tag = match node.borrow().kind() {
-                NodeKind::Element(ref e) => e.kind().to_string(),
+                NodeKind::Element(ref e) => e.tag_name().to_string(),
                 _ => return false,
             };
             let parent = match node.borrow().parent().upgrade() {
@@ -939,7 +939,7 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
             while let Some(c) = child {
                 if let NodeKind::Element(ref e) = c.borrow().kind() {
                     total += 1;
-                    let same_type = e.kind().to_string() == own_tag;
+                    let same_type = e.tag_name() == own_tag;
                     if same_type {
                         total_of_type += 1;
                     }
@@ -985,7 +985,7 @@ fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
     }
     match node.borrow().kind() {
         NodeKind::Element(ref e) => match selector {
-            Selector::TypeSelector(type_name) => e.kind().to_string() == *type_name,
+            Selector::TypeSelector(type_name) => e.tag_name() == *type_name,
             // An element may carry several space-separated class names;
             // the selector matches any one of them.
             // https://html.spec.whatwg.org/multipage/dom.html#classes

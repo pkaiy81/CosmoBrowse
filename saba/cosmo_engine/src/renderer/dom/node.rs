@@ -124,6 +124,15 @@ impl Node {
             NodeKind::Element(ref e) => Some(e.kind()),
         }
     }
+
+    /// The element's real tag name (see `Element::tag_name`), or `None` for
+    /// non-element nodes.
+    pub fn element_tag_name(&self) -> Option<String> {
+        match self.kind {
+            NodeKind::Document | NodeKind::Text(_) => None,
+            NodeKind::Element(ref e) => Some(e.tag_name().to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -148,26 +157,34 @@ impl PartialEq for NodeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Element {
+    tag: String,
     kind: ElementKind,
     attributes: Vec<Attribute>,
 }
 
 impl Element {
     pub fn new(element_name: &str, attributes: Vec<Attribute>) -> Self {
-        // Unknown/custom element names (e.g. `<meta>`, `<svg>`, `<noscript>`,
-        // `<wix-image>` and the countless tags used by modern CMS/framework
-        // pages) must not crash the parser.  HTML5 specifies that unknown
-        // elements behave as `HTMLUnknownElement` and default to inline
-        // display, so we fall back to `Span` — this preserves the document
-        // tree shape for selector matching while keeping content visible.
+        // Unknown/custom element names behave as `HTMLUnknownElement`
+        // (inline display) but keep their real tag name so selectors,
+        // *-of-type counting and future DOM APIs see the true identity.
         // Spec: HTML Living Standard §4.2.2 — Custom and unknown elements.
         // https://html.spec.whatwg.org/multipage/dom.html#htmlunknownelement
-        let kind = ElementKind::from_str(element_name).unwrap_or(ElementKind::Span);
-        Self { kind, attributes }
+        let kind = ElementKind::from_str(element_name).unwrap_or(ElementKind::Unknown);
+        Self {
+            tag: element_name.to_string(),
+            kind,
+            attributes,
+        }
     }
 
     pub fn kind(&self) -> ElementKind {
         self.kind
+    }
+
+    /// The element's real (lowercased) tag name, including names that have
+    /// no dedicated `ElementKind` variant.
+    pub fn tag_name(&self) -> &str {
+        &self.tag
     }
 
     /// HTML "metadata content" plus `<script>` — elements that generate no
@@ -179,46 +196,21 @@ impl Element {
     /// https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements
     pub fn is_non_rendered_element(&self) -> bool {
         matches!(
-            self.kind,
-            ElementKind::Head
-                | ElementKind::Link
-                | ElementKind::Style
-                | ElementKind::Script
-                | ElementKind::Title
+            self.tag.as_str(),
+            "head" | "link" | "style" | "script" | "title" | "meta" | "base" | "noscript"
+                | "template"
         )
     }
 
     pub fn is_block_element(&self) -> bool {
         matches!(
-            self.kind,
-            ElementKind::Body
-                | ElementKind::Div
-                | ElementKind::Form
-                | ElementKind::H1
-                | ElementKind::H2
-                | ElementKind::H3
-                | ElementKind::Header
-                | ElementKind::Li
-                | ElementKind::Main
-                | ElementKind::P
-                | ElementKind::Section
-                | ElementKind::Ul
-                | ElementKind::Center
-                | ElementKind::Table
-                | ElementKind::Tr
-                | ElementKind::Hr
-                | ElementKind::Pre
-                | ElementKind::Blockquote
-                | ElementKind::Br
-                | ElementKind::Td
-                | ElementKind::Th
-                | ElementKind::Dl
-                | ElementKind::Dt
-                | ElementKind::Dd
-                | ElementKind::Caption
-                | ElementKind::Tbody
-                | ElementKind::Thead
-                | ElementKind::Tfoot
+            self.tag.as_str(),
+            "body" | "div" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header"
+                | "li" | "main" | "p" | "section" | "ul" | "ol" | "center" | "table" | "tr"
+                | "hr" | "pre" | "blockquote" | "br" | "td" | "th" | "dl" | "dt" | "dd"
+                | "caption" | "tbody" | "thead" | "tfoot" | "nav" | "article" | "aside"
+                | "footer" | "figure" | "figcaption" | "address" | "details" | "summary"
+                | "fieldset"
         )
     }
 
@@ -284,6 +276,9 @@ pub enum ElementKind {
     Tfoot,
     Colgroup,
     Col,
+    /// Any element without a dedicated variant (custom elements, HTML5 tags
+    /// with no engine-special behavior). The real name lives in `Element::tag`.
+    Unknown,
 }
 
 impl Display for ElementKind {
@@ -335,6 +330,8 @@ impl Display for ElementKind {
             ElementKind::Tfoot => "tfoot",
             ElementKind::Colgroup => "colgroup",
             ElementKind::Col => "col",
+            // Debug label only — real names come from Element::tag_name().
+            ElementKind::Unknown => "unknown",
         };
         write!(f, "{}", s)
     }
