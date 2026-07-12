@@ -169,8 +169,9 @@ impl LayoutObject {
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let mut v = vec![];
-                    let cw =
-                        bold_width_adjust(char_width_px(self.style.font_size()), self.style.is_bold());
+                    let fs = self.style.font_size();
+                    let bold = self.style.is_bold();
+                    let cw = bold_width_adjust(char_width_px(fs), bold);
                     let lh = styled_line_height(&self.style);
                     let plain_text = self.collapse_text_whitespace(&t);
                     // Use the max_width that was established during compute_size so
@@ -203,11 +204,11 @@ impl LayoutObject {
                         // clipping ancestor then truncates it to fit.
                         let mut line = plain_text;
                         if let Some(clip_w) = self.ellipsis_clip_width() {
-                            line = truncate_with_ellipsis(&line, cw, clip_w);
+                            line = truncate_with_ellipsis(&line, fs, bold, clip_w);
                         }
                         vec![line]
                     } else {
-                        split_text(plain_text, cw, max_width)
+                        split_text(plain_text, fs, bold, max_width)
                     };
                     let _ = &mut lines;
                     let href = self.link_href();

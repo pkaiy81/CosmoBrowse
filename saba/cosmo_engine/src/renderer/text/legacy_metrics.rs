@@ -46,15 +46,20 @@ pub(crate) fn line_height_px(font_size: FontSize) -> i64 {
 }
 
 /// Line box height honoring an explicit `line-height`; falls back to the
-/// default leading for the font size.
+/// installed metrics provider's default leading for the font size.
 pub(crate) fn styled_line_height(style: &ComputedStyle) -> i64 {
     match style.line_height() {
         Some(LineHeight::Px(px)) => (px as i64).max(1),
         Some(LineHeight::Factor(f)) => {
             ((style.font_size_or_default().px() as f64 * f) as i64).max(1)
         }
-        None => line_height_px(style.font_size_or_default()),
+        None => super::provider::metrics().line_height(style.font_size_or_default()),
     }
+}
+
+/// Advance width of one character from the installed metrics provider.
+pub(crate) fn char_advance(c: char, font_size: FontSize, bold: bool) -> i64 {
+    super::provider::metrics().char_advance(c, font_size, bold)
 }
 
 pub(crate) fn is_wide_char(c: char) -> bool {
@@ -99,28 +104,23 @@ pub(crate) fn scale_advance(advance_16: i64, cw: i64) -> i64 {
     (advance_16 * cw + CHAR_WIDTH - 1) / CHAR_WIDTH
 }
 
-/// Estimated width of `text` at the effective per-character width `cw`,
-/// accumulating PER-CHARACTER rounded advances — the exact accounting
-/// `split_text` uses, so a box sized from this never wraps its own content
-/// (a one-shot total scale rounds lower and "login" wrapped as "logi/n").
-pub(crate) fn text_width_px(text: &str, cw: i64) -> i64 {
-    text.chars()
-        .map(|c| scale_advance(char_advance_16(c), cw))
-        .sum()
-}
-
 /// Truncate `text` so it plus a trailing `…` fits within `max_width` px.
 /// Returns the original text when it already fits.
-pub(crate) fn truncate_with_ellipsis(text: &str, cw: i64, max_width: i64) -> String {
-    if text_width_px(text, cw) <= max_width {
+pub(crate) fn truncate_with_ellipsis(
+    text: &str,
+    font_size: FontSize,
+    bold: bool,
+    max_width: i64,
+) -> String {
+    if measure_text_width(text, font_size, bold) <= max_width {
         return text.to_string();
     }
-    let ellipsis_w = scale_advance(char_advance_16('…'), cw);
+    let ellipsis_w = char_advance('…', font_size, bold);
     let budget = (max_width - ellipsis_w).max(0);
     let mut acc = 0i64;
     let mut out = String::new();
     for c in text.chars() {
-        let w = scale_advance(char_advance_16(c), cw);
+        let w = char_advance(c, font_size, bold);
         if acc + w > budget {
             break;
         }
@@ -141,9 +141,14 @@ pub(crate) fn bold_width_adjust(width: i64, bold: bool) -> i64 {
     }
 }
 
+/// Width of `text`, accumulating PER-CHARACTER rounded advances — the exact
+/// accounting `split_text` uses, so a box sized from this never wraps its own
+/// content (a one-shot total scale rounds lower and "login" wrapped as
+/// "logi/n").
 pub(crate) fn measure_text_width(text: &str, font_size: FontSize, bold: bool) -> i64 {
-    let cw = bold_width_adjust(char_width_px(font_size), bold);
-    text_width_px(text, cw)
+    text.chars()
+        .map(|c| char_advance(c, font_size, bold))
+        .sum()
 }
 pub(crate) fn is_break_space(c: char) -> bool {
     c == ' ' || c == '\u{3000}'
@@ -162,10 +167,17 @@ pub(crate) fn is_break_space(c: char) -> bool {
 /// consumed, not rendered); if a single run has no space it is hard-broken at
 /// the character that would overflow. Wide (CJK) characters count as two units,
 /// matching [`char_advance_16`].
-pub(crate) fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<String> {
-    let safe_width = max_width.max(char_width).max(1);
+pub(crate) fn split_text(
+    line: String,
+    font_size: FontSize,
+    bold: bool,
+    max_width: i64,
+) -> Vec<String> {
+    let safe_width = max_width
+        .max(bold_width_adjust(char_width_px(font_size), bold))
+        .max(1);
     // Line capacity in pixels; per-character advances come from the same
-    // class table as measurement so wrapping and sizing agree.
+    // provider as measurement so wrapping and sizing agree.
     let max_units = safe_width;
 
     let mut result: Vec<String> = vec![];
@@ -179,7 +191,7 @@ pub(crate) fn split_text(line: String, char_width: i64, max_width: i64) -> Vec<S
     let mut units_after_space = 0i64;
 
     for (idx, c) in line.char_indices() {
-        let w = scale_advance(char_advance_16(c), char_width);
+        let w = char_advance(c, font_size, bold);
 
         if started && cur_units + w > max_units {
             match last_space {

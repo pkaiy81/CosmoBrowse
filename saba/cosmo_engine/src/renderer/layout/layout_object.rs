@@ -38,7 +38,7 @@ use crate::renderer::style::values::{
 use crate::renderer::text::legacy_metrics::{
     bold_width_adjust, char_width_px,
     is_wide_char, measure_text_width, split_text,
-    styled_line_height, text_width_px,
+    styled_line_height,
 };
 
 fn edge_to_i64(value: f64) -> i64 {
@@ -1941,8 +1941,9 @@ impl LayoutObject {
             }
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
-                    let cw =
-                        bold_width_adjust(char_width_px(self.style.font_size()), self.style.is_bold());
+                    let fs = self.style.font_size();
+                    let bold = self.style.is_bold();
+                    let cw = bold_width_adjust(char_width_px(fs), bold);
                     let lh = styled_line_height(&self.style);
                     let plain_text = self.collapse_text_whitespace(&t);
                     // max_width is the available horizontal space for this text
@@ -1962,11 +1963,11 @@ impl LayoutObject {
                     let lines = if self.style.white_space_nowrap() {
                         vec![plain_text.clone()]
                     } else {
-                        split_text(plain_text.clone(), cw, max_width)
+                        split_text(plain_text.clone(), fs, bold, max_width)
                     };
                     let width = lines
                         .iter()
-                        .map(|line| text_width_px(line, cw))
+                        .map(|line| measure_text_width(line, fs, bold))
                         .max()
                         .unwrap_or(0);
                     let height = if lines.is_empty() {
