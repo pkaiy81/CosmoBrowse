@@ -1,0 +1,29 @@
+<html>
+<head>
+<style>
+  .row { display: flex; flex-direction: row; background-color: #eeeeee; padding: 6px; }
+  .col { display: flex; flex-direction: column; width: 200px; background-color: #e8f0fe; padding: 6px; }
+  .chip { background-color: #3366cc; color: #ffffff; padding: 6px; margin: 4px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; width: 640px; }
+  .card { background-color: #fff2d9; padding: 10px; border-width: 1px; border-color: #cc9933; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <span class="chip">nav-one</span>
+    <span class="chip">nav-two</span>
+    <span class="chip">nav-three</span>
+  </div>
+  <div class="col">
+    <span class="chip">stacked-a</span>
+    <span class="chip">stacked-b</span>
+  </div>
+  <div class="cards">
+    <div class="card">Card one body text</div>
+    <div class="card">Card two with a bit more text inside it</div>
+    <div class="card">Card three</div>
+    <div class="card">Card four wraps to the second grid row</div>
+    <div class="card">Card five</div>
+  </div>
+</body>
+</html>

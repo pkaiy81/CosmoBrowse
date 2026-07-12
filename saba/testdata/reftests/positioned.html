@@ -1,0 +1,23 @@
+<html>
+<head>
+<style>
+  body { background-color: #ffffff; }
+  .tall { height: 1400px; background-color: #f4f4f4; }
+  .rel { position: relative; left: 40px; top: 10px; width: 200px; background-color: #ddeedd; }
+  .abs { position: absolute; left: 500px; top: 120px; width: 160px; background-color: #eedddd; z-index: 3; }
+  .abs2 { position: absolute; left: 540px; top: 150px; width: 160px; background-color: #ddddee; z-index: 1; }
+  .fixed { position: fixed; right: 20px; bottom: 20px; width: 150px; background-color: #333333; color: #ffffff; padding: 8px; }
+  .banner { position: fixed; left: 0; top: 0; width: 1024px; background-color: #222266; color: #ffffff; padding: 6px; z-index: 10; }
+</style>
+</head>
+<body>
+  <div class="banner">fixed top banner</div>
+  <div class="tall">
+    <div class="rel">relatively offset box</div>
+    <div class="abs">absolute z:3 (on top)</div>
+    <div class="abs2">absolute z:1 (below)</div>
+    <p>flow content under the positioned boxes</p>
+  </div>
+  <div class="fixed">fixed bottom-right</div>
+</body>
+</html>

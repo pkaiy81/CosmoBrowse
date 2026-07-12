@@ -1,0 +1,26 @@
+<html>
+<head>
+<style>
+  body { font-size: 14px; }
+  .narrow { width: 280px; background-color: #eef6ee; padding: 8px; }
+  .big { font-size: 22px; }
+  .small { font-size: 10px; color: #666666; }
+  a { color: #1155cc; }
+</style>
+</head>
+<body>
+  <div class="narrow">
+    This is a long run of English text that must wrap inside a narrow
+    container at word boundaries, with <b>bold inline runs</b>, links like
+    <a href="#">an inline anchor</a>, and <i>italicised words</i> flowing
+    together on shared lines.
+  </div>
+  <div class="narrow big">Larger text wraps earlier than body text does.</div>
+  <div class="narrow">
+    日本語のテキストは文字単位で折り返される。長い行が続いても
+    コンテナからはみ出さないことを確認する。Mixed English and 日本語
+    in one paragraph also works.
+  </div>
+  <div class="narrow small">tiny 10px caption text — supercalifragilisticexpialidocious unbreakablerunhardbreakshere</div>
+</body>
+</html>
