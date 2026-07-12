@@ -1,13 +1,88 @@
 /// Text rasterizer using fontdue with font fallback chain.
 
+use cosmo_engine::renderer::layout::computed_style::FontSize;
+use cosmo_engine::renderer::text::provider::FontMetricsProvider;
 use fontdue::{Font, FontSettings};
 use tiny_skia::Pixmap;
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Font chains are loaded once and shared between the rasterizer and the
+/// layout metrics provider so both measure and draw with the same glyphs.
+fn shared_font_chains() -> &'static (Arc<Vec<Font>>, Arc<Vec<Font>>) {
+    static CHAINS: OnceLock<(Arc<Vec<Font>>, Arc<Vec<Font>>)> = OnceLock::new();
+    CHAINS.get_or_init(|| (Arc::new(load_font_chain()), Arc::new(load_bold_font_chain())))
+}
+
+/// Layout-side metrics from the same fontdue fonts the painter draws with.
+/// Advances are rounded UP so layout never reserves less than is drawn.
+pub struct FontdueMetricsProvider {
+    fonts: Arc<Vec<Font>>,
+    bold_fonts: Arc<Vec<Font>>,
+    cache: Mutex<HashMap<(char, i64, bool), i64>>,
+}
+
+impl std::fmt::Debug for FontdueMetricsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontdueMetricsProvider").finish()
+    }
+}
+
+impl FontdueMetricsProvider {
+    pub fn new() -> Self {
+        let (fonts, bold_fonts) = shared_font_chains().clone();
+        Self {
+            fonts,
+            bold_fonts,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl FontMetricsProvider for FontdueMetricsProvider {
+    fn char_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
+        let px = font_size.px();
+        let key = (c, px, bold);
+        if let Some(v) = self.cache.lock().unwrap().get(&key) {
+            return *v;
+        }
+        let primary: &[Font] = if bold && !self.bold_fonts.is_empty() {
+            &self.bold_fonts
+        } else {
+            &self.fonts
+        };
+        let fallback: &[Font] = if bold && !self.bold_fonts.is_empty() {
+            &self.fonts
+        } else {
+            &[]
+        };
+        let mut advance = None;
+        for font in primary.iter().chain(fallback.iter()) {
+            if font.lookup_glyph_index(c) == 0 && c != '\0' {
+                continue;
+            }
+            let m = font.metrics(c, px as f32);
+            if m.advance_width > 0.0 || c.is_whitespace() {
+                advance = Some(m.advance_width);
+                break;
+            }
+        }
+        let advance = advance.unwrap_or_else(|| {
+            primary
+                .first()
+                .map(|f| f.metrics(c, px as f32).advance_width)
+                .unwrap_or(px as f32 / 2.0)
+        });
+        let v = (advance.ceil() as i64).max(1);
+        self.cache.lock().unwrap().insert(key, v);
+        v
+    }
+}
 
 pub struct TextRenderer {
-    fonts: Vec<Font>,
-    bold_fonts: Vec<Font>,
+    fonts: Arc<Vec<Font>>,
+    bold_fonts: Arc<Vec<Font>>,
     glyph_cache: HashMap<(char, u32, bool), GlyphBitmap>,
 }
 
@@ -22,8 +97,7 @@ struct GlyphBitmap {
 
 impl TextRenderer {
     pub fn new() -> Self {
-        let fonts = load_font_chain();
-        let bold_fonts = load_bold_font_chain();
+        let (fonts, bold_fonts) = shared_font_chains().clone();
         Self {
             fonts,
             bold_fonts,

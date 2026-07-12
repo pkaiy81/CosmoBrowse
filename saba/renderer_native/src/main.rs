@@ -827,6 +827,15 @@ fn main() {
 }
 
 fn real_main() {
+    // Layout must measure with the same fonts the painter draws with.
+    // COSMO_LEGACY_METRICS=1 keeps the engine's built-in advance tables
+    // (useful for A/B-ing layout diffs against the old estimates).
+    if std::env::var("COSMO_LEGACY_METRICS").ok().as_deref() != Some("1") {
+        let _ = cosmo_engine::renderer::text::provider::set_font_metrics_provider(Box::new(
+            text_render::FontdueMetricsProvider::new(),
+        ));
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     // --screenshot <url> [out.png] [width]
