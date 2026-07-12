@@ -476,6 +476,13 @@ impl HtmlParser {
                                 token = self.t.next();
                                 continue;
                             }
+                            // Anything else: close the head and reprocess in
+                            // AfterHead — stray text before <body> belongs to
+                            // the body, not on the floor (it used to be
+                            // silently dropped here).
+                            self.pop_until(ElementKind::Head);
+                            self.mode = InsertionMode::AfterHead;
+                            continue;
                         }
                         Some(HtmlToken::StartTag {
                             ref tag,

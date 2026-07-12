@@ -326,7 +326,11 @@ impl Iterator for HtmlTokenizer {
                         continue;
                     }
 
-                    if self.is_eof() {
+                    // EOF only when the consume ran PAST the end (pos is
+                    // already incremented, so pos == len means `c` is the
+                    // real final character — it must still be emitted, not
+                    // swallowed).
+                    if self.pos > self.input.len() {
                         return Some(HtmlToken::Eof);
                     }
 
