@@ -32,17 +32,8 @@ impl LayoutObject {
             let first_value = declaration.first_value();
             match declaration.property.as_str() {
                 "background-color" | "background" => {
-                    match first_value {
-                        Some(ComponentValue::Ident(value)) => {
-                            let color = Color::from_name(value).unwrap_or_else(|_| Color::white());
-                            self.style.set_background_color(color);
-                        }
-                        Some(ComponentValue::HashToken(color_code)) => {
-                            let color =
-                                Color::from_code(color_code).unwrap_or_else(|_| Color::white());
-                            self.style.set_background_color(color);
-                        }
-                        _ => {}
+                    if let Some(color) = parse_color_value(&declaration.value) {
+                        self.style.set_background_color(color);
                     }
                     // The background shorthand may also carry an image layer,
                     // a position, and a repeat keyword.
@@ -114,17 +105,11 @@ impl LayoutObject {
                     }
                     _ => {}
                 },
-                "color" => match first_value {
-                    Some(ComponentValue::Ident(value)) => {
-                        let color = Color::from_name(value).unwrap_or_else(|_| Color::black());
+                "color" => {
+                    if let Some(color) = parse_color_value(&declaration.value) {
                         self.style.set_color(color);
                     }
-                    Some(ComponentValue::HashToken(color_code)) => {
-                        let color = Color::from_code(color_code).unwrap_or_else(|_| Color::black());
-                        self.style.set_color(color);
-                    }
-                    _ => {}
-                },
+                }
                 "display" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         let display_type =
@@ -313,32 +298,16 @@ impl LayoutObject {
                     // The `border` shorthand also carries a color (and style):
                     // pull a color token so the stroke is visible.
                     if declaration.property == "border" {
-                        for v in &declaration.value {
-                            let c = match v {
-                                ComponentValue::HashToken(code) => Color::from_code(code).ok(),
-                                ComponentValue::Ident(name) => Color::from_name(name).ok(),
-                                _ => None,
-                            };
-                            if let Some(color) = c {
-                                self.style.set_border_color(color);
-                                break;
-                            }
+                        if let Some(color) = parse_color_value(&declaration.value) {
+                            self.style.set_border_color(color);
                         }
                     }
                 }
-                "border-color" => match first_value {
-                    Some(ComponentValue::HashToken(code)) => {
-                        if let Ok(c) = Color::from_code(code) {
-                            self.style.set_border_color(c);
-                        }
+                "border-color" => {
+                    if let Some(c) = parse_color_value(&declaration.value) {
+                        self.style.set_border_color(c);
                     }
-                    Some(ComponentValue::Ident(name)) => {
-                        if let Ok(c) = Color::from_name(name) {
-                            self.style.set_border_color(c);
-                        }
-                    }
-                    _ => {}
-                },
+                }
                 "border-radius" => {
                     if let Some(px) = first_value
                         .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))

@@ -1125,6 +1125,18 @@ pub struct Color {
 }
 
 impl Color {
+    /// Build a color from resolved channel values (rgb()/hsl() functions).
+    /// Alpha 255 yields a 6-digit code; anything else an 8-digit one, which
+    /// the platform painter's hex parser understands.
+    pub fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        let code = if a == 255 {
+            format!("#{:02x}{:02x}{:02x}", r, g, b)
+        } else {
+            format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a)
+        };
+        Self { name: None, code }
+    }
+
     pub fn from_name(name: &str) -> Result<Self, Error> {
         let code = match name {
             "black" => "#000000".to_string(),

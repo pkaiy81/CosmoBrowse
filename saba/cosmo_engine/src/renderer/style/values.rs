@@ -3,6 +3,7 @@
 //! strings into typed values; they do no layout.
 
 use crate::renderer::css::cssom::ComponentValue;
+use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
 
@@ -581,5 +582,228 @@ pub(crate) fn parse_dimension_pct_attr(value: Option<String>, avail: Option<i64>
         Some(((avail as f64) * pct / 100.0) as i64)
     } else {
         parse_dimension_attr(Some(value))
+    }
+}
+
+/// The full set of CSS named colors (Color Module Level 4 / X11 names) as
+/// 6-digit hex codes, plus a `transparent` special case handled by callers.
+pub(crate) fn named_color_code(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "aliceblue" => "#f0f8ff", "antiquewhite" => "#faebd7", "aqua" => "#00ffff",
+        "aquamarine" => "#7fffd4", "azure" => "#f0ffff", "beige" => "#f5f5dc",
+        "bisque" => "#ffe4c4", "black" => "#000000", "blanchedalmond" => "#ffebcd",
+        "blue" => "#0000ff", "blueviolet" => "#8a2be2", "brown" => "#a52a2a",
+        "burlywood" => "#deb887", "cadetblue" => "#5f9ea0", "chartreuse" => "#7fff00",
+        "chocolate" => "#d2691e", "coral" => "#ff7f50", "cornflowerblue" => "#6495ed",
+        "cornsilk" => "#fff8dc", "crimson" => "#dc143c", "cyan" => "#00ffff",
+        "darkblue" => "#00008b", "darkcyan" => "#008b8b", "darkgoldenrod" => "#b8860b",
+        "darkgray" => "#a9a9a9", "darkgreen" => "#006400", "darkgrey" => "#a9a9a9",
+        "darkkhaki" => "#bdb76b", "darkmagenta" => "#8b008b", "darkolivegreen" => "#556b2f",
+        "darkorange" => "#ff8c00", "darkorchid" => "#9932cc", "darkred" => "#8b0000",
+        "darksalmon" => "#e9967a", "darkseagreen" => "#8fbc8f", "darkslateblue" => "#483d8b",
+        "darkslategray" => "#2f4f4f", "darkslategrey" => "#2f4f4f", "darkturquoise" => "#00ced1",
+        "darkviolet" => "#9400d3", "deeppink" => "#ff1493", "deepskyblue" => "#00bfff",
+        "dimgray" => "#696969", "dimgrey" => "#696969", "dodgerblue" => "#1e90ff",
+        "firebrick" => "#b22222", "floralwhite" => "#fffaf0", "forestgreen" => "#228b22",
+        "fuchsia" => "#ff00ff", "gainsboro" => "#dcdcdc", "ghostwhite" => "#f8f8ff",
+        "gold" => "#ffd700", "goldenrod" => "#daa520", "gray" => "#808080",
+        "green" => "#008000", "greenyellow" => "#adff2f", "grey" => "#808080",
+        "honeydew" => "#f0fff0", "hotpink" => "#ff69b4", "indianred" => "#cd5c5c",
+        "indigo" => "#4b0082", "ivory" => "#fffff0", "khaki" => "#f0e68c",
+        "lavender" => "#e6e6fa", "lavenderblush" => "#fff0f5", "lawngreen" => "#7cfc00",
+        "lemonchiffon" => "#fffacd", "lightblue" => "#add8e6", "lightcoral" => "#f08080",
+        "lightcyan" => "#e0ffff", "lightgoldenrodyellow" => "#fafad2", "lightgray" => "#d3d3d3",
+        "lightgreen" => "#90ee90", "lightgrey" => "#d3d3d3", "lightpink" => "#ffb6c1",
+        "lightsalmon" => "#ffa07a", "lightseagreen" => "#20b2aa", "lightskyblue" => "#87cefa",
+        "lightslategray" => "#778899", "lightslategrey" => "#778899", "lightsteelblue" => "#b0c4de",
+        "lightyellow" => "#ffffe0", "lime" => "#00ff00", "limegreen" => "#32cd32",
+        "linen" => "#faf0e6", "magenta" => "#ff00ff", "maroon" => "#800000",
+        "mediumaquamarine" => "#66cdaa", "mediumblue" => "#0000cd", "mediumorchid" => "#ba55d3",
+        "mediumpurple" => "#9370db", "mediumseagreen" => "#3cb371", "mediumslateblue" => "#7b68ee",
+        "mediumspringgreen" => "#00fa9a", "mediumturquoise" => "#48d1cc", "mediumvioletred" => "#c71585",
+        "midnightblue" => "#191970", "mintcream" => "#f5fffa", "mistyrose" => "#ffe4e1",
+        "moccasin" => "#ffe4b5", "navajowhite" => "#ffdead", "navy" => "#000080",
+        "oldlace" => "#fdf5e6", "olive" => "#808000", "olivedrab" => "#6b8e23",
+        "orange" => "#ffa500", "orangered" => "#ff4500", "orchid" => "#da70d6",
+        "palegoldenrod" => "#eee8aa", "palegreen" => "#98fb98", "paleturquoise" => "#afeeee",
+        "palevioletred" => "#db7093", "papayawhip" => "#ffefd5", "peachpuff" => "#ffdab9",
+        "peru" => "#cd853f", "pink" => "#ffc0cb", "plum" => "#dda0dd",
+        "powderblue" => "#b0e0e6", "purple" => "#800080", "rebeccapurple" => "#663399",
+        "red" => "#ff0000", "rosybrown" => "#bc8f8f", "royalblue" => "#4169e1",
+        "saddlebrown" => "#8b4513", "salmon" => "#fa8072", "sandybrown" => "#f4a460",
+        "seagreen" => "#2e8b57", "seashell" => "#fff5ee", "sienna" => "#a0522d",
+        "silver" => "#c0c0c0", "skyblue" => "#87ceeb", "slateblue" => "#6a5acd",
+        "slategray" => "#708090", "slategrey" => "#708090", "snow" => "#fffafa",
+        "springgreen" => "#00ff7f", "steelblue" => "#4682b4", "tan" => "#d2b48c",
+        "teal" => "#008080", "thistle" => "#d8bfd8", "tomato" => "#ff6347",
+        "turquoise" => "#40e0d0", "violet" => "#ee82ee", "wheat" => "#f5deb3",
+        "white" => "#ffffff", "whitesmoke" => "#f5f5f5", "yellow" => "#ffff00",
+        "yellowgreen" => "#9acd32",
+        _ => return None,
+    })
+}
+
+/// Find the first color in a declaration value: hex, named color, or an
+/// rgb()/rgba()/hsl()/hsla() function. Non-color tokens (url(...), keywords
+/// like `no-repeat`, `inherit`) are skipped; returns None when nothing
+/// color-shaped is present.
+pub(crate) fn parse_color_value(values: &[ComponentValue]) -> Option<Color> {
+    let mut i = 0;
+    while i < values.len() {
+        match &values[i] {
+            ComponentValue::HashToken(code) => {
+                if let Ok(c) = Color::from_code(code) {
+                    return Some(c);
+                }
+            }
+            ComponentValue::Ident(name) => {
+                let lower = name.to_ascii_lowercase();
+                let is_fn = matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
+                if is_fn && matches!(lower.as_str(), "rgb" | "rgba" | "hsl" | "hsla") {
+                    let mut nums: Vec<(f64, bool)> = Vec::new();
+                    let mut j = i + 2;
+                    while j < values.len() {
+                        match &values[j] {
+                            ComponentValue::CloseParenthesis => break,
+                            ComponentValue::Number(n) => nums.push((*n, false)),
+                            ComponentValue::Dimension(n, u) if u == "%" => nums.push((*n, true)),
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if let Some(c) = color_from_function(&lower, &nums) {
+                        return Some(c);
+                    }
+                    i = j;
+                } else if is_fn {
+                    // Skip over an unrelated function (url(...), var(...)).
+                    let mut j = i + 2;
+                    while j < values.len()
+                        && !matches!(values[j], ComponentValue::CloseParenthesis)
+                    {
+                        j += 1;
+                    }
+                    i = j;
+                } else if lower == "transparent" {
+                    return Color::from_name("transparent").ok();
+                } else if let Some(code) = named_color_code(&lower) {
+                    return Color::from_code(code).ok();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn color_from_function(name: &str, nums: &[(f64, bool)]) -> Option<Color> {
+    let channel = |v: f64, pct: bool| -> u8 {
+        let n = if pct { v * 255.0 / 100.0 } else { v };
+        n.round().clamp(0.0, 255.0) as u8
+    };
+    let alpha = |v: f64, pct: bool| -> u8 {
+        let n = if pct { v / 100.0 } else { v };
+        (n * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    match name {
+        "rgb" | "rgba" => {
+            if nums.len() < 3 {
+                return None;
+            }
+            let (r, g, b) = (
+                channel(nums[0].0, nums[0].1),
+                channel(nums[1].0, nums[1].1),
+                channel(nums[2].0, nums[2].1),
+            );
+            let a = nums.get(3).map(|&(v, p)| alpha(v, p)).unwrap_or(255);
+            Some(Color::from_rgba(r, g, b, a))
+        }
+        "hsl" | "hsla" => {
+            if nums.len() < 3 {
+                return None;
+            }
+            let h = nums[0].0.rem_euclid(360.0);
+            let s = (nums[1].0 / 100.0).clamp(0.0, 1.0);
+            let l = (nums[2].0 / 100.0).clamp(0.0, 1.0);
+            let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+            let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+            let m = l - c / 2.0;
+            let (r1, g1, b1) = match h as u32 {
+                0..=59 => (c, x, 0.0),
+                60..=119 => (x, c, 0.0),
+                120..=179 => (0.0, c, x),
+                180..=239 => (0.0, x, c),
+                240..=299 => (x, 0.0, c),
+                _ => (c, 0.0, x),
+            };
+            let to8 = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+            let a = nums.get(3).map(|&(v, p)| alpha(v, p)).unwrap_or(255);
+            Some(Color::from_rgba(to8(r1), to8(g1), to8(b1), a))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::css::token::CssTokenizer;
+
+    fn vals(s: &str) -> Vec<ComponentValue> {
+        let mut t = CssTokenizer::new(s.to_string());
+        let mut out = Vec::new();
+        while let Some(tok) = t.next() {
+            out.push(tok);
+        }
+        out
+    }
+
+    #[test]
+    fn parses_rgb_and_rgba_functions() {
+        assert_eq!(
+            parse_color_value(&vals("rgb(255, 0, 0)")).unwrap().code(),
+            "#ff0000"
+        );
+        assert_eq!(
+            parse_color_value(&vals("rgba(0, 128, 255, 0.5)")).unwrap().code(),
+            "#0080ff80"
+        );
+        assert_eq!(
+            parse_color_value(&vals("rgb(100%, 0%, 50%)")).unwrap().code(),
+            "#ff0080"
+        );
+    }
+
+    #[test]
+    fn parses_hsl_function() {
+        assert_eq!(
+            parse_color_value(&vals("hsl(0, 100%, 50%)")).unwrap().code(),
+            "#ff0000"
+        );
+        assert_eq!(
+            parse_color_value(&vals("hsl(120, 100%, 25%)")).unwrap().code(),
+            "#008000"
+        );
+    }
+
+    #[test]
+    fn parses_extended_named_colors_and_skips_keywords() {
+        assert_eq!(
+            parse_color_value(&vals("rebeccapurple")).unwrap().code(),
+            "#663399"
+        );
+        assert_eq!(
+            parse_color_value(&vals("dimgray")).unwrap().code(),
+            "#696969"
+        );
+        // Keywords and unrelated functions are not colors.
+        assert!(parse_color_value(&vals("inherit")).is_none());
+        assert!(parse_color_value(&vals("url(bg.png) no-repeat")).is_none());
+        // ...but a color after an unrelated function is still found.
+        assert_eq!(
+            parse_color_value(&vals("url(bg.png) crimson")).unwrap().code(),
+            "#dc143c"
+        );
     }
 }
