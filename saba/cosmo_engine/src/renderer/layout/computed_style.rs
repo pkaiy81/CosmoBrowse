@@ -85,6 +85,13 @@ pub struct ComputedStyle {
     bold: Option<bool>,
     visibility_hidden: Option<bool>,
     box_sizing_border_box: Option<bool>,
+    flex_grow: Option<f64>,
+    flex_shrink: Option<f64>,
+    /// `flex-basis` in px; None = auto (use width, else content size).
+    flex_basis: Option<f64>,
+    justify_content: Option<JustifyContent>,
+    align_items: Option<AlignItems>,
+    align_self: Option<AlignItems>,
     min_width: Option<SizeLimit>,
     max_width: Option<SizeLimit>,
     min_height: Option<SizeLimit>,
@@ -237,6 +244,12 @@ impl ComputedStyle {
             bold: None,
             visibility_hidden: None,
             box_sizing_border_box: None,
+            flex_grow: None,
+            flex_shrink: None,
+            flex_basis: None,
+            justify_content: None,
+            align_items: None,
+            align_self: None,
             min_width: None,
             max_width: None,
             min_height: None,
@@ -912,6 +925,44 @@ impl ComputedStyle {
         self.bold = Some(bold);
     }
 
+    pub fn flex_grow(&self) -> f64 {
+        self.flex_grow.unwrap_or(0.0)
+    }
+    pub fn set_flex_grow(&mut self, v: f64) {
+        self.flex_grow = Some(v.max(0.0));
+    }
+    pub fn flex_shrink(&self) -> f64 {
+        self.flex_shrink.unwrap_or(1.0)
+    }
+    pub fn set_flex_shrink(&mut self, v: f64) {
+        self.flex_shrink = Some(v.max(0.0));
+    }
+    pub fn flex_basis(&self) -> Option<f64> {
+        self.flex_basis
+    }
+    pub fn set_flex_basis(&mut self, v: Option<f64>) {
+        self.flex_basis = v;
+    }
+    pub fn justify_content(&self) -> JustifyContent {
+        self.justify_content.unwrap_or(JustifyContent::FlexStart)
+    }
+    pub fn set_justify_content(&mut self, v: JustifyContent) {
+        self.justify_content = Some(v);
+    }
+    pub fn align_items(&self) -> AlignItems {
+        self.align_items.unwrap_or(AlignItems::Stretch)
+    }
+    pub fn set_align_items(&mut self, v: AlignItems) {
+        self.align_items = Some(v);
+    }
+    /// Effective cross-axis alignment for an item inside `container_align`.
+    pub fn align_self_or(&self, container_align: AlignItems) -> AlignItems {
+        self.align_self.unwrap_or(container_align)
+    }
+    pub fn set_align_self(&mut self, v: AlignItems) {
+        self.align_self = Some(v);
+    }
+
     /// `box-sizing: border-box` — explicit width/height include padding and
     /// border. Not inherited (pages opt in with `* { box-sizing: border-box }`,
     /// which the universal selector applies per element).
@@ -1214,6 +1265,25 @@ impl SizeLimit {
             SizeLimit::Ratio(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustifyContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignItems {
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd,
+    Baseline,
 }
 
 #[derive(Debug, Clone, PartialEq)]

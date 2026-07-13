@@ -602,6 +602,118 @@ impl LayoutObject {
         }
     }
 
+    /// Resolve this row-flex item's CONTENT width by running the flex line
+    /// distribution over all the container's items (each item independently
+    /// computes the same distribution — the table-cell pattern).
+    fn flex_row_main_size(&self, container_content_width: i64) -> i64 {
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return 0,
+        };
+        let gap = parent.borrow().style().column_gap();
+
+        struct Item {
+            base_content: f64,
+            box_overhead: f64, // padding+border+margins
+            min_content: f64,
+            grow: f64,
+            shrink: f64,
+            is_self: bool,
+        }
+        let mut items: Vec<Item> = Vec::new();
+        let build = |st: &ComputedStyle,
+                     max_content: f64,
+                     min_content: f64,
+                     is_self: bool|
+         -> Item {
+            let m = compute_box_model_metrics(st);
+            let base_content = if let Some(basis) = st.flex_basis() {
+                basis
+            } else if let Some(ratio) = st.width_ratio() {
+                (container_content_width as f64 * ratio).max(0.0)
+            } else if st.width() > 0.0 {
+                st.width()
+            } else {
+                max_content
+            };
+            Item {
+                base_content,
+                box_overhead: (m.inner_horizontal() + m.outer_horizontal()) as f64,
+                min_content,
+                grow: st.flex_grow(),
+                shrink: st.flex_shrink(),
+                is_self,
+            }
+        };
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            // compute_size holds `self` mutably borrowed; the failing borrow
+            // in this walk IS self — read our own fields directly.
+            match c.try_borrow() {
+                Ok(b) => {
+                    let next = b.next_sibling();
+                    if !b.is_whitespace_text()
+                        && !matches!(
+                            b.style().position(),
+                            PositionType::Absolute | PositionType::Fixed
+                        )
+                    {
+                        let st = b.style();
+                        let item = build(
+                            &st,
+                            b.max_content_width() as f64,
+                            b.min_content_width_hint() as f64,
+                            false,
+                        );
+                        drop(b);
+                        items.push(item);
+                    }
+                    child = next;
+                }
+                Err(_) => {
+                    let next = self.next_sibling.clone();
+                    items.push(build(
+                        &self.style,
+                        self.max_content_width() as f64,
+                        self.min_content_width_hint() as f64,
+                        true,
+                    ));
+                    child = next;
+                }
+            }
+        }
+        if items.is_empty() {
+            return 0;
+        }
+
+        let total: f64 = items.iter().map(|i| i.base_content + i.box_overhead).sum();
+        let gaps = (gap * (items.len() as i64 - 1)) as f64;
+        let free = container_content_width as f64 - total - gaps;
+
+        let me = items.iter().find(|i| i.is_self);
+        let me = match me {
+            Some(m) => m,
+            None => return 0,
+        };
+        let mut target = me.base_content;
+        if free > 0.0 {
+            let total_grow: f64 = items.iter().map(|i| i.grow).sum();
+            if total_grow > 0.0 {
+                target += free * me.grow / total_grow;
+            }
+        } else if free < 0.0 {
+            let total_scaled: f64 = items
+                .iter()
+                .map(|i| i.shrink * (i.base_content + i.box_overhead))
+                .sum();
+            if total_scaled > 0.0 {
+                target += free * (me.shrink * (me.base_content + me.box_overhead)) / total_scaled;
+            }
+        }
+        // Never shrink below the item's min-content (long unbreakable words).
+        (target.max(me.min_content).max(0.0)) as i64
+    }
+
     fn is_flex_container(&self) -> bool {
         self.style.display() == DisplayType::Flex
     }
@@ -626,7 +738,7 @@ impl LayoutObject {
     /// artifacts of the markup (newlines/indentation between elements) and are
     /// not grid items per CSS Grid §6 (only inter-element whitespace that
     /// collapses away).
-    fn is_whitespace_text(&self) -> bool {
+    pub(crate) fn is_whitespace_text(&self) -> bool {
         match self.node.borrow().kind() {
             NodeKind::Text(ref t) => t.trim().is_empty(),
             _ => false,
@@ -1690,17 +1802,11 @@ impl LayoutObject {
                         self.table_cell_auto_width(available_width)
                     }
                 } else if let Some(FlexDirection::Row) = self.parent_flex_direction() {
-                    // Flex item on a row: shrink-to-fit its content (honoring an
-                    // explicit width) so siblings sit side by side instead of
-                    // each filling the container width like a normal block.
-                    let w = if explicit_width > 0 {
-                        explicit_width
-                    } else if let Some(hw) = html_width {
-                        hw
-                    } else {
-                        self.max_content_width()
-                    };
-                    w.min(available_width).max(0)
+                    // Flex item on a single-line row: resolve the main size by
+                    // distributing the container's free space per
+                    // flex-grow/shrink over the items' base sizes.
+                    // https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths
+                    self.flex_row_main_size(parent_size.width())
                 } else if let Some((tracks, col_gap, _)) = self.parent_grid_info() {
                     // Grid item: the width of its column track; the item's
                     // content box is the track minus its own margins.
@@ -2092,25 +2198,37 @@ impl LayoutObject {
             // Flex item placement (main-axis start packing; no grow/shrink yet).
             match dir {
                 FlexDirection::Row => {
-                    // Lay out to the right of the previous item, aligned to the
-                    // container's top (align-items: flex-start).
+                    // Lay out to the right of the previous item (plus the
+                    // container's column-gap), aligned to the container's top;
+                    // justify-content/align-items adjust in a post pass.
+                    let gap = self
+                        .parent
+                        .upgrade()
+                        .map(|p| p.borrow().style().column_gap())
+                        .unwrap_or(0);
                     if let (Some(size), Some(pos)) =
                         (previous_sibling_size, previous_sibling_point)
                     {
-                        point.set_x(pos.x() + size.width() + metrics.margin.left);
+                        point.set_x(pos.x() + size.width() + gap + metrics.margin.left);
                     } else {
                         point.set_x(parent_point.x() + metrics.margin.left);
                     }
                     point.set_y(parent_point.y() + metrics.margin.top);
                 }
                 FlexDirection::Column => {
-                    // Stack vertically like a block formatting context.
+                    // Stack vertically (plus row-gap) like a block context.
+                    let gap = self
+                        .parent
+                        .upgrade()
+                        .map(|p| p.borrow().style().row_gap())
+                        .unwrap_or(0);
                     if let (Some(size), Some(pos)) =
                         (previous_sibling_size, previous_sibling_point)
                     {
                         point.set_y(
                             pos.y()
                                 + size.height()
+                                + gap
                                 + metrics.margin.top
                                 + metrics.margin.bottom,
                         );

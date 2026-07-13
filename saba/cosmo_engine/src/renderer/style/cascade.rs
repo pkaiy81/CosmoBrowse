@@ -117,6 +117,110 @@ impl LayoutObject {
                         self.style.set_display(display_type)
                     }
                 }
+                "flex-grow" => {
+                    if let Some(ComponentValue::Number(v)) = first_value {
+                        self.style.set_flex_grow(*v);
+                    }
+                }
+                "flex-shrink" => {
+                    if let Some(ComponentValue::Number(v)) = first_value {
+                        self.style.set_flex_shrink(*v);
+                    }
+                }
+                "flex-basis" => match first_value {
+                    Some(ComponentValue::Ident(v)) if v == "auto" || v == "content" => {
+                        self.style.set_flex_basis(None);
+                    }
+                    Some(ComponentValue::Number(v)) if *v == 0.0 => {
+                        self.style.set_flex_basis(Some(0.0));
+                    }
+                    Some(ComponentValue::Dimension(v, unit)) if unit != "%" => {
+                        if let Some(px) =
+                            length_to_px(*v, unit, self.style.font_size_or_default())
+                        {
+                            self.style.set_flex_basis(Some(px));
+                        }
+                    }
+                    _ => {}
+                },
+                // flex shorthand: none | auto | <grow> [<shrink>] [<basis>]
+                // https://www.w3.org/TR/css-flexbox-1/#flex-property
+                "flex" => {
+                    let non_ws: Vec<&ComponentValue> = declaration
+                        .value
+                        .iter()
+                        .filter(|v| !matches!(v, ComponentValue::Whitespace))
+                        .collect();
+                    match non_ws.as_slice() {
+                        [ComponentValue::Ident(v)] if v == "none" => {
+                            self.style.set_flex_grow(0.0);
+                            self.style.set_flex_shrink(0.0);
+                            self.style.set_flex_basis(None);
+                        }
+                        [ComponentValue::Ident(v)] if v == "auto" => {
+                            self.style.set_flex_grow(1.0);
+                            self.style.set_flex_shrink(1.0);
+                            self.style.set_flex_basis(None);
+                        }
+                        _ => {
+                            let mut numbers = non_ws.iter().filter_map(|v| match v {
+                                ComponentValue::Number(n) => Some(*n),
+                                _ => None,
+                            });
+                            if let Some(grow) = numbers.next() {
+                                self.style.set_flex_grow(grow);
+                                self.style.set_flex_shrink(numbers.next().unwrap_or(1.0));
+                                // A unitless single value implies flex-basis 0.
+                                self.style.set_flex_basis(Some(0.0));
+                            }
+                            if let Some(px) = non_ws.iter().find_map(|v| match v {
+                                ComponentValue::Dimension(n, unit) if unit != "%" => {
+                                    length_to_px(*n, unit, self.style.font_size_or_default())
+                                }
+                                _ => None,
+                            }) {
+                                self.style.set_flex_basis(Some(px));
+                            }
+                        }
+                    }
+                }
+                "justify-content" => {
+                    if let Some(ComponentValue::Ident(v)) = first_value {
+                        let jc = match v.as_str() {
+                            "flex-start" | "start" | "left" | "normal" => {
+                                Some(JustifyContent::FlexStart)
+                            }
+                            "flex-end" | "end" | "right" => Some(JustifyContent::FlexEnd),
+                            "center" => Some(JustifyContent::Center),
+                            "space-between" => Some(JustifyContent::SpaceBetween),
+                            "space-around" => Some(JustifyContent::SpaceAround),
+                            "space-evenly" => Some(JustifyContent::SpaceEvenly),
+                            _ => None,
+                        };
+                        if let Some(jc) = jc {
+                            self.style.set_justify_content(jc);
+                        }
+                    }
+                }
+                "align-items" | "align-self" => {
+                    if let Some(ComponentValue::Ident(v)) = first_value {
+                        let ai = match v.as_str() {
+                            "stretch" | "normal" => Some(AlignItems::Stretch),
+                            "flex-start" | "start" | "self-start" => Some(AlignItems::FlexStart),
+                            "center" => Some(AlignItems::Center),
+                            "flex-end" | "end" | "self-end" => Some(AlignItems::FlexEnd),
+                            "baseline" => Some(AlignItems::Baseline),
+                            _ => None,
+                        };
+                        if let Some(ai) = ai {
+                            if declaration.property == "align-items" {
+                                self.style.set_align_items(ai);
+                            } else {
+                                self.style.set_align_self(ai);
+                            }
+                        }
+                    }
+                }
                 "flex-direction" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         self.style.set_flex_direction(FlexDirection::from_str(value));

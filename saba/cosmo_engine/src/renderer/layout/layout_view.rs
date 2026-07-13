@@ -662,6 +662,7 @@ impl LayoutView {
             None,
             None,
         );
+        Self::layout_flex_alignment(&self.root);
         Self::align_inline_baselines(&self.root);
         self.reposition_fixed_far_edges(&self.root.clone());
         Self::apply_transforms(&self.root);
@@ -872,6 +873,137 @@ impl LayoutView {
     /// size — the translate(-50%,-50%) centering idiom). A uniform scale
     /// factor is stamped as a scale context (origin = the box's top-left
     /// after translation) for the mappers to scale command geometry.
+    /// Post pass: justify-content / align-items for single-line row flex
+    /// containers. Items were packed at flex-start by compute_position;
+    /// this pass translates each item subtree to its final main position and
+    /// aligns/stretches on the cross axis.
+    fn layout_flex_alignment(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        use crate::renderer::layout::computed_style::{
+            AlignItems, DisplayType, FlexDirection, JustifyContent, PositionType,
+        };
+        let n = match node {
+            Some(n) => n,
+            None => return,
+        };
+        let is_row_flex = {
+            let b = n.borrow();
+            b.style().display() == DisplayType::Flex
+                && b.style().flex_direction() == FlexDirection::Row
+        };
+        if is_row_flex {
+            let (c_point, c_size, c_metrics, justify, align) = {
+                let b = n.borrow();
+                (
+                    b.point(),
+                    b.size(),
+                    compute_box_model_metrics(&b.style()),
+                    b.style().justify_content(),
+                    b.style().align_items(),
+                )
+            };
+            let content_w = c_size.width() - c_metrics.inner_horizontal();
+            let content_h = c_size.height() - c_metrics.inner_vertical();
+
+            // Collect in-flow element items.
+            let mut items: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+            let mut child = n.borrow().first_child();
+            while let Some(c) = child {
+                let next = c.borrow().next_sibling();
+                {
+                    let b = c.borrow();
+                    if !b.is_whitespace_text()
+                        && !matches!(
+                            b.style().position(),
+                            PositionType::Absolute | PositionType::Fixed
+                        )
+                    {
+                        drop(b);
+                        items.push(c.clone());
+                    }
+                }
+                child = next;
+            }
+
+            if !items.is_empty() {
+                // Main axis: leftover after the flex-start packing.
+                let last = items.last().unwrap();
+                let (last_x, last_w) = {
+                    let b = last.borrow();
+                    (b.point().x(), b.size().width())
+                };
+                let first_x = items[0].borrow().point().x();
+                let used = last_x + last_w - first_x;
+                let leftover = (content_w - used).max(0);
+                let count = items.len() as i64;
+                let (lead, between) = match justify {
+                    JustifyContent::FlexStart => (0, 0),
+                    JustifyContent::FlexEnd => (leftover, 0),
+                    JustifyContent::Center => (leftover / 2, 0),
+                    JustifyContent::SpaceBetween if count > 1 => (0, leftover / (count - 1)),
+                    JustifyContent::SpaceBetween => (0, 0),
+                    JustifyContent::SpaceAround => {
+                        let unit = leftover / count;
+                        (unit / 2, unit)
+                    }
+                    JustifyContent::SpaceEvenly => {
+                        let unit = leftover / (count + 1);
+                        (unit, unit)
+                    }
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let dx = lead + between * i as i64;
+                    if dx != 0 {
+                        Self::translate_subtree(item, dx, 0);
+                    }
+                }
+
+                // Cross axis.
+                let c_top = c_point.y();
+                for item in &items {
+                    let (item_h, item_y, align_self, has_explicit_h) = {
+                        let b = item.borrow();
+                        (
+                            b.size().height(),
+                            b.point().y(),
+                            b.style().align_self_or(align),
+                            b.style().height() > 0.0 || b.style().height_ratio().is_some(),
+                        )
+                    };
+                    match align_self {
+                        AlignItems::Stretch => {
+                            if !has_explicit_h && content_h > item_h {
+                                let mut b = item.borrow_mut();
+                                let mut sz = b.size();
+                                sz.set_height(content_h);
+                                b.size = sz;
+                            }
+                        }
+                        AlignItems::Center => {
+                            let dy = c_top + (content_h - item_h) / 2 - item_y;
+                            if dy != 0 {
+                                Self::translate_subtree(item, 0, dy);
+                            }
+                        }
+                        AlignItems::FlexEnd => {
+                            let dy = c_top + content_h - item_h - item_y;
+                            if dy != 0 {
+                                Self::translate_subtree(item, 0, dy);
+                            }
+                        }
+                        AlignItems::FlexStart | AlignItems::Baseline => {}
+                    }
+                }
+            }
+        }
+
+        let (first, next) = {
+            let b = n.borrow();
+            (b.first_child(), b.next_sibling())
+        };
+        Self::layout_flex_alignment(&first);
+        Self::layout_flex_alignment(&next);
+    }
+
     fn apply_transforms(node: &Option<Rc<RefCell<LayoutObject>>>) {
         if let Some(n) = node {
             let op = n.borrow().style().transform_op();
@@ -1177,6 +1309,71 @@ mod tests {
     fn test_empty() {
         let layout_view = create_layout_view("".to_string(), 600);
         assert_eq!(None, layout_view.root());
+    }
+
+    #[test]
+    fn test_flex_grow_distributes_free_space() {
+        let html = r#"<html><head><style>
+            .row { display: flex; flex-direction: row; width: 600px; }
+            .a { flex: 1; height: 10px; background-color: red; }
+            .b { flex: 2; height: 10px; background-color: blue; }
+            .c { width: 120px; height: 10px; background-color: green; }
+        </style></head><body>
+            <div class="row"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let w = |code: &str| -> i64 {
+            view.paint()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Rect { layout_size, style, .. }
+                        if style.background_color().code() == code =>
+                    {
+                        Some(layout_size.width())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(-1)
+        };
+        // 600 - 120 fixed = 480 free over grow 1:2 -> 160 / 320.
+        assert_eq!(w("#ff0000"), 160, "flex:1 item");
+        assert_eq!(w("#0000ff"), 320, "flex:2 item");
+        assert_eq!(w("#008000"), 120, "fixed item");
+    }
+
+    #[test]
+    fn test_flex_justify_and_align() {
+        let html = r#"<html><head><style>
+            .row { display: flex; flex-direction: row; width: 600px; height: 100px;
+                   justify-content: space-between; align-items: center; }
+            .i { width: 100px; height: 20px; background-color: red; }
+            .j { width: 100px; height: 20px; background-color: blue; }
+        </style></head><body>
+            <div class="row"><div class="i"></div><div class="j"></div></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let pos = |code: &str| -> (i64, i64) {
+            view.paint()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Rect { layout_point, layout_size, style, .. }
+                        if style.background_color().code() == code
+                            && layout_size.width() == 100 =>
+                    {
+                        Some((layout_point.x(), layout_point.y()))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (ax, ay) = pos("#ff0000");
+        let (bx, by) = pos("#0000ff");
+        assert_eq!(ax, 0, "space-between: first at start");
+        assert_eq!(bx, 500, "space-between: last flush right (600-100)");
+        assert_eq!(ay, 40, "center: (100-20)/2");
+        assert_eq!(by, 40);
     }
 
     #[test]

@@ -1,0 +1,41 @@
+<html>
+<head>
+<style>
+  .demo { width: 600px; background-color: #eef2f7; margin: 8px; }
+  .row { display: flex; flex-direction: row; }
+  .i { height: 24px; background-color: #3366cc; color: #ffffff; padding: 4px; }
+  .g1 { flex: 1; background-color: #cc4444; }
+  .g2 { flex: 2; background-color: #44aa66; }
+  .fixed { width: 90px; }
+  .sb { justify-content: space-between; }
+  .ce { justify-content: center; align-items: center; height: 70px; }
+  .gap { column-gap: 12px; }
+  .tall { height: 60px; align-items: stretch; }
+  .selfend { align-self: flex-end; }
+</style>
+</head>
+<body>
+  <div class="demo row">
+    <div class="i g1">grow 1</div>
+    <div class="i g2">grow 2</div>
+    <div class="i fixed">fixed</div>
+  </div>
+  <div class="demo row sb">
+    <div class="i fixed">left</div>
+    <div class="i fixed">mid</div>
+    <div class="i fixed">right</div>
+  </div>
+  <div class="demo row ce">
+    <div class="i fixed">centered</div>
+  </div>
+  <div class="demo row gap">
+    <div class="i fixed">gap</div>
+    <div class="i fixed">of</div>
+    <div class="i fixed">12px</div>
+  </div>
+  <div class="demo row tall">
+    <div class="i fixed">stretch</div>
+    <div class="i fixed selfend">self-end</div>
+  </div>
+</body>
+</html>
