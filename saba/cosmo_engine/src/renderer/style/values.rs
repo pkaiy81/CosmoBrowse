@@ -7,12 +7,41 @@ use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
 
+use std::cell::Cell;
+
+thread_local! {
+    /// Viewport (width, height) for resolving vw/vh units during styling.
+    /// Set by LayoutView before the style/layout pass; the engine is
+    /// single-threaded per page so a thread-local is sufficient (same
+    /// transitional pattern as the font-metrics provider).
+    static STYLING_VIEWPORT: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
+}
+
+pub(crate) fn set_styling_viewport(width: i64, height: i64) {
+    STYLING_VIEWPORT.with(|v| v.set((width, height)));
+}
+
 pub(crate) fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64> {
     match unit {
         "px" => Some(value),
         "em" => Some(value * base_font_size.px() as f64),
         "rem" => Some(value * FontSize::Medium.px() as f64),
-        "vh" | "vw" => Some(value),
+        // Viewport-relative units resolve against the viewport captured at
+        // the start of the pass; unknown (0) viewport skips the declaration.
+        "vw" | "vh" | "vmin" | "vmax" => {
+            let (vw, vh) = STYLING_VIEWPORT.with(|v| v.get());
+            let base = match unit {
+                "vw" => vw,
+                "vh" => vh,
+                "vmin" => vw.min(vh),
+                _ => vw.max(vh),
+            };
+            if base > 0 {
+                Some(value * base as f64 / 100.0)
+            } else {
+                None
+            }
+        }
         // Absolute lengths, CSS Values & Units §6.2: 1in = 96px = 72pt = 6pc;
         // 1in = 2.54cm = 25.4mm. https://www.w3.org/TR/css-values-4/#absolute-lengths
         "pt" => Some(value * 96.0 / 72.0),

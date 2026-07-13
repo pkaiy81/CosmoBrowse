@@ -171,6 +171,10 @@ impl LayoutView {
             },
             prefers_dark: std::env::var("COSMO_PREFERS_DARK").ok().as_deref() == Some("1"),
         };
+        crate::renderer::style::values::set_styling_viewport(
+            media_ctx.viewport_width as i64,
+            media_ctx.viewport_height as i64,
+        );
         let filtered;
         let cssom = if cssom.media_conditions.is_empty() {
             cssom
@@ -1173,6 +1177,24 @@ mod tests {
     fn test_empty() {
         let layout_view = create_layout_view("".to_string(), 600);
         assert_eq!(None, layout_view.root());
+    }
+
+    #[test]
+    fn test_viewport_relative_units() {
+        let html = r#"<html><head><style>
+            .half { width: 50vw; height: 10vh; background-color: red; }
+        </style></head><body><div class="half"></div></body></html>"#
+            .to_string();
+        // create_layout_view uses LayoutView::new (height 0 -> nominal 768).
+        let view = create_layout_view(html, 800);
+        let found = view.paint().iter().any(|item| matches!(
+            item,
+            DisplayItem::Rect { layout_size, style, .. }
+                if style.background_color().code() == "#ff0000"
+                    && layout_size.width() == 400
+                    && layout_size.height() == 76 // 10% of nominal 768
+        ));
+        assert!(found, "50vw of 800 = 400, 10vh of 768 = 76");
     }
 
     #[test]

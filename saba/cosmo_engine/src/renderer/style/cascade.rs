@@ -164,30 +164,31 @@ impl LayoutObject {
                     Some(ComponentValue::Number(value)) => {
                         self.style.set_width(*value);
                     }
-                    Some(ComponentValue::Dimension(value, unit)) => match unit.as_str() {
-                        "vw" => self.style.set_width_ratio(*value / 100.0),
-                        "px" | "em" | "rem" => {
-                            if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
-                                self.style.set_width(px);
-                            }
+                    // Percentages resolve against the containing block at
+                    // sizing time; every other unit (px/em/rem/vw/vh/pt/...)
+                    // resolves to px here.
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
+                        self.style.set_width_ratio(*value / 100.0);
+                    }
+                    Some(ComponentValue::Dimension(value, unit)) => {
+                        if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
+                            self.style.set_width(px);
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 },
                 "height" => match first_value {
                     Some(ComponentValue::Number(value)) => {
                         self.style.set_height(*value);
                     }
-                    Some(ComponentValue::Dimension(value, unit)) => match unit.as_str() {
-                        "vh" => self.style.set_height_ratio(*value / 100.0),
-                        "px" | "em" | "rem" => {
-                            if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
-                                self.style.set_height(px);
-                            }
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
+                        self.style.set_height_ratio(*value / 100.0);
+                    }
+                    Some(ComponentValue::Dimension(value, unit)) => {
+                        if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
+                            self.style.set_height(px);
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 },
                 "position" => {
