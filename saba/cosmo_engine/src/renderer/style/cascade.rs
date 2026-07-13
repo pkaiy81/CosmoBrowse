@@ -380,6 +380,48 @@ impl LayoutObject {
                         ));
                     }
                 }
+                // Per-side margin/padding longhands.
+                "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
+                | "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
+                    let base = self.style.font_size_or_default();
+                    let is_margin = declaration.property.starts_with("margin");
+                    let auto = matches!(
+                        first_value,
+                        Some(ComponentValue::Ident(v)) if v == "auto"
+                    );
+                    if is_margin && auto {
+                        if declaration.property.ends_with("left") {
+                            self.style.set_margin_left_auto(true);
+                        } else if declaration.property.ends_with("right") {
+                            self.style.set_margin_right_auto(true);
+                        }
+                    } else if let Some(px) =
+                        first_value.and_then(|v| spacing_component_to_px(v, base))
+                    {
+                        let cur = if is_margin {
+                            self.style.margin_or_default()
+                        } else {
+                            self.style.padding_or_zero()
+                        };
+                        let (mut t, mut r, mut b, mut l) =
+                            (cur.top(), cur.right(), cur.bottom(), cur.left());
+                        match declaration.property.as_str() {
+                            p if p.ends_with("top") => t = px,
+                            p if p.ends_with("right") => r = px,
+                            p if p.ends_with("bottom") => b = px,
+                            _ => l = px,
+                        }
+                        let edges =
+                            crate::renderer::layout::computed_style::EdgeSize::from_values(
+                                t, r, b, l,
+                            );
+                        if is_margin {
+                            self.style.set_margin(edges);
+                        } else {
+                            self.style.set_padding(edges);
+                        }
+                    }
+                }
                 "margin" => {
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =

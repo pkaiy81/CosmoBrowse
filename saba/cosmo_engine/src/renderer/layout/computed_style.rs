@@ -121,6 +121,11 @@ pub struct ComputedStyle {
     position: Option<PositionType>,
     offset_top: Option<f64>,
     offset_left: Option<f64>,
+    /// Author actually declared top/left (the defaulting pass fills the
+    /// Options with 0.0, so Some alone can't mean "declared"). An absolute
+    /// box with an auto side keeps its static position on that axis.
+    offset_top_author: bool,
+    offset_left_author: bool,
     /// CSS `right`/`bottom` — used by the fixed-position pass to anchor a box
     /// against the viewport's far edges.
     offset_right: Option<f64>,
@@ -281,6 +286,8 @@ impl ComputedStyle {
             position: None,
             offset_top: None,
             offset_left: None,
+            offset_top_author: false,
+            offset_left_author: false,
             offset_right: None,
             offset_bottom: None,
             offset_top_ratio: None,
@@ -1171,6 +1178,12 @@ impl ComputedStyle {
             .expect("failed to access CSS property: padding")
     }
 
+    /// Padding during the cascade (before defaulting fills it): zero when
+    /// no earlier declaration set it.
+    pub fn padding_or_zero(&self) -> EdgeSize {
+        self.padding.unwrap_or_else(EdgeSize::zero)
+    }
+
     pub fn set_border_all(&mut self, value: f64) {
         self.border = Some(EdgeSize::all(value));
     }
@@ -1223,7 +1236,16 @@ impl ComputedStyle {
         self.position.unwrap_or(PositionType::Static)
     }
 
+    pub fn offset_top_author(&self) -> bool {
+        self.offset_top_author
+    }
+
+    pub fn offset_left_author(&self) -> bool {
+        self.offset_left_author
+    }
+
     pub fn set_offset_top(&mut self, top: f64) {
+        self.offset_top_author = true;
         self.offset_top = Some(top);
     }
 
@@ -1232,6 +1254,7 @@ impl ComputedStyle {
     }
 
     pub fn set_offset_left(&mut self, left: f64) {
+        self.offset_left_author = true;
         self.offset_left = Some(left);
     }
 
@@ -1241,6 +1264,7 @@ impl ComputedStyle {
     }
 
     pub fn set_offset_top_ratio(&mut self, r: f64) {
+        self.offset_top_author = true;
         self.offset_top_ratio = Some(r);
     }
 
@@ -1249,6 +1273,7 @@ impl ComputedStyle {
     }
 
     pub fn set_offset_left_ratio(&mut self, r: f64) {
+        self.offset_left_author = true;
         self.offset_left_ratio = Some(r);
     }
 

@@ -1312,6 +1312,41 @@ mod tests {
     }
 
     #[test]
+    fn test_absolute_containing_block_and_far_edges() {
+        // The absolute box anchors to the nearest positioned ancestor
+        // (.rel at 100,50 within body flow), not its direct static parent.
+        let html = r#"<html><head><style>
+            .pad { height: 50px; }
+            .rel { position: relative; width: 400px; height: 200px; margin: 0 0 0 100px; background-color: gray; }
+            .wrap { width: 300px; }
+            .abs { position: absolute; top: 20px; left: 30px; width: 50px; height: 10px; background-color: red; }
+            .corner { position: absolute; right: 10px; bottom: 5px; width: 60px; height: 20px; background-color: blue; }
+        </style></head><body>
+            <div class="pad"></div>
+            <div class="rel"><div class="wrap"><div class="abs"></div><div class="corner"></div></div></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let find = |code: &str| -> (i64, i64) {
+            view.paint()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Rect { layout_point, style, .. }
+                        if style.background_color().code() == code =>
+                    {
+                        Some((layout_point.x(), layout_point.y()))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // .rel content origin = (100, 50).
+        assert_eq!(find("#ff0000"), (130, 70), "top/left vs positioned ancestor");
+        // right:10 bottom:5 -> x = 100+400-60-10, y = 50+200-20-5.
+        assert_eq!(find("#0000ff"), (430, 225), "right/bottom vs positioned ancestor");
+    }
+
+    #[test]
     fn test_grid_template_areas_placement() {
         // Header spans both columns; sidebar 100px + content share row 2.
         let html = r#"<html><head><style>

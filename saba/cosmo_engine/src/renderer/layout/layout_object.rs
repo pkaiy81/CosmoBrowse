@@ -856,6 +856,30 @@ impl LayoutObject {
         None
     }
 
+    /// Containing block for an absolutely positioned box: the content box of
+    /// the nearest positioned ancestor. None = no positioned ancestor (the
+    /// caller anchors to its direct parent, the legacy approximation of the
+    /// initial containing block).
+    fn absolute_containing_block(&self) -> Option<(LayoutPoint, LayoutSize)> {
+        let mut anc = self.parent.upgrade();
+        while let Some(a) = anc {
+            let step = match a.try_borrow() {
+                Ok(b) => {
+                    let positioned = b.style().position() != PositionType::Static;
+                    if positioned {
+                        return Some((b.content_origin(), b.content_size()));
+                    }
+                    b.parent.upgrade()
+                }
+                // An ancestor is mid-borrow (shouldn't happen in the position
+                // walk): fall back to the legacy anchor.
+                Err(_) => return None,
+            };
+            anc = step;
+        }
+        None
+    }
+
     fn grid_item_index(&self) -> usize {
         let parent = match self.parent.upgrade() {
             Some(p) => p,
@@ -2510,18 +2534,32 @@ impl LayoutObject {
                 point.set_y(point.y() + edge_to_i64(self.style.offset_top()));
             }
             PositionType::Absolute => {
-                let dx = self
-                    .style
-                    .offset_left_ratio()
-                    .map(|r| (parent_size.width() as f64 * r) as i64)
-                    .unwrap_or_else(|| edge_to_i64(self.style.offset_left()));
-                let dy = self
-                    .style
-                    .offset_top_ratio()
-                    .map(|r| (parent_size.height() as f64 * r) as i64)
-                    .unwrap_or_else(|| edge_to_i64(self.style.offset_top()));
-                point.set_x(parent_point.x() + dx);
-                point.set_y(parent_point.y() + dy);
+                // Containing block: the nearest positioned ancestor's content
+                // box (CSS2.2 §10.1); the direct parent's box when none.
+                let (cb_point, cb_size) = self
+                    .absolute_containing_block()
+                    .unwrap_or((parent_point, parent_size));
+                if self.style.offset_left_author() {
+                    let dx = self
+                        .style
+                        .offset_left_ratio()
+                        .map(|r| (cb_size.width() as f64 * r) as i64)
+                        .unwrap_or_else(|| edge_to_i64(self.style.offset_left()));
+                    point.set_x(cb_point.x() + dx);
+                } else if let Some(r) = self.style.offset_right() {
+                    point.set_x(cb_point.x() + cb_size.width() - self.size.width() - r as i64);
+                }
+                // left/right both auto: keep the static (flow) x.
+                if self.style.offset_top_author() {
+                    let dy = self
+                        .style
+                        .offset_top_ratio()
+                        .map(|r| (cb_size.height() as f64 * r) as i64)
+                        .unwrap_or_else(|| edge_to_i64(self.style.offset_top()));
+                    point.set_y(cb_point.y() + dy);
+                } else if let Some(b) = self.style.offset_bottom() {
+                    point.set_y(cb_point.y() + cb_size.height() - self.size.height() - b as i64);
+                }
             }
             // Fixed: anchored to the viewport origin; the painter additionally
             // exempts it from the scroll offset.
