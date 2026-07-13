@@ -1571,14 +1571,18 @@ impl LayoutObject {
     /// space is removed, as it would be at a line start/end.
     /// https://www.w3.org/TR/css-text-3/#white-space-phase-2
     pub(crate) fn collapse_text_whitespace(&self, t: &str) -> String {
+        // Collapse ALL document white space (space, tab, CR, LF, FF) — but
+        // never U+00A0 NBSP, which is a rendered character. Tabs matter:
+        // tab-indented pages (e.g. Wikipedia) otherwise paint thousands of
+        // tab-only "lines" that inflate the page by many screens.
+        const WS: [char; 5] = [' ', '\t', '\n', '\r', '\u{c}'];
         let collapsed = t
-            .replace('\n', " ")
-            .split(' ')
+            .split(WS)
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        let had_leading = t.starts_with([' ', '\n']);
-        let had_trailing = t.ends_with([' ', '\n']);
+        let had_leading = t.starts_with(WS);
+        let had_trailing = t.ends_with(WS);
         if !had_leading && !had_trailing {
             return collapsed;
         }
@@ -1849,7 +1853,9 @@ impl LayoutObject {
                 // after subtracting explicitly-sized sibling cells.
                 // When total explicit widths exceed available space, scale
                 // proportionally to fit.
-                let content_width = if self.is_table_cell() {
+                let content_width = if self.style.explicit_zero_width() {
+                    0
+                } else if self.is_table_cell() {
                     // Resolve HTML width attribute — percentage values are computed
                     // against available_width (the parent row's inner width).
                     let attr_width = parse_dimension_pct_attr(
@@ -2076,7 +2082,7 @@ impl LayoutObject {
                     2
                 } else {
                     let explicit_height = self.resolved_height(parent_size);
-                    if explicit_height > 0 {
+                    if explicit_height > 0 || self.style.explicit_zero_height() {
                         explicit_height
                     } else {
                         content_height.max(0)

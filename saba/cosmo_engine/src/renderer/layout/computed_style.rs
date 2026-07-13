@@ -105,6 +105,11 @@ pub struct ComputedStyle {
     height_ratio: Option<f64>,
     width: Option<f64>,
     width_ratio: Option<f64>,
+    /// True when width/height came from an author declaration (the
+    /// defaulting pass fills the Options with 0.0 for every element, so
+    /// Some(0.0) alone can't mean "author wrote 0").
+    width_author: bool,
+    height_author: bool,
     margin_left_auto: bool,
     margin_right_auto: bool,
     margin: Option<EdgeSize>,
@@ -265,6 +270,8 @@ impl ComputedStyle {
             height_ratio: None,
             width: None,
             width_ratio: None,
+            width_author: false,
+            height_author: false,
             margin_left_auto: false,
             margin_right_auto: false,
             margin: None,
@@ -1060,12 +1067,29 @@ impl ComputedStyle {
 
     pub fn set_height(&mut self, height: f64) {
         self.height = Some(height);
+        self.height_author = true;
         self.height_ratio = None;
     }
 
     pub fn set_height_ratio(&mut self, ratio: f64) {
         self.height_ratio = Some(ratio);
         self.height = Some(0.0);
+    }
+
+    /// True when the author wrote a literal `height: 0` (not a percentage
+    /// that happened to resolve to 0). Real pages collapse dropdown panels
+    /// with `height:0; overflow:hidden`, so zero must not read as "auto".
+    pub fn explicit_zero_height(&self) -> bool {
+        self.height_author
+            && self.height_ratio.is_none()
+            && matches!(self.height, Some(h) if h == 0.0)
+    }
+
+    /// See `explicit_zero_height`.
+    pub fn explicit_zero_width(&self) -> bool {
+        self.width_author
+            && self.width_ratio.is_none()
+            && matches!(self.width, Some(w) if w == 0.0)
     }
 
     pub fn height(&self) -> f64 {
@@ -1078,6 +1102,7 @@ impl ComputedStyle {
 
     pub fn set_width(&mut self, width: f64) {
         self.width = Some(width);
+        self.width_author = true;
         self.width_ratio = None;
     }
 
