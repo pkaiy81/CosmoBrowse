@@ -145,6 +145,14 @@ impl HtmlTokenizer {
         }
     }
 
+    // HTML "ASCII whitespace": space, tab, LF, FF, CR — the tag/attribute
+    // states must treat ALL of these as separators, not just ' '. Pretty-
+    // printed HTML routinely breaks lines INSIDE tags.
+    // https://infra.spec.whatwg.org/#ascii-whitespace
+    fn is_html_ws(c: char) -> bool {
+        matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+    }
+
     // Check if the current position is the end of the file
     fn is_eof(&self) -> bool {
         self.pos >= self.input.len()
@@ -437,7 +445,7 @@ impl Iterator for HtmlTokenizer {
                 // 5. IF character achieves the end of file, return Eof token
                 // 6. Otherwise, append the character to the tag name
                 State::TagName => {
-                    if c == ' ' {
+                    if Self::is_html_ws(c) {
                         self.state = State::BeforeAttributeName;
                         continue;
                     }
@@ -473,6 +481,11 @@ impl Iterator for HtmlTokenizer {
                         continue;
                     }
 
+                    if Self::is_html_ws(c) {
+                        // Ignore whitespace between attributes.
+                        continue;
+                    }
+
                     self.reconsume = true;
                     self.state = State::AttributeName;
                     self.start_new_attribute();
@@ -484,7 +497,7 @@ impl Iterator for HtmlTokenizer {
                 // 2. If character is '=', switch to BeforeAttributeValue state.
                 // 3. Otherwise, call append_attribute method.
                 State::AttributeName => {
-                    if c == ' ' || c == '/' || c == '>' || self.is_eof() {
+                    if Self::is_html_ws(c) || c == '/' || c == '>' || self.is_eof() {
                         self.reconsume = true;
                         self.state = State::AfterAttributeName;
                         continue;
@@ -511,7 +524,7 @@ impl Iterator for HtmlTokenizer {
                 // 5. Otherwise, set the reconsume flag to true and switch to AttributeName state.
                 //    Then, call start_new_attribute method.
                 State::AfterAttributeName => {
-                    if c == ' ' {
+                    if Self::is_html_ws(c) {
                         // Ignore whitespace
                         continue;
                     }
@@ -619,7 +632,7 @@ impl Iterator for HtmlTokenizer {
                 // 3. If character is EOF, return Eof token.
                 // 4. Otherwise, call append_attribute method.
                 State::AttributeValueUnquoted => {
-                    if c == ' ' {
+                    if Self::is_html_ws(c) {
                         self.state = State::BeforeAttributeName;
                         continue;
                     }
