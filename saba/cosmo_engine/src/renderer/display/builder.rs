@@ -63,7 +63,7 @@ impl LayoutObject {
                         // fragment identifier within a document.
                         // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
                         let anchor_id = self.element_attribute("id");
-                        return vec![DisplayItem::Rect {
+                        let mut items = vec![DisplayItem::Rect {
                             style: self.style(),
                             layout_point: LayoutPoint::new(self.point().x(), rect_y),
                             layout_size: LayoutSize::new(self.size().width(), rect_h),
@@ -79,6 +79,35 @@ impl LayoutObject {
                             }),
                             anchor_id,
                         }];
+                        if let Some(marker) = self.list_marker_text() {
+                            let fs = self.style.font_size();
+                            let bold = self.style.is_bold();
+                            let w = measure_text_width(&marker, fs, bold);
+                            items.push(DisplayItem::Text {
+                                text: marker,
+                                style: self.style(),
+                                layout_point: LayoutPoint::new(
+                                    self.point().x() - w - 6,
+                                    self.point().y(),
+                                ),
+                                href: None,
+                                target: None,
+                                paint_order: PaintOrder {
+                                    stacking_context: self.stacking_context_level(),
+                                    z_index: self.style.z_index_or_default(),
+                                },
+                                clip_rect: self.style.final_clip().map(|(x, y, w, h)| {
+                                    ClipRect {
+                                        x: x as i64,
+                                        y: y as i64,
+                                        width: w as i64,
+                                        height: h as i64,
+                                    }
+                                }),
+                                bold,
+                            });
+                        }
+                        return items;
                     }
                 }
             }

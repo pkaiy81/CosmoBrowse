@@ -880,6 +880,32 @@ impl LayoutObject {
         None
     }
 
+    /// Marker text for a <li> with a non-none list-style-type: bullet glyphs,
+    /// or "N." for decimal (N = 1-based index among <li> DOM siblings).
+    pub(crate) fn list_marker_text(&self) -> Option<String> {
+        use crate::renderer::layout::computed_style::ListStyleType;
+        if self.node.borrow().element_tag_name().as_deref() != Some("li") {
+            return None;
+        }
+        match self.style.list_style_type() {
+            ListStyleType::None => None,
+            ListStyleType::Disc => Some("•".to_string()),
+            ListStyleType::Circle => Some("◦".to_string()),
+            ListStyleType::Square => Some("▪".to_string()),
+            ListStyleType::Decimal => {
+                let mut index = 1usize;
+                let mut prev = self.node.borrow().previous_sibling().upgrade();
+                while let Some(p) = prev {
+                    if p.borrow().element_tag_name().as_deref() == Some("li") {
+                        index += 1;
+                    }
+                    prev = p.borrow().previous_sibling().upgrade();
+                }
+                Some(format!("{}.", index))
+            }
+        }
+    }
+
     fn grid_item_index(&self) -> usize {
         let parent = match self.parent.upgrade() {
             Some(p) => p,

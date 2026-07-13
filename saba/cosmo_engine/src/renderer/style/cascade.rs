@@ -658,6 +658,24 @@ impl LayoutObject {
                         }
                     }
                 }
+                "list-style-type" | "list-style" => {
+                    // The shorthand also carries position/image; we read the
+                    // first recognized type keyword (none included).
+                    let ty = declaration.value.iter().find_map(|v| match v {
+                        ComponentValue::Ident(k) => match k.as_str() {
+                            "none" => Some(ListStyleType::None),
+                            "disc" => Some(ListStyleType::Disc),
+                            "circle" => Some(ListStyleType::Circle),
+                            "square" => Some(ListStyleType::Square),
+                            "decimal" => Some(ListStyleType::Decimal),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                    if let Some(ty) = ty {
+                        self.style.set_list_style_type(ty);
+                    }
+                }
                 "visibility" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         match value.as_str() {

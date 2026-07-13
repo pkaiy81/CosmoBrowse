@@ -86,6 +86,9 @@ pub struct ComputedStyle {
     visibility_hidden: Option<bool>,
     box_sizing_border_box: Option<bool>,
     /// `grid-template-areas` rows (each row a list of area names; "." = empty).
+    /// `list-style-type` (inherited; UA default disc for <ul>, decimal for
+    /// <ol> subtrees).
+    list_style_type: Option<ListStyleType>,
     grid_template_areas: Option<Rc<Vec<Vec<String>>>>,
     /// `grid-area: <name>` on a grid item.
     grid_area_name: Option<String>,
@@ -258,6 +261,7 @@ impl ComputedStyle {
             bold: None,
             visibility_hidden: None,
             box_sizing_border_box: None,
+            list_style_type: None,
             grid_template_areas: None,
             grid_area_name: None,
             flex_grow: None,
@@ -390,6 +394,10 @@ impl ComputedStyle {
             if self.visibility_hidden.is_none() {
                 self.visibility_hidden = parent_style.visibility_hidden;
             }
+            // list-style-type is inherited (set on <ul>/<ol>, read on <li>).
+            if self.list_style_type.is_none() {
+                self.list_style_type = parent_style.list_style_type;
+            }
             // line-height is inherited.
             if self.line_height.is_none() {
                 self.line_height = parent_style.line_height;
@@ -496,6 +504,24 @@ impl ComputedStyle {
         }
         if self.opacity.is_none() {
             self.opacity = Some(1.0);
+        }
+        if self.list_style_type.is_none() {
+            // UA stylesheet: list containers seed the inherited marker type.
+            self.list_style_type = match node.borrow().element_tag_name().as_deref() {
+                Some("ul") | Some("menu") | Some("dir") => Some(ListStyleType::Disc),
+                Some("ol") => Some(ListStyleType::Decimal),
+                _ => None,
+            };
+        }
+        // UA stylesheet: lists indent their items so outside markers have
+        // room (browsers use padding-inline-start: 40px).
+        if self.padding.is_none()
+            && matches!(
+                node.borrow().element_tag_name().as_deref(),
+                Some("ul") | Some("ol") | Some("menu") | Some("dir")
+            )
+        {
+            self.padding = Some(EdgeSize::from_values(0.0, 0.0, 0.0, 40.0));
         }
         if self.height.is_none() {
             self.height = Some(0.0);
@@ -945,6 +971,13 @@ impl ComputedStyle {
         self.bold = Some(bold);
     }
 
+    pub fn list_style_type(&self) -> ListStyleType {
+        self.list_style_type.unwrap_or(ListStyleType::None)
+    }
+    pub fn set_list_style_type(&mut self, v: ListStyleType) {
+        self.list_style_type = Some(v);
+    }
+
     pub fn grid_template_areas(&self) -> Option<Rc<Vec<Vec<String>>>> {
         self.grid_template_areas.clone()
     }
@@ -1334,6 +1367,15 @@ impl SizeLimit {
             SizeLimit::Ratio(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStyleType {
+    None,
+    Disc,
+    Circle,
+    Square,
+    Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
