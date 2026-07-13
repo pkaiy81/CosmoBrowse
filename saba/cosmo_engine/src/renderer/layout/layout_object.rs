@@ -1981,6 +1981,17 @@ impl LayoutObject {
             }
         }
 
+        // min-/max-width/height clamp the used size (CSS2.2 §10.4/§10.7).
+        // Not applied to text runs (their size IS the measured lines) or
+        // non-replaced inline boxes, where the properties have no effect.
+        if self.style.has_size_limits()
+            && !matches!(self.kind, LayoutObjectKind::Text)
+            && self.style.display() != DisplayType::Inline
+        {
+            size.set_width(self.style.clamp_width(size.width(), parent_size.width()));
+            size.set_height(self.style.clamp_height(size.height(), parent_size.height()));
+        }
+
         self.size = size;
     }
 

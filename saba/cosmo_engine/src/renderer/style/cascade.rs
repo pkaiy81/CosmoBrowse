@@ -407,6 +407,32 @@ impl LayoutObject {
                     }
                     _ => {}
                 },
+                "min-width" | "max-width" | "min-height" | "max-height" => {
+                    // Outer None = unparseable (leave untouched);
+                    // Some(None) = explicit `none` (clears an earlier rule's limit).
+                    let parsed: Option<Option<SizeLimit>> = match first_value {
+                        Some(ComponentValue::Dimension(v, unit)) if unit == "%" => {
+                            Some(Some(SizeLimit::Ratio(*v / 100.0)))
+                        }
+                        Some(ComponentValue::Dimension(v, unit)) => {
+                            length_to_px(*v, unit, self.style.font_size_or_default())
+                                .map(|px| Some(SizeLimit::Px(px)))
+                        }
+                        Some(ComponentValue::Number(v)) if *v == 0.0 => {
+                            Some(Some(SizeLimit::Px(0.0)))
+                        }
+                        Some(ComponentValue::Ident(v)) if v == "none" => Some(None),
+                        _ => None,
+                    };
+                    if let Some(limit) = parsed {
+                        match declaration.property.as_str() {
+                            "min-width" => self.style.set_min_width(limit),
+                            "max-width" => self.style.set_max_width(limit),
+                            "min-height" => self.style.set_min_height(limit),
+                            _ => self.style.set_max_height(limit),
+                        }
+                    }
+                }
                 "visibility" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         match value.as_str() {

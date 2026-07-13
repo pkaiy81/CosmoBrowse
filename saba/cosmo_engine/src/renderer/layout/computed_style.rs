@@ -84,6 +84,10 @@ pub struct ComputedStyle {
     text_decoration: Option<TextDecoration>,
     bold: Option<bool>,
     visibility_hidden: Option<bool>,
+    min_width: Option<SizeLimit>,
+    max_width: Option<SizeLimit>,
+    min_height: Option<SizeLimit>,
+    max_height: Option<SizeLimit>,
     opacity: Option<f64>,
     height: Option<f64>,
     height_ratio: Option<f64>,
@@ -231,6 +235,10 @@ impl ComputedStyle {
             text_decoration: None,
             bold: None,
             visibility_hidden: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
             opacity: None,
             height: None,
             height_ratio: None,
@@ -902,6 +910,52 @@ impl ComputedStyle {
         self.bold = Some(bold);
     }
 
+    pub fn set_min_width(&mut self, v: Option<SizeLimit>) {
+        self.min_width = v;
+    }
+    pub fn set_max_width(&mut self, v: Option<SizeLimit>) {
+        self.max_width = v;
+    }
+    pub fn set_min_height(&mut self, v: Option<SizeLimit>) {
+        self.min_height = v;
+    }
+    pub fn set_max_height(&mut self, v: Option<SizeLimit>) {
+        self.max_height = v;
+    }
+
+    /// Clamp a used width to min-/max-width (CSS2.2 §10.4; min wins over
+    /// max). Percentages resolve against the containing block width; when
+    /// that is unknown (<= 0) percentage limits are ignored.
+    pub fn clamp_width(&self, width: i64, containing: i64) -> i64 {
+        let mut w = width;
+        if let Some(px) = self.max_width.as_ref().and_then(|l| l.resolve(containing)) {
+            w = w.min(px);
+        }
+        if let Some(px) = self.min_width.as_ref().and_then(|l| l.resolve(containing)) {
+            w = w.max(px);
+        }
+        w
+    }
+
+    /// Clamp a used height to min-/max-height (CSS2.2 §10.7).
+    pub fn clamp_height(&self, height: i64, containing: i64) -> i64 {
+        let mut h = height;
+        if let Some(px) = self.max_height.as_ref().and_then(|l| l.resolve(containing)) {
+            h = h.min(px);
+        }
+        if let Some(px) = self.min_height.as_ref().and_then(|l| l.resolve(containing)) {
+            h = h.max(px);
+        }
+        h
+    }
+
+    pub fn has_size_limits(&self) -> bool {
+        self.min_width.is_some()
+            || self.max_width.is_some()
+            || self.min_height.is_some()
+            || self.max_height.is_some()
+    }
+
     /// `visibility: hidden` — the box keeps its layout size but paints
     /// nothing (unlike display:none, which removes the box).
     pub fn is_visibility_hidden(&self) -> bool {
@@ -1115,6 +1169,24 @@ impl ComputedStyle {
     pub fn overflow_clip(&self) -> bool {
         self.overflow_clip
             .expect("failed to access CSS property: overflow")
+    }
+}
+
+/// A min-/max-width/height constraint: absolute px or a fraction of the
+/// containing block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeLimit {
+    Px(f64),
+    Ratio(f64),
+}
+
+impl SizeLimit {
+    fn resolve(&self, containing: i64) -> Option<i64> {
+        match self {
+            SizeLimit::Px(v) => Some(*v as i64),
+            SizeLimit::Ratio(r) if containing > 0 => Some((containing as f64 * r) as i64),
+            SizeLimit::Ratio(_) => None,
+        }
     }
 }
 

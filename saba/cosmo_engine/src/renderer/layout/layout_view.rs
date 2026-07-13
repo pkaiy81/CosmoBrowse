@@ -1176,6 +1176,34 @@ mod tests {
     }
 
     #[test]
+    fn test_min_max_width_clamp_used_size() {
+        let html = r#"<html><head><style>
+            .capped { width: 600px; max-width: 300px; height: 20px; background-color: red; }
+            .floored { width: 50px; min-width: 200px; height: 20px; background-color: blue; }
+            .pct { max-width: 50%; height: 20px; background-color: green; }
+        </style></head><body>
+            <div class="capped"></div><div class="floored"></div><div class="pct"></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let widths: Vec<i64> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { layout_size, style, .. }
+                    if style.background_color().code() != "#ffffff" =>
+                {
+                    Some(layout_size.width())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(widths.contains(&300), "max-width must cap 600->300: {:?}", widths);
+        assert!(widths.contains(&200), "min-width must floor 50->200: {:?}", widths);
+        assert!(widths.contains(&400), "max-width:50% of 800 = 400: {:?}", widths);
+    }
+
+    #[test]
     fn test_font_weight_property_sets_bold() {
         let html = r#"<html><head><style>
             .heavy { font-weight: 700; }
