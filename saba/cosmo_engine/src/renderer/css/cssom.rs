@@ -1,4 +1,5 @@
 use std::string::ToString;
+use crate::renderer::css::media::{parse_media_query_list, MediaContext, MediaQueryList};
 use crate::renderer::css::token::CssToken;
 use crate::renderer::css::token::CssTokenizer;
 use std::boxed::Box;
@@ -10,11 +11,17 @@ use std::iter::Peekable;
 #[derive(Debug, Clone)]
 pub struct CssParser {
     t: Peekable<CssTokenizer>,
+    /// Conditions collected from `@media` preludes; `QualifiedRule::media`
+    /// indexes into this.
+    media_conditions: Vec<MediaQueryList>,
 }
 
 impl CssParser {
     pub fn new(t: CssTokenizer) -> Self {
-        Self { t: t.peekable() }
+        Self {
+            t: t.peekable(),
+            media_conditions: Vec::new(),
+        }
     }
 
     /// Skip any whitespace tokens. Whitespace is only meaningful inside
@@ -486,13 +493,23 @@ impl CssParser {
     }
 
     fn consume_list_of_rules(&mut self) -> Vec<QualifiedRule> {
+        self.consume_rules(false)
+    }
+
+    /// Consume rules until EOF, or — inside an `@media { ... }` block —
+    /// until the matching `}`.
+    fn consume_rules(&mut self, in_block: bool) -> Vec<QualifiedRule> {
         let mut rules = Vec::new();
 
         loop {
             let token = match self.t.peek() {
-                Some(t) => t,
+                Some(t) => t.clone(),
                 None => return rules,
             };
+            if in_block && token == CssToken::CloseCurly {
+                self.t.next();
+                return rules;
+            }
             match token {
                 // Whitespace between rules must be skipped HERE: if it falls
                 // through to consume_qualified_rule, an at-rule behind it is
@@ -500,13 +517,41 @@ impl CssParser {
                 CssToken::Whitespace => {
                     self.t.next();
                 }
+                CssToken::AtKeyword(ref keyword) if keyword == "media" && !in_block => {
+                    // Parse the prelude into a media condition and keep the
+                    // block's rules, tagged with the condition index. Rules
+                    // become active/inactive per layout via
+                    // `StyleSheet::filter_for_media`. (Nested @media inside a
+                    // media block still falls to consume_at_rule below.)
+                    self.t.next(); // @media
+                    let mut prelude = Vec::new();
+                    loop {
+                        match self.t.next() {
+                            None => return rules,
+                            Some(CssToken::OpenCurly) => break,
+                            Some(CssToken::SemiColon) => {
+                                prelude.clear();
+                                break;
+                            }
+                            Some(t) => prelude.push(t),
+                        }
+                    }
+                    let idx = self.media_conditions.len();
+                    self.media_conditions.push(parse_media_query_list(&prelude));
+                    for mut rule in self.consume_rules(true) {
+                        if rule.media.is_none() {
+                            rule.media = Some(idx);
+                        }
+                        rules.push(rule);
+                    }
+                }
                 CssToken::AtKeyword(_keyword) => {
-                    // Skip the whole at-rule. The engine can't evaluate at-rule
-                    // preludes (`@media`, `@supports`, `@font-face`, `@import`),
-                    // and the previous code parsed the *contents* of an
-                    // `@media { ... }` block as top-level rules — producing
-                    // spurious rules (e.g. mobile `width`/`display` overrides)
-                    // that collapsed desktop layouts such as Hacker News.
+                    // Skip every other at-rule wholesale. The engine can't
+                    // evaluate `@supports` / `@font-face` / `@import` /
+                    // `@keyframes` preludes yet, and parsing their contents
+                    // as top-level rules would leak spurious rules (the
+                    // historical @media bug that collapsed HN's desktop
+                    // layout).
                     self.consume_at_rule();
                 }
                 _ => {
@@ -563,6 +608,7 @@ impl CssParser {
                         let mut r = QualifiedRule::new();
                         r.set_selector(alt);
                         r.set_declarations(rule.declarations.clone());
+                        r.media = rule.media;
                         rules.push(r);
                     }
                 }
@@ -570,6 +616,7 @@ impl CssParser {
             }
         }
         sheet.set_rules(rules);
+        sheet.media_conditions = core::mem::take(&mut self.media_conditions);
         sheet
     }
 }
@@ -751,15 +798,44 @@ pub fn substitute_vars(value: &[CssToken], vars: &BTreeMap<String, Vec<CssToken>
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyleSheet {
     pub rules: Vec<QualifiedRule>,
+    /// `@media` conditions referenced by `QualifiedRule::media`.
+    pub media_conditions: Vec<MediaQueryList>,
 }
 
 impl StyleSheet {
     pub fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            media_conditions: Vec::new(),
+        }
     }
 
     pub fn set_rules(&mut self, rules: Vec<QualifiedRule>) {
         self.rules = rules;
+    }
+
+    /// The rules that apply in `ctx`: unconditional rules plus the rules of
+    /// matching `@media` blocks, in document order, with conditions
+    /// resolved away.
+    pub fn filter_for_media(&self, ctx: &MediaContext) -> StyleSheet {
+        let active: Vec<bool> = self
+            .media_conditions
+            .iter()
+            .map(|q| q.matches(ctx))
+            .collect();
+        StyleSheet {
+            rules: self
+                .rules
+                .iter()
+                .filter(|r| r.media.map_or(true, |i| active.get(i).copied().unwrap_or(false)))
+                .map(|r| {
+                    let mut r = r.clone();
+                    r.media = None;
+                    r
+                })
+                .collect(),
+            media_conditions: Vec::new(),
+        }
     }
 }
 
@@ -767,6 +843,9 @@ impl StyleSheet {
 pub struct QualifiedRule {
     pub selector: Selector,
     pub declarations: Vec<Declaration>,
+    /// `Some(i)` = this rule lives inside the `@media` block whose condition
+    /// is `StyleSheet::media_conditions[i]`.
+    pub media: Option<usize>,
 }
 
 impl QualifiedRule {
@@ -774,6 +853,7 @@ impl QualifiedRule {
         Self {
             selector: Selector::TypeSelector("".to_string()),
             declarations: Vec::new(),
+            media: None,
         }
     }
 
@@ -1139,20 +1219,51 @@ mod tests {
 
 
     #[test]
-    fn test_at_rule_media_block_is_skipped() {
+    fn test_media_block_rules_are_kept_and_filtered_by_viewport() {
         let style = "td { color: blue; } @media (max-width: 600px) { td { width: 10px; display: block; } } p { color: red; }".to_string();
         let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
-        // Only the two top-level rules (td, p) should survive; the @media block
-        // and its inner rules must be discarded, not mangled into rules.
-        let selectors: std::vec::Vec<_> = cssom.rules.iter().map(|r| r.selector.clone()).collect();
+        // All three rules survive in document order; the middle one carries
+        // its @media condition index (it must never leak as unconditional —
+        // that was the historical bug that collapsed HN's desktop layout).
+        let tagged: std::vec::Vec<_> = cssom
+            .rules
+            .iter()
+            .map(|r| (r.selector.clone(), r.media))
+            .collect();
         assert_eq!(
-            selectors,
+            tagged,
             std::vec![
-                Selector::TypeSelector("td".to_string()),
-                Selector::TypeSelector("p".to_string()),
+                (Selector::TypeSelector("td".to_string()), None),
+                (Selector::TypeSelector("td".to_string()), Some(0)),
+                (Selector::TypeSelector("p".to_string()), None),
             ],
-            "got rules: {:?}", cssom.rules
+            "got rules: {:?}",
+            cssom.rules
         );
+        assert_eq!(cssom.media_conditions.len(), 1);
+
+        let desktop = MediaContext {
+            viewport_width: 1024.0,
+            viewport_height: 768.0,
+            prefers_dark: false,
+        };
+        let phone = MediaContext {
+            viewport_width: 390.0,
+            viewport_height: 800.0,
+            prefers_dark: false,
+        };
+        assert_eq!(cssom.filter_for_media(&desktop).rules.len(), 2);
+        let phone_rules = cssom.filter_for_media(&phone).rules;
+        assert_eq!(phone_rules.len(), 3);
+        assert!(phone_rules.iter().all(|r| r.media.is_none()));
+    }
+
+    #[test]
+    fn test_other_at_rules_still_skipped() {
+        let style = "@import url(x.css); @font-face { font-family: X; src: url(x.woff); } td { color: blue; } @supports (display: grid) { p { color: red; } }".to_string();
+        let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+        let selectors: std::vec::Vec<_> = cssom.rules.iter().map(|r| r.selector.clone()).collect();
+        assert_eq!(selectors, std::vec![Selector::TypeSelector("td".to_string())]);
     }
 
     #[test]

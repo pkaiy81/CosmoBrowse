@@ -1,5 +1,6 @@
 use crate::display_item::DisplayItem;
 use crate::renderer::css::cssom::StyleSheet;
+use crate::renderer::css::media::MediaContext;
 use crate::renderer::dom::api::get_target_element_node;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
@@ -155,6 +156,28 @@ impl LayoutView {
         viewport_height: i64,
     ) -> Self {
         let body_root = get_target_element_node(Some(root), ElementKind::Body);
+
+        // Resolve @media blocks against the viewport before styling. An
+        // unknown viewport height (0, e.g. Page::new without a frame) is
+        // evaluated as a nominal 768 so height queries don't all flip false.
+        // Dark mode comes from the host via COSMO_PREFERS_DARK until winit
+        // theme plumbing lands (plan 1.2).
+        let media_ctx = MediaContext {
+            viewport_width: viewport_width.max(1) as f64,
+            viewport_height: if viewport_height > 0 {
+                viewport_height as f64
+            } else {
+                768.0
+            },
+            prefers_dark: std::env::var("COSMO_PREFERS_DARK").ok().as_deref() == Some("1"),
+        };
+        let filtered;
+        let cssom = if cssom.media_conditions.is_empty() {
+            cssom
+        } else {
+            filtered = cssom.filter_for_media(&media_ctx);
+            &filtered
+        };
 
         let mut tree = Self {
             root: build_layout_tree(&body_root, &None, cssom),
@@ -1150,6 +1173,29 @@ mod tests {
     fn test_empty() {
         let layout_view = create_layout_view("".to_string(), 600);
         assert_eq!(None, layout_view.root());
+    }
+
+    #[test]
+    fn test_media_query_selects_rules_by_viewport_width() {
+        // The paragraph is hidden only under the max-width:600px condition.
+        let html = r#"<html><head><style>
+            p { color: blue; }
+            @media (max-width: 600px) { p { display: none; } }
+        </style></head><body><p>hello</p></body></html>"#
+            .to_string();
+
+        let has_text = |view: &LayoutView| {
+            view.paint().iter().any(|item| matches!(
+                item,
+                DisplayItem::Text { text, .. } if text.contains("hello")
+            ))
+        };
+
+        let wide = create_layout_view(html.clone(), 900);
+        assert!(has_text(&wide), "media rule must be inactive at 900px");
+
+        let narrow = create_layout_view(html, 480);
+        assert!(!has_text(&narrow), "media rule must hide <p> at 480px");
     }
 
     #[test]
