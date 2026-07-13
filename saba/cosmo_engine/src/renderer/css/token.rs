@@ -160,6 +160,18 @@ impl Iterator for CssTokenizer {
                 '(' => CssToken::OpenParenthesis,
                 ')' => CssToken::CloseParenthesis,
                 ',' => CssToken::Delim(','),
+                // `.8em` — a leading-dot decimal is a number, not a class
+                // dot. (Real CSS uses this constantly; treating it as
+                // Delim('.') turned .8em into 8em.)
+                '.' if self
+                    .input
+                    .get(self.pos + 1)
+                    .is_some_and(|c| c.is_ascii_digit()) =>
+                {
+                    let t = self.consume_numeric_token();
+                    self.pos -= 1;
+                    t
+                }
                 '.' => CssToken::Delim('.'),
                 ':' => CssToken::Colon,
                 ';' => CssToken::SemiColon,
@@ -388,6 +400,20 @@ mod tests {
         assert_eq!(
             semantic_tokens("body { width: 60vw; font-size: 1.5em; }"),
             expected.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_leading_dot_decimal_is_a_number() {
+        let mut t = CssTokenizer::new("padding:.8em".to_string());
+        let mut toks = Vec::new();
+        while let Some(tok) = t.next() {
+            toks.push(tok);
+        }
+        assert!(
+            toks.contains(&CssToken::Dimension(0.8, "em".to_string())),
+            "{:?}",
+            toks
         );
     }
 }
