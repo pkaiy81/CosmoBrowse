@@ -443,6 +443,12 @@ pub struct LayoutObject {
     // Spec: CSS2.2 §9.4.2 — inline formatting context line construction.
     // https://www.w3.org/TR/CSS22/visuren.html#inline-formatting
     pub(crate) text_line_max_width: i64,
+    /// Flow-end cursor of a wrapped text run: width of the LAST line, the
+    /// number of lines, and the line height used. A following inline sibling
+    /// continues after the last line, not at the bounding box's top-right.
+    pub(crate) text_last_line_width: i64,
+    pub(crate) text_line_count: i64,
+    pub(crate) text_line_height: i64,
     // Per-logical-column max of min_content_width_hint, populated once per
     // table by the pre-pass before any cell sizing.  Only meaningful on table
     // nodes; None elsewhere.  Used by `table_cell_auto_width` so that a row
@@ -482,6 +488,9 @@ impl LayoutObject {
             point: LayoutPoint::new(0, 0),
             size: LayoutSize::new(0, 0),
             text_line_max_width: 0,
+            text_last_line_width: 0,
+            text_line_count: 0,
+            text_line_height: 0,
             column_min_hints: None,
             column_max_hints: None,
         }
@@ -821,6 +830,30 @@ impl LayoutObject {
             }
         }
         heights
+    }
+
+    /// The layout sibling directly before `self`, skipping zero-size boxes
+    /// (collapsed whitespace nodes are not flow anchors — same rule the
+    /// position walk uses). Pointer identity, so it works while `self` is
+    /// mutably borrowed.
+    fn previous_layout_sibling(&self) -> Option<Rc<RefCell<LayoutObject>>> {
+        let parent = self.parent.upgrade()?;
+        let mut prev: Option<Rc<RefCell<LayoutObject>>> = None;
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            if std::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
+                return prev;
+            }
+            let b = c.borrow();
+            let zero_size = b.size.width() == 0 && b.size.height() == 0;
+            let next = b.next_sibling();
+            drop(b);
+            if !zero_size {
+                prev = Some(c);
+            }
+            child = next;
+        }
+        None
     }
 
     fn grid_item_index(&self) -> usize {
@@ -2205,6 +2238,12 @@ impl LayoutObject {
                         .map(|line| measure_text_width(line, fs, bold))
                         .max()
                         .unwrap_or(0);
+                    self.text_line_count = lines.len() as i64;
+                    self.text_last_line_width = lines
+                        .last()
+                        .map(|l| measure_text_width(l, fs, bold))
+                        .unwrap_or(0);
+                    self.text_line_height = lh;
                     let height = if lines.is_empty() {
                         0
                     } else {
@@ -2400,6 +2439,21 @@ impl LayoutObject {
             }
             (LayoutFlow::InlineFlow, LayoutFlow::InlineFlow) => {
                 if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
+                    // A wrapped multi-line text sibling ends at its LAST
+                    // line's cursor, not at its bounding box's top-right —
+                    // continue the inline flow from there.
+                    let (mut pos, mut size) = (pos, size);
+                    if let Some(prev) = self.previous_layout_sibling() {
+                        if let Ok(b) = prev.try_borrow() {
+                            if b.text_line_count > 1 {
+                                let mut p = b.point();
+                                p.set_y(p.y() + (b.text_line_count - 1) * b.text_line_height);
+                                pos = p;
+                                size =
+                                    LayoutSize::new(b.text_last_line_width, b.text_line_height);
+                            }
+                        }
+                    }
                     // Candidate X if we place this element right after the previous one.
                     let candidate_x = pos.x() + size.width() + metrics.margin.left;
                     let right_edge = parent_point.x() + parent_size.width();
