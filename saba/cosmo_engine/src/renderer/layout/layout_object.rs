@@ -1597,17 +1597,32 @@ impl LayoutObject {
     }
 
     fn resolved_width(&self, parent_size: LayoutSize) -> i64 {
-        if let Some(ratio) = self.style.width_ratio() {
-            return edge_to_i64(parent_size.width() as f64 * ratio);
+        let w = if let Some(ratio) = self.style.width_ratio() {
+            edge_to_i64(parent_size.width() as f64 * ratio)
+        } else {
+            edge_to_i64(self.style.width())
+        };
+        // border-box: the declared width includes padding+border; callers add
+        // inner_horizontal back on, so hand them the content width. Keep at
+        // least 1px so the "has an explicit width" signal (w > 0) survives.
+        if w > 0 && self.style.is_border_box() {
+            (w - compute_box_model_metrics(&self.style).inner_horizontal()).max(1)
+        } else {
+            w
         }
-        edge_to_i64(self.style.width())
     }
 
     fn resolved_height(&self, parent_size: LayoutSize) -> i64 {
-        if let Some(ratio) = self.style.height_ratio() {
-            return edge_to_i64(parent_size.height() as f64 * ratio);
+        let h = if let Some(ratio) = self.style.height_ratio() {
+            edge_to_i64(parent_size.height() as f64 * ratio)
+        } else {
+            edge_to_i64(self.style.height())
+        };
+        if h > 0 && self.style.is_border_box() {
+            (h - compute_box_model_metrics(&self.style).inner_vertical()).max(1)
+        } else {
+            h
         }
-        edge_to_i64(self.style.height())
     }
 
     /// Stacking-context level for paint ordering: 1 when this box is

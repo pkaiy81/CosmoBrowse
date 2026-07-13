@@ -433,6 +433,15 @@ impl LayoutObject {
                         }
                     }
                 }
+                "box-sizing" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        match value.as_str() {
+                            "border-box" => self.style.set_border_box(true),
+                            "content-box" => self.style.set_border_box(false),
+                            _ => {}
+                        }
+                    }
+                }
                 "visibility" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         match value.as_str() {

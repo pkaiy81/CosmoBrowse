@@ -1176,6 +1176,38 @@ mod tests {
     }
 
     #[test]
+    fn test_box_sizing_border_box_absorbs_padding() {
+        let html = r#"<html><head><style>
+            .bb { box-sizing: border-box; width: 200px; height: 40px; padding: 10px; background-color: red; }
+            .cb { width: 200px; height: 40px; padding: 10px; background-color: blue; }
+        </style></head><body><div class="bb"></div><div class="cb"></div></body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let sizes: Vec<(String, i64, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { layout_size, style, .. } => Some((
+                    style.background_color().code().to_string(),
+                    layout_size.width(),
+                    layout_size.height(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sizes.iter().any(|(c, w, h)| c == "#ff0000" && *w == 200 && *h == 40),
+            "border-box: outer box stays 200x40, got {:?}",
+            sizes
+        );
+        assert!(
+            sizes.iter().any(|(c, w, h)| c == "#0000ff" && *w == 220 && *h == 60),
+            "content-box: padding grows the box to 220x60, got {:?}",
+            sizes
+        );
+    }
+
+    #[test]
     fn test_min_max_width_clamp_used_size() {
         let html = r#"<html><head><style>
             .capped { width: 600px; max-width: 300px; height: 20px; background-color: red; }

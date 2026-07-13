@@ -84,6 +84,7 @@ pub struct ComputedStyle {
     text_decoration: Option<TextDecoration>,
     bold: Option<bool>,
     visibility_hidden: Option<bool>,
+    box_sizing_border_box: Option<bool>,
     min_width: Option<SizeLimit>,
     max_width: Option<SizeLimit>,
     min_height: Option<SizeLimit>,
@@ -235,6 +236,7 @@ impl ComputedStyle {
             text_decoration: None,
             bold: None,
             visibility_hidden: None,
+            box_sizing_border_box: None,
             min_width: None,
             max_width: None,
             min_height: None,
@@ -908,6 +910,17 @@ impl ComputedStyle {
 
     pub fn set_bold(&mut self, bold: bool) {
         self.bold = Some(bold);
+    }
+
+    /// `box-sizing: border-box` — explicit width/height include padding and
+    /// border. Not inherited (pages opt in with `* { box-sizing: border-box }`,
+    /// which the universal selector applies per element).
+    pub fn is_border_box(&self) -> bool {
+        self.box_sizing_border_box.unwrap_or(false)
+    }
+
+    pub fn set_border_box(&mut self, v: bool) {
+        self.box_sizing_border_box = Some(v);
     }
 
     pub fn set_min_width(&mut self, v: Option<SizeLimit>) {
