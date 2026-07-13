@@ -750,6 +750,18 @@ pub fn value_has_var(value: &[CssToken]) -> bool {
 /// Replace `var(--name[, fallback])` sequences in `value` using `vars`.
 /// Unknown variables fall back to the (optional) fallback tokens.
 pub fn substitute_vars(value: &[CssToken], vars: &BTreeMap<String, Vec<CssToken>>) -> Vec<CssToken> {
+    substitute_vars_depth(value, vars, 0)
+}
+
+fn substitute_vars_depth(
+    value: &[CssToken],
+    vars: &BTreeMap<String, Vec<CssToken>>,
+    depth: u32,
+) -> Vec<CssToken> {
+    // Cycle/pathology guard: --a:var(--b);--b:var(--a) must terminate.
+    if depth > 8 {
+        return value.to_vec();
+    }
     let mut out: Vec<CssToken> = Vec::new();
     let mut i = 0;
     while i < value.len() {
@@ -786,9 +798,39 @@ pub fn substitute_vars(value: &[CssToken], vars: &BTreeMap<String, Vec<CssToken>
             .position(|t| *t == CssToken::Delim(','))
             .map(|p| inner[p + 1..].to_vec())
             .unwrap_or_default();
+        // A custom property whose value is (or contains a substituted)
+        // `initial` is the guaranteed-invalid value: the var() must use its
+        // fallback instead. This is also how the csstools light-dark()
+        // polyfill toggles: the "off" branch is set to `initial` so the
+        // fallback (light) color wins. The fallback itself may nest var().
+        let is_invalid = |v: &[CssToken]| {
+            v.iter().any(|t| matches!(t, CssToken::Ident(s) if s == "initial"))
+                || v.iter().all(|t| matches!(t, CssToken::Whitespace))
+        };
+        // An invalid substitution with no fallback must POISON the value
+        // (emit the guaranteed-invalid sentinel) so an outer var() sees it —
+        // this is how the csstools light-dark() polyfill selects its branch.
+        let mut emit_fallback_or_poison =
+            |out: &mut Vec<CssToken>, fallback: &[CssToken]| {
+                let fb = substitute_vars_depth(fallback, vars, depth + 1);
+                if fb.iter().all(|t| matches!(t, CssToken::Whitespace)) {
+                    out.push(CssToken::Ident("initial".to_string()));
+                } else {
+                    out.extend(fb);
+                }
+            };
         match vars.get(&name) {
-            Some(v) => out.extend(v.clone()),
-            None => out.extend(fallback),
+            Some(v) => {
+                // Resolve nested var() FIRST; only then can we tell whether
+                // the value collapses to guaranteed-invalid (`initial`).
+                let resolved = substitute_vars_depth(v, vars, depth + 1);
+                if is_invalid(&resolved) {
+                    emit_fallback_or_poison(&mut out, &fallback);
+                } else {
+                    out.extend(resolved);
+                }
+            }
+            None => emit_fallback_or_poison(&mut out, &fallback),
         }
         i = j + 1; // skip past the close paren
     }
