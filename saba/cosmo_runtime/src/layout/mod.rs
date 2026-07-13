@@ -243,6 +243,12 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     .max(border.bottom())
                     .max(border.left())
                     .round() as i64;
+                let border_widths = Some((
+                    border.top().round() as i64,
+                    border.right().round() as i64,
+                    border.bottom().round() as i64,
+                    border.left().round() as i64,
+                ));
                 let border_color = style.border_color()
                     .map(|c| c.code().to_string())
                     .unwrap_or_default();
@@ -260,6 +266,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
                     anchor_id,
                     border_width,
+                    border_widths,
                     border_color,
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
@@ -517,6 +524,7 @@ mod diff_tests {
             clip_rect: None,
             anchor_id: None,
             border_width: 0,
+            border_widths: None,
             border_color: String::new(),
             background_position: None,
             background_no_repeat: false,
@@ -541,6 +549,7 @@ mod diff_tests {
             clip_rect: None,
             anchor_id: None,
             border_width: 0,
+            border_widths: None,
             border_color: String::new(),
             background_position: None,
             background_no_repeat: false,

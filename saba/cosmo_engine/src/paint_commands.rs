@@ -71,6 +71,9 @@ pub struct DrawRect {
     /// Set from the HTML `border` attribute on `<table>` (propagated to cells).
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub border_width: i64,
+    /// Per-side border widths (top, right, bottom, left); None = uniform.
+    #[serde(default)]
+    pub border_widths: Option<(i64, i64, i64, i64)>,
     /// CSS color string for the border (e.g. "#808080"). Empty when no border.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub border_color: String,

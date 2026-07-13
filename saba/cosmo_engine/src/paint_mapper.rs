@@ -111,6 +111,7 @@ pub fn map_display_items_to_paint_commands(
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
                     anchor_id: anchor_id.clone(),
                     border_width,
+                    border_widths: None,
                     border_color,
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),

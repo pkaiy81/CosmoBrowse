@@ -1080,6 +1080,19 @@ impl ComputedStyle {
         self.border = Some(EdgeSize::all(value));
     }
 
+    /// Overwrite one border side's width, keeping the others.
+    pub fn set_border_side(&mut self, side: usize, px: f64) {
+        let b = self.border_or_zero();
+        let (mut t, mut r, mut bo, mut l) = (b.top(), b.right(), b.bottom(), b.left());
+        match side {
+            0 => t = px,
+            1 => r = px,
+            2 => bo = px,
+            _ => l = px,
+        }
+        self.border = Some(EdgeSize::from_values(t, r, bo, l));
+    }
+
     pub fn set_border(&mut self, border: EdgeSize) {
         self.border = Some(border);
     }

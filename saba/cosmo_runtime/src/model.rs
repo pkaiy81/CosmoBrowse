@@ -270,6 +270,10 @@ pub enum SceneItem {
         anchor_id: Option<String>,
         /// Border width in pixels from `border` HTML attribute (0 = no border).
         border_width: i64,
+        /// Per-side border widths (top, right, bottom, left). None = uniform
+        /// `border_width` on all sides (legacy producers).
+        #[serde(default)]
+        border_widths: Option<(i64, i64, i64, i64)>,
         /// CSS color string for the border (e.g. "#808080"). Empty = no border.
         border_color: String,
         /// CSS background-position as (x, x_is_percent, y, y_is_percent).

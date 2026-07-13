@@ -1176,6 +1176,37 @@ mod tests {
     }
 
     #[test]
+    fn test_per_side_border_longhands() {
+        let html = r#"<html><head><style>
+            .b { width: 100px; height: 20px; border-bottom: 4px solid blue; border-top-width: 2px; }
+            .n { width: 100px; height: 20px; border: 3px solid black; border-style: none; }
+        </style></head><body><div class="b"></div><div class="n"></div></body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let borders: Vec<(f64, f64, f64, f64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { style, layout_size, .. } if layout_size.width() < 200 => {
+                    let b = style.border_or_zero();
+                    Some((b.top(), b.right(), b.bottom(), b.left()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            borders.contains(&(2.0, 0.0, 4.0, 0.0)),
+            "border-bottom 4px + border-top-width 2px, got {:?}",
+            borders
+        );
+        assert!(
+            borders.contains(&(0.0, 0.0, 0.0, 0.0)),
+            "border-style:none must zero the 3px border, got {:?}",
+            borders
+        );
+    }
+
+    #[test]
     fn test_box_sizing_border_box_absorbs_padding() {
         let html = r#"<html><head><style>
             .bb { box-sizing: border-box; width: 200px; height: 40px; padding: 10px; background-color: red; }

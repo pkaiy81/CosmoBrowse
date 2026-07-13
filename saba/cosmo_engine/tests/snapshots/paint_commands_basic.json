@@ -10,7 +10,8 @@
       "background_image": null,
       "opacity": 1.0,
       "z_index": 0,
-      "clip_rect": null
+      "clip_rect": null,
+      "border_widths": null
     },
     {
       "kind": "draw_text",

@@ -681,7 +681,12 @@ fn draw_rect(
     }
 
     // Draw border strokes (CSS box-model: border inside the element's box).
-    if rect.border_width > 0 && !rect.border_color.is_empty() {
+    let any_border = rect.border_width > 0
+        || rect
+            .border_widths
+            .map(|(t, r, b, l)| t > 0 || r > 0 || b > 0 || l > 0)
+            .unwrap_or(false);
+    if any_border && !rect.border_color.is_empty() {
         let bw = rect.border_width;
         let (br, bg_c, bb, _) = parse_css_color(&rect.border_color);
         let border_opacity = (rect.opacity).clamp(0.0, 1.0) as f32;
@@ -719,30 +724,23 @@ fn draw_rect(
             );
         } else {
             bp.anti_alias = false;
-            // Top border
-            if let Some((cx, cy, cw, ch)) = apply_clip(x, y, w, bw, &screen_clip) {
-                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+            // Per-side widths when provided (border-bottom etc.); a uniform
+            // legacy width otherwise.
+            let (bt, brr, bb, bl) = rect.border_widths.unwrap_or((bw, bw, bw, bw));
+            let mut bar = |bx: i64, by: i64, bw_: i64, bh: i64| {
+                if bw_ <= 0 || bh <= 0 {
+                    return;
                 }
-            }
-            // Bottom border
-            if let Some((cx, cy, cw, ch)) = apply_clip(x, y + h - bw, w, bw, &screen_clip) {
-                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+                if let Some((cx, cy, cw, ch)) = apply_clip(bx, by, bw_, bh, &screen_clip) {
+                    if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
+                        pixmap.fill_rect(sr, &bp, Transform::identity(), None);
+                    }
                 }
-            }
-            // Left border
-            if let Some((cx, cy, cw, ch)) = apply_clip(x, y, bw, h, &screen_clip) {
-                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
-                }
-            }
-            // Right border
-            if let Some((cx, cy, cw, ch)) = apply_clip(x + w - bw, y, bw, h, &screen_clip) {
-                if let Some(sr) = Rect::from_xywh(cx as f32, cy as f32, cw as f32, ch as f32) {
-                    pixmap.fill_rect(sr, &bp, Transform::identity(), None);
-                }
-            }
+            };
+            bar(x, y, w, bt); // top
+            bar(x, y + h - bb, w, bb); // bottom
+            bar(x, y, bl, h); // left
+            bar(x + w - brr, y, brr, h); // right
         }
     }
 
@@ -1016,6 +1014,7 @@ fn draw_image(
         clip_rect: img.clip_rect,
         anchor_id: None,
         border_width: 0,
+        border_widths: None,
         border_color: String::new(),
         background_position: None,
         background_no_repeat: false,

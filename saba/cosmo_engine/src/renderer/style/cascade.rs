@@ -303,6 +303,51 @@ impl LayoutObject {
                         }
                     }
                 }
+                // Per-side border shorthands and width longhands. The engine
+                // keeps ONE border color for the whole box, so the color from
+                // the most recent side shorthand wins (common pages use the
+                // same color on every side).
+                "border-top" | "border-right" | "border-bottom" | "border-left"
+                | "border-top-width" | "border-right-width" | "border-bottom-width"
+                | "border-left-width" => {
+                    let side = match declaration.property.as_str() {
+                        p if p.starts_with("border-top") => 0,
+                        p if p.starts_with("border-right") => 1,
+                        p if p.starts_with("border-bottom") => 2,
+                        _ => 3,
+                    };
+                    let base = self.style.font_size_or_default();
+                    let mut width = declaration
+                        .value
+                        .iter()
+                        .find_map(|v| spacing_component_to_px(v, base));
+                    // `border-top: none` / style `none` zeroes the side.
+                    if declaration
+                        .value
+                        .iter()
+                        .any(|v| matches!(v, ComponentValue::Ident(s) if s == "none" || s == "hidden"))
+                    {
+                        width = Some(0.0);
+                    }
+                    if let Some(px) = width {
+                        self.style.set_border_side(side, px.max(0.0));
+                    }
+                    if !declaration.property.ends_with("-width") {
+                        if let Some(color) = parse_color_value(&declaration.value) {
+                            self.style.set_border_color(color);
+                        }
+                    }
+                }
+                "border-style" => {
+                    // Approximation: any visible style keeps the stroke;
+                    // none/hidden removes the border entirely (computed
+                    // border-width becomes 0 per spec).
+                    if let Some(ComponentValue::Ident(v)) = first_value {
+                        if v == "none" || v == "hidden" {
+                            self.style.set_border(EdgeSize::zero());
+                        }
+                    }
+                }
                 "border-color" => {
                     if let Some(c) = parse_color_value(&declaration.value) {
                         self.style.set_border_color(c);

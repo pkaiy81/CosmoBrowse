@@ -1391,6 +1391,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 clip_rect: rect.clip_rect,
                 anchor_id: rect.anchor_id.clone(),
                 border_width: rect.border_width,
+                border_widths: rect.border_widths,
                 border_color: rect.border_color.clone(),
                 background_position: rect.background_position,
                 background_no_repeat: rect.background_no_repeat,

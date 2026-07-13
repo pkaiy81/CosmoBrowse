@@ -1,0 +1,19 @@
+<html>
+<head>
+<style>
+  body { background-color: #ffffff; }
+  .u { width: 200px; height: 40px; border-width: 3px; border-color: #cc0000; margin: 10px; }
+  .bottom-only { width: 200px; height: 40px; border-bottom: 4px solid #0044cc; margin: 10px; }
+  .mixed { width: 200px; height: 40px; border-top: 6px solid #009944; border-left: 2px solid #009944; margin: 10px; }
+  .none { width: 200px; height: 40px; border: 3px solid #000000; border-style: none; background-color: #eeeeee; margin: 10px; }
+  .rgbfn { width: 200px; height: 40px; border-bottom: 3px solid rgb(255, 128, 0); background-color: hsl(210, 60%, 90%); margin: 10px; }
+</style>
+</head>
+<body>
+  <div class="u">uniform 3px</div>
+  <div class="bottom-only">bottom only 4px</div>
+  <div class="mixed">top 6px + left 2px</div>
+  <div class="none">border-style none</div>
+  <div class="rgbfn">rgb()/hsl() colors</div>
+</body>
+</html>
