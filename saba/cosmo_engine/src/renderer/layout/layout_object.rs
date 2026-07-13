@@ -749,6 +749,80 @@ impl LayoutObject {
     /// whitespace-only text siblings are skipped (they are not grid items).
     /// Identified by pointer identity, so it works while `self` is inside an
     /// active borrow.
+    /// (row_start, row_span, col_start, col_span) of `name` inside a
+    /// grid-template-areas matrix.
+    pub(crate) fn area_rect_in(
+        areas: &[Vec<String>],
+        name: &str,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let (mut r0, mut r1, mut c0, mut c1) = (usize::MAX, 0usize, usize::MAX, 0usize);
+        for (r, row) in areas.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if cell == name {
+                    r0 = r0.min(r);
+                    r1 = r1.max(r);
+                    c0 = c0.min(c);
+                    c1 = c1.max(c);
+                }
+            }
+        }
+        if r0 == usize::MAX {
+            return None;
+        }
+        Some((r0, r1 - r0 + 1, c0, c1 - c0 + 1))
+    }
+
+    /// This item's grid-area rectangle within its parent's template areas.
+    fn grid_area_rect(&self) -> Option<(usize, usize, usize, usize)> {
+        let name = self.style.grid_area_name()?.to_string();
+        let parent = self.parent.upgrade()?;
+        let areas = parent.borrow().style().grid_template_areas()?;
+        Self::area_rect_in(&areas, &name)
+    }
+
+    /// Heights of the parent grid's area rows: for each template row, the
+    /// max outer height of the items whose area starts there. Sizes are
+    /// final by position time, and the walk tolerates `self` being mutably
+    /// borrowed (try_borrow failure = self).
+    fn grid_area_row_heights(&self) -> Vec<i64> {
+        let parent = match self.parent.upgrade() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let areas = match parent.borrow().style().grid_template_areas() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let mut heights = vec![0i64; areas.len()];
+        let mut tally = |style: &ComputedStyle, size: LayoutSize| {
+            if let Some(name) = style.grid_area_name() {
+                if let Some((r0, _, _, _)) = Self::area_rect_in(&areas, name) {
+                    let m = compute_box_model_metrics(style);
+                    heights[r0] =
+                        heights[r0].max(size.height() + m.margin.top + m.margin.bottom);
+                }
+            }
+        };
+        let mut child = parent.borrow().first_child();
+        while let Some(c) = child {
+            match c.try_borrow() {
+                Ok(b) => {
+                    let next = b.next_sibling();
+                    if !b.is_whitespace_text() {
+                        tally(&b.style(), b.size);
+                    }
+                    drop(b);
+                    child = next;
+                }
+                Err(_) => {
+                    tally(&self.style, self.size);
+                    child = self.next_sibling.clone();
+                }
+            }
+        }
+        heights
+    }
+
     fn grid_item_index(&self) -> usize {
         let parent = match self.parent.upgrade() {
             Some(p) => p,
@@ -1808,13 +1882,18 @@ impl LayoutObject {
                     // https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths
                     self.flex_row_main_size(parent_size.width())
                 } else if let Some((tracks, col_gap, _)) = self.parent_grid_info() {
-                    // Grid item: the width of its column track; the item's
-                    // content box is the track minus its own margins.
+                    // Grid item: the width of its column track(s); the item's
+                    // content box is the track minus its own margins. An item
+                    // with a grid-area spans that area's columns.
                     let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
-                    let col = self.grid_item_index() % tracks.len().max(1);
-                    let track =
-                        (widths.get(col).copied().unwrap_or(0) - metrics.outer_horizontal())
-                            .max(0);
+                    let (col, span) = self
+                        .grid_area_rect()
+                        .map(|(_, _, c, sp)| (c, sp))
+                        .unwrap_or((self.grid_item_index() % tracks.len().max(1), 1));
+                    let end = (col + span).min(widths.len());
+                    let spanned: i64 = widths[col.min(widths.len())..end].iter().sum::<i64>()
+                        + col_gap * (span as i64 - 1).max(0);
+                    let track = (spanned - metrics.outer_horizontal()).max(0);
                     if explicit_width > 0 {
                         explicit_width.min(track)
                     } else {
@@ -1891,6 +1970,8 @@ impl LayoutObject {
                     None
                 };
                 let grid_row_gap = self.style.row_gap();
+                let mut area_row_heights: Vec<i64> = Vec::new();
+                let mut area_row_heights_extra: i64 = 0;
                 let mut grid_idx = 0usize;
                 let mut grid_rows_done = 0usize;
                 let mut grid_row_height = 0i64;
@@ -1915,6 +1996,26 @@ impl LayoutObject {
                                 + c_metrics.margin.top
                                 + c_metrics.margin.bottom,
                         );
+                    } else if let Some(areas) = self.style.grid_template_areas() {
+                        // Areas grid: rows are sized after the loop from the
+                        // per-row max of the items placed in them.
+                        if !c.borrow().is_whitespace_text() {
+                            let b = c.borrow();
+                            let m = compute_box_model_metrics(&b.style());
+                            let outer_h = b.size.height() + m.margin.top + m.margin.bottom;
+                            let rect = b
+                                .style()
+                                .grid_area_name()
+                                .and_then(|nm| Self::area_rect_in(&areas, nm));
+                            if let Some((r0, _rspan, _, _)) = rect {
+                                if area_row_heights.len() < areas.len() {
+                                    area_row_heights.resize(areas.len(), 0);
+                                }
+                                area_row_heights[r0] = area_row_heights[r0].max(outer_h);
+                            } else {
+                                area_row_heights_extra = area_row_heights_extra.max(outer_h);
+                            }
+                        }
                     } else if let Some(n) = grid_cols {
                         // Whitespace-only text children are not grid items.
                         if !c.borrow().is_whitespace_text() {
@@ -1951,6 +2052,13 @@ impl LayoutObject {
                     }
                     previous_child_kind = c_kind;
                     child = c.borrow().next_sibling();
+                }
+                // Areas grid: container height = sum of the area rows.
+                if !area_row_heights.is_empty() || area_row_heights_extra > 0 {
+                    let rows: i64 = area_row_heights.iter().sum();
+                    let gaps = grid_row_gap
+                        * (area_row_heights.iter().filter(|h| **h > 0).count() as i64 - 1).max(0);
+                    content_height += rows + gaps + area_row_heights_extra;
                 }
                 // Final, possibly partial grid row.
                 if grid_row_height > 0 {
@@ -2164,11 +2272,27 @@ impl LayoutObject {
                 point.set_y(parent_point.y() + metrics.margin.top + v_offset);
             }
         } else if let Some((tracks, col_gap, row_gap)) = self.parent_grid_info() {
-            // Grid item placement: row-major into the column tracks.
+            let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
+            if let Some((row_start, _row_span, col_start, _col_span)) = self.grid_area_rect() {
+                // Area placement: x from the column prefix, y from the
+                // heights of the area rows above (each item computes the
+                // row table independently from its siblings' sizes).
+                let x_offset: i64 = widths[..col_start.min(widths.len())].iter().sum::<i64>()
+                    + col_start as i64 * col_gap;
+                point.set_x(parent_point.x() + x_offset + metrics.margin.left);
+                let row_heights = self.grid_area_row_heights();
+                let mut y_off = 0i64;
+                for h in row_heights.iter().take(row_start) {
+                    if *h > 0 {
+                        y_off += h + row_gap;
+                    }
+                }
+                point.set_y(parent_point.y() + y_off + metrics.margin.top);
+            } else {
+            // Row-major placement into the column tracks.
             let n = tracks.len().max(1);
             let idx = self.grid_item_index();
             let col = idx % n;
-            let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
             let x_offset: i64 =
                 widths[..col.min(widths.len())].iter().sum::<i64>() + col as i64 * col_gap;
             point.set_x(parent_point.x() + x_offset + metrics.margin.left);
@@ -2193,6 +2317,7 @@ impl LayoutObject {
                         .map(|p| p.y())
                         .unwrap_or(parent_point.y() + metrics.margin.top),
                 );
+            }
             }
         } else if let Some(dir) = self.parent_flex_direction() {
             // Flex item placement (main-axis start packing; no grow/shrink yet).

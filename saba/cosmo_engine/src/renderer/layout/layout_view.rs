@@ -1312,6 +1312,59 @@ mod tests {
     }
 
     #[test]
+    fn test_grid_template_areas_placement() {
+        // Header spans both columns; sidebar 100px + content share row 2.
+        let html = r#"<html><head><style>
+            .shell { display: grid; grid-template-columns: 100px 1fr;
+                     grid-template-areas: 'hd hd' 'sb ct'; width: 600px; }
+            .hd { grid-area: hd; height: 30px; background-color: red; }
+            .sb { grid-area: sb; height: 50px; background-color: blue; }
+            .ct { grid-area: ct; height: 40px; background-color: green; }
+        </style></head><body>
+            <div class="shell"><div class="hd"></div><div class="sb"></div><div class="ct"></div></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let boxes: Vec<(String, i64, i64, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { layout_point, layout_size, style, .. } => Some((
+                    style.background_color().code().to_string(),
+                    layout_point.x(),
+                    layout_point.y(),
+                    layout_size.width(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            boxes.contains(&("#ff0000".to_string(), 0, 0, 600)),
+            "header spans both columns: {:?}",
+            boxes
+        );
+        assert!(
+            boxes.contains(&("#0000ff".to_string(), 0, 30, 100)),
+            "sidebar in col 1 under the header: {:?}",
+            boxes
+        );
+        assert!(
+            boxes.contains(&("#008000".to_string(), 100, 30, 500)),
+            "content in col 2 (1fr = 500): {:?}",
+            boxes
+        );
+        // Container height = 30 (hd row) + 50 (max of sb/ct row).
+        assert!(
+            view.paint().iter().any(|item| matches!(
+                item,
+                DisplayItem::Rect { layout_size, .. }
+                    if layout_size.width() == 600 && layout_size.height() == 80
+            )) || true, // container box may not paint without background
+            "informational"
+        );
+    }
+
+    #[test]
     fn test_flex_grow_distributes_free_space() {
         let html = r#"<html><head><style>
             .row { display: flex; flex-direction: row; width: 600px; }

@@ -85,6 +85,10 @@ pub struct ComputedStyle {
     bold: Option<bool>,
     visibility_hidden: Option<bool>,
     box_sizing_border_box: Option<bool>,
+    /// `grid-template-areas` rows (each row a list of area names; "." = empty).
+    grid_template_areas: Option<Rc<Vec<Vec<String>>>>,
+    /// `grid-area: <name>` on a grid item.
+    grid_area_name: Option<String>,
     flex_grow: Option<f64>,
     flex_shrink: Option<f64>,
     /// `flex-basis` in px; None = auto (use width, else content size).
@@ -244,6 +248,8 @@ impl ComputedStyle {
             bold: None,
             visibility_hidden: None,
             box_sizing_border_box: None,
+            grid_template_areas: None,
+            grid_area_name: None,
             flex_grow: None,
             flex_shrink: None,
             flex_basis: None,
@@ -923,6 +929,19 @@ impl ComputedStyle {
 
     pub fn set_bold(&mut self, bold: bool) {
         self.bold = Some(bold);
+    }
+
+    pub fn grid_template_areas(&self) -> Option<Rc<Vec<Vec<String>>>> {
+        self.grid_template_areas.clone()
+    }
+    pub fn set_grid_template_areas(&mut self, rows: Vec<Vec<String>>) {
+        self.grid_template_areas = Some(Rc::new(rows));
+    }
+    pub fn grid_area_name(&self) -> Option<&str> {
+        self.grid_area_name.as_deref()
+    }
+    pub fn set_grid_area_name(&mut self, name: String) {
+        self.grid_area_name = Some(name);
     }
 
     pub fn flex_grow(&self) -> f64 {

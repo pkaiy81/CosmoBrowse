@@ -119,10 +119,38 @@ pub(crate) fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridT
             ComponentValue::Number(v) => {
                 tracks.push(GridTrack::Px((*v).max(0.0)));
             }
+            ComponentValue::Ident(name) if name.eq_ignore_ascii_case("minmax") => {
+                // minmax(min, max): size by the max part (a fr max flexes,
+                // a px max is fixed). The min clamp is approximated away.
+                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
+                    let mut depth = 1;
+                    let mut j = i + 2;
+                    while j < values.len() && depth > 0 {
+                        match &values[j] {
+                            ComponentValue::OpenParenthesis => depth += 1,
+                            ComponentValue::CloseParenthesis => depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let inner = &values[(i + 2).min(values.len())..(j - 1).min(values.len())];
+                    let parts = parse_grid_template_tracks(
+                        &inner
+                            .iter()
+                            .filter(|t| **t != ComponentValue::Delim(','))
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    );
+                    tracks.push(parts.last().copied().unwrap_or(GridTrack::Auto));
+                    i = j;
+                    continue;
+                }
+                tracks.push(GridTrack::Auto);
+            }
             ComponentValue::Ident(_) => {
                 tracks.push(GridTrack::Auto);
-                // Skip a function's argument list (e.g. minmax(0, 1fr)) so its
-                // contents don't count as extra tracks.
+                // Skip a function's argument list so its contents don't count
+                // as extra tracks.
                 if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
                     let mut depth = 1;
                     let mut j = i + 2;

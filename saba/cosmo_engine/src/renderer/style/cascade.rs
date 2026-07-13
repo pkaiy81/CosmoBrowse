@@ -226,6 +226,30 @@ impl LayoutObject {
                         self.style.set_flex_direction(FlexDirection::from_str(value));
                     }
                 }
+                "grid-template-areas" => {
+                    let rows: Vec<Vec<String>> = declaration
+                        .value
+                        .iter()
+                        .filter_map(|v| match v {
+                            ComponentValue::StringToken(s) => Some(
+                                s.split_ascii_whitespace()
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>(),
+                            ),
+                            _ => None,
+                        })
+                        .filter(|r| !r.is_empty())
+                        .collect();
+                    if !rows.is_empty() {
+                        self.style.set_grid_template_areas(rows);
+                    }
+                }
+                // grid-area: <name> (line-number forms are not supported yet).
+                "grid-area" => {
+                    if let Some(ComponentValue::Ident(name)) = first_value {
+                        self.style.set_grid_area_name(name.clone());
+                    }
+                }
                 "grid-template-columns" => {
                     let tracks = parse_grid_template_tracks(&declaration.value);
                     self.style.set_grid_template_columns(tracks);
