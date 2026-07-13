@@ -29,6 +29,16 @@ impl LayoutObject {
                     declaration.value = substitute_vars(&declaration.value, scope);
                 }
             }
+            // Fold resolvable calc() into plain px so every property arm
+            // sees ordinary Dimension tokens.
+            if declaration
+                .value
+                .iter()
+                .any(|v| matches!(v, ComponentValue::Ident(s) if s.eq_ignore_ascii_case("calc")))
+            {
+                declaration.value =
+                    fold_calc(&declaration.value, self.style.font_size_or_default());
+            }
             let first_value = declaration.first_value();
             match declaration.property.as_str() {
                 "background-color" | "background" => {

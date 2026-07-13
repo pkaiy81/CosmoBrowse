@@ -2600,8 +2600,8 @@ impl LayoutObject {
             // Sticky flows normally; the painter pins it at scroll time.
             PositionType::Static | PositionType::Sticky => {}
             PositionType::Relative => {
-                point.set_x(point.x() + edge_to_i64(self.style.offset_left()));
-                point.set_y(point.y() + edge_to_i64(self.style.offset_top()));
+                point.set_x(point.x() + self.style.offset_left() as i64);
+                point.set_y(point.y() + self.style.offset_top() as i64);
             }
             PositionType::Absolute => {
                 // Containing block: the nearest positioned ancestor's content
@@ -2614,7 +2614,7 @@ impl LayoutObject {
                         .style
                         .offset_left_ratio()
                         .map(|r| (cb_size.width() as f64 * r) as i64)
-                        .unwrap_or_else(|| edge_to_i64(self.style.offset_left()));
+                        .unwrap_or_else(|| self.style.offset_left() as i64);
                     point.set_x(cb_point.x() + dx);
                 } else if let Some(r) = self.style.offset_right() {
                     point.set_x(cb_point.x() + cb_size.width() - self.size.width() - r as i64);
@@ -2625,7 +2625,7 @@ impl LayoutObject {
                         .style
                         .offset_top_ratio()
                         .map(|r| (cb_size.height() as f64 * r) as i64)
-                        .unwrap_or_else(|| edge_to_i64(self.style.offset_top()));
+                        .unwrap_or_else(|| self.style.offset_top() as i64);
                     point.set_y(cb_point.y() + dy);
                 } else if let Some(b) = self.style.offset_bottom() {
                     point.set_y(cb_point.y() + cb_size.height() - self.size.height() - b as i64);

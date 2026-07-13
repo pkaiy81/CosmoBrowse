@@ -227,7 +227,18 @@ fn parse_single_query(tokens: &[CssToken]) -> MediaQuery {
 }
 
 fn parse_feature(inner: &[CssToken]) -> MediaFeature {
-    // Expect: Ident(name) [ ':' value... ]
+    let toks: Vec<&CssToken> = inner
+        .iter()
+        .filter(|t| !matches!(t, CssToken::Whitespace))
+        .collect();
+    // Range syntax (Media Queries L4): width <= 1044px / 1044px < width.
+    if toks
+        .iter()
+        .any(|t| matches!(t, CssToken::Delim('<') | CssToken::Delim('>')))
+    {
+        return parse_range_feature(&toks);
+    }
+    // Classic form: Ident(name) [ ':' value... ]
     let mut name = String::new();
     let mut value = Vec::new();
     let mut seen_colon = false;
@@ -239,13 +250,81 @@ fn parse_feature(inner: &[CssToken]) -> MediaFeature {
                 name = s.to_ascii_lowercase();
             }
             t if seen_colon => value.push(t.clone()),
-            _ => return MediaFeature::Unknown, // range syntax etc.
+            _ => return MediaFeature::Unknown,
         }
     }
     if name.is_empty() {
         return MediaFeature::Unknown;
     }
     feature_from(&name, &value)
+}
+
+/// One side of a range comparison: the feature name or a length.
+enum RangeItem {
+    Name(String),
+    Px(f64),
+}
+
+/// Media Queries L4 range form. Handles `name op value`, `value op name`
+/// and the double form `v1 op name op v2`. Strict comparisons are
+/// approximated by nudging the boundary 1px (viewports are integral here).
+fn parse_range_feature(toks: &[&CssToken]) -> MediaFeature {
+    let mut items: Vec<RangeItem> = Vec::new();
+    let mut ops: Vec<(char, bool)> = Vec::new(); // (direction, inclusive)
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i] {
+            CssToken::Ident(s) => items.push(RangeItem::Name(s.to_ascii_lowercase())),
+            CssToken::Number(n) => items.push(RangeItem::Px(*n)),
+            CssToken::Dimension(n, u) => match length_to_px(*n, u) {
+                Some(px) => items.push(RangeItem::Px(px)),
+                None => return MediaFeature::Unknown,
+            },
+            CssToken::Delim(d @ ('<' | '>')) => {
+                let inclusive = matches!(toks.get(i + 1), Some(CssToken::Delim('=')));
+                if inclusive {
+                    i += 1;
+                }
+                ops.push((*d, inclusive));
+            }
+            CssToken::Delim('=') => {}
+            _ => return MediaFeature::Unknown,
+        }
+        i += 1;
+    }
+    let feature = |name: &str, upper: bool, px: f64, inclusive: bool| -> MediaFeature {
+        let v = if inclusive {
+            px
+        } else if upper {
+            px - 1.0
+        } else {
+            px + 1.0
+        };
+        match (name, upper) {
+            ("width", true) => MediaFeature::MaxWidth(v),
+            ("width", false) => MediaFeature::MinWidth(v),
+            ("height", true) => MediaFeature::MaxHeight(v),
+            ("height", false) => MediaFeature::MinHeight(v),
+            _ => MediaFeature::Unknown,
+        }
+    };
+    match (items.as_slice(), ops.as_slice()) {
+        // name < value : name has an upper bound (for '<'/'<=').
+        ([RangeItem::Name(n), RangeItem::Px(v)], [(d, inc)]) => {
+            feature(n, *d == '<', *v, *inc)
+        }
+        // value < name : name has a LOWER bound.
+        ([RangeItem::Px(v), RangeItem::Name(n)], [(d, inc)]) => {
+            feature(n, *d == '>', *v, *inc)
+        }
+        // v1 < name < v2 : evaluated as the lower bound only (the caller
+        // AND-combines features, so emit the tighter single bound; a full
+        // pair would need two features — approximate with the first).
+        ([RangeItem::Px(v1), RangeItem::Name(n), RangeItem::Px(_v2)], [(d1, inc1), _]) => {
+            feature(n, *d1 == '>', *v1, *inc1)
+        }
+        _ => MediaFeature::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +399,23 @@ mod tests {
         assert!(q.matches(&DESKTOP)); // second query still matches
         let solo = parse_media_query_list(&toks("(pointer: fine)"));
         assert!(!solo.matches(&DESKTOP));
+    }
+
+    #[test]
+    fn range_syntax_forms() {
+        let q = parse_media_query_list(&toks("(width <= 1044px)"));
+        assert!(q.matches(&DESKTOP)); // 1024 <= 1044
+        assert!(q.matches(&PHONE));
+        let m = parse_media_query_list(&toks("(width <= 800px)"));
+        assert!(!m.matches(&DESKTOP));
+        assert!(m.matches(&PHONE));
+        let g = parse_media_query_list(&toks("(width > 1044px)"));
+        assert!(!g.matches(&DESKTOP));
+        assert!(!g.matches(&PHONE));
+        let ge = parse_media_query_list(&toks("(width >= 1024px)"));
+        assert!(ge.matches(&DESKTOP));
+        let rev = parse_media_query_list(&toks("(1044px >= width)"));
+        assert!(rev.matches(&PHONE));
     }
 
     #[test]

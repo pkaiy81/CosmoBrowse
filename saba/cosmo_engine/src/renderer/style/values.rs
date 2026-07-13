@@ -817,6 +817,18 @@ mod tests {
     }
 
     #[test]
+    fn calc_folds_absolute_lengths() {
+        use crate::renderer::layout::computed_style::FontSize;
+        let folded = fold_calc(&vals("calc(20em * -1)"), FontSize::Medium);
+        assert_eq!(folded, vals("-320px"), "{:?}", folded);
+        let folded = fold_calc(&vals("calc(100px + 2em - (4px / 2))"), FontSize::Medium);
+        assert_eq!(folded, vals("130px"), "{:?}", folded);
+        // Percentages are left unresolved.
+        let kept = fold_calc(&vals("calc(100% - 20px)"), FontSize::Medium);
+        assert!(kept.iter().any(|v| matches!(v, ComponentValue::Ident(s) if s == "calc")));
+    }
+
+    #[test]
     fn parses_rgb_and_rgba_functions() {
         assert_eq!(
             parse_color_value(&vals("rgb(255, 0, 0)")).unwrap().code(),
@@ -862,5 +874,122 @@ mod tests {
             parse_color_value(&vals("url(bg.png) crimson")).unwrap().code(),
             "#dc143c"
         );
+    }
+}
+
+/// Fold every resolvable `calc(...)` in a declaration value into a plain
+/// px Dimension token (absolute lengths and numbers only; percentages and
+/// unknown units leave the calc unresolved and untouched). Runs after var()
+/// substitution so `calc(var(--x)*2)` folds too.
+pub(crate) fn fold_calc(values: &[ComponentValue], base_font_size: FontSize) -> Vec<ComponentValue> {
+    let mut out = Vec::with_capacity(values.len());
+    let mut i = 0;
+    while i < values.len() {
+        let is_calc = matches!(&values[i], ComponentValue::Ident(s) if s.eq_ignore_ascii_case("calc"))
+            && matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
+        if is_calc {
+            // Find the matching close paren.
+            let mut depth = 1;
+            let mut j = i + 2;
+            while j < values.len() && depth > 0 {
+                match &values[j] {
+                    ComponentValue::OpenParenthesis => depth += 1,
+                    ComponentValue::CloseParenthesis => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let inner = &values[i + 2..(j - 1).max(i + 2)];
+            if let Some(px) = eval_calc_sum(&mut inner.iter().peekable(), base_font_size) {
+                out.push(ComponentValue::Dimension(px, "px".to_string()));
+            } else {
+                // Unresolvable: keep the original tokens (arms will skip).
+                out.extend_from_slice(&values[i..j]);
+            }
+            i = j;
+        } else {
+            out.push(values[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+type CalcIter<'a> = core::iter::Peekable<core::slice::Iter<'a, ComponentValue>>;
+
+fn eval_calc_sum(it: &mut CalcIter, base: FontSize) -> Option<f64> {
+    let mut acc = eval_calc_product(it, base)?;
+    loop {
+        match it.peek() {
+            Some(ComponentValue::Delim(op @ ('+' | '-'))) => {
+                let op = *op;
+                it.next();
+                let rhs = eval_calc_product(it, base)?;
+                if op == '+' {
+                    acc += rhs;
+                } else {
+                    acc -= rhs;
+                }
+            }
+            // The CSS tokenizer's negative-number handling emits a lone
+            // minus/plus between spaces as an Ident.
+            Some(ComponentValue::Ident(ops)) if ops == "-" || ops == "+" => {
+                let op = if ops == "-" { '-' } else { '+' };
+                it.next();
+                let rhs = eval_calc_product(it, base)?;
+                if op == '+' {
+                    acc += rhs;
+                } else {
+                    acc -= rhs;
+                }
+            }
+            Some(ComponentValue::Whitespace) => {
+                it.next();
+            }
+            Some(ComponentValue::CloseParenthesis) | None => return Some(acc),
+            _ => return None,
+        }
+    }
+}
+
+fn eval_calc_product(it: &mut CalcIter, base: FontSize) -> Option<f64> {
+    let mut acc = eval_calc_atom(it, base)?;
+    loop {
+        match it.peek() {
+            Some(ComponentValue::Delim(op @ ('*' | '/'))) => {
+                let op = *op;
+                it.next();
+                let rhs = eval_calc_atom(it, base)?;
+                if op == '*' {
+                    acc *= rhs;
+                } else if rhs != 0.0 {
+                    acc /= rhs;
+                } else {
+                    return None;
+                }
+            }
+            Some(ComponentValue::Whitespace) => {
+                it.next();
+            }
+            _ => return Some(acc),
+        }
+    }
+}
+
+fn eval_calc_atom(it: &mut CalcIter, base: FontSize) -> Option<f64> {
+    while matches!(it.peek(), Some(ComponentValue::Whitespace)) {
+        it.next();
+    }
+    match it.next()? {
+        ComponentValue::Number(n) => Some(*n),
+        ComponentValue::Dimension(n, unit) if unit != "%" => length_to_px(*n, unit, base),
+        ComponentValue::OpenParenthesis => {
+            let v = eval_calc_sum(it, base)?;
+            match it.next() {
+                Some(ComponentValue::CloseParenthesis) => Some(v),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
