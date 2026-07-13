@@ -17,6 +17,12 @@ impl LayoutObject {
         if self.style.display() == DisplayType::DisplayNone {
             return vec![];
         }
+        // visibility:hidden boxes keep their layout space but emit nothing.
+        // Paint runs per node (not per subtree), so a descendant that resets
+        // visibility:visible still paints via the inherited flag it cleared.
+        if self.style.is_visibility_hidden() {
+            return vec![];
+        }
 
         match self.kind {
             LayoutObjectKind::Block => {

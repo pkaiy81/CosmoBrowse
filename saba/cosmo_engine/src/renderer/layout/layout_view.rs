@@ -1176,6 +1176,51 @@ mod tests {
     }
 
     #[test]
+    fn test_font_weight_property_sets_bold() {
+        let html = r#"<html><head><style>
+            .heavy { font-weight: 700; }
+            .light { font-weight: normal; }
+        </style></head><body><span class="heavy">wide</span><b class="light">thin</b></body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let bolds: Vec<(String, bool)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, bold, .. } => Some((text.clone(), *bold)),
+                _ => None,
+            })
+            .collect();
+        assert!(bolds.contains(&("wide".to_string(), true)), "{:?}", bolds);
+        // font-weight:normal overrides the UA bold of <b>.
+        assert!(bolds.contains(&("thin".to_string(), false)), "{:?}", bolds);
+    }
+
+    #[test]
+    fn test_visibility_hidden_keeps_space_but_paints_nothing() {
+        let hidden = r#"<html><head><style>
+            .gap { visibility: hidden; height: 50px; }
+        </style></head><body><div class="gap">ghost</div><p>after</p></body></html>"#
+            .to_string();
+        let view = create_layout_view(hidden, 800);
+        let items = view.paint();
+        assert!(
+            !items.iter().any(|i| matches!(i, DisplayItem::Text { text, .. } if text.contains("ghost"))),
+            "hidden content must not paint"
+        );
+        let after_y = items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { text, layout_point, .. } if text.contains("after") => {
+                    Some(layout_point.y())
+                }
+                _ => None,
+            })
+            .expect("after text");
+        assert!(after_y >= 50, "hidden box must keep its 50px space, got y={after_y}");
+    }
+
+    #[test]
     fn test_media_query_selects_rules_by_viewport_width() {
         // The paragraph is hidden only under the max-width:600px condition.
         let html = r#"<html><head><style>

@@ -83,6 +83,7 @@ pub struct ComputedStyle {
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
     bold: Option<bool>,
+    visibility_hidden: Option<bool>,
     opacity: Option<f64>,
     height: Option<f64>,
     height_ratio: Option<f64>,
@@ -229,6 +230,7 @@ impl ComputedStyle {
             font_size: None,
             text_decoration: None,
             bold: None,
+            visibility_hidden: None,
             opacity: None,
             height: None,
             height_ratio: None,
@@ -339,6 +341,11 @@ impl ComputedStyle {
             // font-weight (bold) is inherited.
             if self.bold.is_none() && parent_style.bold == Some(true) {
                 self.bold = Some(true);
+            }
+            // visibility is inherited (a child may set visible to reappear
+            // inside a hidden parent).
+            if self.visibility_hidden.is_none() {
+                self.visibility_hidden = parent_style.visibility_hidden;
             }
             // line-height is inherited.
             if self.line_height.is_none() {
@@ -889,6 +896,20 @@ impl ComputedStyle {
 
     pub fn is_bold(&self) -> bool {
         self.bold.unwrap_or(false)
+    }
+
+    pub fn set_bold(&mut self, bold: bool) {
+        self.bold = Some(bold);
+    }
+
+    /// `visibility: hidden` — the box keeps its layout size but paints
+    /// nothing (unlike display:none, which removes the box).
+    pub fn is_visibility_hidden(&self) -> bool {
+        self.visibility_hidden.unwrap_or(false)
+    }
+
+    pub fn set_visibility_hidden(&mut self, hidden: bool) {
+        self.visibility_hidden = Some(hidden);
     }
 
     pub fn set_opacity(&mut self, opacity: f64) {

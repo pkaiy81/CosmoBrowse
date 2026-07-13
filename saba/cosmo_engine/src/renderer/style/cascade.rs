@@ -425,6 +425,28 @@ impl LayoutObject {
                         self.style.set_opacity(*value);
                     }
                 }
+                "font-weight" => match first_value {
+                    // bolder/lighter are resolved as their common effect
+                    // (relative-to-parent weights need real weight tracking).
+                    Some(ComponentValue::Ident(value)) => match value.as_str() {
+                        "bold" | "bolder" => self.style.set_bold(true),
+                        "normal" | "lighter" => self.style.set_bold(false),
+                        _ => {}
+                    },
+                    Some(ComponentValue::Number(value)) => {
+                        self.style.set_bold(*value >= 600.0);
+                    }
+                    _ => {}
+                },
+                "visibility" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        match value.as_str() {
+                            "hidden" | "collapse" => self.style.set_visibility_hidden(true),
+                            "visible" => self.style.set_visibility_hidden(false),
+                            _ => {}
+                        }
+                    }
+                }
                 "font-family" => {
                     if let Some(font_family) = first_font_family(&declaration.value) {
                         self.style.set_font_family(font_family);
