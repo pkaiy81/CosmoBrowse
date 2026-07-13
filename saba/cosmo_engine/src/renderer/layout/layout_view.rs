@@ -1574,6 +1574,37 @@ mod tests {
     }
 
     #[test]
+    fn test_pre_preserves_newlines_and_spaces() {
+        let html = "<html><head></head><body><pre>first   line\nsecond line\n\nfourth</pre></body></html>"
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let texts: Vec<(String, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, layout_point, .. } => {
+                    Some((text.clone(), layout_point.y()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("first   line")),
+            "runs of spaces must survive in <pre>: {:?}",
+            texts
+        );
+        let y_first = texts.iter().find(|(t, _)| t.contains("first")).unwrap().1;
+        let y_second = texts.iter().find(|(t, _)| t.contains("second")).unwrap().1;
+        let y_fourth = texts.iter().find(|(t, _)| t.contains("fourth")).unwrap().1;
+        assert!(y_second > y_first, "newline breaks the line");
+        assert!(
+            y_fourth >= y_second + 2 * (y_second - y_first),
+            "the blank line keeps its row: {:?}",
+            texts
+        );
+    }
+
+    #[test]
     fn test_font_weight_property_sets_bold() {
         let html = r#"<html><head><style>
             .heavy { font-weight: 700; }

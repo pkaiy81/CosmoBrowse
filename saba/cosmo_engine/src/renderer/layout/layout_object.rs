@@ -1653,7 +1653,55 @@ impl LayoutObject {
     /// (e.g. `<span>197 points</span> by <a>user</a>`). At block edges the
     /// space is removed, as it would be at a line start/end.
     /// https://www.w3.org/TR/css-text-3/#white-space-phase-2
+    /// The visual lines of a text run: honors white-space (pre keeps hard
+    /// newlines; pre-wrap additionally wraps; nowrap = single line) — the
+    /// sizing and paint passes MUST use this same function so boxes never
+    /// wrap their own content.
+    pub(crate) fn build_text_lines(
+        &self,
+        plain_text: &str,
+        fs: FontSize,
+        bold: bool,
+        max_width: i64,
+    ) -> Vec<String> {
+        use crate::renderer::layout::computed_style::WhiteSpace;
+        if self.style.white_space_preserves_newlines() {
+            let mut out = Vec::new();
+            for seg in plain_text.split('\n') {
+                if self.style.white_space() == WhiteSpace::PreWrap && !seg.is_empty() {
+                    out.extend(split_text(seg.to_string(), fs, bold, max_width));
+                } else {
+                    out.push(seg.to_string());
+                }
+            }
+            out
+        } else if self.style.white_space_nowrap() {
+            vec![plain_text.to_string()]
+        } else {
+            split_text(plain_text.to_string(), fs, bold, max_width)
+        }
+    }
+
     pub(crate) fn collapse_text_whitespace(&self, t: &str) -> String {
+        // pre / pre-wrap: spaces and newlines are content. Tabs render as
+        // 4 spaces (a fixed approximation of tab stops).
+        if self.style.white_space_preserves_spaces() {
+            return t.replace('\r', "").replace('\t', "    ");
+        }
+        // pre-line: collapse runs within each line, keep the newlines.
+        if self.style.white_space_preserves_newlines() {
+            return t
+                .replace('\r', "")
+                .split('\n')
+                .map(|line| {
+                    line.split([' ', '\t'])
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
         // Collapse ALL document white space (space, tab, CR, LF, FF) — but
         // never U+00A0 NBSP, which is a rendered character. Tabs matter:
         // tab-indented pages (e.g. Wikipedia) otherwise paint thousands of
@@ -2278,11 +2326,7 @@ impl LayoutObject {
                         );
                     // Cache so paint() uses the identical boundary (see paint Text arm).
                     self.text_line_max_width = max_width;
-                    let lines = if self.style.white_space_nowrap() {
-                        vec![plain_text.clone()]
-                    } else {
-                        split_text(plain_text.clone(), fs, bold, max_width)
-                    };
+                    let lines = self.build_text_lines(&plain_text, fs, bold, max_width);
                     let width = lines
                         .iter()
                         .map(|line| measure_text_width(line, fs, bold))

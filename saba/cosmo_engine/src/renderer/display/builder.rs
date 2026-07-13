@@ -233,7 +233,9 @@ impl LayoutObject {
                                 self.size().width().max(cw)
                             }
                         });
-                    let mut lines = if self.style.white_space_nowrap() {
+                    let mut lines = if self.style.white_space_nowrap()
+                        && !self.style.white_space_preserves_newlines()
+                    {
                         // nowrap: a single line (the collapser already turned
                         // newlines into spaces). text-overflow:ellipsis on a
                         // clipping ancestor then truncates it to fit.
@@ -243,7 +245,7 @@ impl LayoutObject {
                         }
                         vec![line]
                     } else {
-                        split_text(plain_text, fs, bold, max_width)
+                        self.build_text_lines(&plain_text, fs, bold, max_width)
                     };
                     let _ = &mut lines;
                     let href = self.link_href();

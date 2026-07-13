@@ -201,7 +201,7 @@ pub struct ComputedStyle {
     /// `box-shadow`: (dx, dy, blur, color).
     box_shadow: Option<(f64, f64, f64, Color)>,
     /// `white-space: nowrap` — suppress line wrapping. Inherited.
-    white_space_nowrap: Option<bool>,
+    white_space: Option<WhiteSpace>,
     /// `text-overflow: ellipsis` — truncate a clipped single line with `…`.
     text_overflow_ellipsis: bool,
     /// Final clip rectangle (x, y, w, h) stamped by the post-layout pass:
@@ -316,7 +316,7 @@ impl ComputedStyle {
             rotate_context: None,
             border_radius: None,
             box_shadow: None,
-            white_space_nowrap: None,
+            white_space: None,
             text_overflow_ellipsis: false,
             final_clip: None,
             scroll_container: None,
@@ -403,8 +403,8 @@ impl ComputedStyle {
                 self.line_height = parent_style.line_height;
             }
             // white-space is inherited.
-            if self.white_space_nowrap.is_none() {
-                self.white_space_nowrap = parent_style.white_space_nowrap;
+            if self.white_space.is_none() {
+                self.white_space = parent_style.white_space;
             }
             // text-align is inherited.
             if self.text_align.is_none() && parent_style.text_align != Some(TextAlign::Left) {
@@ -512,6 +512,11 @@ impl ComputedStyle {
                 Some("ol") => Some(ListStyleType::Decimal),
                 _ => None,
             };
+        }
+        if self.white_space.is_none()
+            && node.borrow().element_tag_name().as_deref() == Some("pre")
+        {
+            self.white_space = Some(WhiteSpace::Pre);
         }
         // UA stylesheet: lists indent their items so outside markers have
         // room (browsers use padding-inline-start: 40px).
@@ -795,12 +800,30 @@ impl ComputedStyle {
         self.box_shadow.clone()
     }
 
-    pub fn set_white_space_nowrap(&mut self, v: bool) {
-        self.white_space_nowrap = Some(v);
+    pub fn set_white_space(&mut self, v: WhiteSpace) {
+        self.white_space = Some(v);
     }
 
+    pub fn white_space(&self) -> WhiteSpace {
+        self.white_space.unwrap_or(WhiteSpace::Normal)
+    }
+
+    /// Automatic wrapping at spaces is suppressed (nowrap/pre).
     pub fn white_space_nowrap(&self) -> bool {
-        self.white_space_nowrap.unwrap_or(false)
+        matches!(self.white_space(), WhiteSpace::Nowrap | WhiteSpace::Pre)
+    }
+
+    /// Runs of spaces/tabs are preserved (pre/pre-wrap).
+    pub fn white_space_preserves_spaces(&self) -> bool {
+        matches!(self.white_space(), WhiteSpace::Pre | WhiteSpace::PreWrap)
+    }
+
+    /// Newlines force line breaks (pre/pre-wrap/pre-line).
+    pub fn white_space_preserves_newlines(&self) -> bool {
+        matches!(
+            self.white_space(),
+            WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+        )
     }
 
     pub fn set_text_overflow_ellipsis(&mut self, v: bool) {
@@ -1367,6 +1390,15 @@ impl SizeLimit {
             SizeLimit::Ratio(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhiteSpace {
+    Normal,
+    Nowrap,
+    Pre,
+    PreWrap,
+    PreLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

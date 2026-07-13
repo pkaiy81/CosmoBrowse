@@ -533,12 +533,17 @@ impl LayoutObject {
                 }
                 "white-space" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
-                        // nowrap and pre suppress automatic wrapping at spaces;
-                        // normal/pre-wrap/pre-line wrap.
-                        self.style.set_white_space_nowrap(matches!(
-                            value.as_str(),
-                            "nowrap" | "pre"
-                        ));
+                        let ws = match value.as_str() {
+                            "normal" => Some(WhiteSpace::Normal),
+                            "nowrap" => Some(WhiteSpace::Nowrap),
+                            "pre" => Some(WhiteSpace::Pre),
+                            "pre-wrap" => Some(WhiteSpace::PreWrap),
+                            "pre-line" => Some(WhiteSpace::PreLine),
+                            _ => None,
+                        };
+                        if let Some(ws) = ws {
+                            self.style.set_white_space(ws);
+                        }
                     }
                 }
                 "text-overflow" => {
