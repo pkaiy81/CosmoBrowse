@@ -78,6 +78,10 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             return matches!(node.borrow().kind(), NodeKind::Element(_))
                 && !dom_node_selected(node, inner);
         }
+        Selector::Is(inner) => {
+            return matches!(node.borrow().kind(), NodeKind::Element(_))
+                && dom_node_selected(node, inner);
+        }
         Selector::PseudoClass(kind) => {
             if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
                 return false;

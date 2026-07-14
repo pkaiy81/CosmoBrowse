@@ -212,6 +212,25 @@ impl CssParser {
                         parts.push(Selector::Not(Box::new(inner)));
                         continue;
                     }
+                    // `:is(list)` / `:where(list)`: matches when ANY of the
+                    // alternatives matches. (:where's zero specificity is
+                    // approximated by the argument list's own specificity.)
+                    if (name == "is" || name == "where" || name == "matches")
+                        && self.t.peek() == Some(&CssToken::OpenParenthesis)
+                    {
+                        self.t.next();
+                        self.skip_whitespace();
+                        let inner = self.consume_selector_list();
+                        self.skip_whitespace();
+                        loop {
+                            match self.t.next() {
+                                None | Some(CssToken::CloseParenthesis) => break,
+                                _ => {}
+                            }
+                        }
+                        parts.push(Selector::Is(Box::new(inner)));
+                        continue;
+                    }
                     // Other functional pseudos (`:nth-child(2n+1)`): capture
                     // the argument tokens (balanced parens).
                     let mut args: Vec<CssToken> = Vec::new();
@@ -949,6 +968,10 @@ pub enum Selector {
     /// `:not(...)` — matches when the inner selector does NOT match.
     /// https://www.w3.org/TR/selectors-4/#negation
     Not(Box<Selector>),
+    /// `:is(...)` (also `:where(...)`/legacy `:matches(...)`) — matches when
+    /// ANY alternative in the list matches.
+    /// https://www.w3.org/TR/selectors-4/#matches
+    Is(Box<Selector>),
     /// `host::before` / `host::after` — never matches a real element (so its
     /// declarations don't leak onto the host); the layout tree builder uses
     /// `pseudo_element_target` to find these and synthesize a generated box.
@@ -1044,6 +1067,7 @@ impl Selector {
                 .unwrap_or((0, 0, 0)),
             // :not() takes the specificity of its argument (Selectors L4 §17).
             Selector::Not(inner) => inner.specificity_abc(),
+            Selector::Is(inner) => inner.specificity_abc(),
             // A pseudo-element counts as a type selector, added to the host.
             Selector::PseudoElement(host, _) => {
                 let (a, b, c) = host.specificity_abc();

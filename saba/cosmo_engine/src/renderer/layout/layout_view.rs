@@ -3153,6 +3153,37 @@ mod tests {
     }
 
     #[test]
+    fn test_is_selector_matches_any_alternative() {
+        let html = r#"<html><head><style>
+            :is(.a, .b) { color: #ff0000; }
+            div:is([data-on], .never) { color: #0000ff; }
+            .c:is(:hover, .c2) { color: #00ff00; }
+        </style></head><body>
+            <p class="b">red</p>
+            <div data-on="1">blue</div>
+            <p class="c">plain</p>
+            <p class="c c2">green</p>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let color_of = |needle: &str| -> String {
+            view.paint()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text { text, style, .. } if text.contains(needle) => {
+                        Some(style.color().code().to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(color_of("red"), "#ff0000", ":is(.a,.b) matches .b");
+        assert_eq!(color_of("blue"), "#0000ff", ":is with attribute alternative");
+        assert_eq!(color_of("green"), "#00ff00", ":hover alternative ignored, .c2 matches");
+        assert_ne!(color_of("plain"), "#00ff00", ".c alone must not match");
+    }
+
+    #[test]
     fn test_attribute_selectors_and_sibling_combinators() {
         let html = concat!(
             "<html><head><style>",
