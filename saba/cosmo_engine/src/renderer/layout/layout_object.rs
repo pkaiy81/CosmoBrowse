@@ -781,12 +781,30 @@ impl LayoutObject {
         Some((r0, r1 - r0 + 1, c0, c1 - c0 + 1))
     }
 
-    /// This item's grid-area rectangle within its parent's template areas.
+    /// This item's grid-area rectangle within its parent's template areas,
+    /// or (row 0) between the parent's named column lines `name-start` /
+    /// `name-end` when no template area defines it.
     fn grid_area_rect(&self) -> Option<(usize, usize, usize, usize)> {
         let name = self.style.grid_area_name()?.to_string();
         let parent = self.parent.upgrade()?;
-        let areas = parent.borrow().style().grid_template_areas()?;
-        Self::area_rect_in(&areas, &name)
+        let pstyle = parent.borrow().style();
+        if let Some(areas) = pstyle.grid_template_areas() {
+            if let Some(r) = Self::area_rect_in(&areas, &name) {
+                return Some(r);
+            }
+        }
+        let lines = pstyle.grid_column_line_names()?;
+        let start_name = format!("{name}-start");
+        let end_name = format!("{name}-end");
+        let start = lines
+            .iter()
+            .position(|ns| ns.contains(&start_name) || ns.contains(&name));
+        let end = lines.iter().position(|ns| ns.contains(&end_name));
+        match (start, end) {
+            (Some(s), Some(e)) if e > s => Some((0, 1, s, e - s)),
+            (Some(s), None) => Some((0, 1, s, 1)),
+            _ => None,
+        }
     }
 
     /// Heights of the parent grid's area rows: for each template row, the

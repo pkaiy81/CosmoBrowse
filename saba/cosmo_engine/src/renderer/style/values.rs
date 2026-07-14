@@ -58,9 +58,53 @@ pub(crate) fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> 
 /// `Auto` (≈1fr); `repeat(N, tracks)` expands to N copies of its track list.
 /// Returns an empty Vec when nothing can be recognized.
 pub(crate) fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridTrack> {
+    parse_grid_template_tracks_with_lines(values).0
+}
+
+/// Like `parse_grid_template_tracks` but also returns the named grid lines:
+/// `line_names[i]` holds the names declared before track `i`
+/// (`[full-start left-sidebar-start] 1fr [left-sidebar-end] ...`), with a
+/// final entry after the last track. `grid-area: X` resolves against the
+/// `X-start`/`X-end` names.
+pub(crate) fn parse_grid_template_tracks_with_lines(
+    values: &[ComponentValue],
+) -> (Vec<GridTrack>, Vec<Vec<String>>) {
     let mut tracks: Vec<GridTrack> = Vec::new();
+    let mut line_names: Vec<Vec<String>> = vec![Vec::new()];
     let mut i = 0;
     while i < values.len() {
+        // Named line block: collect idents until ']'.
+        if matches!(&values[i], ComponentValue::Delim('[')) {
+            i += 1;
+            while i < values.len() && !matches!(&values[i], ComponentValue::Delim(']')) {
+                if let ComponentValue::Ident(n) = &values[i] {
+                    line_names
+                        .last_mut()
+                        .expect("line_names is never empty")
+                        .push(n.to_ascii_lowercase());
+                }
+                i += 1;
+            }
+            i += 1; // skip ']'
+            continue;
+        }
+        let before = tracks.len();
+        i = parse_one_track(values, i, &mut tracks);
+        if tracks.len() > before {
+            line_names.push(Vec::new());
+        }
+    }
+    (tracks, line_names)
+}
+
+/// Consume one track (or a repeat()/minmax() construct) starting at `i`;
+/// returns the next index. Extracted from the old single-pass loop so the
+/// line-name variant can interleave.
+fn parse_one_track(values: &[ComponentValue], i: usize, tracks: &mut Vec<GridTrack>) -> usize {
+    if i >= values.len() {
+        return i;
+    }
+    {
         match &values[i] {
             ComponentValue::Ident(name) if name.eq_ignore_ascii_case("repeat") => {
                 // repeat(N, tracks) — recurse on the inner track list.
@@ -99,8 +143,7 @@ pub(crate) fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridT
                     for _ in 0..n {
                         tracks.extend(unit.iter().copied());
                     }
-                    i = j;
-                    continue;
+                    return j;
                 }
                 tracks.push(GridTrack::Auto);
             }
@@ -142,8 +185,7 @@ pub(crate) fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridT
                             .collect::<Vec<_>>(),
                     );
                     tracks.push(parts.last().copied().unwrap_or(GridTrack::Auto));
-                    i = j;
-                    continue;
+                    return j;
                 }
                 tracks.push(GridTrack::Auto);
             }
@@ -162,15 +204,13 @@ pub(crate) fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridT
                         }
                         j += 1;
                     }
-                    i = j;
-                    continue;
+                    return j;
                 }
             }
             _ => {}
         }
-        i += 1;
     }
-    tracks
+    i + 1
 }
 
 /// Resolve column tracks to pixel widths for the given content width:

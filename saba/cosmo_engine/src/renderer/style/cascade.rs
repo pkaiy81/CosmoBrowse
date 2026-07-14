@@ -261,8 +261,10 @@ impl LayoutObject {
                     }
                 }
                 "grid-template-columns" => {
-                    let tracks = parse_grid_template_tracks(&declaration.value);
+                    let (tracks, lines) =
+                        parse_grid_template_tracks_with_lines(&declaration.value);
                     self.style.set_grid_template_columns(tracks);
+                    self.style.set_grid_column_line_names(lines);
                 }
                 // gap shorthand: one value = both axes, two = row then column.
                 // https://www.w3.org/TR/css-align-3/#gap-shorthand

@@ -1347,6 +1347,36 @@ mod tests {
     }
 
     #[test]
+    fn test_grid_named_lines_placement() {
+        // MDN-style named-line tracks: sidebar between its -start/-end lines.
+        let html = r#"<html><head><style>
+            .shell { display: grid; width: 600px;
+                     grid-template-columns: [full-start sb-start] 150px [sb-end main-start] 1fr [main-end full-end]; }
+            .sb { grid-area: sb; height: 30px; background-color: blue; }
+            .main { grid-area: main; height: 30px; background-color: green; }
+        </style></head><body>
+            <div class="shell"><div class="sb"></div><div class="main"></div></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let find = |code: &str| -> (i64, i64) {
+            view.paint()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Rect { layout_point, layout_size, style, .. }
+                        if style.background_color().code() == code =>
+                    {
+                        Some((layout_point.x(), layout_size.width()))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(find("#0000ff"), (0, 150), "sidebar in the 150px track");
+        assert_eq!(find("#008000"), (150, 450), "main in the 1fr track");
+    }
+
+    #[test]
     fn test_grid_template_areas_placement() {
         // Header spans both columns; sidebar 100px + content share row 2.
         let html = r#"<html><head><style>

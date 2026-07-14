@@ -90,6 +90,9 @@ pub struct ComputedStyle {
     /// <ol> subtrees).
     list_style_type: Option<ListStyleType>,
     grid_template_areas: Option<Rc<Vec<Vec<String>>>>,
+    /// Named grid lines of grid-template-columns: entry i = names before
+    /// track i (last entry = names after the final track).
+    grid_column_line_names: Option<Rc<Vec<Vec<String>>>>,
     /// `grid-area: <name>` on a grid item.
     grid_area_name: Option<String>,
     flex_grow: Option<f64>,
@@ -263,6 +266,7 @@ impl ComputedStyle {
             box_sizing_border_box: None,
             list_style_type: None,
             grid_template_areas: None,
+            grid_column_line_names: None,
             grid_area_name: None,
             flex_grow: None,
             flex_shrink: None,
@@ -1007,6 +1011,15 @@ impl ComputedStyle {
     pub fn set_grid_template_areas(&mut self, rows: Vec<Vec<String>>) {
         self.grid_template_areas = Some(Rc::new(rows));
     }
+    pub fn grid_column_line_names(&self) -> Option<Rc<Vec<Vec<String>>>> {
+        self.grid_column_line_names.clone()
+    }
+    pub fn set_grid_column_line_names(&mut self, v: Vec<Vec<String>>) {
+        if v.iter().any(|names| !names.is_empty()) {
+            self.grid_column_line_names = Some(Rc::new(v));
+        }
+    }
+
     pub fn grid_area_name(&self) -> Option<&str> {
         self.grid_area_name.as_deref()
     }
