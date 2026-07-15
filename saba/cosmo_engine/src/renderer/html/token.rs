@@ -406,6 +406,26 @@ impl Iterator for HtmlTokenizer {
                         continue;
                     }
 
+                    // `<?` begins a bogus comment (e.g. a stray processing
+                    // instruction like `<?>` or `<?xml ...?>`): consume up to
+                    // and including the next `>` and discard it. Otherwise the
+                    // `?` and the closing `>` leaked into the page as text.
+                    // https://html.spec.whatwg.org/multipage/parsing.html#tag-open-state
+                    if c == '?' {
+                        loop {
+                            if self.is_eof() {
+                                break;
+                            }
+                            if self.input[self.pos] == '>' {
+                                self.pos += 1;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                        self.state = State::Data;
+                        continue;
+                    }
+
                     if c.is_ascii_alphabetic() {
                         self.reconsume = true;
                         self.state = State::TagName;
@@ -966,5 +986,22 @@ mod tests {
         for e in expected {
             assert_eq!(Some(e), tokenizer.next());
         }
+    }
+
+    #[test]
+    fn test_bogus_comment_question_mark_is_discarded() {
+        // `<?>` and `<?xml ...?>` are bogus comments: nothing between `<?`
+        // and the next `>` reaches the token stream.
+        let html = "a<?>b<?xml version=\"1.0\"?>c".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let mut chars = String::new();
+        while let Some(tok) = tokenizer.next() {
+            match tok {
+                HtmlToken::Char(c) => chars.push(c),
+                HtmlToken::Eof => break,
+                other => panic!("unexpected token: {:?}", other),
+            }
+        }
+        assert_eq!(chars, "abc");
     }
 }
