@@ -59,6 +59,35 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     );
     obj.insert_property(js_string!("tagName"), accessor(element_get_tag_name, None));
     obj.insert_property(js_string!("classList"), accessor(element_get_class_list, None));
+    obj.insert_property(js_string!("parentNode"), accessor(element_get_parent_node, None));
+    obj.insert_property(
+        js_string!("parentElement"),
+        accessor(element_get_parent_node, None),
+    );
+    obj.insert_property(
+        js_string!("firstChild"),
+        accessor(element_get_first_child, None),
+    );
+    obj.insert_property(
+        js_string!("lastChild"),
+        accessor(element_get_last_child, None),
+    );
+    obj.insert_property(
+        js_string!("nextSibling"),
+        accessor(element_get_next_sibling, None),
+    );
+    obj.insert_property(
+        js_string!("previousSibling"),
+        accessor(element_get_previous_sibling, None),
+    );
+    obj.insert_property(
+        js_string!("children"),
+        accessor(element_get_children, None),
+    );
+    obj.insert_property(
+        js_string!("childNodes"),
+        accessor(element_get_child_nodes, None),
+    );
 
     let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name, len| {
         let desc = PropertyDescriptor::builder()
@@ -219,6 +248,72 @@ fn element_remove(this: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResul
         detach_node(&node);
     }
     Ok(JsValue::undefined())
+}
+
+fn node_or_null(node: Option<Rc<RefCell<Node>>>, ctx: &mut Context) -> JsValue {
+    match node {
+        Some(n) => JsValue::from(make_element(n, ctx)),
+        None => JsValue::null(),
+    }
+}
+
+fn element_get_parent_node(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let parent = handle_node(this).and_then(|n| n.borrow().parent().upgrade());
+    Ok(node_or_null(parent, ctx))
+}
+fn element_get_first_child(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = handle_node(this).and_then(|n| n.borrow().first_child());
+    Ok(node_or_null(n, ctx))
+}
+fn element_get_last_child(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = handle_node(this).and_then(|n| n.borrow().last_child().upgrade());
+    Ok(node_or_null(n, ctx))
+}
+fn element_get_next_sibling(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = handle_node(this).and_then(|n| n.borrow().next_sibling());
+    Ok(node_or_null(n, ctx))
+}
+fn element_get_previous_sibling(
+    this: &JsValue,
+    _a: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let n = handle_node(this).and_then(|n| n.borrow().previous_sibling().upgrade());
+    Ok(node_or_null(n, ctx))
+}
+
+/// Collect the direct children of `this`, optionally elements only.
+fn child_nodes(this: &JsValue, elements_only: bool) -> Vec<Rc<RefCell<Node>>> {
+    let Some(node) = handle_node(this) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cur = node.borrow().first_child();
+    while let Some(c) = cur {
+        let is_element = matches!(c.borrow().kind(), NodeKind::Element(_));
+        if !elements_only || is_element {
+            out.push(c.clone());
+        }
+        cur = c.borrow().next_sibling();
+    }
+    out
+}
+
+fn element_get_children(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let arr = JsArray::new(ctx);
+    for c in child_nodes(this, true) {
+        let el = make_element(c, ctx);
+        arr.push(JsValue::from(el), ctx)?;
+    }
+    Ok(JsValue::from(arr))
+}
+fn element_get_child_nodes(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let arr = JsArray::new(ctx);
+    for c in child_nodes(this, false) {
+        let el = make_element(c, ctx);
+        arr.push(JsValue::from(el), ctx)?;
+    }
+    Ok(JsValue::from(arr))
 }
 
 fn element_get_id(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
@@ -760,6 +855,37 @@ mod tests {
 
         // querySelectorAll sees the current tree.
         assert_eq!(host.eval_to_string("document.querySelectorAll('li').length").unwrap(), "2");
+    }
+
+    #[test]
+    fn navigation_accessors() {
+        let html =
+            "<html><body><ul id=\"list\"><li id=\"a\">A</li><li id=\"b\">B</li></ul></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        assert_eq!(
+            host.eval_to_string("document.getElementById('a').parentNode.id").unwrap(),
+            "list"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('a').nextSibling.id").unwrap(),
+            "b"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('b').previousSibling.id").unwrap(),
+            "a"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('list').children.length").unwrap(),
+            "2"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('list').children[1].id").unwrap(),
+            "b"
+        );
     }
 
     #[test]
