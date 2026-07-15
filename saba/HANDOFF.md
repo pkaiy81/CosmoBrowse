@@ -235,10 +235,15 @@
 >   ツリーを見る。暫定 512KB バイトキャップ=watchdog 代替(Boa 0.20 に fuel 無し)。
 >   **cosmo_script に初の依存クレートができた。** テスト: `execute_scripts_boa` が <script> で
 >   ノード追加→ツリー反映を確認(cosmo_runtime 52 tests)。
+> - ラッパーキャッシュ ✅ (`7af23af`) **make_element を node identity(Rc::as_ptr)で
+>   キャッシュ**→ `el === el` が query/navigation をまたいで成立、wrapper に付けた
+>   カスタムプロパティも保持。キャッシュが Rc を pin するのでアドレス再利用なし。navigation でクリア。
+> - capture フェーズ ✅ (`da7ff74`) **addEventListener の useCapture / {capture:true}**。
+>   run_dispatch を capture(root→target親)→at-target(両方)→bubble(親→root)の3相に。
 > - 次: (a) **COSMO_USE_BOA を GUI ヘッドレスで JS デモ検証**して golden 化 → 既定を Boa に
->   切替(専用コミットで再ベースライン)。(b) Boa の実 watchdog(別スレッド不可なので
->   反復/時間ガードの検討)。(c) `renderer/js/` 玩具の削除。capture フェーズ、
->   style(setProperty/インライン)、fetch/XHR、ラッパーキャッシュ(el===el)、
+>   切替(専用コミットで再ベースライン、**ユーザー確認推奨**=凍結フィクスチャの回帰網に触れる)。
+>   (b) Boa の実 watchdog(Context が !Send で別スレッド不可 → 反復/時間ガードの検討)。
+>   (c) `renderer/js/` 玩具の削除。style(setProperty/インライン)、fetch/XHR、
 >   DOM 変異世代カウンタ(全再構築でなく差分 relayout)。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
