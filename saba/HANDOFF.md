@@ -253,8 +253,13 @@
 > - 次: (a) **COSMO_USE_BOA を GUI ヘッドレスで JS デモ検証**して golden 化 → 既定を Boa に
 >   切替(専用コミットで再ベースライン、**ユーザー確認推奨**=凍結フィクスチャの回帰網に触れる)。
 >   (b) Boa の実 watchdog(Context が !Send で別スレッド不可 → 反復/時間ガードの検討)。
->   (c) `renderer/js/` 玩具の削除。fetch/XHR(loader へワーカ委譲)、
->   DOM 変異世代カウンタ(全再構築でなく差分 relayout)、el.dataset、requestAnimationFrame。
+>   (c) `renderer/js/` 玩具の削除。fetch/XHR(loader へワーカ委譲、**アーキ判断=ユーザー確認**)、
+>   DOM 変異世代カウンタ(全再構築でなく差分 relayout)、el.dataset。
+> - ⚠ **既定切替(a)前に要検討 — 初期ロード時のイベントループ意味論**: `execute_scripts_boa`
+>   が `run_pending(1000)` で due タイマーを全消化しつつ仮想クロックを進めるため、
+>   `setInterval` が初回レイアウトで最大 1000 回発火しうる(過剰実行)。初期ロードで
+>   どれだけ仮想時間を進めるか(microtask + delay0 のみ発火 vs. 一定量進める)は実ページ
+>   挙動に効く設計判断なので、既定を Boa にする際にユーザーと決める。現状は既定 OFF で無害。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
