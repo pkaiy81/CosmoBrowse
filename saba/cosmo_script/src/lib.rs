@@ -1073,9 +1073,19 @@ fn serialize_children(node: &Rc<RefCell<Node>>, out: &mut String) {
     }
 }
 
+/// Escape a text node's data for HTML serialization (`&`, `<`, `>`).
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escape an attribute value for the double-quoted form (`&`, `"`).
+fn escape_html_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
 fn serialize_node(node: &Rc<RefCell<Node>>, out: &mut String) {
     match node.borrow().kind() {
-        NodeKind::Text(t) => out.push_str(&t),
+        NodeKind::Text(t) => out.push_str(&escape_html_text(&t)),
         NodeKind::Element(e) => {
             let tag = e.tag_name().to_string();
             out.push('<');
@@ -1084,7 +1094,7 @@ fn serialize_node(node: &Rc<RefCell<Node>>, out: &mut String) {
                 out.push(' ');
                 out.push_str(&attr.name());
                 out.push_str("=\"");
-                out.push_str(&attr.value());
+                out.push_str(&escape_html_attr(&attr.value()));
                 out.push('"');
             }
             out.push('>');
@@ -2238,6 +2248,13 @@ mod tests {
         assert_eq!(
             host.eval_to_string("document.querySelectorAll('.item').length").unwrap(),
             "2"
+        );
+        // Text content is HTML-escaped when serialized (no markup injection on
+        // round-trip).
+        host.eval_to_string("document.getElementById('list').textContent = '1 < 2 & 3';").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('list').innerHTML").unwrap(),
+            "1 &lt; 2 &amp; 3"
         );
     }
 
