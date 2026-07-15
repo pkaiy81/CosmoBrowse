@@ -72,6 +72,38 @@ thread_local! {
     static NEXT_TIMER_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
     /// Monotonic virtual clock advanced as timers fire (see run_pending).
     static VIRTUAL_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// The document URL exposed as `location`. Read by the location accessors;
+    /// updated by `ScriptHost::set_location` and by assigning `location.href`.
+    static LOCATION_HREF: RefCell<String> = RefCell::new(String::from("about:blank"));
+}
+
+/// Decompose a URL into (protocol, host, pathname, search, hash). Best-effort;
+/// missing parts default to empty (pathname defaults to "/").
+fn parse_url_parts(href: &str) -> (String, String, String, String, String) {
+    let (proto, rest) = match href.find("://") {
+        Some(i) => (href[..i + 1].to_string(), &href[i + 3..]),
+        None => match href.find(':') {
+            // Scheme-only URLs like "about:blank".
+            Some(i) => (href[..i + 1].to_string(), &href[i + 1..]),
+            None => (String::new(), href),
+        },
+    };
+    // Split off hash then search.
+    let (before_hash, hash) = match rest.find('#') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, String::new()),
+    };
+    let (authority_path, search) = match before_hash.find('?') {
+        Some(i) => (&before_hash[..i], before_hash[i..].to_string()),
+        None => (before_hash, String::new()),
+    };
+    // Host is up to the first '/'; the rest is the path.
+    let (host, pathname) = match authority_path.find('/') {
+        Some(i) => (authority_path[..i].to_string(), authority_path[i..].to_string()),
+        None => (authority_path.to_string(), "/".to_string()),
+    };
+    (proto, host, pathname, search, hash)
 }
 
 fn node_key(node: &Rc<RefCell<Node>>) -> usize {
@@ -978,6 +1010,47 @@ impl ScriptHost {
                 .register_global_property(js_string!(name), func, Attribute::all())
                 .expect("register timer");
         }
+
+        // location: a live view over LOCATION_HREF.
+        let realm = self.context.realm().clone();
+        let location = ObjectInitializer::new(&mut self.context).build();
+        let loc_accessor = |get: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+                            set: Option<fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>>|
+         -> PropertyDescriptor {
+            let mut b = PropertyDescriptor::builder()
+                .get(NativeFunction::from_fn_ptr(get).to_js_function(&realm))
+                .enumerable(true)
+                .configurable(true);
+            if let Some(set) = set {
+                b = b.set(NativeFunction::from_fn_ptr(set).to_js_function(&realm));
+            }
+            b.build()
+        };
+        location.insert_property(
+            js_string!("href"),
+            loc_accessor(location_get_href, Some(location_set_href)),
+        );
+        location.insert_property(js_string!("protocol"), loc_accessor(location_get_protocol, None));
+        location.insert_property(js_string!("host"), loc_accessor(location_get_host, None));
+        location.insert_property(js_string!("hostname"), loc_accessor(location_get_host, None));
+        location.insert_property(js_string!("pathname"), loc_accessor(location_get_pathname, None));
+        location.insert_property(js_string!("search"), loc_accessor(location_get_search, None));
+        location.insert_property(js_string!("hash"), loc_accessor(location_get_hash, None));
+        self.context
+            .register_global_property(js_string!("location"), location, Attribute::all())
+            .expect("register location");
+
+        // window aliases the global object (window.document, window.setTimeout,
+        // window.location, etc. all resolve to the globals registered above).
+        let global = self.context.global_object();
+        self.context
+            .register_global_property(js_string!("window"), global, Attribute::all())
+            .expect("register window");
+    }
+
+    /// Set the URL exposed to script as `location`.
+    pub fn set_location(&mut self, href: &str) {
+        LOCATION_HREF.with(|h| *h.borrow_mut() = href.to_string());
     }
 
     /// Evaluate a script and return its completion value rendered as a
@@ -1041,6 +1114,33 @@ impl ScriptHost {
             fired += 1;
         }
     }
+}
+
+fn location_href() -> String {
+    LOCATION_HREF.with(|h| h.borrow().clone())
+}
+fn location_get_href(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(location_href().as_str())))
+}
+fn location_set_href(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let href = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    LOCATION_HREF.with(|h| *h.borrow_mut() = href);
+    Ok(JsValue::undefined())
+}
+fn location_get_protocol(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(parse_url_parts(&location_href()).0.as_str())))
+}
+fn location_get_host(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(parse_url_parts(&location_href()).1.as_str())))
+}
+fn location_get_pathname(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(parse_url_parts(&location_href()).2.as_str())))
+}
+fn location_get_search(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(parse_url_parts(&location_href()).3.as_str())))
+}
+fn location_get_hash(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(parse_url_parts(&location_href()).4.as_str())))
 }
 
 fn console_log(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1412,6 +1512,34 @@ mod tests {
 
         // querySelectorAll sees the current tree.
         assert_eq!(host.eval_to_string("document.querySelectorAll('li').length").unwrap(), "2");
+    }
+
+    #[test]
+    fn window_and_location() {
+        let html = "<html><body><div id=\"x\">hi</div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+        host.set_location("https://example.com/path/page?q=1#frag");
+
+        // window aliases the global object.
+        assert_eq!(host.eval_to_string("window.document === document").unwrap(), "true");
+        assert_eq!(
+            host.eval_to_string("window.document.getElementById('x').textContent").unwrap(),
+            "hi"
+        );
+        // location parts.
+        assert_eq!(host.eval_to_string("location.href").unwrap(), "https://example.com/path/page?q=1#frag");
+        assert_eq!(host.eval_to_string("location.protocol").unwrap(), "https:");
+        assert_eq!(host.eval_to_string("location.host").unwrap(), "example.com");
+        assert_eq!(host.eval_to_string("location.pathname").unwrap(), "/path/page");
+        assert_eq!(host.eval_to_string("location.search").unwrap(), "?q=1");
+        assert_eq!(host.eval_to_string("location.hash").unwrap(), "#frag");
+        assert_eq!(host.eval_to_string("window.location.host").unwrap(), "example.com");
+        // Assigning href updates the view.
+        host.eval_to_string("location.href = 'https://a.test/b';").unwrap();
+        assert_eq!(host.eval_to_string("location.pathname").unwrap(), "/b");
     }
 
     #[test]
