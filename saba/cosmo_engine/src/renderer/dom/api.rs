@@ -129,7 +129,9 @@ pub fn get_target_element_node(
     }
 }
 
-fn collect_text(node: Option<Rc<RefCell<Node>>>, output: &mut String) {
+/// Append the concatenated text of `node` and its descendants to `output`
+/// (the DOM `textContent` read algorithm, simplified).
+pub fn collect_text(node: Option<Rc<RefCell<Node>>>, output: &mut String) {
     let Some(node) = node else {
         return;
     };
