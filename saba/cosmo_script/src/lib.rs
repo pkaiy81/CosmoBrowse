@@ -3,13 +3,80 @@
 //! surface directly — DOM bindings and the event loop layer on top of this.
 
 use boa_engine::{
-    js_string, object::ObjectInitializer, property::Attribute, Context, JsValue, NativeFunction,
-    Source,
+    js_string,
+    object::{JsObject, ObjectInitializer},
+    property::{Attribute, PropertyDescriptor},
+    Context, JsData, JsResult, JsValue, NativeFunction, Source,
 };
+use boa_engine::gc::{Finalize, Trace};
 use cosmo_engine::renderer::dom::api::{collect_text, get_element_by_id};
-use cosmo_engine::renderer::dom::node::Node;
+use cosmo_engine::renderer::dom::node::{Node, NodeKind};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// Host data attached to an `Element` JsObject: a handle to the live DOM
+/// node, kept outside Boa's GC. The Rc/RefCell contain no GC-managed
+/// values, so ignoring them for tracing is sound.
+#[derive(Trace, Finalize, JsData)]
+struct NodeHandle {
+    #[unsafe_ignore_trace]
+    node: Rc<RefCell<Node>>,
+}
+
+/// Wrap a DOM node as an `Element` JsObject exposing a live `textContent`
+/// accessor (get reads the node's text, set replaces its children).
+fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
+    let obj = JsObject::from_proto_and_data(None, NodeHandle { node });
+    let realm = context.realm().clone();
+    let getter = NativeFunction::from_fn_ptr(element_get_text_content).to_js_function(&realm);
+    let setter = NativeFunction::from_fn_ptr(element_set_text_content).to_js_function(&realm);
+    let desc = PropertyDescriptor::builder()
+        .get(getter)
+        .set(setter)
+        .enumerable(true)
+        .configurable(true)
+        .build();
+    obj.insert_property(js_string!("textContent"), desc);
+    obj
+}
+
+fn handle_node(this: &JsValue) -> Option<Rc<RefCell<Node>>> {
+    this.as_object()
+        .and_then(|o| o.downcast_ref::<NodeHandle>().map(|h| h.node.clone()))
+}
+
+fn element_get_text_content(
+    this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let mut s = String::new();
+    collect_text(node.borrow().first_child(), &mut s);
+    Ok(JsValue::from(js_string!(s.as_str())))
+}
+
+fn element_set_text_content(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let text = args
+        .first()
+        .cloned()
+        .unwrap_or(JsValue::undefined())
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    // textContent setter replaces all children with a single text node.
+    node.borrow_mut()
+        .set_first_child(Some(Rc::new(RefCell::new(Node::new(NodeKind::Text(text))))));
+    Ok(JsValue::undefined())
+}
 
 thread_local! {
     /// The document currently exposed to script. The DOM stays a
@@ -79,24 +146,17 @@ impl ScriptHost {
 fn dom_get_element_by_id(
     _this: &JsValue,
     args: &[JsValue],
-    _ctx: &mut Context,
-) -> boa_engine::JsResult<JsValue> {
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
     let id = args
         .first()
         .and_then(|v| v.as_string())
         .map(|s| s.to_std_string_escaped())
         .unwrap_or_default();
-    let text = SCRIPT_DOM.with(|d| {
-        d.borrow().as_ref().and_then(|dom| {
-            get_element_by_id(Some(dom.clone()), &id).map(|el| {
-                let mut s = String::new();
-                collect_text(el.borrow().first_child(), &mut s);
-                s
-            })
-        })
-    });
-    Ok(match text {
-        Some(t) => JsValue::from(js_string!(t.as_str())),
+    let node = SCRIPT_DOM
+        .with(|d| d.borrow().as_ref().and_then(|dom| get_element_by_id(Some(dom.clone()), &id)));
+    Ok(match node {
+        Some(n) => JsValue::from(make_element(n, ctx)),
         None => JsValue::null(),
     })
 }
@@ -133,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn get_element_by_id_reads_dom_text() {
+    fn get_element_by_id_reads_textcontent() {
         let html =
             "<html><body><div id=\"greeting\">Hello DOM</div><p id=\"x\">other</p></body></html>";
         let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
@@ -142,7 +202,7 @@ mod tests {
         let mut host = ScriptHost::new();
         host.set_document(document);
         assert_eq!(
-            host.eval_to_string("document.getElementById('greeting')")
+            host.eval_to_string("document.getElementById('greeting').textContent")
                 .unwrap(),
             "Hello DOM"
         );
@@ -151,11 +211,33 @@ mod tests {
                 .unwrap(),
             "null"
         );
-        // Script can compute over DOM-derived values.
         assert_eq!(
-            host.eval_to_string("document.getElementById('greeting').length")
+            host.eval_to_string("document.getElementById('greeting').textContent.length")
                 .unwrap(),
             "9"
         );
+    }
+
+    #[test]
+    fn set_textcontent_mutates_the_dom() {
+        let html = "<html><body><div id=\"out\">initial</div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+        // Mutate via JS, then read back through a fresh binding.
+        host.eval_to_string("document.getElementById('out').textContent = 'changed by JS';")
+            .unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('out').textContent")
+                .unwrap(),
+            "changed by JS"
+        );
+        // The change is visible in the real DOM (not just the JS view).
+        let el = get_element_by_id(Some(document), &"out".to_string()).unwrap();
+        let mut s = String::new();
+        collect_text(el.borrow().first_child(), &mut s);
+        assert_eq!(s, "changed by JS");
     }
 }
