@@ -240,11 +240,15 @@
 >   カスタムプロパティも保持。キャッシュが Rc を pin するのでアドレス再利用なし。navigation でクリア。
 > - capture フェーズ ✅ (`da7ff74`) **addEventListener の useCapture / {capture:true}**。
 >   run_dispatch を capture(root→target親)→at-target(両方)→bubble(親→root)の3相に。
+> - style ✅ (`c9d58e7`) **element.style**: setProperty/getPropertyValue/removeProperty/
+>   cssText + camelCase アクセサ(backgroundColor→background-color 等、static テーブルを
+>   captured closure で生成)。インライン style="" 属性を読み書き→エンジンが layout 時に
+>   再パースするので次の relayout で反映。空値は宣言削除。
 > - 次: (a) **COSMO_USE_BOA を GUI ヘッドレスで JS デモ検証**して golden 化 → 既定を Boa に
 >   切替(専用コミットで再ベースライン、**ユーザー確認推奨**=凍結フィクスチャの回帰網に触れる)。
 >   (b) Boa の実 watchdog(Context が !Send で別スレッド不可 → 反復/時間ガードの検討)。
->   (c) `renderer/js/` 玩具の削除。style(setProperty/インライン)、fetch/XHR、
->   DOM 変異世代カウンタ(全再構築でなく差分 relayout)。
+>   (c) `renderer/js/` 玩具の削除。fetch/XHR(loader へワーカ委譲)、
+>   DOM 変異世代カウンタ(全再構築でなく差分 relayout)、el.dataset、requestAnimationFrame。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
