@@ -760,11 +760,20 @@ impl LayoutObject {
             Err(_) => return None,
         };
         if p.style.display() == DisplayType::Grid {
-            Some((
-                p.style.grid_template_columns(),
-                p.style.column_gap(),
-                p.style.row_gap(),
-            ))
+            let mut tracks = p.style.grid_template_columns();
+            // grid-template-areas implies a column count. When the explicit
+            // grid-template-columns declares fewer tracks than the areas have
+            // columns (e.g. Wikipedia's `columns: minmax(0,1fr)` with
+            // `areas: 'columnStart pageContent'`), the missing tracks default
+            // to `auto` — without this the 2nd-column items get a zero-width
+            // out-of-range track and collapse against the right edge.
+            if let Some(areas) = p.style.grid_template_areas() {
+                let cols = areas.iter().map(|r| r.len()).max().unwrap_or(0);
+                while tracks.len() < cols {
+                    tracks.push(GridTrack::Auto);
+                }
+            }
+            Some((tracks, p.style.column_gap(), p.style.row_gap()))
         } else {
             None
         }
