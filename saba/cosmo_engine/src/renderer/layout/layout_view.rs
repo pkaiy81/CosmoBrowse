@@ -1647,6 +1647,32 @@ mod tests {
     }
 
     #[test]
+    fn test_text_transform() {
+        let html = r#"<html><head><style>
+            .up { text-transform: uppercase; }
+            .cap { text-transform: capitalize; }
+        </style></head><body>
+            <p class="up">hello world</p>
+            <p class="cap">the quick brown</p>
+            <div class="up"><span>inherited lower</span></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let texts: Vec<String> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("HELLO WORLD")), "{:?}", texts);
+        assert!(texts.iter().any(|t| t.contains("The Quick Brown")), "{:?}", texts);
+        // text-transform inherits into the child span.
+        assert!(texts.iter().any(|t| t.contains("INHERITED LOWER")), "{:?}", texts);
+    }
+
+    #[test]
     fn test_pre_preserves_newlines_and_spaces() {
         let html = "<html><head></head><body><pre>first   line\nsecond line\n\nfourth</pre></body></html>"
             .to_string();

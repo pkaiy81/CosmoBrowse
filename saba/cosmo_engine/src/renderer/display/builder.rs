@@ -208,7 +208,7 @@ impl LayoutObject {
                     let bold = self.style.is_bold();
                     let cw = bold_width_adjust(char_width_px(fs), bold);
                     let lh = styled_line_height(&self.style);
-                    let plain_text = self.collapse_text_whitespace(&t);
+                    let plain_text = self.display_text(&t);
                     // Use the max_width that was established during compute_size so
                     // that the line-break boundaries are identical between the sizing
                     // and painting passes.  Recomputing against self.size().width()

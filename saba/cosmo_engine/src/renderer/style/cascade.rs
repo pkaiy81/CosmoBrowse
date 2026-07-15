@@ -549,6 +549,20 @@ impl LayoutObject {
                         self.style.set_border_radius(px);
                     }
                 }
+                "text-transform" => {
+                    if let Some(ComponentValue::Ident(v)) = first_value {
+                        let tt = match v.as_str() {
+                            "none" => Some(TextTransform::None),
+                            "uppercase" => Some(TextTransform::Uppercase),
+                            "lowercase" => Some(TextTransform::Lowercase),
+                            "capitalize" => Some(TextTransform::Capitalize),
+                            _ => None,
+                        };
+                        if let Some(tt) = tt {
+                            self.style.set_text_transform(tt);
+                        }
+                    }
+                }
                 "white-space" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         let ws = match value.as_str() {

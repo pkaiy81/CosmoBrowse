@@ -1750,6 +1750,35 @@ impl LayoutObject {
         }
     }
 
+    /// Text as it should be measured and painted: whitespace collapsed for
+    /// the element's white-space mode, then `text-transform` applied. Sizing
+    /// and paint MUST both call this so their line breaks agree.
+    pub(crate) fn display_text(&self, t: &str) -> String {
+        use crate::renderer::layout::computed_style::TextTransform;
+        let collapsed = self.collapse_text_whitespace(t);
+        match self.style.text_transform() {
+            TextTransform::None => collapsed,
+            TextTransform::Uppercase => collapsed.to_uppercase(),
+            TextTransform::Lowercase => collapsed.to_lowercase(),
+            TextTransform::Capitalize => {
+                let mut out = String::with_capacity(collapsed.len());
+                let mut at_word_start = true;
+                for c in collapsed.chars() {
+                    if c.is_whitespace() {
+                        at_word_start = true;
+                        out.push(c);
+                    } else if at_word_start {
+                        out.extend(c.to_uppercase());
+                        at_word_start = false;
+                    } else {
+                        out.push(c);
+                    }
+                }
+                out
+            }
+        }
+    }
+
     pub(crate) fn collapse_text_whitespace(&self, t: &str) -> String {
         // pre / pre-wrap: spaces and newlines are content. Tabs render as
         // 4 spaces (a fixed approximation of tab stops).
@@ -2384,7 +2413,7 @@ impl LayoutObject {
                     let bold = self.style.is_bold();
                     let cw = bold_width_adjust(char_width_px(fs), bold);
                     let lh = styled_line_height(&self.style);
-                    let plain_text = self.collapse_text_whitespace(&t);
+                    let plain_text = self.display_text(&t);
                     // max_width is the available horizontal space for this text
                     // node within its containing block.  Use the nearest block/cell
                     // ancestor's content width so that inline parents (e.g. <a>,

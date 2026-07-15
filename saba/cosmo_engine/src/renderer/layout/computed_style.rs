@@ -206,6 +206,7 @@ pub struct ComputedStyle {
     box_shadow: Option<(f64, f64, f64, Color)>,
     /// `white-space: nowrap` — suppress line wrapping. Inherited.
     white_space: Option<WhiteSpace>,
+    text_transform: Option<TextTransform>,
     /// `text-overflow: ellipsis` — truncate a clipped single line with `…`.
     text_overflow_ellipsis: bool,
     /// Final clip rectangle (x, y, w, h) stamped by the post-layout pass:
@@ -323,6 +324,7 @@ impl ComputedStyle {
             border_radius: None,
             box_shadow: None,
             white_space: None,
+            text_transform: None,
             text_overflow_ellipsis: false,
             final_clip: None,
             scroll_container: None,
@@ -409,6 +411,9 @@ impl ComputedStyle {
                 self.line_height = parent_style.line_height;
             }
             // white-space is inherited.
+            if self.text_transform.is_none() {
+                self.text_transform = parent_style.text_transform;
+            }
             if self.white_space.is_none() {
                 self.white_space = parent_style.white_space;
             }
@@ -819,6 +824,13 @@ impl ComputedStyle {
 
     pub fn white_space(&self) -> WhiteSpace {
         self.white_space.unwrap_or(WhiteSpace::Normal)
+    }
+
+    pub fn text_transform(&self) -> TextTransform {
+        self.text_transform.unwrap_or(TextTransform::None)
+    }
+    pub fn set_text_transform(&mut self, v: TextTransform) {
+        self.text_transform = Some(v);
     }
 
     /// Automatic wrapping at spaces is suppressed (nowrap/pre).
@@ -1412,6 +1424,14 @@ impl SizeLimit {
             SizeLimit::Ratio(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTransform {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
