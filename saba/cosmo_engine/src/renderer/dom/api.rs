@@ -290,3 +290,35 @@ pub fn query_selector_all(
 pub fn query_selector(root: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<RefCell<Node>>> {
     query_selector_all(root, selector).into_iter().next()
 }
+
+/// `element.matches(selector)`: does `node` match the CSS selector? Reuses the
+/// engine's selector matcher (same parse-into-empty-rule trick as
+/// `query_selector_all`). Non-element nodes never match.
+pub fn element_matches(node: &Rc<RefCell<Node>>, selector: &str) -> bool {
+    use crate::renderer::css::cssom::CssParser;
+    use crate::renderer::css::token::CssTokenizer;
+    use crate::renderer::style::selector::dom_node_selected;
+
+    if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+        return false;
+    }
+    let css = format!("{selector}{{}}");
+    let sheet = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
+    sheet
+        .rules
+        .iter()
+        .any(|r| dom_node_selected(node, &r.selector))
+}
+
+/// `element.closest(selector)`: the nearest inclusive ancestor of `node`
+/// (starting with `node` itself) that matches the selector, or None.
+pub fn element_closest(node: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<RefCell<Node>>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if element_matches(&n, selector) {
+            return Some(n);
+        }
+        current = n.borrow().parent().upgrade();
+    }
+    None
+}

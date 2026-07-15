@@ -11,7 +11,8 @@ use boa_engine::{
 use boa_engine::gc::{Finalize, Trace};
 use boa_engine::object::builtins::JsArray;
 use cosmo_engine::renderer::dom::api::{
-    collect_text, get_element_by_id, query_selector, query_selector_all,
+    collect_text, element_closest, element_matches, get_element_by_id, query_selector,
+    query_selector_all,
 };
 use cosmo_engine::renderer::dom::node::{Element, Node, NodeKind};
 use std::cell::RefCell;
@@ -156,6 +157,10 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     method(element_remove_child, js_string!("removeChild"), 1);
     method(element_insert_before, js_string!("insertBefore"), 2);
     method(element_remove, js_string!("remove"), 0);
+    method(elem_matches, js_string!("matches"), 1);
+    method(elem_closest, js_string!("closest"), 1);
+    method(elem_query_selector, js_string!("querySelector"), 1);
+    method(elem_query_selector_all, js_string!("querySelectorAll"), 1);
     method(element_add_event_listener, js_string!("addEventListener"), 2);
     method(
         element_remove_event_listener,
@@ -481,6 +486,44 @@ fn node_or_null(node: Option<Rc<RefCell<Node>>>, ctx: &mut Context) -> JsValue {
         Some(n) => JsValue::from(make_element(n, ctx)),
         None => JsValue::null(),
     }
+}
+
+fn elem_matches(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::from(false));
+    };
+    let sel = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(JsValue::from(element_matches(&node, &sel)))
+}
+
+fn elem_closest(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::null());
+    };
+    let sel = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(node_or_null(element_closest(node, &sel), c))
+}
+
+/// Element-scoped querySelector: matches within `this`'s subtree.
+fn elem_query_selector(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::null());
+    };
+    let sel = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(node_or_null(query_selector(node, &sel), c))
+}
+
+fn elem_query_selector_all(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::from(JsArray::new(c)));
+    };
+    let sel = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let arr = JsArray::new(c);
+    for n in query_selector_all(node, &sel) {
+        let el = make_element(n, c);
+        arr.push(JsValue::from(el), c)?;
+    }
+    Ok(JsValue::from(arr))
 }
 
 fn element_get_parent_node(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1220,6 +1263,41 @@ mod tests {
 
         // querySelectorAll sees the current tree.
         assert_eq!(host.eval_to_string("document.querySelectorAll('li').length").unwrap(), "2");
+    }
+
+    #[test]
+    fn matches_and_closest() {
+        let html = "<html><body><div class=\"card\" id=\"c\">\
+                    <p class=\"title\"><a href=\"/x\" id=\"lnk\">go</a></p></div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        assert_eq!(host.eval_to_string("document.getElementById('c').matches('.card')").unwrap(), "true");
+        assert_eq!(host.eval_to_string("document.getElementById('c').matches('.nope')").unwrap(), "false");
+        // closest walks up to the nearest matching ancestor.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('lnk').closest('.card').id").unwrap(),
+            "c"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('lnk').closest('a').id").unwrap(),
+            "lnk"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('lnk').closest('.missing')").unwrap(),
+            "null"
+        );
+        // Element-scoped querySelector searches within the subtree.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('c').querySelector('a').getAttribute('href')").unwrap(),
+            "/x"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('c').querySelectorAll('a').length").unwrap(),
+            "1"
+        );
     }
 
     #[test]
