@@ -1515,6 +1515,76 @@ mod tests {
     }
 
     #[test]
+    fn todo_app_end_to_end() {
+        // A miniature TodoMVC: an "add" button appends <li> items; clicking an
+        // item toggles a 'done' class; a per-item delete removes it. Exercises
+        // createElement, appendChild, addEventListener, dispatchEvent (bubbling),
+        // classList, textContent, removeChild and querySelectorAll together.
+        let html = "<html><body>\
+            <button id=\"add\">add</button>\
+            <ul id=\"todos\"></ul>\
+            </body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+
+        host.eval_to_string(
+            "var seq = 0; \
+             function addTodo(text) { \
+                 var li = document.createElement('li'); \
+                 li.className = 'todo'; \
+                 li.textContent = text; \
+                 li.addEventListener('click', function(e) { \
+                     e.target.classList.toggle('done'); \
+                 }); \
+                 document.getElementById('todos').appendChild(li); \
+                 return li; \
+             } \
+             document.getElementById('add').addEventListener('click', function() { \
+                 addTodo('item ' + (++seq)); \
+             });",
+        )
+        .unwrap();
+
+        // Click "add" three times -> three todos.
+        let add = get_element_by_id(Some(document.clone()), &"add".to_string()).unwrap();
+        for _ in 0..3 {
+            host.dispatch_event(add.clone(), "click");
+        }
+        assert_eq!(host.eval_to_string("document.querySelectorAll('.todo').length").unwrap(), "3");
+        assert_eq!(
+            host.eval_to_string("document.getElementById('todos').textContent").unwrap(),
+            "item 1item 2item 3"
+        );
+
+        // Click the second todo -> toggles 'done'.
+        host.eval_to_string(
+            "document.querySelectorAll('.todo')[1].dispatchEvent({type:'click'});",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.querySelectorAll('.done').length").unwrap(), "1");
+        assert_eq!(
+            host.eval_to_string("document.querySelectorAll('.done')[0].textContent").unwrap(),
+            "item 2"
+        );
+
+        // Remove the first todo.
+        host.eval_to_string(
+            "var list = document.getElementById('todos'); \
+             list.removeChild(list.children[0]);",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.querySelectorAll('.todo').length").unwrap(), "2");
+        assert_eq!(
+            host.eval_to_string("document.getElementById('todos').textContent").unwrap(),
+            "item 2item 3"
+        );
+        // The toggled item survived removal with its state intact.
+        assert_eq!(host.eval_to_string("document.querySelectorAll('.done').length").unwrap(), "1");
+    }
+
+    #[test]
     fn window_and_location() {
         let html = "<html><body><div id=\"x\">hi</div></body></html>";
         let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
