@@ -259,6 +259,9 @@ pub enum SceneItem {
         height: i64,
         background_color: String,
         background_image: Option<String>,
+        /// `linear-gradient(...)` background: (angle_deg, [(hex_color, pos)]).
+        #[serde(default)]
+        background_gradient: Option<(f64, Vec<(String, f64)>)>,
         opacity: f64,
         z_index: i32,
         clip_rect: Option<(i64, i64, i64, i64)>,

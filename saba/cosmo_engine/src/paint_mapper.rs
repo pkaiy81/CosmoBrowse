@@ -104,6 +104,15 @@ pub fn map_display_items_to_paint_commands(
                     height: scaled_len(ctx, layout_size.height()),
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
+                    background_gradient: style.background_gradient().map(|g| {
+                        (
+                            g.angle_deg,
+                            g.stops
+                                .iter()
+                                .map(|(c, p)| (c.code().to_string(), *p))
+                                .collect(),
+                        )
+                    }),
                     opacity: style.opacity(),
                     // Final paint-order key from the engine's stacking pass
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).

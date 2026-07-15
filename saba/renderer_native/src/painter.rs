@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use cosmo_engine::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
-use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
+use tiny_skia::{
+    Color, GradientStop, LinearGradient, Paint, Pixmap, Point, Rect, Shader, SpreadMode, Transform,
+};
 use winit::event_loop::EventLoopProxy;
 
 use crate::color::parse_css_color;
@@ -680,6 +682,56 @@ fn draw_rect(
         pixmap.fill_rect(skia_rect, &paint, Transform::identity(), None);
     }
 
+    // linear-gradient background image paints over the background color.
+    // The gradient line is computed against the FULL box (pre-clip) so a
+    // clipped fill still samples the correct part of the gradient.
+    if let Some((angle_deg, ref stops)) = rect.background_gradient {
+        // The gradient's opacity is the element opacity times each stop's own
+        // alpha — NOT the (possibly transparent) background COLOR's alpha,
+        // which `opacity` above folded in for the solid fill.
+        let elem_opacity = (rect.opacity).clamp(0.0, 1.0) as f32;
+        if let Some(skia_rect) = Rect::from_xywh(x as f32, y as f32, w as f32, h as f32) {
+            let cx = rx as f32 + rect.width as f32 / 2.0;
+            let cy = ry as f32 + effective_height as f32 / 2.0;
+            // CSS angle: 0deg points up (end color at top). Direction of the
+            // gradient line, and its length across the box.
+            let theta = (angle_deg as f32).to_radians();
+            let (dx, dy) = (theta.sin(), -theta.cos());
+            let len =
+                (rect.width as f32 * theta.sin()).abs() + (effective_height as f32 * theta.cos()).abs();
+            let half = len / 2.0;
+            let start = Point::from_xy(cx - dx * half, cy - dy * half);
+            let end = Point::from_xy(cx + dx * half, cy + dy * half);
+            let gstops: Vec<GradientStop> = stops
+                .iter()
+                .map(|(hex, pos)| {
+                    let (sr, sg, sb, sa) = parse_css_color(hex);
+                    GradientStop::new(
+                        (*pos as f32).clamp(0.0, 1.0),
+                        Color::from_rgba(
+                            sr as f32 / 255.0,
+                            sg as f32 / 255.0,
+                            sb as f32 / 255.0,
+                            (sa as f32 / 255.0) * elem_opacity,
+                        )
+                        .unwrap_or(Color::BLACK),
+                    )
+                })
+                .collect();
+            if let Some(shader) =
+                LinearGradient::new(start, end, gstops, SpreadMode::Pad, Transform::identity())
+            {
+                let mut gp = Paint::default();
+                gp.shader = shader;
+                gp.anti_alias = false;
+                pixmap.fill_rect(skia_rect, &gp, Transform::identity(), None);
+            } else {
+                // A degenerate (zero-length) line: fall back to the last stop.
+                let _ = Shader::SolidColor(Color::BLACK);
+            }
+        }
+    }
+
     // Draw border strokes (CSS box-model: border inside the element's box).
     let any_border = rect.border_width > 0
         || rect
@@ -1009,6 +1061,7 @@ fn draw_image(
         height: img.height,
         background_color: "#d0d0d0".to_string(),
         background_image: None,
+        background_gradient: None,
         opacity: img.opacity,
         z_index: img.z_index,
         clip_rect: img.clip_rect,

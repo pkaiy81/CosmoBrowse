@@ -57,6 +57,9 @@ pub struct DrawRect {
     pub height: i64,
     pub background_color: String,
     pub background_image: Option<String>,
+    /// `linear-gradient(...)`: (angle_deg, [(hex_color, pos)]). None = no gradient.
+    #[serde(default)]
+    pub background_gradient: Option<(f64, Vec<(String, f64)>)>,
     pub opacity: f64,
     pub z_index: i32,
     pub clip_rect: Option<(i64, i64, i64, i64)>,

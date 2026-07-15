@@ -259,6 +259,15 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     height: lh,
                     background_color: style.background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
+                    background_gradient: style.background_gradient().map(|g| {
+                        (
+                            g.angle_deg,
+                            g.stops
+                                .iter()
+                                .map(|(c, p)| (c.code().to_string(), *p))
+                                .collect(),
+                        )
+                    }),
                     opacity: style.opacity(),
                     // Final paint-order key from the engine's stacking pass
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
@@ -520,6 +529,7 @@ mod diff_tests {
             height: 10,
             background_color: "#fff".to_string(),
             background_image: None,
+            background_gradient: None,
             opacity: 1.0,
             z_index: 0,
             clip_rect: None,
@@ -545,6 +555,7 @@ mod diff_tests {
             height: 10,
             background_color: "#fff".to_string(),
             background_image: None,
+            background_gradient: None,
             opacity: 1.0,
             z_index: 1,
             clip_rect: None,

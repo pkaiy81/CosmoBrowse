@@ -4,6 +4,7 @@
 
 use crate::renderer::css::cssom::ComponentValue;
 use crate::renderer::layout::computed_style::Color;
+use crate::renderer::layout::computed_style::LinearGradient;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
 
@@ -857,6 +858,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_linear_gradient() {
+        let g = parse_linear_gradient(&vals("linear-gradient(90deg, red, blue)")).unwrap();
+        assert_eq!(g.angle_deg, 90.0);
+        assert_eq!(g.stops.len(), 2);
+        assert_eq!(g.stops[0].0.code(), "#ff0000");
+        assert_eq!(g.stops[0].1, 0.0);
+        assert_eq!(g.stops[1].0.code(), "#0000ff");
+        assert_eq!(g.stops[1].1, 1.0);
+
+        // `to right` = 90deg; three evenly-spaced stops.
+        let g = parse_linear_gradient(&vals("linear-gradient(to right, #000, #888, #fff)")).unwrap();
+        assert_eq!(g.angle_deg, 90.0);
+        assert_eq!(g.stops.len(), 3);
+        assert!((g.stops[1].1 - 0.5).abs() < 1e-9);
+
+        // Default direction (to bottom = 180deg) + explicit positions.
+        let g = parse_linear_gradient(&vals("linear-gradient(red 20%, blue 80%)")).unwrap();
+        assert_eq!(g.angle_deg, 180.0);
+        assert!((g.stops[0].1 - 0.2).abs() < 1e-9);
+        assert!((g.stops[1].1 - 0.8).abs() < 1e-9);
+
+        // Not a gradient / single stop -> None.
+        assert!(parse_linear_gradient(&vals("url(x.png)")).is_none());
+        assert!(parse_linear_gradient(&vals("linear-gradient(red)")).is_none());
+    }
+
+    #[test]
     fn calc_folds_absolute_lengths() {
         use crate::renderer::layout::computed_style::FontSize;
         let folded = fold_calc(&vals("calc(20em * -1)"), FontSize::Medium);
@@ -1032,4 +1060,135 @@ fn eval_calc_atom(it: &mut CalcIter, base: FontSize) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+/// Parse a `linear-gradient(...)` from a declaration value (the first one
+/// found). Supports an optional leading `<angle>deg` or `to <side>`
+/// direction, followed by comma-separated color stops (each an optional
+/// position in %). Returns None when no gradient is present or it is
+/// unparseable. Repeating/radial/conic gradients are not handled.
+pub(crate) fn parse_linear_gradient(values: &[ComponentValue]) -> Option<LinearGradient> {
+    // Locate `linear-gradient(` and collect its balanced argument tokens.
+    let mut i = 0;
+    while i < values.len() {
+        let is_grad = matches!(&values[i], ComponentValue::Ident(s)
+            if s.eq_ignore_ascii_case("linear-gradient"))
+            && matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
+        if is_grad {
+            break;
+        }
+        i += 1;
+    }
+    if i >= values.len() {
+        return None;
+    }
+    let mut depth = 1;
+    let mut j = i + 2;
+    let mut inner: Vec<ComponentValue> = Vec::new();
+    while j < values.len() && depth > 0 {
+        match &values[j] {
+            ComponentValue::OpenParenthesis => {
+                depth += 1;
+                inner.push(values[j].clone());
+            }
+            ComponentValue::CloseParenthesis => {
+                depth -= 1;
+                if depth > 0 {
+                    inner.push(values[j].clone());
+                }
+            }
+            t => inner.push(t.clone()),
+        }
+        j += 1;
+    }
+
+    // Split the argument list on top-level commas.
+    let mut segments: Vec<Vec<ComponentValue>> = vec![Vec::new()];
+    let mut d = 0i32;
+    for t in &inner {
+        match t {
+            ComponentValue::OpenParenthesis => {
+                d += 1;
+                segments.last_mut().unwrap().push(t.clone());
+            }
+            ComponentValue::CloseParenthesis => {
+                d -= 1;
+                segments.last_mut().unwrap().push(t.clone());
+            }
+            ComponentValue::Delim(',') if d == 0 => segments.push(Vec::new()),
+            _ => segments.last_mut().unwrap().push(t.clone()),
+        }
+    }
+
+    // The first segment may be a direction (angle or `to <side>`).
+    let mut angle_deg = 180.0; // CSS default direction: to bottom.
+    let mut start = 0;
+    if let Some(first) = segments.first() {
+        if let Some(a) = parse_gradient_direction(first) {
+            angle_deg = a;
+            start = 1;
+        }
+    }
+
+    let stop_segments = &segments[start..];
+    let mut stops: Vec<(Color, f64)> = Vec::new();
+    let n = stop_segments.len();
+    for (idx, seg) in stop_segments.iter().enumerate() {
+        let color = parse_color_value(seg)?;
+        // Explicit position (%), else evenly distributed.
+        let pos = seg
+            .iter()
+            .find_map(|t| match t {
+                ComponentValue::Dimension(v, u) if u == "%" => Some((*v / 100.0) as f64),
+                _ => None,
+            })
+            .unwrap_or(if n <= 1 { 0.0 } else { idx as f64 / (n as f64 - 1.0) });
+        stops.push((color, pos.clamp(0.0, 1.0)));
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    Some(LinearGradient { angle_deg, stops })
+}
+
+fn parse_gradient_direction(seg: &[ComponentValue]) -> Option<f64> {
+    // `<angle>deg` (also rad/turn/grad) or `to <side...>`.
+    for t in seg {
+        match t {
+            ComponentValue::Dimension(v, unit) => {
+                return Some(match unit.as_str() {
+                    "deg" => *v,
+                    "rad" => *v * 180.0 / core::f64::consts::PI,
+                    "turn" => *v * 360.0,
+                    "grad" => *v * 0.9,
+                    _ => return None,
+                });
+            }
+            ComponentValue::Ident(k) if k.eq_ignore_ascii_case("to") => {
+                let sides: Vec<String> = seg
+                    .iter()
+                    .filter_map(|t| match t {
+                        ComponentValue::Ident(s) if !s.eq_ignore_ascii_case("to") => {
+                            Some(s.to_ascii_lowercase())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let has = |k: &str| sides.iter().any(|s| s == k);
+                return Some(match (has("top"), has("right"), has("bottom"), has("left")) {
+                    (true, false, false, false) => 0.0,
+                    (false, true, false, false) => 90.0,
+                    (false, false, true, false) => 180.0,
+                    (false, false, false, true) => 270.0,
+                    (true, true, _, _) => 45.0,
+                    (false, true, true, _) => 135.0,
+                    (false, false, true, true) => 225.0,
+                    (true, false, _, true) => 315.0,
+                    _ => 180.0,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }

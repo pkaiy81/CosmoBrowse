@@ -77,6 +77,7 @@ impl EdgeSize {
 pub struct ComputedStyle {
     background_color: Option<Color>,
     background_image: Option<String>,
+    background_gradient: Option<LinearGradient>,
     color: Option<Color>,
     display: Option<DisplayType>,
     font_family: Option<String>,
@@ -256,6 +257,7 @@ impl ComputedStyle {
         Self {
             background_color: None,
             background_image: None,
+            background_gradient: None,
             color: None,
             display: None,
             font_family: None,
@@ -676,6 +678,13 @@ impl ComputedStyle {
 
     pub fn background_image(&self) -> Option<&str> {
         self.background_image.as_deref()
+    }
+
+    pub fn background_gradient(&self) -> Option<&LinearGradient> {
+        self.background_gradient.as_ref()
+    }
+    pub fn set_background_gradient(&mut self, g: LinearGradient) {
+        self.background_gradient = Some(g);
     }
 
     pub fn set_background_image(&mut self, url: String) {
@@ -1442,6 +1451,16 @@ pub enum AlignItems {
     Baseline,
 }
 
+/// A parsed `linear-gradient(...)`. `angle_deg` follows the CSS
+/// convention: 0deg points up (start color at the bottom), 90deg right,
+/// 180deg down. Stops carry their color and position along the line (0..1);
+/// positions are filled in evenly when omitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGradient {
+    pub angle_deg: f64,
+    pub stops: Vec<(Color, f64)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Color {
     name: Option<String>,
@@ -1504,7 +1523,10 @@ impl Color {
             )));
         }
 
-        let normalized = if code.len() == 4 {
+        // #rgb and #rgba expand each nibble; #rrggbb and #rrggbbaa are kept
+        // as-is. The 8-digit (alpha) form flows through unchanged — the
+        // platform painter's hex parser reads the trailing alpha byte.
+        let normalized = if code.len() == 4 || code.len() == 5 {
             let mut expanded = String::from("#");
             for ch in code.chars().skip(1) {
                 expanded.push(ch);
@@ -1515,7 +1537,7 @@ impl Color {
             code.to_string()
         };
 
-        if normalized.len() != 7 {
+        if normalized.len() != 7 && normalized.len() != 9 {
             return Err(Error::UnexpectedInput(format!(
                 "invalid color code: {}",
                 code

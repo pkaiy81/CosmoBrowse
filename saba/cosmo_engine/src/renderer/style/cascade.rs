@@ -45,6 +45,9 @@ impl LayoutObject {
                     if let Some(color) = parse_color_value(&declaration.value) {
                         self.style.set_background_color(color);
                     }
+                    if let Some(grad) = parse_linear_gradient(&declaration.value) {
+                        self.style.set_background_gradient(grad);
+                    }
                     // The background shorthand may also carry an image layer,
                     // a position, and a repeat keyword.
                     if declaration.property == "background" {
@@ -67,6 +70,9 @@ impl LayoutObject {
                 "background-image" => {
                     if let Some(url) = extract_css_url(&declaration.value) {
                         self.style.set_background_image(url);
+                    }
+                    if let Some(grad) = parse_linear_gradient(&declaration.value) {
+                        self.style.set_background_gradient(grad);
                     }
                 }
                 "background-position" => {

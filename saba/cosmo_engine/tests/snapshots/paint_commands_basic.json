@@ -8,6 +8,7 @@
       "height": 20,
       "background_color": "#eeeeee",
       "background_image": null,
+      "background_gradient": null,
       "opacity": 1.0,
       "z_index": 0,
       "clip_rect": null,
