@@ -203,7 +203,28 @@
 >   (EventFlags host data)。dispatch は target→祖先(bubble)、stopPropagation で停止。
 >   `ScriptHost::dispatch_event(node, type) -> bool`(false = default 抑止)で runtime が
 >   実入力を注入可能。**capture フェーズはまだ未実装**。
-> - 次: **イベントループ**(runtime.rs の task/microtask 骨格を event_loop.rs へ移植)、
+> - 3.1/3.4 イベントループ ✅ (`4520f0f`) **console.\* + setTimeout/setInterval**:
+>   console.{log,info,debug,warn,error} を CONSOLE_LOG にバッファ(`take_console_log`)。
+>   setTimeout/setInterval/clearTimeout/clearInterval は仮想クロックのタイマーキュー。
+>   `ScriptHost::run_pending(max)` が Boa の microtask job を回してから due タイマーを順に
+>   発火(delay は順序だけ、ブロックしない)。ネスト setTimeout も解決。navigation でリセット。
+> - 3.2 matches/closest ✅ (`89bc307`) **element.matches/closest + 要素スコープ
+>   querySelector(All)**: `dom/api.rs` に `element_matches`/`element_closest`(祖先を遡上、
+>   同じマッチャ再利用)。**loader.rs の注入ナビゲーションスクリプトが依存する closest('a') を解禁。**
+> - 3.2 innerHTML ✅ (`88e8ac4`) **innerHTML get/set + getElementsByTagName/ClassName**:
+>   getter は子を HTML シリアライズ(void 要素は閉じタグなし)、setter はフラグメントを
+>   フルドキュメントとしてパースし body の子を target へ再ペアレント。collections は
+>   query_selector_all 経由(`*`・空白区切り class 複合対応)。
+> - 次: **cosmo_runtime 統合(3.5, 最重要・大)** — `layout/mod.rs:112` の玩具
+>   `JsRuntime` を `cosmo_script::ScriptHost` に差し替え(set_document→各<script> eval→
+>   run_pending→そのまま layout。DOM 変異は同 Rc 上なので relayout は自然に反映)。
+>   **未解決の前提**: (a) `MAX_SCRIPT_BYTES` 撤廃 vs Boa にfuel/watchdog が無くヘビーJSで
+>   ハング懸念(暫定でバイトキャップ維持が安全)、(b) loader.rs:585 注入スクリプトが
+>   `window.parent.postMessage`/`window`/`location` を要求(未実装)、(c) localStorage が
+>   cosmo_script 未実装(玩具側の replace_local_storage 配線が切れる)。→ window/postMessage/
+>   localStorage を先に cosmo_script へ足してから差し替えるのが安全。
+> - 旧「次」(残タスク): capture フェーズ、style(setProperty/インライン)、fetch/XHR、
+>   ラッパーキャッシュ(el===el)、`renderer/js/` 玩具の削除。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
