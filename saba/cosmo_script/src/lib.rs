@@ -80,6 +80,11 @@ thread_local! {
     /// `localStorage` backing store: insertion-ordered key/value pairs (order
     /// matters for `key(n)`). Seeded/snapshotted by the runtime per origin.
     static LOCAL_STORAGE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+
+    /// Messages posted via `window.parent.postMessage`, JSON-serialized in
+    /// order. The runtime drains these (e.g. to handle cosmobrowse:navigate
+    /// from the injected link-interception script).
+    static POSTED_MESSAGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 fn ls_get(key: &str) -> Option<String> {
@@ -1002,6 +1007,21 @@ impl ScriptHost {
                 js_string!("getElementsByClassName"),
                 1,
             )
+            .function(
+                NativeFunction::from_fn_ptr(doc_add_event_listener),
+                js_string!("addEventListener"),
+                2,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(doc_remove_event_listener),
+                js_string!("removeEventListener"),
+                2,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(doc_dispatch_event),
+                js_string!("dispatchEvent"),
+                1,
+            )
             .build();
         self.context
             .register_global_property(js_string!("document"), document, Attribute::all())
@@ -1082,12 +1102,37 @@ impl ScriptHost {
             .register_global_property(js_string!("localStorage"), storage, Attribute::all())
             .expect("register localStorage");
 
+        // window.parent: a chrome-side target for postMessage. Messages are
+        // captured (JSON-serialized) for the runtime to drain. In a real
+        // browser window.parent === window for a top-level frame, but the
+        // injected navigation script posts to the embedding chrome, so a
+        // distinct capturing object is closer to that intent.
+        let parent = ObjectInitializer::new(&mut self.context)
+            .function(NativeFunction::from_fn_ptr(post_message), js_string!("postMessage"), 2)
+            .build();
+        self.context
+            .register_global_property(js_string!("parent"), parent, Attribute::all())
+            .expect("register parent");
+        // window.postMessage also captures (some scripts post to self).
+        let post_fn = NativeFunction::from_fn_ptr(post_message)
+            .to_js_function(&self.context.realm().clone());
+        self.context
+            .register_global_property(js_string!("postMessage"), post_fn, Attribute::all())
+            .expect("register postMessage");
+
         // window aliases the global object (window.document, window.setTimeout,
-        // window.location, etc. all resolve to the globals registered above).
+        // window.location, window.parent, etc. all resolve to the globals
+        // registered above).
         let global = self.context.global_object();
         self.context
             .register_global_property(js_string!("window"), global, Attribute::all())
             .expect("register window");
+    }
+
+    /// Drain the messages posted via `window.parent.postMessage` (JSON
+    /// strings). The runtime parses these to handle e.g. link navigation.
+    pub fn take_posted_messages(&self) -> Vec<String> {
+        POSTED_MESSAGES.with(|m| std::mem::take(&mut *m.borrow_mut()))
     }
 
     /// Set the URL exposed to script as `location`.
@@ -1279,6 +1324,82 @@ fn clear_timer(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let id = args.first().map(|v| v.to_number(ctx)).transpose()?.unwrap_or(0.0) as u32;
     TIMERS.with(|t| t.borrow_mut().retain(|tm| tm.id != id));
     Ok(JsValue::undefined())
+}
+
+fn script_dom_root() -> Option<Rc<RefCell<Node>>> {
+    SCRIPT_DOM.with(|d| d.borrow().clone())
+}
+
+/// Register a document-level event listener (on the DOM root node, so bubbling
+/// events from any element reach it — used by the injected navigation script's
+/// `document.addEventListener('click', ...)`).
+fn doc_add_event_listener(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(root) = script_dom_root() else {
+        return Ok(JsValue::undefined());
+    };
+    let event_type = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let Some(cb) = a.get(1).and_then(|v| v.as_object()).cloned() else {
+        return Ok(JsValue::undefined());
+    };
+    LISTENERS.with(|m| {
+        m.borrow_mut()
+            .entry(node_key(&root))
+            .or_default()
+            .push(Listener { event_type, callback: cb });
+    });
+    Ok(JsValue::undefined())
+}
+
+fn doc_remove_event_listener(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(root) = script_dom_root() else {
+        return Ok(JsValue::undefined());
+    };
+    let event_type = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let cb = a.get(1).and_then(|v| v.as_object()).cloned();
+    LISTENERS.with(|m| {
+        if let Some(v) = m.borrow_mut().get_mut(&node_key(&root)) {
+            v.retain(|l| {
+                l.event_type != event_type || cb.as_ref().map(|c| c != &l.callback).unwrap_or(true)
+            });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn doc_dispatch_event(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(root) = script_dom_root() else {
+        return Ok(JsValue::from(true));
+    };
+    let event_type = match a.first() {
+        Some(v) if v.is_object() => v
+            .as_object()
+            .unwrap()
+            .get(js_string!("type"), c)?
+            .to_string(c)?
+            .to_std_string_escaped(),
+        Some(v) => v.clone().to_string(c)?.to_std_string_escaped(),
+        None => String::new(),
+    };
+    Ok(JsValue::from(run_dispatch(root, &event_type, c)))
+}
+
+/// `window.parent.postMessage(message, targetOrigin)` — capture the message
+/// (JSON-serialized) for the runtime to drain.
+fn post_message(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let msg = args.first().cloned().unwrap_or(JsValue::undefined());
+    let serialized = json_stringify(&msg, ctx).unwrap_or_else(|| "null".to_string());
+    POSTED_MESSAGES.with(|m| m.borrow_mut().push(serialized));
+    Ok(JsValue::undefined())
+}
+
+/// Serialize a value via the built-in `JSON.stringify`.
+fn json_stringify(value: &JsValue, ctx: &mut Context) -> Option<String> {
+    let json = ctx.global_object().get(js_string!("JSON"), ctx).ok()?;
+    let json_obj = json.as_object()?.clone();
+    let stringify = json_obj.get(js_string!("stringify"), ctx).ok()?;
+    let func = stringify.as_object()?.clone();
+    let result = func.call(&json, &[value.clone()], ctx).ok()?;
+    Some(result.to_string(ctx).ok()?.to_std_string_escaped())
 }
 
 fn dom_select_all_to_array(selector: &str, ctx: &mut Context) -> JsResult<JsValue> {
@@ -1668,6 +1789,43 @@ mod tests {
         );
         // The toggled item survived removal with its state intact.
         assert_eq!(host.eval_to_string("document.querySelectorAll('.done').length").unwrap(), "1");
+    }
+
+    #[test]
+    fn injected_navigation_script_posts_message() {
+        // Mirrors loader.rs's injected link-interception script: a document
+        // click listener finds the closest <a>, prevents default, and posts a
+        // navigate message to window.parent.
+        let html = "<html><body><div><a href=\"/next\" id=\"lnk\">go</a></div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+
+        host.eval_to_string(
+            "document.addEventListener('click', function(event) { \
+                 var anchor = event.target && event.target.closest ? event.target.closest('a') : null; \
+                 if (!anchor) return; \
+                 if (event.defaultPrevented) return; \
+                 var href = anchor.getAttribute('href'); \
+                 if (!href) return; \
+                 event.preventDefault(); \
+                 window.parent.postMessage({type:'cosmobrowse:navigate', href:href, target:anchor.getAttribute('target')||''}, '*'); \
+             });",
+        )
+        .unwrap();
+
+        // Dispatch a click on the anchor (as the runtime would on a real click).
+        let lnk = get_element_by_id(Some(document), &"lnk".to_string()).unwrap();
+        let default_ran = host.dispatch_event(lnk, "click");
+        assert!(!default_ran, "preventDefault should suppress the default action");
+
+        let msgs = host.take_posted_messages();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("cosmobrowse:navigate"), "got: {}", msgs[0]);
+        assert!(msgs[0].contains("/next"), "got: {}", msgs[0]);
+        // Drained.
+        assert!(host.take_posted_messages().is_empty());
     }
 
     #[test]
