@@ -1,6 +1,6 @@
 # CosmoBrowse — 作業引継ぎ (handoff)
 
-最終更新: 2026-07-12 / ブランチ: `wip/native-renderer-winit-2026-03-30`
+最終更新: 2026-07-15 / ブランチ: `wip/native-renderer-winit-2026-03-30`
 
 > **⭐ 2026-07-12: モダンブラウザ化の長期計画が承認された。今後の実装セッションは
 > `docs/modernization-plan.md`(Phase 0〜5 のロードマップ)に従うこと。**
@@ -184,11 +184,30 @@
 >   getAttribute/setAttribute/hasAttribute メソッド。すべて NodeHandle host data 経由。
 >   cosmo_engine に `Element::set_attribute`(+`Attribute::from_name_value`/`set_value`)と
 >   `Node::kind_mut`(script からの in-place 属性変更用)を追加。
-> - 次: **querySelector(All)**(エンジンの `dom_node_selected` + CssParser を再利用 —
->   要 pub 化 or ヘルパ)、classList(add/remove/toggle/contains)、createElement/
->   appendChild/removeChild、イベント(addEventListener+capture→target→bubble dispatch)、
->   イベントループ(runtime.rs の task/microtask 骨格移植)、cosmo_runtime の玩具 JS 置換、
->   MAX_SCRIPT_BYTES 撤廃、DOM 変異→再レイアウトのトリガ。
+> - 3.2 querySelector ✅ (`5746ff2`) **document.querySelector / querySelectorAll**:
+>   `dom/api.rs` に `query_selector[_all]` を追加(`CssParser` で `sel{}` をパースし
+>   DOM を pre-order 走査、`dom_node_selected` でマッチ = スタイル解決と同一のマッチャ)。
+>   querySelectorAll は JsArray を返す。子孫結合子・id/class・セレクタリスト対応。
+> - 3.2 classList ✅ (`32f5a0d`) **element.classList** add/remove/toggle/contains。
+>   同じ NodeHandle を持つトークンリストオブジェクトを返し class 属性を直接変更。
+>   toggle は結果の所属を返し、任意の force 引数を尊重。
+> - 3.2 ツリー変更 ✅ (`f09b2e8`) **createElement/createTextNode + appendChild/
+>   removeChild/insertBefore/remove**: `Rc<RefCell<Node>>` の first/last-child・
+>   sibling・parent リンクを保守しつつ splice。`detach_node`/`append_child_node`/
+>   `insert_before_node` ヘルパ。textContent は Text ノードを in-place 読み書き。
+> - 3.2 ナビゲーション ✅ (`24df18a`) **parentNode/parentElement・firstChild/lastChild・
+>   nextSibling/previousSibling・children(要素のみ)・childNodes(全)**。
+> - 3.3 イベント ✅ (`f444530`) **addEventListener/removeEventListener/dispatchEvent**:
+>   ノード identity(`Rc::as_ptr`)でキーする LISTENERS レジストリ(D5: DOM 外に保持、
+>   `set_document` でクリア)。Event は type/target + preventDefault/stopPropagation
+>   (EventFlags host data)。dispatch は target→祖先(bubble)、stopPropagation で停止。
+>   `ScriptHost::dispatch_event(node, type) -> bool`(false = default 抑止)で runtime が
+>   実入力を注入可能。**capture フェーズはまだ未実装**。
+> - 次: **イベントループ**(runtime.rs の task/microtask 骨格を event_loop.rs へ移植)、
+>   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
+>   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
+>   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
+>   setTimeout/setInterval、capture フェーズ、ラッパーキャッシュ(el===el)。
 > **→ Phase 2 の受け入れ目標(MDN 記事)に到達。HN/abehiroshi/Wikipedia/MDN 全て読める。
 >   残: Try it iframe 空欄(埋め込み未対応)、Wikipedia のサムネイル float 未対応。
 >   次候補: 残 CSS(linear-gradient・transition)、floats(Phase 2.3)、
