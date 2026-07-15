@@ -657,7 +657,11 @@ fn elem_query_selector(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResu
         return Ok(JsValue::null());
     };
     let sel = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
-    Ok(node_or_null(query_selector(node, &sel), c))
+    // Element-scoped query matches descendants only, never the element itself.
+    let found = query_selector_all(node.clone(), &sel)
+        .into_iter()
+        .find(|n| !Rc::ptr_eq(n, &node));
+    Ok(node_or_null(found, c))
 }
 
 fn elem_query_selector_all(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
@@ -666,7 +670,11 @@ fn elem_query_selector_all(this: &JsValue, a: &[JsValue], c: &mut Context) -> Js
     };
     let sel = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
     let arr = JsArray::new(c);
-    for n in query_selector_all(node, &sel) {
+    // Descendants only — exclude the element itself if it happens to match.
+    for n in query_selector_all(node.clone(), &sel) {
+        if Rc::ptr_eq(&n, &node) {
+            continue;
+        }
         let el = make_element(n, c);
         arr.push(JsValue::from(el), c)?;
     }
@@ -2265,6 +2273,16 @@ mod tests {
         assert_eq!(
             host.eval_to_string("document.getElementById('c').querySelectorAll('a').length").unwrap(),
             "1"
+        );
+        // Descendant-only scoping: the element itself never matches, even when
+        // it satisfies the selector (DOM spec).
+        assert_eq!(
+            host.eval_to_string("document.getElementById('c').querySelector('.card')").unwrap(),
+            "null"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('c').querySelectorAll('.card').length").unwrap(),
+            "0"
         );
     }
 
