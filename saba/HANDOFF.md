@@ -215,14 +215,21 @@
 >   getter は子を HTML シリアライズ(void 要素は閉じタグなし)、setter はフラグメントを
 >   フルドキュメントとしてパースし body の子を target へ再ペアレント。collections は
 >   query_selector_all 経由(`*`・空白区切り class 複合対応)。
+ - window/location ✅ (`59c2012`) **window(=globalThis エイリアス)+ location**
+>   (href/protocol/host/hostname/pathname/search/hash、`ScriptHost::set_location`)。
+> - localStorage ✅ (`4840965`) **localStorage**(getItem/setItem/removeItem/clear/key/length、
+>   挿入順保持)+ `ScriptHost::local_storage_entries`/`set_local_storage_entries`(玩具の
+>   replace_local_storage 配線に対応)。navigation では非クリア(オリジン単位)。
+> - E2E ✅ (`af8256a`) **TodoMVC 相当の統合テスト**(create/append/addEventListener/
+>   dispatchEvent bubble/classList.toggle/removeChild/querySelectorAll の合成動作)。
 > - 次: **cosmo_runtime 統合(3.5, 最重要・大)** — `layout/mod.rs:112` の玩具
->   `JsRuntime` を `cosmo_script::ScriptHost` に差し替え(set_document→各<script> eval→
->   run_pending→そのまま layout。DOM 変異は同 Rc 上なので relayout は自然に反映)。
->   **未解決の前提**: (a) `MAX_SCRIPT_BYTES` 撤廃 vs Boa にfuel/watchdog が無くヘビーJSで
->   ハング懸念(暫定でバイトキャップ維持が安全)、(b) loader.rs:585 注入スクリプトが
->   `window.parent.postMessage`/`window`/`location` を要求(未実装)、(c) localStorage が
->   cosmo_script 未実装(玩具側の replace_local_storage 配線が切れる)。→ window/postMessage/
->   localStorage を先に cosmo_script へ足してから差し替えるのが安全。
+>   `JsRuntime` を `cosmo_script::ScriptHost` に差し替え(set_document→set_location→
+>   set_local_storage_entries→各<script> eval→run_pending→そのまま layout。DOM 変異は同 Rc
+>   上なので relayout は自然に反映。後で local_storage_entries を replace_local_storage へ)。
+>   **残る前提**: (a) `MAX_SCRIPT_BYTES` 撤廃 vs Boa に fuel/watchdog が無くヘビーJSで
+>   ハング懸念(暫定でバイトキャップ維持が安全)、(b) loader.rs:585 注入スクリプトの
+>   `window.parent.postMessage` はフレームバス依存で未実装(window/location 自体は解禁済み)。
+>   → **(c) localStorage は解決済み**。まず postMessage スタブ or フレーム連携を足す。
 > - 旧「次」(残タスク): capture フェーズ、style(setProperty/インライン)、fetch/XHR、
 >   ラッパーキャッシュ(el===el)、`renderer/js/` 玩具の削除。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
