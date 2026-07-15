@@ -64,7 +64,8 @@ fn parse_capture(arg: Option<&JsValue>, ctx: &mut Context) -> bool {
     }
 }
 
-/// A scheduled `setTimeout`/`setInterval` callback awaiting its turn.
+/// A scheduled `setTimeout`/`setInterval`/`requestAnimationFrame` callback
+/// awaiting its turn.
 struct Timer {
     id: u32,
     callback: JsObject,
@@ -72,6 +73,9 @@ struct Timer {
     due: u64,
     /// Repeat interval in ms for `setInterval`; `None` for one-shot timers.
     interval: Option<u64>,
+    /// True for `requestAnimationFrame` callbacks — they receive the current
+    /// timestamp as their argument.
+    is_raf: bool,
 }
 
 thread_local! {
@@ -1305,12 +1309,14 @@ impl ScriptHost {
             .register_global_property(js_string!("console"), console, Attribute::all())
             .expect("register console");
 
-        // Timers: setTimeout/setInterval/clearTimeout/clearInterval.
+        // Timers: setTimeout/setInterval/clearTimeout/clearInterval + rAF.
         for (name, f) in [
             ("setTimeout", set_timeout as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
             ("setInterval", set_interval),
             ("clearTimeout", clear_timer),
             ("clearInterval", clear_timer),
+            ("requestAnimationFrame", request_animation_frame),
+            ("cancelAnimationFrame", clear_timer),
         ] {
             let func = NativeFunction::from_fn_ptr(f).to_js_function(&self.context.realm().clone());
             self.context
@@ -1459,18 +1465,26 @@ impl ScriptHost {
             });
             let Some(timer) = next else { break };
             VIRTUAL_CLOCK.with(|c| c.set(c.get().max(timer.due)));
+            let clock = VIRTUAL_CLOCK.with(|c| c.get());
+            // requestAnimationFrame callbacks receive the current timestamp.
+            let args: Vec<JsValue> = if timer.is_raf {
+                vec![JsValue::from(clock as f64)]
+            } else {
+                Vec::new()
+            };
             let _ = timer
                 .callback
-                .call(&JsValue::undefined(), &[], &mut self.context);
+                .call(&JsValue::undefined(), &args, &mut self.context);
             // Reschedule intervals relative to the virtual clock.
             if let Some(iv) = timer.interval {
-                let due = VIRTUAL_CLOCK.with(|c| c.get()) + iv.max(1);
+                let due = clock + iv.max(1);
                 TIMERS.with(|t| {
                     t.borrow_mut().push(Timer {
                         id: timer.id,
                         callback: timer.callback,
                         due,
                         interval: Some(iv),
+                        is_raf: false,
                     })
                 });
             }
@@ -1575,6 +1589,7 @@ fn schedule_timer(args: &[JsValue], ctx: &mut Context, repeat: bool) -> JsResult
             callback: cb,
             due,
             interval: if repeat { Some(delay) } else { None },
+            is_raf: false,
         })
     });
     Ok(JsValue::from(id))
@@ -1590,6 +1605,32 @@ fn clear_timer(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let id = args.first().map(|v| v.to_number(ctx)).transpose()?.unwrap_or(0.0) as u32;
     TIMERS.with(|t| t.borrow_mut().retain(|tm| tm.id != id));
     Ok(JsValue::undefined())
+}
+
+/// `requestAnimationFrame(cb)` — schedule `cb` to run on the next frame
+/// (~16ms of virtual time). The callback receives the frame timestamp. Shares
+/// the timer queue so `run_pending` drives it; `cancelAnimationFrame(id)`
+/// cancels via the same id space.
+fn request_animation_frame(_this: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(cb) = args.first().and_then(|v| v.as_object()).cloned() else {
+        return Ok(JsValue::from(0));
+    };
+    let id = NEXT_TIMER_ID.with(|n| {
+        let id = n.get();
+        n.set(id + 1);
+        id
+    });
+    let due = VIRTUAL_CLOCK.with(|c| c.get()) + 16;
+    TIMERS.with(|t| {
+        t.borrow_mut().push(Timer {
+            id,
+            callback: cb,
+            due,
+            interval: None,
+            is_raf: true,
+        })
+    });
+    Ok(JsValue::from(id))
 }
 
 fn script_dom_root() -> Option<Rc<RefCell<Node>>> {
@@ -2221,6 +2262,39 @@ mod tests {
             host.eval_to_string("document.getElementById('c').querySelectorAll('a').length").unwrap(),
             "1"
         );
+    }
+
+    #[test]
+    fn request_animation_frame_runs_via_event_loop() {
+        let html = "<html><body><p id=\"out\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // A rAF callback receives a timestamp and can chain another frame.
+        host.eval_to_string(
+            "var frames = 0; \
+             function tick(ts) { \
+                 frames++; \
+                 document.getElementById('out').textContent += (typeof ts === 'number' ? 'n' : '?'); \
+                 if (frames < 3) requestAnimationFrame(tick); \
+             } \
+             requestAnimationFrame(tick);",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("frames").unwrap(), "0");
+        host.run_pending(100);
+        assert_eq!(host.eval_to_string("frames").unwrap(), "3");
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "nnn");
+
+        // cancelAnimationFrame prevents a scheduled frame.
+        host.eval_to_string(
+            "var id = requestAnimationFrame(function(){ frames++; }); cancelAnimationFrame(id);",
+        )
+        .unwrap();
+        host.run_pending(100);
+        assert_eq!(host.eval_to_string("frames").unwrap(), "3");
     }
 
     #[test]
