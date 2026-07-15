@@ -23,21 +23,120 @@ struct NodeHandle {
     node: Rc<RefCell<Node>>,
 }
 
-/// Wrap a DOM node as an `Element` JsObject exposing a live `textContent`
-/// accessor (get reads the node's text, set replaces its children).
+/// Wrap a DOM node as an `Element` JsObject exposing live accessors
+/// (textContent, id, className, tagName) and attribute methods.
 fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     let obj = JsObject::from_proto_and_data(None, NodeHandle { node });
     let realm = context.realm().clone();
-    let getter = NativeFunction::from_fn_ptr(element_get_text_content).to_js_function(&realm);
-    let setter = NativeFunction::from_fn_ptr(element_set_text_content).to_js_function(&realm);
-    let desc = PropertyDescriptor::builder()
-        .get(getter)
-        .set(setter)
-        .enumerable(true)
-        .configurable(true)
-        .build();
-    obj.insert_property(js_string!("textContent"), desc);
+
+    let accessor = |get: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+                    set: Option<fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>>|
+     -> PropertyDescriptor {
+        let mut b = PropertyDescriptor::builder()
+            .get(NativeFunction::from_fn_ptr(get).to_js_function(&realm))
+            .enumerable(true)
+            .configurable(true);
+        if let Some(set) = set {
+            b = b.set(NativeFunction::from_fn_ptr(set).to_js_function(&realm));
+        }
+        b.build()
+    };
+
+    obj.insert_property(
+        js_string!("textContent"),
+        accessor(element_get_text_content, Some(element_set_text_content)),
+    );
+    obj.insert_property(
+        js_string!("id"),
+        accessor(element_get_id, Some(element_set_id)),
+    );
+    obj.insert_property(
+        js_string!("className"),
+        accessor(element_get_class_name, Some(element_set_class_name)),
+    );
+    obj.insert_property(js_string!("tagName"), accessor(element_get_tag_name, None));
+
+    let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name, len| {
+        let desc = PropertyDescriptor::builder()
+            .value(NativeFunction::from_fn_ptr(f).to_js_function(&realm))
+            .writable(true)
+            .enumerable(false)
+            .configurable(true)
+            .build();
+        obj.insert_property(name, desc);
+        let _ = len;
+    };
+    method(element_get_attribute, js_string!("getAttribute"), 1);
+    method(element_set_attribute, js_string!("setAttribute"), 2);
+    method(element_has_attribute, js_string!("hasAttribute"), 1);
+
     obj
+}
+
+/// Read an element attribute via the NodeHandle in `this`.
+fn attr_of(this: &JsValue, name: &str) -> Option<String> {
+    let node = handle_node(this)?;
+    let b = node.borrow();
+    match b.kind() {
+        NodeKind::Element(ref e) => e.get_attribute(name),
+        _ => None,
+    }
+}
+
+/// Write an element attribute via the NodeHandle in `this`.
+fn set_attr_of(this: &JsValue, name: &str, value: &str) {
+    if let Some(node) = handle_node(this) {
+        if let NodeKind::Element(ref mut e) = node.borrow_mut().kind_mut() {
+            e.set_attribute(name, value);
+        }
+    }
+}
+
+fn element_get_id(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(attr_of(this, "id")
+        .unwrap_or_default()
+        .as_str())))
+}
+fn element_set_id(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let v = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    set_attr_of(this, "id", &v);
+    Ok(JsValue::undefined())
+}
+fn element_get_class_name(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(attr_of(this, "class")
+        .unwrap_or_default()
+        .as_str())))
+}
+fn element_set_class_name(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let v = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    set_attr_of(this, "class", &v);
+    Ok(JsValue::undefined())
+}
+fn element_get_tag_name(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    let tag = handle_node(this)
+        .and_then(|n| match n.borrow().kind() {
+            NodeKind::Element(ref e) => Some(e.tag_name().to_uppercase()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(tag.as_str())))
+}
+fn element_get_attribute(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(match attr_of(this, &name) {
+        Some(v) => JsValue::from(js_string!(v.as_str())),
+        None => JsValue::null(),
+    })
+}
+fn element_set_attribute(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let value = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    set_attr_of(this, &name, &value);
+    Ok(JsValue::undefined())
+}
+fn element_has_attribute(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(JsValue::from(attr_of(this, &name).is_some()))
 }
 
 fn handle_node(this: &JsValue) -> Option<Rc<RefCell<Node>>> {
@@ -215,6 +314,39 @@ mod tests {
             host.eval_to_string("document.getElementById('greeting').textContent.length")
                 .unwrap(),
             "9"
+        );
+    }
+
+    #[test]
+    fn element_attributes_read_and_write() {
+        let html = "<html><body><div id=\"box\" class=\"a b\" data-role=\"panel\">x</div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        assert_eq!(host.eval_to_string("document.getElementById('box').id").unwrap(), "box");
+        assert_eq!(host.eval_to_string("document.getElementById('box').className").unwrap(), "a b");
+        assert_eq!(host.eval_to_string("document.getElementById('box').tagName").unwrap(), "DIV");
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').getAttribute('data-role')").unwrap(),
+            "panel"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').hasAttribute('data-role')").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').getAttribute('missing')").unwrap(),
+            "null"
+        );
+        // Write className and a custom attribute, read back.
+        host.eval_to_string("document.getElementById('box').className = 'c';").unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('box').className").unwrap(), "c");
+        host.eval_to_string("document.getElementById('box').setAttribute('data-n', '42');").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').getAttribute('data-n')").unwrap(),
+            "42"
         );
     }
 

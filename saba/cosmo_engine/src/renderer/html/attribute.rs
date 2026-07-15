@@ -14,6 +14,19 @@ impl Attribute {
         }
     }
 
+    /// Construct an attribute from a name/value pair (e.g. from a DOM
+    /// `setAttribute` call).
+    pub fn from_name_value(name: &str, value: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    pub fn set_value(&mut self, value: &str) {
+        self.value = value.to_string();
+    }
+
     pub fn add_char(&mut self, c: char, is_name: bool) {
         if is_name {
             self.name.push(c);

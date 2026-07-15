@@ -111,6 +111,12 @@ impl Node {
         self.kind.clone()
     }
 
+    /// Mutable access to this node's kind, for in-place DOM mutation
+    /// (e.g. an element attribute change from script).
+    pub fn kind_mut(&mut self) -> &mut NodeKind {
+        &mut self.kind
+    }
+
     pub fn get_element(&self) -> Option<Element> {
         match self.kind {
             NodeKind::Document | NodeKind::Text(_) => None,
@@ -225,6 +231,17 @@ impl Element {
             }
         }
         None
+    }
+
+    /// Set (or add) an attribute value — the DOM `setAttribute` operation.
+    pub fn set_attribute(&mut self, name: &str, value: &str) {
+        for attr in &mut self.attributes {
+            if attr.name() == name {
+                attr.set_value(value);
+                return;
+            }
+        }
+        self.attributes.push(Attribute::from_name_value(name, value));
     }
 }
 
