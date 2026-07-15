@@ -222,16 +222,24 @@
 >   replace_local_storage 配線に対応)。navigation では非クリア(オリジン単位)。
 > - E2E ✅ (`af8256a`) **TodoMVC 相当の統合テスト**(create/append/addEventListener/
 >   dispatchEvent bubble/classList.toggle/removeChild/querySelectorAll の合成動作)。
-> - 次: **cosmo_runtime 統合(3.5, 最重要・大)** — `layout/mod.rs:112` の玩具
->   `JsRuntime` を `cosmo_script::ScriptHost` に差し替え(set_document→set_location→
->   set_local_storage_entries→各<script> eval→run_pending→そのまま layout。DOM 変異は同 Rc
->   上なので relayout は自然に反映。後で local_storage_entries を replace_local_storage へ)。
->   **残る前提**: (a) `MAX_SCRIPT_BYTES` 撤廃 vs Boa に fuel/watchdog が無くヘビーJSで
->   ハング懸念(暫定でバイトキャップ維持が安全)、(b) loader.rs:585 注入スクリプトの
->   `window.parent.postMessage` はフレームバス依存で未実装(window/location 自体は解禁済み)。
->   → **(c) localStorage は解決済み**。まず postMessage スタブ or フレーム連携を足す。
-> - 旧「次」(残タスク): capture フェーズ、style(setProperty/インライン)、fetch/XHR、
->   ラッパーキャッシュ(el===el)、`renderer/js/` 玩具の削除。
+> - postMessage/doc events ✅ (`25e5a2a`) **window.parent.postMessage / window.postMessage**
+>   (JSON 直列化して POSTED_MESSAGES、`take_posted_messages` で drain)+ **document 直下の
+>   addEventListener/removeEventListener/dispatchEvent**(root ノードに登録=バブルが届く)。
+>   loader.rs 注入スクリプトの closest('a')→preventDefault→postMessage を E2E テストで再現。
+>   → 差し替え前提 (b) 解決。
+> - **cosmo_runtime 統合 ✅ (`c0d0e31`, 3.5 の主要部)** — `layout/mod.rs`
+>   `build_layout_scene_with_script_runtime` が `COSMO_USE_BOA=1` で `cosmo_script::ScriptHost`
+>   経由(set_location→set_local_storage_entries→set_document→<script> eval→run_pending→
+>   localStorage 永続化→console を diagnostics へ)。**既定は玩具のまま**(凍結フィクスチャの
+>   golden 不変)。両経路とも同 Rc<RefCell<Node>> を破壊的更新するので layout は post-script
+>   ツリーを見る。暫定 512KB バイトキャップ=watchdog 代替(Boa 0.20 に fuel 無し)。
+>   **cosmo_script に初の依存クレートができた。** テスト: `execute_scripts_boa` が <script> で
+>   ノード追加→ツリー反映を確認(cosmo_runtime 52 tests)。
+> - 次: (a) **COSMO_USE_BOA を GUI ヘッドレスで JS デモ検証**して golden 化 → 既定を Boa に
+>   切替(専用コミットで再ベースライン)。(b) Boa の実 watchdog(別スレッド不可なので
+>   反復/時間ガードの検討)。(c) `renderer/js/` 玩具の削除。capture フェーズ、
+>   style(setProperty/インライン)、fetch/XHR、ラッパーキャッシュ(el===el)、
+>   DOM 変異世代カウンタ(全再構築でなく差分 relayout)。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
