@@ -45,6 +45,23 @@ struct EventFlags {
 struct Listener {
     event_type: String,
     callback: JsObject,
+    /// True if registered for the capture phase (addEventListener's 3rd arg
+    /// `true` or `{capture: true}`).
+    capture: bool,
+}
+
+/// Parse addEventListener's optional 3rd argument (a boolean `useCapture` or an
+/// options object with a `capture` property).
+fn parse_capture(arg: Option<&JsValue>, ctx: &mut Context) -> bool {
+    match arg {
+        Some(v) if v.is_object() => v
+            .as_object()
+            .and_then(|o| o.get(js_string!("capture"), ctx).ok())
+            .map(|c| c.to_boolean())
+            .unwrap_or(false),
+        Some(v) => v.to_boolean(),
+        None => false,
+    }
 }
 
 /// A scheduled `setTimeout`/`setInterval` callback awaiting its turn.
@@ -408,11 +425,12 @@ fn element_add_event_listener(
     let Some(cb) = a.get(1).and_then(|v| v.as_object()).cloned() else {
         return Ok(JsValue::undefined());
     };
+    let capture = parse_capture(a.get(2), c);
     LISTENERS.with(|m| {
         m.borrow_mut()
             .entry(node_key(&node))
             .or_default()
-            .push(Listener { event_type, callback: cb });
+            .push(Listener { event_type, callback: cb, capture });
     });
     Ok(JsValue::undefined())
 }
@@ -521,26 +539,48 @@ fn event_stop_propagation(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> J
     Ok(JsValue::undefined())
 }
 
-/// Dispatch `event_type` at `target` and bubble up its ancestor chain. Returns
-/// `true` if `preventDefault` was NOT called (i.e. the default action runs).
+/// Dispatch `event_type` at `target` through the standard three phases:
+/// capture (root→target's parent), at-target (both), then bubble
+/// (parent→root). Returns `true` if `preventDefault` was NOT called (i.e. the
+/// default action runs).
 fn run_dispatch(target: Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) -> bool {
     let event = make_event(&target, event_type, ctx);
 
-    // Bubble order: target first, then each ancestor.
-    let mut chain = vec![target.clone()];
+    // Propagation path: [target, parent, ..., root].
+    let mut path = vec![target.clone()];
     let mut cur = target.borrow().parent().upgrade();
     while let Some(p) = cur {
-        chain.push(p.clone());
+        path.push(p.clone());
         cur = p.borrow().parent().upgrade();
     }
 
-    'outer: for node in chain {
+    let stopped = |event: &JsObject| {
+        event
+            .downcast_ref::<EventFlags>()
+            .map(|f| f.stop_propagation.get())
+            .unwrap_or(false)
+    };
+
+    // Fire listeners on `node` whose capture flag is in `want`. `None` means
+    // "either" (the at-target phase runs both capture and bubble listeners).
+    // Returns false if propagation was stopped.
+    fn fire(
+        node: &Rc<RefCell<Node>>,
+        event_type: &str,
+        want: Option<bool>,
+        event: &JsObject,
+        stopped: &dyn Fn(&JsObject) -> bool,
+        ctx: &mut Context,
+    ) -> bool {
         let callbacks: Vec<JsObject> = LISTENERS.with(|m| {
             m.borrow()
-                .get(&node_key(&node))
+                .get(&node_key(node))
                 .map(|v| {
                     v.iter()
-                        .filter(|l| l.event_type == event_type)
+                        .filter(|l| {
+                            l.event_type == event_type
+                                && want.map(|w| l.capture == w).unwrap_or(true)
+                        })
                         .map(|l| l.callback.clone())
                         .collect()
                 })
@@ -549,16 +589,34 @@ fn run_dispatch(target: Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) 
         for cb in callbacks {
             let this = JsValue::from(make_element(node.clone(), ctx));
             let _ = cb.call(&this, &[JsValue::from(event.clone())], ctx);
-            let stop = event
-                .downcast_ref::<EventFlags>()
-                .map(|f| f.stop_propagation.get())
-                .unwrap_or(false);
-            if stop {
-                break 'outer;
+            if stopped(event) {
+                return false;
             }
+        }
+        true
+    }
+
+    // Capture phase: root down to (but not including) the target.
+    for node in path[1..].iter().rev() {
+        if !fire(node, event_type, Some(true), &event, &stopped, ctx) {
+            return default_allowed(&event);
+        }
+    }
+    // At target: both capture and bubble listeners.
+    if !fire(&target, event_type, None, &event, &stopped, ctx) {
+        return default_allowed(&event);
+    }
+    // Bubble phase: parent up to root.
+    for node in path[1..].iter() {
+        if !fire(node, event_type, Some(false), &event, &stopped, ctx) {
+            return default_allowed(&event);
         }
     }
 
+    default_allowed(&event)
+}
+
+fn default_allowed(event: &JsObject) -> bool {
     !event
         .downcast_ref::<EventFlags>()
         .map(|f| f.default_prevented.get())
@@ -1363,11 +1421,12 @@ fn doc_add_event_listener(_this: &JsValue, a: &[JsValue], c: &mut Context) -> Js
     let Some(cb) = a.get(1).and_then(|v| v.as_object()).cloned() else {
         return Ok(JsValue::undefined());
     };
+    let capture = parse_capture(a.get(2), c);
     LISTENERS.with(|m| {
         m.borrow_mut()
             .entry(node_key(&root))
             .or_default()
-            .push(Listener { event_type, callback: cb });
+            .push(Listener { event_type, callback: cb, capture });
     });
     Ok(JsValue::undefined())
 }
@@ -1975,6 +2034,49 @@ mod tests {
         assert_eq!(
             host.eval_to_string("document.getElementById('c').querySelectorAll('a').length").unwrap(),
             "1"
+        );
+    }
+
+    #[test]
+    fn event_capture_phase_ordering() {
+        let html = "<html><body><div id=\"outer\"><button id=\"btn\">x</button></div>\
+                    <p id=\"log\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+
+        // Capture listener on the ancestor fires BEFORE the target's listener;
+        // a bubble listener on the ancestor fires AFTER.
+        host.eval_to_string(
+            "function log(s){ document.getElementById('log').textContent += s; } \
+             document.getElementById('outer').addEventListener('click', function(){ log('C'); }, true); \
+             document.getElementById('btn').addEventListener('click', function(){ log('T'); }); \
+             document.getElementById('outer').addEventListener('click', function(){ log('B'); }, false);",
+        )
+        .unwrap();
+
+        let btn = get_element_by_id(Some(document.clone()), &"btn".to_string()).unwrap();
+        host.dispatch_event(btn, "click");
+        assert_eq!(
+            host.eval_to_string("document.getElementById('log').textContent").unwrap(),
+            "CTB"
+        );
+
+        // {capture:true} option form works, and a capture-phase stopPropagation
+        // suppresses the target + bubble listeners.
+        host.eval_to_string(
+            "document.getElementById('log').textContent=''; \
+             document.getElementById('outer').addEventListener('click', function(e){ e.stopPropagation(); log('X'); }, {capture:true});",
+        )
+        .unwrap();
+        let btn2 = get_element_by_id(Some(document), &"btn".to_string()).unwrap();
+        host.dispatch_event(btn2, "click");
+        // The pre-existing capture listener 'C' runs, then the new capturing
+        // 'X' stops propagation — no 'T'/'B'.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('log').textContent").unwrap(),
+            "CX"
         );
     }
 
