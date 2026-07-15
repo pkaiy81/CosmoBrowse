@@ -13,9 +13,9 @@ use boa_engine::object::builtins::JsArray;
 use cosmo_engine::renderer::dom::api::{
     collect_text, get_element_by_id, query_selector, query_selector_all,
 };
-use cosmo_engine::renderer::dom::node::{Node, NodeKind};
+use cosmo_engine::renderer::dom::node::{Element, Node, NodeKind};
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 /// Host data attached to an `Element` JsObject: a handle to the live DOM
 /// node, kept outside Boa's GC. The Rc/RefCell contain no GC-managed
@@ -73,6 +73,10 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     method(element_get_attribute, js_string!("getAttribute"), 1);
     method(element_set_attribute, js_string!("setAttribute"), 2);
     method(element_has_attribute, js_string!("hasAttribute"), 1);
+    method(element_append_child, js_string!("appendChild"), 1);
+    method(element_remove_child, js_string!("removeChild"), 1);
+    method(element_insert_before, js_string!("insertBefore"), 2);
+    method(element_remove, js_string!("remove"), 0);
 
     obj
 }
@@ -94,6 +98,127 @@ fn set_attr_of(this: &JsValue, name: &str, value: &str) {
             e.set_attribute(name, value);
         }
     }
+}
+
+/// Unlink `child` from its current parent and siblings, if any.
+fn detach_node(child: &Rc<RefCell<Node>>) {
+    let parent = child.borrow().parent().upgrade();
+    let prev = child.borrow().previous_sibling().upgrade();
+    let next = child.borrow().next_sibling();
+
+    match &prev {
+        Some(p) => p.borrow_mut().set_next_sibling(next.clone()),
+        None => {
+            if let Some(par) = &parent {
+                par.borrow_mut().set_first_child(next.clone());
+            }
+        }
+    }
+    match &next {
+        Some(n) => n
+            .borrow_mut()
+            .set_previous_sibling(prev.as_ref().map(Rc::downgrade).unwrap_or_default()),
+        None => {
+            if let Some(par) = &parent {
+                par.borrow_mut()
+                    .set_last_child(prev.as_ref().map(Rc::downgrade).unwrap_or_default());
+            }
+        }
+    }
+    let mut cb = child.borrow_mut();
+    cb.set_parent(Weak::new());
+    cb.set_previous_sibling(Weak::new());
+    cb.set_next_sibling(None);
+}
+
+/// Append `child` as the last child of `parent` (detaching it first).
+fn append_child_node(parent: &Rc<RefCell<Node>>, child: &Rc<RefCell<Node>>) {
+    detach_node(child);
+    let last = parent.borrow().last_child().upgrade();
+    match &last {
+        Some(l) => {
+            l.borrow_mut().set_next_sibling(Some(child.clone()));
+            child.borrow_mut().set_previous_sibling(Rc::downgrade(l));
+        }
+        None => {
+            parent.borrow_mut().set_first_child(Some(child.clone()));
+        }
+    }
+    parent.borrow_mut().set_last_child(Rc::downgrade(child));
+    child.borrow_mut().set_parent(Rc::downgrade(parent));
+}
+
+/// Insert `new_node` before `ref_node` under `parent`. If `ref_node` is None,
+/// this is equivalent to appendChild.
+fn insert_before_node(
+    parent: &Rc<RefCell<Node>>,
+    new_node: &Rc<RefCell<Node>>,
+    ref_node: Option<&Rc<RefCell<Node>>>,
+) {
+    let Some(reference) = ref_node else {
+        append_child_node(parent, new_node);
+        return;
+    };
+    detach_node(new_node);
+    let prev = reference.borrow().previous_sibling().upgrade();
+    match &prev {
+        Some(p) => p.borrow_mut().set_next_sibling(Some(new_node.clone())),
+        None => parent.borrow_mut().set_first_child(Some(new_node.clone())),
+    }
+    {
+        let mut nb = new_node.borrow_mut();
+        nb.set_parent(Rc::downgrade(parent));
+        nb.set_previous_sibling(prev.as_ref().map(Rc::downgrade).unwrap_or_default());
+        nb.set_next_sibling(Some(reference.clone()));
+    }
+    reference
+        .borrow_mut()
+        .set_previous_sibling(Rc::downgrade(new_node));
+}
+
+/// True if `ancestor` is a (transitive) parent of `node`.
+fn is_child_of(ancestor: &Rc<RefCell<Node>>, node: &Rc<RefCell<Node>>) -> bool {
+    node.borrow()
+        .parent()
+        .upgrade()
+        .map(|p| Rc::ptr_eq(&p, ancestor))
+        .unwrap_or(false)
+}
+
+fn element_append_child(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (Some(parent), Some(child)) = (handle_node(this), a.first().and_then(handle_node)) else {
+        return Ok(JsValue::null());
+    };
+    append_child_node(&parent, &child);
+    Ok(JsValue::from(make_element(child, ctx)))
+}
+
+fn element_remove_child(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (Some(parent), Some(child)) = (handle_node(this), a.first().and_then(handle_node)) else {
+        return Ok(JsValue::null());
+    };
+    if !is_child_of(&parent, &child) {
+        return Ok(JsValue::null());
+    }
+    detach_node(&child);
+    Ok(JsValue::from(make_element(child, ctx)))
+}
+
+fn element_insert_before(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (Some(parent), Some(new_node)) = (handle_node(this), a.first().and_then(handle_node)) else {
+        return Ok(JsValue::null());
+    };
+    let reference = a.get(1).and_then(handle_node);
+    insert_before_node(&parent, &new_node, reference.as_ref());
+    Ok(JsValue::from(make_element(new_node, ctx)))
+}
+
+/// `element.remove()` — detach the element from its parent.
+fn element_remove(this: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(node) = handle_node(this) {
+        detach_node(&node);
+    }
+    Ok(JsValue::undefined())
 }
 
 fn element_get_id(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
@@ -239,6 +364,11 @@ fn element_get_text_content(
     let Some(node) = handle_node(this) else {
         return Ok(JsValue::undefined());
     };
+    // A text node's textContent is its own data; an element's is the
+    // concatenation of its descendants' text.
+    if let NodeKind::Text(ref t) = node.borrow().kind() {
+        return Ok(JsValue::from(js_string!(t.as_str())));
+    }
     let mut s = String::new();
     collect_text(node.borrow().first_child(), &mut s);
     Ok(JsValue::from(js_string!(s.as_str())))
@@ -258,7 +388,12 @@ fn element_set_text_content(
         .unwrap_or(JsValue::undefined())
         .to_string(ctx)?
         .to_std_string_escaped();
-    // textContent setter replaces all children with a single text node.
+    // On a text node, replace its data in place; on an element, replace all
+    // children with a single text node.
+    if let NodeKind::Text(_) = node.borrow().kind() {
+        *node.borrow_mut().kind_mut() = NodeKind::Text(text);
+        return Ok(JsValue::undefined());
+    }
     node.borrow_mut()
         .set_first_child(Some(Rc::new(RefCell::new(Node::new(NodeKind::Text(text))))));
     Ok(JsValue::undefined())
@@ -319,6 +454,16 @@ impl ScriptHost {
                 js_string!("querySelectorAll"),
                 1,
             )
+            .function(
+                NativeFunction::from_fn_ptr(dom_create_element),
+                js_string!("createElement"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(dom_create_text_node),
+                js_string!("createTextNode"),
+                1,
+            )
             .build();
         self.context
             .register_global_property(js_string!("document"), document, Attribute::all())
@@ -337,6 +482,31 @@ impl ScriptHost {
             Err(e) => Err(e.to_string()),
         }
     }
+}
+
+fn dom_create_element(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let tag = args
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let node = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+        &tag,
+        Vec::new(),
+    )))));
+    Ok(JsValue::from(make_element(node, ctx)))
+}
+
+fn dom_create_text_node(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let text = args
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let node = Rc::new(RefCell::new(Node::new(NodeKind::Text(text))));
+    Ok(JsValue::from(make_element(node, ctx)))
 }
 
 fn dom_get_element_by_id(
@@ -553,6 +723,43 @@ mod tests {
         let mut s = String::new();
         collect_text(el.borrow().first_child(), &mut s);
         assert_eq!(s, "changed by JS");
+    }
+
+    #[test]
+    fn create_and_mutate_the_tree() {
+        let html = "<html><body><ul id=\"list\"><li id=\"a\">A</li></ul></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // createElement + createTextNode + appendChild builds a new <li>B</li>.
+        host.eval_to_string(
+            "var li = document.createElement('li'); \
+             li.appendChild(document.createTextNode('B')); \
+             document.getElementById('list').appendChild(li);",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('list').textContent").unwrap(), "AB");
+
+        // insertBefore places a new node ahead of the first child.
+        host.eval_to_string(
+            "var first = document.getElementById('a'); \
+             var c = document.createElement('li'); c.textContent = 'C'; \
+             document.getElementById('list').insertBefore(c, first);",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('list').textContent").unwrap(), "CAB");
+
+        // removeChild drops the original first <li>.
+        host.eval_to_string(
+            "document.getElementById('list').removeChild(document.getElementById('a'));",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('list').textContent").unwrap(), "CB");
+
+        // querySelectorAll sees the current tree.
+        assert_eq!(host.eval_to_string("document.querySelectorAll('li').length").unwrap(), "2");
     }
 
     #[test]
