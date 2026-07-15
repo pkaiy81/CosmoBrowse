@@ -258,16 +258,27 @@ impl LayoutView {
             );
 
             let next_sibling = n.borrow().next_sibling();
-            // A zero-size node (e.g. a whitespace-only text node collapsed to
-            // nothing at a block boundary) must not become the next sibling's
-            // flow anchor: stacking below its meaningless y=…,h=0 point pulled
-            // following blocks up over the real previous line. Pass through
-            // the anchor we were given instead.
-            let zero_sized = {
+            // A node must not become the next sibling's flow anchor when it
+            // does not participate in normal flow:
+            //  - zero-size nodes (whitespace-only text collapsed at a block
+            //    boundary) — their meaningless y=…,h=0 point pulled following
+            //    blocks up over the real previous line;
+            //  - out-of-flow boxes (position:absolute/fixed) — their box is
+            //    removed from flow, so a following in-flow sibling stacks
+            //    against the PRIOR in-flow box. Anchoring against an absolute
+            //    box placed at, e.g., top:-20em (off-screen skip links) shoved
+            //    the entire rest of the page up by that offset.
+            // In both cases, pass through the anchor we were given.
+            let out_of_flow = {
                 let b = n.borrow();
-                b.size().width() == 0 && b.size().height() == 0
+                let zero_sized = b.size().width() == 0 && b.size().height() == 0;
+                let positioned = matches!(
+                    b.style().position(),
+                    PositionType::Absolute | PositionType::Fixed
+                );
+                zero_sized || positioned
             };
-            if zero_sized {
+            if out_of_flow {
                 Self::calculate_node_position(
                     &next_sibling,
                     parent_point,
