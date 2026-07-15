@@ -45,12 +45,31 @@ struct Listener {
     callback: JsObject,
 }
 
+/// A scheduled `setTimeout`/`setInterval` callback awaiting its turn.
+struct Timer {
+    id: u32,
+    callback: JsObject,
+    /// Virtual fire time (accumulated delay), used only to order due timers.
+    due: u64,
+    /// Repeat interval in ms for `setInterval`; `None` for one-shot timers.
+    interval: Option<u64>,
+}
+
 thread_local! {
     /// Event listeners keyed by DOM node identity (`Rc::as_ptr`). The DOM
     /// nodes themselves stay outside Boa's GC (plan D5), so listeners live
     /// here rather than on the node; cleared on navigation via `clear_state`.
     static LISTENERS: RefCell<std::collections::HashMap<usize, Vec<Listener>>> =
         RefCell::new(std::collections::HashMap::new());
+
+    /// Lines emitted by `console.*`, in order. Drained by the runtime/tests.
+    static CONSOLE_LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+
+    /// Pending timers (setTimeout/setInterval) and the next timer id.
+    static TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
+    static NEXT_TIMER_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+    /// Monotonic virtual clock advanced as timers fire (see run_pending).
+    static VIRTUAL_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn node_key(node: &Rc<RefCell<Node>>) -> usize {
@@ -736,6 +755,8 @@ impl ScriptHost {
     /// registry is per-page and reset on navigation).
     pub fn set_document(&mut self, root: Rc<RefCell<Node>>) {
         LISTENERS.with(|m| m.borrow_mut().clear());
+        TIMERS.with(|t| t.borrow_mut().clear());
+        VIRTUAL_CLOCK.with(|c| c.set(0));
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
     }
 
@@ -781,6 +802,31 @@ impl ScriptHost {
         self.context
             .register_global_property(js_string!("document"), document, Attribute::all())
             .expect("register document");
+
+        // console.{log,info,warn,error,debug}
+        let console = ObjectInitializer::new(&mut self.context)
+            .function(NativeFunction::from_fn_ptr(console_log), js_string!("log"), 1)
+            .function(NativeFunction::from_fn_ptr(console_log), js_string!("info"), 1)
+            .function(NativeFunction::from_fn_ptr(console_log), js_string!("debug"), 1)
+            .function(NativeFunction::from_fn_ptr(console_log), js_string!("warn"), 1)
+            .function(NativeFunction::from_fn_ptr(console_log), js_string!("error"), 1)
+            .build();
+        self.context
+            .register_global_property(js_string!("console"), console, Attribute::all())
+            .expect("register console");
+
+        // Timers: setTimeout/setInterval/clearTimeout/clearInterval.
+        for (name, f) in [
+            ("setTimeout", set_timeout as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+            ("setInterval", set_interval),
+            ("clearTimeout", clear_timer),
+            ("clearInterval", clear_timer),
+        ] {
+            let func = NativeFunction::from_fn_ptr(f).to_js_function(&self.context.realm().clone());
+            self.context
+                .register_global_property(js_string!(name), func, Attribute::all())
+                .expect("register timer");
+        }
     }
 
     /// Evaluate a script and return its completion value rendered as a
@@ -795,6 +841,107 @@ impl ScriptHost {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    /// Drain and take the buffered `console.*` output.
+    pub fn take_console_log(&self) -> Vec<String> {
+        CONSOLE_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// Run the event loop until it settles: Boa's promise/microtask jobs plus
+    /// all due timers. Timers fire in due order on a virtual clock (delays
+    /// order them but do not block), so `setTimeout(f, 0)` chains resolve.
+    /// `max_timer_fires` bounds runaway `setInterval` loops.
+    pub fn run_pending(&mut self, max_timer_fires: usize) {
+        self.context.run_jobs();
+        let mut fired = 0;
+        while fired < max_timer_fires {
+            // Pop the earliest-due timer.
+            let next = TIMERS.with(|t| {
+                let mut v = t.borrow_mut();
+                if v.is_empty() {
+                    return None;
+                }
+                let (idx, _) = v
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, tm)| tm.due)
+                    .map(|(i, tm)| (i, tm.due))
+                    .unwrap();
+                Some(v.remove(idx))
+            });
+            let Some(timer) = next else { break };
+            VIRTUAL_CLOCK.with(|c| c.set(c.get().max(timer.due)));
+            let _ = timer
+                .callback
+                .call(&JsValue::undefined(), &[], &mut self.context);
+            // Reschedule intervals relative to the virtual clock.
+            if let Some(iv) = timer.interval {
+                let due = VIRTUAL_CLOCK.with(|c| c.get()) + iv.max(1);
+                TIMERS.with(|t| {
+                    t.borrow_mut().push(Timer {
+                        id: timer.id,
+                        callback: timer.callback,
+                        due,
+                        interval: Some(iv),
+                    })
+                });
+            }
+            self.context.run_jobs();
+            fired += 1;
+        }
+    }
+}
+
+fn console_log(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let parts: Vec<String> = args
+        .iter()
+        .map(|v| {
+            v.to_string(ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|_| "<unrenderable>".to_string())
+        })
+        .collect();
+    CONSOLE_LOG.with(|l| l.borrow_mut().push(parts.join(" ")));
+    Ok(JsValue::undefined())
+}
+
+fn schedule_timer(args: &[JsValue], ctx: &mut Context, repeat: bool) -> JsResult<JsValue> {
+    let Some(cb) = args.first().and_then(|v| v.as_object()).cloned() else {
+        return Ok(JsValue::from(0));
+    };
+    let delay = args
+        .get(1)
+        .map(|v| v.to_number(ctx))
+        .transpose()?
+        .unwrap_or(0.0)
+        .max(0.0) as u64;
+    let id = NEXT_TIMER_ID.with(|n| {
+        let id = n.get();
+        n.set(id + 1);
+        id
+    });
+    let due = VIRTUAL_CLOCK.with(|c| c.get()) + delay;
+    TIMERS.with(|t| {
+        t.borrow_mut().push(Timer {
+            id,
+            callback: cb,
+            due,
+            interval: if repeat { Some(delay) } else { None },
+        })
+    });
+    Ok(JsValue::from(id))
+}
+
+fn set_timeout(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    schedule_timer(args, ctx, false)
+}
+fn set_interval(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    schedule_timer(args, ctx, true)
+}
+fn clear_timer(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let id = args.first().map(|v| v.to_number(ctx)).transpose()?.unwrap_or(0.0) as u32;
+    TIMERS.with(|t| t.borrow_mut().retain(|tm| tm.id != id));
+    Ok(JsValue::undefined())
 }
 
 fn dom_create_element(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1104,6 +1251,41 @@ mod tests {
             host.eval_to_string("document.getElementById('list').children[1].id").unwrap(),
             "b"
         );
+    }
+
+    #[test]
+    fn console_and_timers_via_event_loop() {
+        let html = "<html><body><p id=\"out\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        host.eval_to_string("console.log('hello', 42); console.warn('w');").unwrap();
+        assert_eq!(host.take_console_log(), vec!["hello 42".to_string(), "w".to_string()]);
+
+        // Timers do not fire until the loop is pumped.
+        host.eval_to_string(
+            "setTimeout(function() { \
+                 document.getElementById('out').textContent += 'A'; \
+                 setTimeout(function() { document.getElementById('out').textContent += 'B'; }, 0); \
+             }, 0);",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "");
+        host.run_pending(100);
+        // Nested setTimeout also ran, in order.
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "AB");
+
+        // clearTimeout cancels a pending timer.
+        host.eval_to_string(
+            "var id = setTimeout(function() { \
+                 document.getElementById('out').textContent += 'X'; }, 5); \
+             clearTimeout(id);",
+        )
+        .unwrap();
+        host.run_pending(100);
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "AB");
     }
 
     #[test]
