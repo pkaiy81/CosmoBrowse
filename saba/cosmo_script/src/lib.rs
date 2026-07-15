@@ -9,7 +9,10 @@ use boa_engine::{
     Context, JsData, JsResult, JsValue, NativeFunction, Source,
 };
 use boa_engine::gc::{Finalize, Trace};
-use cosmo_engine::renderer::dom::api::{collect_text, get_element_by_id};
+use boa_engine::object::builtins::JsArray;
+use cosmo_engine::renderer::dom::api::{
+    collect_text, get_element_by_id, query_selector, query_selector_all,
+};
 use cosmo_engine::renderer::dom::node::{Node, NodeKind};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -222,6 +225,16 @@ impl ScriptHost {
                 js_string!("getElementById"),
                 1,
             )
+            .function(
+                NativeFunction::from_fn_ptr(dom_query_selector),
+                js_string!("querySelector"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(dom_query_selector_all),
+                js_string!("querySelectorAll"),
+                1,
+            )
             .build();
         self.context
             .register_global_property(js_string!("document"), document, Attribute::all())
@@ -258,6 +271,43 @@ fn dom_get_element_by_id(
         Some(n) => JsValue::from(make_element(n, ctx)),
         None => JsValue::null(),
     })
+}
+
+fn dom_query_selector(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let sel = args
+        .first()
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    let node =
+        SCRIPT_DOM.with(|d| d.borrow().as_ref().and_then(|dom| query_selector(dom.clone(), &sel)));
+    Ok(match node {
+        Some(n) => JsValue::from(make_element(n, ctx)),
+        None => JsValue::null(),
+    })
+}
+
+fn dom_query_selector_all(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let sel = args
+        .first()
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    let nodes = SCRIPT_DOM.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|dom| query_selector_all(dom.clone(), &sel))
+            .unwrap_or_default()
+    });
+    let array = JsArray::new(ctx);
+    for n in nodes {
+        array.push(make_element(n, ctx), ctx)?;
+    }
+    Ok(array.into())
 }
 
 #[cfg(test)]
@@ -314,6 +364,54 @@ mod tests {
             host.eval_to_string("document.getElementById('greeting').textContent.length")
                 .unwrap(),
             "9"
+        );
+    }
+
+    #[test]
+    fn query_selector_reuses_engine_matcher() {
+        let html = r##"<html><body>
+            <div class="card"><p class="title">First</p><a href="#">link</a></div>
+            <div class="card"><p class="title">Second</p></div>
+            <span id="lone">x</span>
+        </body></html>"##;
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // First match, in document order.
+        assert_eq!(
+            host.eval_to_string("document.querySelector('.title').textContent").unwrap(),
+            "First"
+        );
+        // Descendant combinator + id.
+        assert_eq!(
+            host.eval_to_string("document.querySelector('.card .title').textContent").unwrap(),
+            "First"
+        );
+        assert_eq!(
+            host.eval_to_string("document.querySelector('#lone').tagName").unwrap(),
+            "SPAN"
+        );
+        // querySelectorAll returns an array; length + element access work.
+        assert_eq!(
+            host.eval_to_string("document.querySelectorAll('.title').length").unwrap(),
+            "2"
+        );
+        assert_eq!(
+            host.eval_to_string("document.querySelectorAll('.title')[1].textContent").unwrap(),
+            "Second"
+        );
+        // Selector list (union).
+        assert_eq!(
+            host.eval_to_string("document.querySelectorAll('a, span').length").unwrap(),
+            "2"
+        );
+        // No match: querySelector null, querySelectorAll empty.
+        assert_eq!(host.eval_to_string("document.querySelector('.nope')").unwrap(), "null");
+        assert_eq!(
+            host.eval_to_string("document.querySelectorAll('.nope').length").unwrap(),
+            "0"
         );
     }
 

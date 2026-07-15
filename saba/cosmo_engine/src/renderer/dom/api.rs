@@ -245,3 +245,48 @@ pub fn get_stylesheet_links(root: Rc<RefCell<Node>>) -> Vec<String> {
     collect_stylesheet_links_internal(Some(root), &mut links);
     links
 }
+
+
+/// `querySelectorAll`: every element in `root`'s subtree (document order)
+/// matching the CSS selector string. Reuses the layout engine's selector
+/// matcher; the selector is parsed by wrapping it in an empty rule. A
+/// selector list (`a, .b`) matches the union.
+pub fn query_selector_all(
+    root: Rc<RefCell<Node>>,
+    selector: &str,
+) -> Vec<Rc<RefCell<Node>>> {
+    use crate::renderer::css::cssom::CssParser;
+    use crate::renderer::css::token::CssTokenizer;
+    use crate::renderer::style::selector::dom_node_selected;
+
+    let css = format!("{selector}{{}}");
+    let sheet = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
+    let mut out: Vec<Rc<RefCell<Node>>> = Vec::new();
+    fn walk(
+        node: Option<Rc<RefCell<Node>>>,
+        rules: &[crate::renderer::css::cssom::QualifiedRule],
+        out: &mut Vec<Rc<RefCell<Node>>>,
+    ) {
+        use crate::renderer::style::selector::dom_node_selected;
+        let Some(n) = node else { return };
+        if matches!(n.borrow().kind(), NodeKind::Element(_))
+            && rules.iter().any(|r| dom_node_selected(&n, &r.selector))
+        {
+            out.push(n.clone());
+        }
+        let (first, next) = {
+            let b = n.borrow();
+            (b.first_child(), b.next_sibling())
+        };
+        walk(first, rules, out);
+        walk(next, rules, out);
+    }
+    let _ = dom_node_selected; // (used inside walk)
+    walk(Some(root), &sheet.rules, &mut out);
+    out
+}
+
+/// `querySelector`: the first `query_selector_all` match, or None.
+pub fn query_selector(root: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<RefCell<Node>>> {
+    query_selector_all(root, selector).into_iter().next()
+}
