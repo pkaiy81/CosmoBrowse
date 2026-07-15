@@ -1704,6 +1704,11 @@ pub enum DisplayType {
     /// `display:inline-block` — an atomic box that flows inline but
     /// shrink-wraps its content like a block (explicit width/height honored).
     InlineBlock,
+    /// `display:contents` — the element generates no box of its own.
+    /// Approximated as a zero-decoration full-width block whose children
+    /// resolve their grid/flex placement against the nearest non-contents
+    /// ancestor.
+    Contents,
     DisplayNone,
 }
 
@@ -1755,7 +1760,8 @@ impl DisplayType {
             // Grid containers get basic row-major track placement.
             "grid" => Ok(Self::Grid),
             "inline-block" => Ok(Self::InlineBlock),
-            "inline" | "inline-grid" | "inline-table" | "contents" => Ok(Self::Inline),
+            "inline" | "inline-grid" | "inline-table" => Ok(Self::Inline),
+            "contents" => Ok(Self::Contents),
             _ => Ok(Self::Block),
         }
     }

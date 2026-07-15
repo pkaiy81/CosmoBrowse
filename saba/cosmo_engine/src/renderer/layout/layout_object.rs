@@ -17,6 +17,7 @@ use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
 use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
+use crate::renderer::layout::computed_style::EdgeSize;
 use crate::renderer::layout::computed_style::FlexDirection;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
@@ -729,9 +730,35 @@ impl LayoutObject {
 
     /// If this object's parent is a grid container (`display:grid`), return
     /// its (column tracks, column gap, row gap); otherwise `None`.
+    /// Nearest ancestor that generates a real box (skipping display:contents
+    /// wrappers) — the parent grid/flex placement resolves against.
+    fn effective_placement_parent(&self) -> Option<Rc<RefCell<LayoutObject>>> {
+        let mut anc = self.parent.upgrade();
+        while let Some(a) = anc {
+            let step: Option<Option<Rc<RefCell<LayoutObject>>>> = match a.try_borrow() {
+                Ok(b) => {
+                    if b.style().display() == DisplayType::Contents {
+                        Some(b.parent.upgrade())
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+            match step {
+                None => return Some(a),
+                Some(next) => anc = next,
+            }
+        }
+        None
+    }
+
     fn parent_grid_info(&self) -> Option<(Vec<GridTrack>, i64, i64)> {
-        let parent = self.parent.upgrade()?;
-        let p = parent.borrow();
+        let parent = self.effective_placement_parent()?;
+        let p = match parent.try_borrow() {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
         if p.style.display() == DisplayType::Grid {
             Some((
                 p.style.grid_template_columns(),
@@ -786,8 +813,11 @@ impl LayoutObject {
     /// `name-end` when no template area defines it.
     fn grid_area_rect(&self) -> Option<(usize, usize, usize, usize)> {
         let name = self.style.grid_area_name()?.to_string();
-        let parent = self.parent.upgrade()?;
-        let pstyle = parent.borrow().style();
+        let parent = self.effective_placement_parent()?;
+        let pstyle = match parent.try_borrow() {
+            Ok(p) => p.style(),
+            Err(_) => return None,
+        };
         if let Some(areas) = pstyle.grid_template_areas() {
             if let Some(r) = Self::area_rect_in(&areas, &name) {
                 return Some(r);
@@ -812,38 +842,49 @@ impl LayoutObject {
     /// final by position time, and the walk tolerates `self` being mutably
     /// borrowed (try_borrow failure = self).
     fn grid_area_row_heights(&self) -> Vec<i64> {
-        let parent = match self.parent.upgrade() {
+        let parent = match self.effective_placement_parent() {
             Some(p) => p,
             None => return Vec::new(),
         };
-        let areas = match parent.borrow().style().grid_template_areas() {
+        let areas = match parent.try_borrow().ok().and_then(|p| p.style().grid_template_areas()) {
             Some(a) => a,
             None => return Vec::new(),
         };
         let mut heights = vec![0i64; areas.len()];
-        let mut tally = |style: &ComputedStyle, size: LayoutSize| {
-            if let Some(name) = style.grid_area_name() {
-                if let Some((r0, _, _, _)) = Self::area_rect_in(&areas, name) {
-                    let m = compute_box_model_metrics(style);
-                    heights[r0] =
-                        heights[r0].max(size.height() + m.margin.top + m.margin.bottom);
-                }
-            }
-        };
-        let mut child = parent.borrow().first_child();
-        while let Some(c) = child {
-            match c.try_borrow() {
-                Ok(b) => {
-                    let next = b.next_sibling();
-                    if !b.is_whitespace_text() {
-                        tally(&b.style(), b.size);
+        // Walk the grid's items; display:contents children are transparent —
+        // descend into them so their children (the real grid items) tally.
+        let mut stack: Vec<Option<Rc<RefCell<LayoutObject>>>> =
+            vec![parent.try_borrow().ok().and_then(|p| p.first_child())];
+        while let Some(slot) = stack.pop() {
+            let mut child = slot;
+            while let Some(c) = child {
+                match c.try_borrow() {
+                    Ok(b) => {
+                        let next = b.next_sibling();
+                        if b.style().display() == DisplayType::Contents {
+                            stack.push(b.first_child());
+                        } else if !b.is_whitespace_text() {
+                            if let Some(name) = b.style().grid_area_name() {
+                                if let Some((r0, _, _, _)) = Self::area_rect_in(&areas, name) {
+                                    let m = compute_box_model_metrics(&b.style());
+                                    heights[r0] = heights[r0]
+                                        .max(b.size.height() + m.margin.top + m.margin.bottom);
+                                }
+                            }
+                        }
+                        drop(b);
+                        child = next;
                     }
-                    drop(b);
-                    child = next;
-                }
-                Err(_) => {
-                    tally(&self.style, self.size);
-                    child = self.next_sibling.clone();
+                    Err(_) => {
+                        if let Some(name) = self.style.grid_area_name() {
+                            if let Some((r0, _, _, _)) = Self::area_rect_in(&areas, name) {
+                                let m = compute_box_model_metrics(&self.style);
+                                heights[r0] = heights[r0]
+                                    .max(self.size.height() + m.margin.top + m.margin.bottom);
+                            }
+                        }
+                        child = self.next_sibling.clone();
+                    }
                 }
             }
         }
@@ -2002,7 +2043,12 @@ impl LayoutObject {
                 // after subtracting explicitly-sized sibling cells.
                 // When total explicit widths exceed available space, scale
                 // proportionally to fit.
-                let content_width = if self.style.explicit_zero_width() {
+                let content_width = if self.style.display() == DisplayType::Contents {
+                    // No box of its own: span the full containing width so
+                    // children's grid-column offsets (resolved against the
+                    // real grid ancestor) land where the tracks are.
+                    available_width
+                } else if self.style.explicit_zero_width() {
                     0
                 } else if self.is_table_cell() {
                     // Resolve HTML width attribute — percentage values are computed
@@ -2677,6 +2723,14 @@ impl LayoutObject {
                 // its children are sized and positioned, not its own outer flow.
                 DisplayType::Block | DisplayType::Flex | DisplayType::Grid => {
                     self.kind = LayoutObjectKind::Block
+                }
+                // display:contents — no box of its own: approximate with a
+                // zero-decoration block; placement helpers skip through it.
+                DisplayType::Contents => {
+                    self.kind = LayoutObjectKind::Block;
+                    self.style.set_margin(EdgeSize::zero());
+                    self.style.set_padding(EdgeSize::zero());
+                    self.style.set_border(EdgeSize::zero());
                 }
                 // inline-block flows inline; its block-ish sizing is handled
                 // in the Inline compute_size arm.

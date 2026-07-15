@@ -1347,6 +1347,38 @@ mod tests {
     }
 
     #[test]
+    fn test_display_contents_grid_wrapper_is_transparent() {
+        // MDN idiom: a display:contents wrapper between the grid and its
+        // items — the items must still resolve their named-line placement.
+        let html = r#"<html><head><style>
+            .shell { display: grid; width: 600px;
+                     grid-template-columns: [sb-start] 150px [sb-end main-start] 1fr [main-end]; }
+            .wrap { display: contents; }
+            .sb { grid-area: sb; height: 30px; background-color: blue; }
+            .main { grid-area: main; height: 30px; background-color: green; }
+        </style></head><body>
+            <div class="shell"><div class="wrap"><div class="sb"></div><div class="main"></div></div></div>
+        </body></html>"#
+            .to_string();
+        let view = create_layout_view(html, 800);
+        let find = |code: &str| -> (i64, i64) {
+            view.paint()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Rect { layout_point, layout_size, style, .. }
+                        if style.background_color().code() == code =>
+                    {
+                        Some((layout_point.x(), layout_size.width()))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(find("#0000ff"), (0, 150), "sidebar through contents wrapper");
+        assert_eq!(find("#008000"), (150, 450), "main through contents wrapper");
+    }
+
+    #[test]
     fn test_grid_named_lines_placement() {
         // MDN-style named-line tracks: sidebar between its -start/-end lines.
         let html = r#"<html><head><style>
