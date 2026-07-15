@@ -11,10 +11,11 @@ use boa_engine::{
 use boa_engine::gc::{Finalize, Trace};
 use boa_engine::object::builtins::JsArray;
 use cosmo_engine::renderer::dom::api::{
-    collect_text, element_closest, element_matches, get_element_by_id, query_selector,
-    query_selector_all,
+    collect_text, element_closest, element_matches, get_element_by_id, get_target_element_node,
+    query_selector, query_selector_all,
 };
-use cosmo_engine::renderer::dom::node::{Element, Node, NodeKind};
+use cosmo_engine::renderer::dom::node::{Element, ElementKind, Node, NodeKind};
+use cosmo_engine::renderer::html::{parser::HtmlParser, token::HtmlTokenizer};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
@@ -109,6 +110,10 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
         accessor(element_get_class_name, Some(element_set_class_name)),
     );
     obj.insert_property(js_string!("tagName"), accessor(element_get_tag_name, None));
+    obj.insert_property(
+        js_string!("innerHTML"),
+        accessor(element_get_inner_html, Some(element_set_inner_html)),
+    );
     obj.insert_property(js_string!("classList"), accessor(element_get_class_list, None));
     obj.insert_property(js_string!("parentNode"), accessor(element_get_parent_node, None));
     obj.insert_property(
@@ -715,6 +720,99 @@ fn classlist_contains(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResul
     Ok(JsValue::from(class_tokens(this).iter().any(|x| x == &token)))
 }
 
+/// Void elements never emit a closing tag when serialized.
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
+            | "param" | "source" | "track" | "wbr"
+    )
+}
+
+/// Serialize a node's children to an HTML string (the `innerHTML` getter).
+fn serialize_children(node: &Rc<RefCell<Node>>, out: &mut String) {
+    let mut cur = node.borrow().first_child();
+    while let Some(c) = cur {
+        serialize_node(&c, out);
+        cur = c.borrow().next_sibling();
+    }
+}
+
+fn serialize_node(node: &Rc<RefCell<Node>>, out: &mut String) {
+    match node.borrow().kind() {
+        NodeKind::Text(t) => out.push_str(&t),
+        NodeKind::Element(e) => {
+            let tag = e.tag_name().to_string();
+            out.push('<');
+            out.push_str(&tag);
+            for attr in e.attributes() {
+                out.push(' ');
+                out.push_str(&attr.name());
+                out.push_str("=\"");
+                out.push_str(&attr.value());
+                out.push('"');
+            }
+            out.push('>');
+            if !is_void_element(&tag) {
+                serialize_children(node, out);
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+        }
+        _ => {}
+    }
+}
+
+fn element_get_inner_html(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::from(js_string!("")));
+    };
+    let mut s = String::new();
+    serialize_children(&node, &mut s);
+    Ok(JsValue::from(js_string!(s.as_str())))
+}
+
+/// `innerHTML` setter: parse the markup as a fragment and replace all of the
+/// element's children with the parsed nodes. The fragment is parsed as a full
+/// document; the resulting <body>'s children are re-parented onto the target.
+fn element_set_inner_html(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(target) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let html = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+
+    // Remove the target's existing children.
+    {
+        let mut cur = target.borrow().first_child();
+        while let Some(child) = cur {
+            let next = child.borrow().next_sibling();
+            child.borrow_mut().set_parent(Weak::new());
+            child.borrow_mut().set_previous_sibling(Weak::new());
+            child.borrow_mut().set_next_sibling(None);
+            cur = next;
+        }
+        target.borrow_mut().set_first_child(None);
+        target.borrow_mut().set_last_child(Weak::new());
+    }
+
+    // Parse the fragment and re-parent the body's children under the target.
+    let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
+    let doc = window.borrow().document();
+    if let Some(body) = get_target_element_node(Some(doc), ElementKind::Body) {
+        let mut new_children = Vec::new();
+        let mut cur = body.borrow().first_child();
+        while let Some(child) = cur {
+            new_children.push(child.clone());
+            cur = child.borrow().next_sibling();
+        }
+        for child in new_children {
+            append_child_node(&target, &child);
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
 fn handle_node(this: &JsValue) -> Option<Rc<RefCell<Node>>> {
     this.as_object()
         .and_then(|o| o.downcast_ref::<NodeHandle>().map(|h| h.node.clone()))
@@ -839,6 +937,16 @@ impl ScriptHost {
             .function(
                 NativeFunction::from_fn_ptr(dom_create_text_node),
                 js_string!("createTextNode"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(dom_get_elements_by_tag_name),
+                js_string!("getElementsByTagName"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(dom_get_elements_by_class_name),
+                js_string!("getElementsByClassName"),
                 1,
             )
             .build();
@@ -985,6 +1093,47 @@ fn clear_timer(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let id = args.first().map(|v| v.to_number(ctx)).transpose()?.unwrap_or(0.0) as u32;
     TIMERS.with(|t| t.borrow_mut().retain(|tm| tm.id != id));
     Ok(JsValue::undefined())
+}
+
+fn dom_select_all_to_array(selector: &str, ctx: &mut Context) -> JsResult<JsValue> {
+    let nodes = SCRIPT_DOM.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|dom| query_selector_all(dom.clone(), selector))
+            .unwrap_or_default()
+    });
+    let arr = JsArray::new(ctx);
+    for n in nodes {
+        let el = make_element(n, ctx);
+        arr.push(JsValue::from(el), ctx)?;
+    }
+    Ok(JsValue::from(arr))
+}
+
+fn dom_get_elements_by_tag_name(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let tag = args.first().cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
+    if tag == "*" {
+        return dom_select_all_to_array("*", ctx);
+    }
+    dom_select_all_to_array(&tag, ctx)
+}
+
+fn dom_get_elements_by_class_name(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let classes = args.first().cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
+    // Multiple space-separated class names form a compound selector.
+    let selector: String = classes.split_whitespace().map(|c| format!(".{c}")).collect();
+    if selector.is_empty() {
+        return Ok(JsValue::from(JsArray::new(ctx)));
+    }
+    dom_select_all_to_array(&selector, ctx)
 }
 
 fn dom_create_element(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1263,6 +1412,41 @@ mod tests {
 
         // querySelectorAll sees the current tree.
         assert_eq!(host.eval_to_string("document.querySelectorAll('li').length").unwrap(), "2");
+    }
+
+    #[test]
+    fn inner_html_get_set_and_collections() {
+        let html = "<html><body><ul id=\"list\"><li class=\"item\">A</li></ul></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // Getter serializes children.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('list').innerHTML").unwrap(),
+            "<li class=\"item\">A</li>"
+        );
+        // Setter parses a fragment and replaces children.
+        host.eval_to_string(
+            "document.getElementById('list').innerHTML = \
+             '<li class=\"item\">X</li><li class=\"item\">Y</li>';",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('list').textContent").unwrap(), "XY");
+        assert_eq!(
+            host.eval_to_string("document.getElementsByTagName('li').length").unwrap(),
+            "2"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementsByClassName('item').length").unwrap(),
+            "2"
+        );
+        // The parsed nodes are live: querySelector sees them.
+        assert_eq!(
+            host.eval_to_string("document.querySelectorAll('.item').length").unwrap(),
+            "2"
+        );
     }
 
     #[test]
