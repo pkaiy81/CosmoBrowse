@@ -64,6 +64,12 @@ thread_local! {
     static LISTENERS: RefCell<std::collections::HashMap<usize, Vec<Listener>>> =
         RefCell::new(std::collections::HashMap::new());
 
+    /// Element-wrapper cache keyed by node identity (`Rc::as_ptr`), so repeated
+    /// lookups of the same node return the same JsObject (`el === el`). Cleared
+    /// on navigation (plan D5).
+    static WRAPPER_CACHE: RefCell<std::collections::HashMap<usize, JsObject>> =
+        RefCell::new(std::collections::HashMap::new());
+
     /// Lines emitted by `console.*`, in order. Drained by the runtime/tests.
     static CONSOLE_LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 
@@ -138,7 +144,22 @@ fn node_key(node: &Rc<RefCell<Node>>) -> usize {
 
 /// Wrap a DOM node as an `Element` JsObject exposing live accessors
 /// (textContent, id, className, tagName) and attribute methods.
+///
+/// Wrappers are cached by node identity so `el === el` holds across separate
+/// lookups (plan D5). The cache pins the node's `Rc` (via the wrapper's
+/// NodeHandle), so a cached node is never freed and its address never reused
+/// while cached; the cache is cleared on navigation.
 fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
+    let key = node_key(&node);
+    if let Some(cached) = WRAPPER_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let obj = build_element_wrapper(node, context);
+    WRAPPER_CACHE.with(|c| c.borrow_mut().insert(key, obj.clone()));
+    obj
+}
+
+fn build_element_wrapper(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     let obj = JsObject::from_proto_and_data(None, NodeHandle { node });
     let realm = context.realm().clone();
 
@@ -955,6 +976,7 @@ impl ScriptHost {
     pub fn set_document(&mut self, root: Rc<RefCell<Node>>) {
         LISTENERS.with(|m| m.borrow_mut().clear());
         TIMERS.with(|t| t.borrow_mut().clear());
+        WRAPPER_CACHE.with(|c| c.borrow_mut().clear());
         VIRTUAL_CLOCK.with(|c| c.set(0));
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
     }
@@ -1952,6 +1974,44 @@ mod tests {
         );
         assert_eq!(
             host.eval_to_string("document.getElementById('c').querySelectorAll('a').length").unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn wrapper_identity_is_stable() {
+        let html = "<html><body><div id=\"a\"><span id=\"b\">x</span></div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // Same node, separate lookups -> identical wrapper object.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('a') === document.getElementById('a')").unwrap(),
+            "true"
+        );
+        // Identity holds across different access paths (query vs navigation).
+        assert_eq!(
+            host.eval_to_string(
+                "document.getElementById('b') === document.querySelector('#a').firstChild"
+            )
+            .unwrap(),
+            "true"
+        );
+        // Distinct nodes are not equal.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('a') === document.getElementById('b')").unwrap(),
+            "false"
+        );
+        // A wrapper can be used as a Set/Map-style key across lookups.
+        assert_eq!(
+            host.eval_to_string(
+                "var seen = document.getElementById('a'); \
+                 seen.dataset_marker = 1; \
+                 document.getElementById('a').dataset_marker"
+            )
+            .unwrap(),
             "1"
         );
     }
