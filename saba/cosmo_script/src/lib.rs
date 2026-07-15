@@ -58,6 +58,7 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
         accessor(element_get_class_name, Some(element_set_class_name)),
     );
     obj.insert_property(js_string!("tagName"), accessor(element_get_tag_name, None));
+    obj.insert_property(js_string!("classList"), accessor(element_get_class_list, None));
 
     let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name, len| {
         let desc = PropertyDescriptor::builder()
@@ -140,6 +141,89 @@ fn element_set_attribute(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsRe
 fn element_has_attribute(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
     Ok(JsValue::from(attr_of(this, &name).is_some()))
+}
+
+/// `element.classList` — a live token-list view over the `class` attribute.
+/// The returned object carries the same NodeHandle, so its methods mutate the
+/// element's class attribute directly.
+fn element_get_class_list(this: &JsValue, _a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let obj = JsObject::from_proto_and_data(None, NodeHandle { node });
+    let realm = c.realm().clone();
+    let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name| {
+        let desc = PropertyDescriptor::builder()
+            .value(NativeFunction::from_fn_ptr(f).to_js_function(&realm))
+            .writable(true)
+            .enumerable(false)
+            .configurable(true)
+            .build();
+        obj.insert_property(name, desc);
+    };
+    method(classlist_add, js_string!("add"));
+    method(classlist_remove, js_string!("remove"));
+    method(classlist_toggle, js_string!("toggle"));
+    method(classlist_contains, js_string!("contains"));
+    Ok(JsValue::from(obj))
+}
+
+fn class_tokens(this: &JsValue) -> Vec<String> {
+    attr_of(this, "class")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn set_class_tokens(this: &JsValue, tokens: &[String]) {
+    set_attr_of(this, "class", &tokens.join(" "));
+}
+
+fn classlist_add(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let mut tokens = class_tokens(this);
+    for arg in a {
+        let t = arg.clone().to_string(c)?.to_std_string_escaped();
+        if !t.is_empty() && !tokens.iter().any(|x| x == &t) {
+            tokens.push(t);
+        }
+    }
+    set_class_tokens(this, &tokens);
+    Ok(JsValue::undefined())
+}
+
+fn classlist_remove(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let mut tokens = class_tokens(this);
+    let mut drop: Vec<String> = Vec::new();
+    for arg in a {
+        drop.push(arg.clone().to_string(c)?.to_std_string_escaped());
+    }
+    tokens.retain(|x| !drop.iter().any(|d| d == x));
+    set_class_tokens(this, &tokens);
+    Ok(JsValue::undefined())
+}
+
+fn classlist_toggle(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let token = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let mut tokens = class_tokens(this);
+    let present = tokens.iter().any(|x| x == &token);
+    // Optional second argument forces the resulting state.
+    let force = a.get(1).map(|v| v.to_boolean());
+    let should_have = force.unwrap_or(!present);
+    if should_have {
+        if !present && !token.is_empty() {
+            tokens.push(token);
+        }
+    } else {
+        tokens.retain(|x| x != &token);
+    }
+    set_class_tokens(this, &tokens);
+    Ok(JsValue::from(should_have))
+}
+
+fn classlist_contains(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let token = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(JsValue::from(class_tokens(this).iter().any(|x| x == &token)))
 }
 
 fn handle_node(this: &JsValue) -> Option<Rc<RefCell<Node>>> {
@@ -469,5 +553,57 @@ mod tests {
         let mut s = String::new();
         collect_text(el.borrow().first_child(), &mut s);
         assert_eq!(s, "changed by JS");
+    }
+
+    #[test]
+    fn class_list_add_remove_toggle_contains() {
+        let html = "<html><body><div id=\"box\" class=\"a b\">x</div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').classList.contains('a')").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').classList.contains('z')").unwrap(),
+            "false"
+        );
+        // add is idempotent and appends new tokens.
+        host.eval_to_string("document.getElementById('box').classList.add('a', 'c');").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').className").unwrap(),
+            "a b c"
+        );
+        // remove drops the token.
+        host.eval_to_string("document.getElementById('box').classList.remove('b');").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').className").unwrap(),
+            "a c"
+        );
+        // toggle returns the resulting membership.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').classList.toggle('a')").unwrap(),
+            "false"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').classList.toggle('d')").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').className").unwrap(),
+            "c d"
+        );
+        // toggle with force keeps the forced state.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').classList.toggle('c', true)").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').className").unwrap(),
+            "c d"
+        );
     }
 }
