@@ -118,24 +118,14 @@ pub fn build_layout_scene_with_script_runtime(
     let window = HtmlParser::new(tokenizer).construct_tree();
     let dom = window.borrow().document();
 
-    let script = get_js_content(dom.clone());
-    let mut runtime = JsRuntime::new(dom.clone());
-    runtime.replace_local_storage_entries(local_storage_snapshot(document_url));
-    // Real-world pages (Wix, Squarespace, GA/GTM-instrumented sites) ship
-    // hundreds of kilobytes of minified JavaScript that this engine cannot
-    // meaningfully execute.  Even just *parsing* that volume of tokens can
-    // take many seconds and trip an infinite loop in the recursive-descent
-    // parser when fed constructs it doesn't understand.  Bail out early when
-    // the script payload exceeds a conservative size so navigation to such
-    // pages stays responsive — the engine doesn't run their JS anyway.
-    const MAX_SCRIPT_BYTES: usize = 32 * 1024;
-    if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
-        let lexer = JsLexer::new(script);
-        let mut parser = JsParser::new(lexer);
-        let program = parser.parse_ast();
-        runtime.execute(&program);
-    }
-    replace_local_storage(document_url, &runtime.local_storage_entries());
+    // Script execution: the real Boa engine (cosmo_script) when
+    // COSMO_USE_BOA=1, otherwise the legacy toy interpreter. Both mutate the
+    // same `dom` in place, so layout below sees the post-script tree.
+    let (dom_updated, mut script_diagnostics) = if use_boa_engine() {
+        execute_scripts_boa(document_url, dom.clone())
+    } else {
+        execute_scripts_toy(document_url, dom.clone())
+    };
 
     // Combine external <link rel="stylesheet"> sheets with inline <style>.
     // External sheets are applied first so a later inline <style> wins on equal
@@ -160,8 +150,8 @@ pub fn build_layout_scene_with_script_runtime(
 
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
     let render_tree = render_tree_snapshot(&layout_view, rect);
-    let mut diagnostics = runtime.diagnostics();
-    if runtime.dom_updated() {
+    let mut diagnostics = std::mem::take(&mut script_diagnostics);
+    if dom_updated {
         diagnostics.push("Render loop: DOM mutation -> relayout -> repaint".to_string());
     }
 
@@ -169,8 +159,78 @@ pub fn build_layout_scene_with_script_runtime(
         layout_scene,
         render_tree,
         diagnostics,
-        dom_updated: runtime.dom_updated(),
+        dom_updated,
     }
+}
+
+/// Whether to route script execution through the real Boa engine
+/// (`cosmo_script`). Off by default; opt in with `COSMO_USE_BOA=1` while the
+/// legacy toy interpreter remains the reference for the frozen fixtures.
+fn use_boa_engine() -> bool {
+    std::env::var("COSMO_USE_BOA").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Run page scripts with the legacy toy interpreter (the default path).
+fn execute_scripts_toy(
+    document_url: &str,
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+) -> (bool, Vec<String>) {
+    let script = get_js_content(dom.clone());
+    let mut runtime = JsRuntime::new(dom);
+    runtime.replace_local_storage_entries(local_storage_snapshot(document_url));
+    // Real-world pages (Wix, Squarespace, GA/GTM-instrumented sites) ship
+    // hundreds of kilobytes of minified JavaScript that this engine cannot
+    // meaningfully execute.  Even just *parsing* that volume of tokens can
+    // take many seconds and trip an infinite loop in the recursive-descent
+    // parser when fed constructs it doesn't understand.  Bail out early when
+    // the script payload exceeds a conservative size so navigation to such
+    // pages stays responsive — the engine doesn't run their JS anyway.
+    const MAX_SCRIPT_BYTES: usize = 32 * 1024;
+    if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
+        let lexer = JsLexer::new(script);
+        let mut parser = JsParser::new(lexer);
+        let program = parser.parse_ast();
+        runtime.execute(&program);
+    }
+    replace_local_storage(document_url, &runtime.local_storage_entries());
+    (runtime.dom_updated(), runtime.diagnostics())
+}
+
+/// Run page scripts with the real Boa engine (`cosmo_script`). Mutates `dom`
+/// in place. A byte cap remains as an interim watchdog: Boa has no fuel/
+/// instruction budget in 0.20, so an unbounded minified bundle could hang the
+/// pipeline (the same failure the toy path guards against).
+fn execute_scripts_boa(
+    document_url: &str,
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+) -> (bool, Vec<String>) {
+    let script = get_js_content(dom.clone());
+    let mut diagnostics = Vec::new();
+    let mut host = cosmo_script::ScriptHost::new();
+    host.set_location(document_url);
+    host.set_local_storage_entries(local_storage_snapshot(document_url));
+    host.set_document(dom);
+
+    // Interim watchdog (see fn doc). Larger than the toy cap since Boa handles
+    // far more real-world JS, but still bounded.
+    const MAX_SCRIPT_BYTES: usize = 512 * 1024;
+    let ran = if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
+        if let Err(e) = host.eval_to_string(&script) {
+            diagnostics.push(format!("Script error: {e}"));
+        }
+        // Drain microtasks and timers (bounded to cap runaway setInterval).
+        host.run_pending(1000);
+        true
+    } else {
+        false
+    };
+    replace_local_storage(document_url, &host.local_storage_entries());
+    for line in host.take_console_log() {
+        diagnostics.push(format!("console: {line}"));
+    }
+    // Without a mutation-generation counter we can't cheaply tell whether the
+    // DOM actually changed; conservatively relayout whenever a script ran.
+    (ran, diagnostics)
 }
 
 pub fn build_layout_scene(html: &str, rect: &FrameRect) -> LayoutScene {
@@ -513,6 +573,34 @@ mod tests {
             SceneItem::Image { x, .. } => *x,
         };
         assert!(first_x >= rect.x);
+    }
+
+    #[test]
+    fn boa_path_executes_scripts_and_mutates_dom() {
+        // The real Boa engine (cosmo_script) runs a script that appends a DOM
+        // node; the mutation must be visible in the resulting layout scene.
+        let html = "<html><head><style>body{margin:0}</style></head><body>\
+            <ul id=\"list\"></ul>\
+            <script>\
+                var li = document.createElement('li'); \
+                li.textContent = 'from-js'; \
+                document.getElementById('list').appendChild(li); \
+                console.log('ran');\
+            </script></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let dom = window.borrow().document();
+
+        let (dom_updated, diagnostics) = execute_scripts_boa("about:blank", dom.clone());
+        assert!(dom_updated);
+        assert!(
+            diagnostics.iter().any(|d| d.contains("ran")),
+            "console output should be captured: {diagnostics:?}"
+        );
+
+        // The appended text is now part of the document.
+        let mut text = String::new();
+        cosmo_engine::renderer::dom::api::collect_text(Some(dom), &mut text);
+        assert!(text.contains("from-js"), "DOM mutation not applied: {text:?}");
     }
 }
 
