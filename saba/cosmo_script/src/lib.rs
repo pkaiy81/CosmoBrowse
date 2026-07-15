@@ -26,6 +26,37 @@ struct NodeHandle {
     node: Rc<RefCell<Node>>,
 }
 
+/// Host data on an `Event` JsObject: the propagation/default flags. Held as
+/// `Cell`s so the native `preventDefault` / `stopPropagation` methods can flip
+/// them through a shared `&self` reference.
+#[derive(Trace, Finalize, JsData)]
+struct EventFlags {
+    #[unsafe_ignore_trace]
+    default_prevented: std::cell::Cell<bool>,
+    #[unsafe_ignore_trace]
+    stop_propagation: std::cell::Cell<bool>,
+}
+
+/// A registered event listener: the event type and its JS callback. The
+/// callback is a `JsObject`, whose `Gc` handle keeps the function rooted while
+/// it lives in the registry.
+struct Listener {
+    event_type: String,
+    callback: JsObject,
+}
+
+thread_local! {
+    /// Event listeners keyed by DOM node identity (`Rc::as_ptr`). The DOM
+    /// nodes themselves stay outside Boa's GC (plan D5), so listeners live
+    /// here rather than on the node; cleared on navigation via `clear_state`.
+    static LISTENERS: RefCell<std::collections::HashMap<usize, Vec<Listener>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn node_key(node: &Rc<RefCell<Node>>) -> usize {
+    Rc::as_ptr(node) as usize
+}
+
 /// Wrap a DOM node as an `Element` JsObject exposing live accessors
 /// (textContent, id, className, tagName) and attribute methods.
 fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
@@ -106,6 +137,13 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     method(element_remove_child, js_string!("removeChild"), 1);
     method(element_insert_before, js_string!("insertBefore"), 2);
     method(element_remove, js_string!("remove"), 0);
+    method(element_add_event_listener, js_string!("addEventListener"), 2);
+    method(
+        element_remove_event_listener,
+        js_string!("removeEventListener"),
+        2,
+    );
+    method(element_dispatch_event, js_string!("dispatchEvent"), 1);
 
     obj
 }
@@ -248,6 +286,175 @@ fn element_remove(this: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResul
         detach_node(&node);
     }
     Ok(JsValue::undefined())
+}
+
+fn element_add_event_listener(
+    this: &JsValue,
+    a: &[JsValue],
+    c: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let event_type = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let Some(cb) = a.get(1).and_then(|v| v.as_object()).cloned() else {
+        return Ok(JsValue::undefined());
+    };
+    LISTENERS.with(|m| {
+        m.borrow_mut()
+            .entry(node_key(&node))
+            .or_default()
+            .push(Listener { event_type, callback: cb });
+    });
+    Ok(JsValue::undefined())
+}
+
+fn element_remove_event_listener(
+    this: &JsValue,
+    a: &[JsValue],
+    c: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let event_type = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let cb = a.get(1).and_then(|v| v.as_object()).cloned();
+    LISTENERS.with(|m| {
+        if let Some(v) = m.borrow_mut().get_mut(&node_key(&node)) {
+            v.retain(|l| {
+                l.event_type != event_type || cb.as_ref().map(|c| c != &l.callback).unwrap_or(true)
+            });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn element_dispatch_event(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::from(true));
+    };
+    // Accept either an Event-like object with a `type` property or a bare
+    // string naming the event type.
+    let event_type = match a.first() {
+        Some(v) if v.is_object() => v
+            .as_object()
+            .unwrap()
+            .get(js_string!("type"), c)?
+            .to_string(c)?
+            .to_std_string_escaped(),
+        Some(v) => v.clone().to_string(c)?.to_std_string_escaped(),
+        None => String::new(),
+    };
+    let not_prevented = run_dispatch(node, &event_type, c);
+    Ok(JsValue::from(not_prevented))
+}
+
+/// Build an `Event` JsObject carrying `type`, `target`, propagation flags, and
+/// the `preventDefault` / `stopPropagation` methods.
+fn make_event(target: &Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) -> JsObject {
+    let obj = JsObject::from_proto_and_data(
+        None,
+        EventFlags {
+            default_prevented: std::cell::Cell::new(false),
+            stop_propagation: std::cell::Cell::new(false),
+        },
+    );
+    let realm = ctx.realm().clone();
+    obj.insert_property(
+        js_string!("type"),
+        PropertyDescriptor::builder()
+            .value(js_string!(event_type))
+            .writable(false)
+            .enumerable(true)
+            .configurable(true)
+            .build(),
+    );
+    let target_val = JsValue::from(make_element(target.clone(), ctx));
+    obj.insert_property(
+        js_string!("target"),
+        PropertyDescriptor::builder()
+            .value(target_val)
+            .writable(false)
+            .enumerable(true)
+            .configurable(true)
+            .build(),
+    );
+    let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name| {
+        obj.insert_property(
+            name,
+            PropertyDescriptor::builder()
+                .value(NativeFunction::from_fn_ptr(f).to_js_function(&realm))
+                .writable(true)
+                .enumerable(false)
+                .configurable(true)
+                .build(),
+        );
+    };
+    method(event_prevent_default, js_string!("preventDefault"));
+    method(event_stop_propagation, js_string!("stopPropagation"));
+    obj
+}
+
+fn event_prevent_default(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    if let Some(obj) = this.as_object() {
+        if let Some(f) = obj.downcast_ref::<EventFlags>() {
+            f.default_prevented.set(true);
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+fn event_stop_propagation(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    if let Some(obj) = this.as_object() {
+        if let Some(f) = obj.downcast_ref::<EventFlags>() {
+            f.stop_propagation.set(true);
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Dispatch `event_type` at `target` and bubble up its ancestor chain. Returns
+/// `true` if `preventDefault` was NOT called (i.e. the default action runs).
+fn run_dispatch(target: Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) -> bool {
+    let event = make_event(&target, event_type, ctx);
+
+    // Bubble order: target first, then each ancestor.
+    let mut chain = vec![target.clone()];
+    let mut cur = target.borrow().parent().upgrade();
+    while let Some(p) = cur {
+        chain.push(p.clone());
+        cur = p.borrow().parent().upgrade();
+    }
+
+    'outer: for node in chain {
+        let callbacks: Vec<JsObject> = LISTENERS.with(|m| {
+            m.borrow()
+                .get(&node_key(&node))
+                .map(|v| {
+                    v.iter()
+                        .filter(|l| l.event_type == event_type)
+                        .map(|l| l.callback.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        for cb in callbacks {
+            let this = JsValue::from(make_element(node.clone(), ctx));
+            let _ = cb.call(&this, &[JsValue::from(event.clone())], ctx);
+            let stop = event
+                .downcast_ref::<EventFlags>()
+                .map(|f| f.stop_propagation.get())
+                .unwrap_or(false);
+            if stop {
+                break 'outer;
+            }
+        }
+    }
+
+    !event
+        .downcast_ref::<EventFlags>()
+        .map(|f| f.default_prevented.get())
+        .unwrap_or(false)
 }
 
 fn node_or_null(node: Option<Rc<RefCell<Node>>>, ctx: &mut Context) -> JsValue {
@@ -524,9 +731,20 @@ impl ScriptHost {
         host
     }
 
-    /// Expose the given document root to script as `document`.
+    /// Expose the given document root to script as `document`. Clears any
+    /// event listeners left over from a previous document (plan D5: the
+    /// registry is per-page and reset on navigation).
     pub fn set_document(&mut self, root: Rc<RefCell<Node>>) {
+        LISTENERS.with(|m| m.borrow_mut().clear());
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
+    }
+
+    /// Fire an event of `event_type` at `target`, bubbling up its ancestor
+    /// chain. Returns `true` if the default action should run (i.e.
+    /// `preventDefault` was not called). Used by the runtime to route real
+    /// input events (click/input/submit) into script.
+    pub fn dispatch_event(&mut self, target: Rc<RefCell<Node>>, event_type: &str) -> bool {
+        run_dispatch(target, event_type, &mut self.context)
     }
 
     fn install_dom_globals(&mut self) {
@@ -886,6 +1104,51 @@ mod tests {
             host.eval_to_string("document.getElementById('list').children[1].id").unwrap(),
             "b"
         );
+    }
+
+    #[test]
+    fn event_listeners_dispatch_and_bubble() {
+        let html = "<html><body><div id=\"outer\"><button id=\"btn\">x</button></div>\
+                    <p id=\"log\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+
+        // A click handler on the button appends to a log; a bubbling handler
+        // on the ancestor also fires.
+        host.eval_to_string(
+            "document.getElementById('btn').addEventListener('click', function(e) { \
+                 document.getElementById('log').textContent += 'B'; \
+             }); \
+             document.getElementById('outer').addEventListener('click', function(e) { \
+                 document.getElementById('log').textContent += 'O'; \
+             });",
+        )
+        .unwrap();
+
+        // Dispatch from JS: target handler then bubbling ancestor handler.
+        host.eval_to_string("document.getElementById('btn').dispatchEvent({type:'click'});")
+            .unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('log').textContent").unwrap(), "BO");
+
+        // Dispatch from the runtime side returns default-not-prevented.
+        let btn = get_element_by_id(Some(document.clone()), &"btn".to_string()).unwrap();
+        assert!(host.dispatch_event(btn.clone(), "click"));
+        assert_eq!(host.eval_to_string("document.getElementById('log').textContent").unwrap(), "BOBO");
+
+        // stopPropagation halts the bubble; preventDefault flips the return.
+        host.eval_to_string(
+            "document.getElementById('log').textContent = ''; \
+             document.getElementById('btn').addEventListener('click', function(e) { \
+                 e.stopPropagation(); e.preventDefault(); \
+             });",
+        )
+        .unwrap();
+        assert!(!host.dispatch_event(btn, "click"));
+        // Only the button's two handlers ran (B twice); the ancestor 'O' was
+        // suppressed by stopPropagation.
+        assert_eq!(host.eval_to_string("document.getElementById('log').textContent").unwrap(), "B");
     }
 
     #[test]
