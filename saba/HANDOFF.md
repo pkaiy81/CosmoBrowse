@@ -244,6 +244,12 @@
 >   cssText + camelCase アクセサ(backgroundColor→background-color 等、static テーブルを
 >   captured closure で生成)。インライン style="" 属性を読み書き→エンジンが layout 時に
 >   再パースするので次の relayout で反映。空値は宣言削除。
+> - rAF ✅ (`4bf0783`) **requestAnimationFrame/cancelAnimationFrame**(タイマーキュー共用、
+>   due=clock+16ms、コールバックに timestamp 引数、run_pending で駆動)。
+> - 堅牢化 ✅ (`76f454a`) set_document が CONSOLE_LOG/POSTED_MESSAGES もクリア(ページ単位の
+>   一時バッファをナビゲーションでリセット;localStorage はオリジン単位で存続)。
+> **→ cosmo_script の DOM/BOM バインディング層はほぼ揃った(22 tests)。次の主要マイルストーンは
+>   コード追加でなく COSMO_USE_BOA の GUI 検証と既定切替(ユーザー確認案件)。**
 > - 次: (a) **COSMO_USE_BOA を GUI ヘッドレスで JS デモ検証**して golden 化 → 既定を Boa に
 >   切替(専用コミットで再ベースライン、**ユーザー確認推奨**=凍結フィクスチャの回帰網に触れる)。
 >   (b) Boa の実 watchdog(Context が !Send で別スレッド不可 → 反復/時間ガードの検討)。
