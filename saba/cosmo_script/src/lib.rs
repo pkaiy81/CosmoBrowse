@@ -211,6 +211,7 @@ fn build_element_wrapper(node: Rc<RefCell<Node>>, context: &mut Context) -> JsOb
         accessor(element_get_inner_html, Some(element_set_inner_html)),
     );
     obj.insert_property(js_string!("classList"), accessor(element_get_class_list, None));
+    obj.insert_property(js_string!("style"), accessor(element_get_style, None));
     obj.insert_property(js_string!("parentNode"), accessor(element_get_parent_node, None));
     obj.insert_property(
         js_string!("parentElement"),
@@ -797,6 +798,191 @@ fn element_get_class_list(this: &JsValue, _a: &[JsValue], c: &mut Context) -> Js
     method(classlist_toggle, js_string!("toggle"));
     method(classlist_contains, js_string!("contains"));
     Ok(JsValue::from(obj))
+}
+
+/// camelCase → kebab-case CSS property names exposed as `style.<prop>`
+/// accessors. `setProperty`/`getPropertyValue` cover anything not listed.
+const STYLE_PROPS: &[(&str, &str)] = &[
+    ("color", "color"),
+    ("backgroundColor", "background-color"),
+    ("background", "background"),
+    ("display", "display"),
+    ("visibility", "visibility"),
+    ("opacity", "opacity"),
+    ("width", "width"),
+    ("height", "height"),
+    ("minWidth", "min-width"),
+    ("maxWidth", "max-width"),
+    ("minHeight", "min-height"),
+    ("maxHeight", "max-height"),
+    ("top", "top"),
+    ("left", "left"),
+    ("right", "right"),
+    ("bottom", "bottom"),
+    ("position", "position"),
+    ("margin", "margin"),
+    ("padding", "padding"),
+    ("border", "border"),
+    ("borderColor", "border-color"),
+    ("borderRadius", "border-radius"),
+    ("fontSize", "font-size"),
+    ("fontWeight", "font-weight"),
+    ("fontFamily", "font-family"),
+    ("textAlign", "text-align"),
+    ("lineHeight", "line-height"),
+    ("zIndex", "z-index"),
+    ("overflow", "overflow"),
+    ("flex", "flex"),
+    ("flexDirection", "flex-direction"),
+    ("justifyContent", "justify-content"),
+    ("alignItems", "align-items"),
+    ("gap", "gap"),
+    ("transform", "transform"),
+    ("transition", "transition"),
+    ("cursor", "cursor"),
+];
+
+/// Parse a `style="..."` attribute value into ordered (property, value) pairs.
+fn parse_style_decls(css: &str) -> Vec<(String, String)> {
+    css.split(';')
+        .filter_map(|decl| {
+            let decl = decl.trim();
+            if decl.is_empty() {
+                return None;
+            }
+            let (prop, value) = decl.split_once(':')?;
+            Some((prop.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn serialize_style_decls(decls: &[(String, String)]) -> String {
+    decls
+        .iter()
+        .map(|(p, v)| format!("{p}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn style_get(this: &JsValue, prop: &str) -> Option<String> {
+    let prop = prop.to_ascii_lowercase();
+    parse_style_decls(&attr_of(this, "style").unwrap_or_default())
+        .into_iter()
+        .find(|(p, _)| *p == prop)
+        .map(|(_, v)| v)
+}
+
+fn style_set(this: &JsValue, prop: &str, value: &str) {
+    let prop = prop.to_ascii_lowercase();
+    let mut decls = parse_style_decls(&attr_of(this, "style").unwrap_or_default());
+    // An empty value removes the declaration (matches setProperty('', '')).
+    if value.trim().is_empty() {
+        decls.retain(|(p, _)| *p != prop);
+    } else if let Some(entry) = decls.iter_mut().find(|(p, _)| *p == prop) {
+        entry.1 = value.trim().to_string();
+    } else {
+        decls.push((prop, value.trim().to_string()));
+    }
+    set_attr_of(this, "style", &serialize_style_decls(&decls));
+}
+
+fn style_remove(this: &JsValue, prop: &str) {
+    let prop = prop.to_ascii_lowercase();
+    let mut decls = parse_style_decls(&attr_of(this, "style").unwrap_or_default());
+    decls.retain(|(p, _)| *p != prop);
+    set_attr_of(this, "style", &serialize_style_decls(&decls));
+}
+
+/// `element.style` — a live view over the inline `style` attribute. Exposes
+/// setProperty/getPropertyValue/removeProperty + cssText and camelCase
+/// accessors for common properties. The engine re-parses the style attribute
+/// at layout time, so writes here take effect on the next relayout.
+fn element_get_style(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let obj = JsObject::from_proto_and_data(None, NodeHandle { node });
+    let realm = ctx.realm().clone();
+
+    let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name| {
+        obj.insert_property(
+            name,
+            PropertyDescriptor::builder()
+                .value(NativeFunction::from_fn_ptr(f).to_js_function(&realm))
+                .writable(true)
+                .enumerable(false)
+                .configurable(true)
+                .build(),
+        );
+    };
+    method(style_set_property, js_string!("setProperty"));
+    method(style_get_property_value, js_string!("getPropertyValue"));
+    method(style_remove_property, js_string!("removeProperty"));
+    obj.insert_property(
+        js_string!("cssText"),
+        PropertyDescriptor::builder()
+            .get(NativeFunction::from_fn_ptr(style_get_css_text).to_js_function(&realm))
+            .set(NativeFunction::from_fn_ptr(style_set_css_text).to_js_function(&realm))
+            .enumerable(true)
+            .configurable(true)
+            .build(),
+    );
+
+    // camelCase accessors that map to individual CSS properties. Closures
+    // capture the (Copy) &'static kebab name.
+    for (js_name, css_name) in STYLE_PROPS {
+        let css_for_get: &'static str = css_name;
+        let getter = NativeFunction::from_copy_closure(move |this: &JsValue, _a: &[JsValue], _c: &mut Context| {
+            Ok(JsValue::from(js_string!(style_get(this, css_for_get)
+                .unwrap_or_default()
+                .as_str())))
+        })
+        .to_js_function(&realm);
+        let css_for_set: &'static str = css_name;
+        let setter = NativeFunction::from_copy_closure(move |this: &JsValue, a: &[JsValue], c: &mut Context| {
+            let v = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+            style_set(this, css_for_set, &v);
+            Ok(JsValue::undefined())
+        })
+        .to_js_function(&realm);
+        obj.insert_property(
+            js_string!(*js_name),
+            PropertyDescriptor::builder()
+                .get(getter)
+                .set(setter)
+                .enumerable(true)
+                .configurable(true)
+                .build(),
+        );
+    }
+
+    Ok(JsValue::from(obj))
+}
+
+fn style_set_property(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let value = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    style_set(this, &name, &value);
+    Ok(JsValue::undefined())
+}
+fn style_get_property_value(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(JsValue::from(js_string!(style_get(this, &name).unwrap_or_default().as_str())))
+}
+fn style_remove_property(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let prev = style_get(this, &name).unwrap_or_default();
+    style_remove(this, &name);
+    Ok(JsValue::from(js_string!(prev.as_str())))
+}
+fn style_get_css_text(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(attr_of(this, "style").unwrap_or_default().as_str())))
+}
+fn style_set_css_text(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let text = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    // Normalize through the parser so subsequent reads are consistent.
+    set_attr_of(this, "style", &serialize_style_decls(&parse_style_decls(&text)));
+    Ok(JsValue::undefined())
 }
 
 fn class_tokens(this: &JsValue) -> Vec<String> {
@@ -2034,6 +2220,48 @@ mod tests {
         assert_eq!(
             host.eval_to_string("document.getElementById('c').querySelectorAll('a').length").unwrap(),
             "1"
+        );
+    }
+
+    #[test]
+    fn inline_style_api() {
+        let html = "<html><body><div id=\"box\" style=\"color: red\">x</div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+
+        // Read existing inline declaration via camelCase and getPropertyValue.
+        assert_eq!(host.eval_to_string("document.getElementById('box').style.color").unwrap(), "red");
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').style.getPropertyValue('color')").unwrap(),
+            "red"
+        );
+        // camelCase setter maps to kebab-case and writes the style attribute.
+        host.eval_to_string("document.getElementById('box').style.backgroundColor = 'blue';").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').style.backgroundColor").unwrap(),
+            "blue"
+        );
+        // setProperty for arbitrary props; the change is visible on the DOM
+        // attribute the engine reads at layout time.
+        host.eval_to_string("document.getElementById('box').style.setProperty('display', 'none');").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').getAttribute('style')").unwrap(),
+            "color: red; background-color: blue; display: none"
+        );
+        // removeProperty returns the old value and drops the declaration.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').style.removeProperty('display')").unwrap(),
+            "none"
+        );
+        assert_eq!(host.eval_to_string("document.getElementById('box').style.display").unwrap(), "");
+        // cssText round-trips.
+        host.eval_to_string("document.getElementById('box').style.cssText = 'width: 10px; height: 20px';").unwrap();
+        assert_eq!(host.eval_to_string("document.getElementById('box').style.width").unwrap(), "10px");
+        assert_eq!(
+            host.eval_to_string("document.getElementById('box').getAttribute('style')").unwrap(),
+            "width: 10px; height: 20px"
         );
     }
 
