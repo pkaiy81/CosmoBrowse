@@ -76,6 +76,27 @@ thread_local! {
     /// The document URL exposed as `location`. Read by the location accessors;
     /// updated by `ScriptHost::set_location` and by assigning `location.href`.
     static LOCATION_HREF: RefCell<String> = RefCell::new(String::from("about:blank"));
+
+    /// `localStorage` backing store: insertion-ordered key/value pairs (order
+    /// matters for `key(n)`). Seeded/snapshotted by the runtime per origin.
+    static LOCAL_STORAGE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn ls_get(key: &str) -> Option<String> {
+    LOCAL_STORAGE.with(|s| s.borrow().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+}
+fn ls_set(key: &str, value: &str) {
+    LOCAL_STORAGE.with(|s| {
+        let mut v = s.borrow_mut();
+        if let Some(entry) = v.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = value.to_string();
+        } else {
+            v.push((key.to_string(), value.to_string()));
+        }
+    });
+}
+fn ls_remove(key: &str) {
+    LOCAL_STORAGE.with(|s| s.borrow_mut().retain(|(k, _)| k != key));
 }
 
 /// Decompose a URL into (protocol, host, pathname, search, hash). Best-effort;
@@ -1040,6 +1061,27 @@ impl ScriptHost {
             .register_global_property(js_string!("location"), location, Attribute::all())
             .expect("register location");
 
+        // localStorage: getItem/setItem/removeItem/clear/key + length.
+        let storage = ObjectInitializer::new(&mut self.context)
+            .function(NativeFunction::from_fn_ptr(storage_get_item), js_string!("getItem"), 1)
+            .function(NativeFunction::from_fn_ptr(storage_set_item), js_string!("setItem"), 2)
+            .function(NativeFunction::from_fn_ptr(storage_remove_item), js_string!("removeItem"), 1)
+            .function(NativeFunction::from_fn_ptr(storage_clear), js_string!("clear"), 0)
+            .function(NativeFunction::from_fn_ptr(storage_key), js_string!("key"), 1)
+            .build();
+        let length_getter = PropertyDescriptor::builder()
+            .get(
+                NativeFunction::from_fn_ptr(storage_length)
+                    .to_js_function(&self.context.realm().clone()),
+            )
+            .enumerable(true)
+            .configurable(true)
+            .build();
+        storage.insert_property(js_string!("length"), length_getter);
+        self.context
+            .register_global_property(js_string!("localStorage"), storage, Attribute::all())
+            .expect("register localStorage");
+
         // window aliases the global object (window.document, window.setTimeout,
         // window.location, etc. all resolve to the globals registered above).
         let global = self.context.global_object();
@@ -1051,6 +1093,17 @@ impl ScriptHost {
     /// Set the URL exposed to script as `location`.
     pub fn set_location(&mut self, href: &str) {
         LOCATION_HREF.with(|h| *h.borrow_mut() = href.to_string());
+    }
+
+    /// Snapshot the current `localStorage` contents (for per-origin
+    /// persistence by the runtime).
+    pub fn local_storage_entries(&self) -> Vec<(String, String)> {
+        LOCAL_STORAGE.with(|s| s.borrow().clone())
+    }
+
+    /// Replace `localStorage` with the given entries (seed from persistence).
+    pub fn set_local_storage_entries(&mut self, entries: Vec<(String, String)>) {
+        LOCAL_STORAGE.with(|s| *s.borrow_mut() = entries);
     }
 
     /// Evaluate a script and return its completion value rendered as a
@@ -1114,6 +1167,39 @@ impl ScriptHost {
             fired += 1;
         }
     }
+}
+
+fn storage_get_item(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let key = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(match ls_get(&key) {
+        Some(v) => JsValue::from(js_string!(v.as_str())),
+        None => JsValue::null(),
+    })
+}
+fn storage_set_item(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let key = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let value = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    ls_set(&key, &value);
+    Ok(JsValue::undefined())
+}
+fn storage_remove_item(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let key = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    ls_remove(&key);
+    Ok(JsValue::undefined())
+}
+fn storage_clear(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    LOCAL_STORAGE.with(|s| s.borrow_mut().clear());
+    Ok(JsValue::undefined())
+}
+fn storage_key(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let idx = a.first().map(|v| v.to_number(c)).transpose()?.unwrap_or(0.0) as usize;
+    Ok(LOCAL_STORAGE.with(|s| match s.borrow().get(idx) {
+        Some((k, _)) => JsValue::from(js_string!(k.as_str())),
+        None => JsValue::null(),
+    }))
+}
+fn storage_length(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(LOCAL_STORAGE.with(|s| s.borrow().len()) as u32))
 }
 
 fn location_href() -> String {
@@ -1582,6 +1668,36 @@ mod tests {
         );
         // The toggled item survived removal with its state intact.
         assert_eq!(host.eval_to_string("document.querySelectorAll('.done').length").unwrap(), "1");
+    }
+
+    #[test]
+    fn local_storage_and_snapshot() {
+        let html = "<html><body></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_local_storage_entries(vec![]);
+        host.set_document(document);
+
+        host.eval_to_string("localStorage.setItem('a', '1'); localStorage.setItem('b', '2');").unwrap();
+        assert_eq!(host.eval_to_string("localStorage.getItem('a')").unwrap(), "1");
+        assert_eq!(host.eval_to_string("localStorage.length").unwrap(), "2");
+        assert_eq!(host.eval_to_string("localStorage.key(1)").unwrap(), "b");
+        assert_eq!(host.eval_to_string("localStorage.getItem('missing')").unwrap(), "null");
+
+        // Overwrite keeps position; remove drops it.
+        host.eval_to_string("localStorage.setItem('a', '9'); localStorage.removeItem('b');").unwrap();
+        assert_eq!(host.eval_to_string("localStorage.getItem('a')").unwrap(), "9");
+        assert_eq!(host.eval_to_string("localStorage.length").unwrap(), "1");
+
+        // Snapshot reflects the current state; window.localStorage is the same.
+        assert_eq!(host.local_storage_entries(), vec![("a".to_string(), "9".to_string())]);
+        assert_eq!(host.eval_to_string("window.localStorage.getItem('a')").unwrap(), "9");
+
+        // Restore replaces contents.
+        host.set_local_storage_entries(vec![("x".to_string(), "y".to_string())]);
+        assert_eq!(host.eval_to_string("localStorage.getItem('x')").unwrap(), "y");
+        assert_eq!(host.eval_to_string("localStorage.length").unwrap(), "1");
     }
 
     #[test]
