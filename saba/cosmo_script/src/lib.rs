@@ -1218,13 +1218,17 @@ impl ScriptHost {
         host
     }
 
-    /// Expose the given document root to script as `document`. Clears any
-    /// event listeners left over from a previous document (plan D5: the
-    /// registry is per-page and reset on navigation).
+    /// Expose the given document root to script as `document`. Resets all
+    /// per-page state (listeners, timers, wrapper cache, console/message
+    /// buffers) left over from a previous document — plan D5: these registries
+    /// are per-page and reset on navigation. `localStorage` intentionally
+    /// persists (per-origin; seed it via `set_local_storage_entries`).
     pub fn set_document(&mut self, root: Rc<RefCell<Node>>) {
         LISTENERS.with(|m| m.borrow_mut().clear());
         TIMERS.with(|t| t.borrow_mut().clear());
         WRAPPER_CACHE.with(|c| c.borrow_mut().clear());
+        CONSOLE_LOG.with(|l| l.borrow_mut().clear());
+        POSTED_MESSAGES.with(|m| m.borrow_mut().clear());
         VIRTUAL_CLOCK.with(|c| c.set(0));
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
     }
