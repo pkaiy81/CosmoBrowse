@@ -526,17 +526,35 @@ fn fetch_one_stylesheet(url: &str) -> String {
 
 const MAX_FETCH_BYTES: usize = 4 * 1024 * 1024;
 
+/// A completion notifier: called (from the worker thread) once a fetch has a
+/// response ready, so an idle UI event loop can wake and pump/re-layout.
+pub type FetchWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Network backend for `cosmo_script`'s `fetch`/XHR, bound to a document's URL
 /// for relative-URL resolution. Each request runs on its own worker thread and
 /// reports back over a channel, so script execution never blocks on the socket.
 pub struct RuntimeFetchEngine {
     base_url: String,
+    waker: Option<FetchWaker>,
 }
 
 /// Build a fetch backend for scripts running in the document at `base_url`.
 pub fn make_fetch_engine(base_url: &str) -> Box<dyn cosmo_script::FetchEngine> {
     Box::new(RuntimeFetchEngine {
         base_url: base_url.to_string(),
+        waker: None,
+    })
+}
+
+/// Build a fetch backend that additionally calls `waker` when a response is
+/// ready, so the render loop can wake to pump completions (progressive render).
+pub fn make_fetch_engine_with_waker(
+    base_url: &str,
+    waker: FetchWaker,
+) -> Box<dyn cosmo_script::FetchEngine> {
+    Box::new(RuntimeFetchEngine {
+        base_url: base_url.to_string(),
+        waker: Some(waker),
     })
 }
 
@@ -547,8 +565,14 @@ impl cosmo_script::FetchEngine for RuntimeFetchEngine {
     ) -> std::sync::mpsc::Receiver<cosmo_script::FetchResponse> {
         let (tx, rx) = std::sync::mpsc::channel();
         let base = self.base_url.clone();
+        let waker = self.waker.clone();
         std::thread::spawn(move || {
             let _ = tx.send(do_fetch(&base, req));
+            // Wake the render loop *after* the response is queued so the pump
+            // that follows finds it ready.
+            if let Some(waker) = waker {
+                waker();
+            }
         });
         rx
     }

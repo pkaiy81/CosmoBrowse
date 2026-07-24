@@ -184,15 +184,25 @@ pub struct LivePage {
 impl LivePage {
     /// Parse `html`, run its scripts once (immediate first paint — no waiting on
     /// in-flight fetches), and lay out. The host and DOM are retained so
-    /// `pump_and_relayout` can apply later async mutations.
-    pub fn load(document_url: &str, html: &str, rect: &FrameRect) -> (Self, LayoutScene) {
+    /// `pump_and_relayout` can apply later async mutations. When `waker` is
+    /// provided, fetch completions call it so the render loop can wake and pump.
+    pub fn load(
+        document_url: &str,
+        html: &str,
+        rect: &FrameRect,
+        waker: Option<crate::loader::FetchWaker>,
+    ) -> (Self, LayoutScene) {
         let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
         let dom = window.borrow().document();
 
         let mut host = cosmo_script::ScriptHost::new();
         host.set_location(document_url);
         host.set_local_storage_entries(local_storage_snapshot(document_url));
-        host.set_fetch_engine(crate::loader::make_fetch_engine(document_url));
+        let engine = match waker {
+            Some(w) => crate::loader::make_fetch_engine_with_waker(document_url, w),
+            None => crate::loader::make_fetch_engine(document_url),
+        };
+        host.set_fetch_engine(engine);
         host.set_document(dom.clone());
 
         let script = get_js_content(dom.clone());
@@ -738,8 +748,15 @@ mod tests {
             </script></body></html>";
         let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
 
+        // A waker fires when the fetch response is ready (drives the render
+        // loop wake-up in the GUI).
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let woken2 = woken.clone();
+        let waker: crate::loader::FetchWaker =
+            std::sync::Arc::new(move || woken2.store(true, std::sync::atomic::Ordering::SeqCst));
+
         // First paint happens immediately, before the fetch resolves.
-        let (mut page, first_scene) = LivePage::load(&base, html, &rect);
+        let (mut page, first_scene) = LivePage::load(&base, html, &rect, Some(waker));
         let first_has = first_scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-")));
         assert!(!first_has, "fetched data should NOT be in the first paint");
         assert!(page.has_pending_work(), "the fetch should still be in flight");
@@ -756,6 +773,10 @@ mod tests {
         let now_has_x = scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-x")));
         let now_has_y = scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-y")));
         assert!(now_has_x && now_has_y, "progressive re-layout did not render the fetched items");
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the fetch waker should have fired to wake the render loop"
+        );
     }
 }
 
