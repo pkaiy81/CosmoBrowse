@@ -295,8 +295,11 @@
 >   全て DTO 前提。→ シーン生成を adapter から AppBridge へ移し DTO 消費側を全付け替えする大改修に
 >   なる。現状 bounded-wait は fetch 内容を正しく描画済み(遅延のみ)なので増分価値はレイテンシ改善。
 >   **推奨: フル GUI 結線は専用の集中作業として別途。** 中核ロジック(LivePage/waker)はテスト済み。
-> - 次(小さい安全な項目): Boa の実 watchdog(反復/時間ガード)、setRequestHeader のヘッダ転送
->   (FetchRequest にヘッダ追加)、el.dataset、DOM 変異世代カウンタ。
+> - ✅ **fetch/XHR ヘッダ転送 (`59e4e96`)** — FetchRequest にヘッダ追加。fetch は
+>   options.headers({name:value})、XHR は setRequestHeader を蓄積し、RuntimeFetchEngine が
+>   reqwest で転送。テストで method/headers/body の到達を確認。
+> - 次(小さい安全な項目): Boa の実 watchdog(反復/時間ガード)、el.dataset(JsProxy 要調査)、
+>   DOM 変異世代カウンタ。**大: item 3 のフル GUI 結線(上記 ⚠ 参照、専用作業)。**
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
