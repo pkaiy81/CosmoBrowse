@@ -311,8 +311,15 @@
 >   (=fetch/timer 完了でも DOM 未変更なら**再レイアウト・再描画をスキップ**)。AppBridge は Some 時のみ
 >   再スプライス。**注**: これは粗い版(無変化スキップ)。真の差分 relayout(変更サブツリーのみ)は
 >   Phase 4.1(dirty-bit 伝播)で別途。
-> - 次(残課題): **plan D5: ScriptHost の thread-local 脱却**(per-page 状態を host に移す→ frameset/
->   複数フレームの host 対応)。true 差分 relayout(Phase 4.1)。setRequestHeader の CORS 検証。
+> - ✅ **plan D5: ScriptHost の thread-local 脱却 (`2df4d1c`)** — 14 個の module thread-local
+>   (SCRIPT_DOM/LISTENERS/TIMERS/WRAPPER_CACHE/PENDING_FETCHES/localStorage/DOM_GENERATION 等)を
+>   単一 `PageState` 構造体に集約し各 `ScriptHost` が `Rc<PageState>` として所有。単一の
+>   `ACTIVE_PAGE` thread-local が実行中 host を指す(各 pub entry で `activate()`)。`page_field!`
+>   マクロで各 field に `.with()` を生やし**60 箇所の呼び出しは無変更**。JS は単一スレッドなので
+>   同時1アクティブだが host ごとに独立状態→「1スレッド1host」制約が解消(frameset/iframe が
+>   各々 script host を持てる)。2 host 独立性テスト追加。全 green、reftest 12/12。
+> - 次(残課題): **true 差分 relayout(Phase 4.1)** — dirty-bit 伝播で変更サブツリーのみ再計算。
+>   setRequestHeader の CORS 検証。frameset の複数 LivePage 対応(D5 で下地はできた)。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、

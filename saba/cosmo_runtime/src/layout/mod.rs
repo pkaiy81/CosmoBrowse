@@ -189,10 +189,10 @@ fn layout_dom(
 /// rendering. (Skeleton: the render loop still needs to be wired to call
 /// `pump_and_relayout` when async work is pending, and to wake on completion.)
 ///
-/// NB: `ScriptHost` keeps its per-page state in thread-locals, so only one
-/// `LivePage` can be the *active* document per thread at a time — the one whose
-/// `load()`/`set_document` ran last. Multi-tab concurrency needs the state
-/// moved onto the host (plan D5) and is out of scope for this skeleton.
+/// NB: each `ScriptHost` now owns its per-page state (plan D5 done), so
+/// multiple `LivePage`s can coexist on one thread — the active one is swapped
+/// in on each call. (AppBridge currently hosts only the root frame; framesets/
+/// child frames could each get their own LivePage.)
 pub struct LivePage {
     host: cosmo_script::ScriptHost,
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
