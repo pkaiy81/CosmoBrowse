@@ -214,6 +214,7 @@ fn execute_scripts_boa(
     let mut host = cosmo_script::ScriptHost::new();
     host.set_location(document_url);
     host.set_local_storage_entries(local_storage_snapshot(document_url));
+    host.set_fetch_engine(crate::loader::make_fetch_engine(document_url));
     host.set_document(dom);
 
     // Interim watchdog (see fn doc). Larger than the toy cap since Boa handles
@@ -227,6 +228,17 @@ fn execute_scripts_boa(
         // interval fires at most once (no spinning at first paint). Bounded to
         // cap runaway setTimeout(0) chains.
         host.run_initial_load(1000);
+        // Interim lifecycle: this layout pass is one-shot, so wait (bounded)
+        // for in-flight fetch() requests to settle and their .then chains to
+        // mutate the DOM before we lay out. Progressive rendering across
+        // passes (paint, then update on completion) is future work — see
+        // HANDOFF. The IO itself runs on worker threads, so this only blocks
+        // on genuinely slow responses up to the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while host.has_pending_fetches() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            host.run_initial_load(1000);
+        }
         true
     } else {
         false
@@ -608,6 +620,66 @@ mod tests {
         let mut text = String::new();
         cosmo_engine::renderer::dom::api::collect_text(Some(dom), &mut text);
         assert!(text.contains("from-js"), "DOM mutation not applied: {text:?}");
+    }
+
+    #[test]
+    fn boa_fetch_renders_network_json() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Minimal one-shot HTTP server returning JSON.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // Serve a couple of connections (favicon/other probes aside, the
+            // page makes one fetch); accept until the test's request is served.
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"items":["net-a","net-b"]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                break; // one request is enough for this test
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{port}/");
+        let html = "<html><head><style>body{margin:0}</style></head><body>\
+            <ul id=\"list\"></ul>\
+            <script>\
+              fetch('data.json').then(function(r){return r.json();}).then(function(d){\
+                var ul=document.getElementById('list');\
+                for(var i=0;i<d.items.length;i++){var li=document.createElement('li');li.textContent=d.items[i];ul.appendChild(li);}\
+              });\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let result = build_layout_scene_with_script_runtime(&base, html, &rect);
+
+        // The fetched items were rendered into the document (the bounded-wait
+        // lifecycle settled the promise before layout).
+        let has_a = result.render_tree_contains("net-a");
+        let has_b = result.render_tree_contains("net-b");
+        let _ = server.join();
+        assert!(has_a && has_b, "fetched items not rendered; diagnostics={:?}", result.diagnostics);
+    }
+}
+
+#[cfg(test)]
+impl ScriptLayoutResult {
+    /// Whether any text node in the rendered scene contains `needle`.
+    fn render_tree_contains(&self, needle: &str) -> bool {
+        self.layout_scene.scene_items.iter().any(|item| match item {
+            SceneItem::Text { text, .. } => text.contains(needle),
+            _ => false,
+        })
     }
 }
 

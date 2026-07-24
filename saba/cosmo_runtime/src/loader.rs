@@ -524,6 +524,96 @@ fn fetch_one_stylesheet(url: &str) -> String {
     css
 }
 
+const MAX_FETCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// Network backend for `cosmo_script`'s `fetch`/XHR, bound to a document's URL
+/// for relative-URL resolution. Each request runs on its own worker thread and
+/// reports back over a channel, so script execution never blocks on the socket.
+pub struct RuntimeFetchEngine {
+    base_url: String,
+}
+
+/// Build a fetch backend for scripts running in the document at `base_url`.
+pub fn make_fetch_engine(base_url: &str) -> Box<dyn cosmo_script::FetchEngine> {
+    Box::new(RuntimeFetchEngine {
+        base_url: base_url.to_string(),
+    })
+}
+
+impl cosmo_script::FetchEngine for RuntimeFetchEngine {
+    fn start(
+        &self,
+        req: cosmo_script::FetchRequest,
+    ) -> std::sync::mpsc::Receiver<cosmo_script::FetchResponse> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = self.base_url.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(do_fetch(&base, req));
+        });
+        rx
+    }
+}
+
+fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchResponse {
+    let reject = |url: String, msg: String| cosmo_script::FetchResponse {
+        ok: false,
+        status: 0,
+        status_text: String::new(),
+        url,
+        body: String::new(),
+        error: Some(msg),
+    };
+    let url = match resolve_url(base, &req.url) {
+        Ok(u) => u,
+        Err(e) => return reject(req.url.clone(), format!("invalid URL: {e}")),
+    };
+    // Only http(s) is fetchable; file:// and other schemes are blocked (matches
+    // the document loader's security posture).
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return reject(url.clone(), "unsupported URL scheme".to_string());
+    }
+
+    let mut diagnostics = Vec::new();
+    let client = select_http_client(&url, &mut diagnostics);
+    let mut builder = match req.method.to_ascii_uppercase().as_str() {
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "DELETE" => client.delete(&url),
+        "HEAD" => client.head(&url),
+        _ => client.get(&url),
+    };
+    if let Some(body) = req.body {
+        builder = builder.body(body);
+    }
+    match builder.send() {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let status_text = resp
+                .status()
+                .canonical_reason()
+                .unwrap_or("")
+                .to_string();
+            let ok = resp.status().is_success();
+            let body = match resp.bytes() {
+                Ok(bytes) => {
+                    let slice = &bytes[..bytes.len().min(MAX_FETCH_BYTES)];
+                    String::from_utf8_lossy(slice).into_owned()
+                }
+                Err(e) => return reject(url, format!("body read failed: {e}")),
+            };
+            cosmo_script::FetchResponse {
+                ok,
+                status,
+                status_text,
+                url,
+                body,
+                error: None,
+            }
+        }
+        Err(e) => reject(url, format!("request failed: {e}")),
+    }
+}
+
 pub fn resolve_url(base_url: &str, target: &str) -> AppResult<String> {
     let base = Url::parse(base_url)
         .map_err(|error| AppError::validation(format!("Invalid base URL: {error}")))?;
