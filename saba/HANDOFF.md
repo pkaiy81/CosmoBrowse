@@ -269,10 +269,19 @@
 >   layout。**プログレッシブ描画(描画→完了時に更新)は persistent-host lifecycle が要る=今後**。
 >   統合テスト: ローカル TCP で実 HTTP を配信し fetch した JSON がシーンに描画されることを確認。
 >   フィクスチャ回帰なし(Wikipedia 画素一致・時間 +1.4s のみ)。**残: XMLHttpRequest 未実装**。
-> - 次: (b) Boa の実 watchdog(Context が !Send で別スレッド不可 → 反復/時間ガードの検討)。
->   (c) `renderer/js/` 玩具の削除(Boa 既定になったので安全)。XMLHttpRequest、
->   プログレッシブ描画(persistent-host + fetch 完了で relayout)、
->   DOM 変異世代カウンタ(全再構築でなく差分 relayout)、el.dataset。
+> - ✅ **XMLHttpRequest (`5cbd00a`)** — 構築可能な XHR(open/send/setRequestHeader/abort、
+>   readyState 0/1/4、status/statusText/responseText/response、onreadystatechange/onload/onerror)。
+>   send() は fetch と同じ FetchEngine に委譲、pump_xhr が drain で解決。GUI で end-to-end 検証。
+>   setRequestHeader は現状 no-op(FetchRequest がヘッダ未対応)。
+> - ✅ **玩具 JS エンジン削除 (`4626d88`)** — `cosmo_engine/src/renderer/js/`(~2.3k 行 + 37 テスト)
+>   と `js_runtime.rs` を削除。cosmo_runtime の toy フォールバック + COSMO_USE_BOA/COSMO_LEGACY_JS
+>   ゲート撤去(Boa 無条件)。cosmo_engine の `Page` は JS 非実行に(JS は cosmo_runtime/Boa のみ)。
+>   adapter_cli の verify-event-loop 診断は cosmo_script::ScriptHost に移植。engine 173→136 tests。
+> - 次: **プログレッシブ描画(item 3, 大)** — 現状 fetch はレイアウト一発 + bounded-wait なので
+>   「描画→完了時に更新」ができない。BrowserSession/App が per-page で ScriptHost + DOM を
+>   **永続保持**し、fetch/timer 完了で同じ host/DOM を使って relayout する lifecycle が要る。
+>   関連: DOM 変異世代カウンタ(全再構築でなく差分 relayout)、Boa の実 watchdog、
+>   setRequestHeader のヘッダ転送、el.dataset。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
