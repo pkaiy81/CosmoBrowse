@@ -71,6 +71,9 @@ pub struct FetchRequest {
     pub url: String,
     pub method: String,
     pub body: Option<String>,
+    /// Request headers (name, value) from fetch `options.headers` or
+    /// `XMLHttpRequest.setRequestHeader`.
+    pub headers: Vec<(String, String)>,
 }
 
 /// The result of a network request delivered back from the host's worker.
@@ -109,6 +112,8 @@ struct XhrState {
     method: RefCell<String>,
     #[unsafe_ignore_trace]
     url: RefCell<String>,
+    #[unsafe_ignore_trace]
+    headers: RefCell<Vec<(String, String)>>,
 }
 
 /// An `XMLHttpRequest.send()` awaiting its worker response: the channel plus
@@ -1900,10 +1905,31 @@ fn request_animation_frame(_this: &JsValue, args: &[JsValue], _ctx: &mut Context
 /// `fetch(url, options?)` → Promise<Response>. Delegates the network IO to the
 /// host's FetchEngine (worker thread); the returned promise settles when
 /// `pump_fetches` sees the response. With no engine installed, rejects.
+/// Read a plain `{name: value}` headers object into ordered (name, value)
+/// pairs. Non-object values (undefined/null) yield an empty list.
+fn read_header_object(value: &JsValue, ctx: &mut Context) -> Vec<(String, String)> {
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let Ok(keys) = obj.own_property_keys(ctx) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in keys {
+        let name = key.to_string();
+        if let Ok(v) = obj.get(key, ctx) {
+            if let Ok(s) = v.to_string(ctx) {
+                out.push((name, s.to_std_string_escaped()));
+            }
+        }
+    }
+    out
+}
+
 fn js_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let url = args.first().cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
-    // options.method / options.body
-    let (method, body) = match args.get(1).filter(|v| v.is_object()) {
+    // options.method / options.body / options.headers
+    let (method, body, headers) = match args.get(1).filter(|v| v.is_object()) {
         Some(opts) => {
             let o = opts.as_object().unwrap();
             let method = o
@@ -1919,9 +1945,10 @@ fn js_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
                     Some(b.to_string(ctx)?.to_std_string_escaped())
                 }
             };
-            (method, body)
+            let headers = read_header_object(&o.get(js_string!("headers"), ctx)?, ctx);
+            (method, body, headers)
         }
-        None => ("GET".to_string(), None),
+        None => ("GET".to_string(), None, Vec::new()),
     };
 
     let (promise, resolvers) = JsPromise::new_pending(ctx);
@@ -1931,6 +1958,7 @@ fn js_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
                 url: url.clone(),
                 method: method.clone(),
                 body: body.clone(),
+                headers: headers.clone(),
             })
         })
     });
@@ -2085,11 +2113,12 @@ fn xhr_send(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     let Some(obj) = xhr_state(this) else {
         return Ok(JsValue::undefined());
     };
-    let (method, url) = {
+    let (method, url, headers) = {
         let state = obj.downcast_ref::<XhrState>().unwrap();
         let m = state.method.borrow().clone();
         let u = state.url.borrow().clone();
-        (m, u)
+        let h = state.headers.borrow().clone();
+        (m, u, h)
     };
     let body = match a.first() {
         Some(v) if !v.is_undefined() && !v.is_null() => Some(v.to_string(ctx)?.to_std_string_escaped()),
@@ -2098,7 +2127,7 @@ fn xhr_send(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     let started = FETCH_ENGINE.with(|e| {
         e.borrow()
             .as_ref()
-            .map(|eng| eng.start(FetchRequest { url, method, body }))
+            .map(|eng| eng.start(FetchRequest { url, method, body, headers }))
     });
     match started {
         Some(rx) => PENDING_XHR.with(|p| p.borrow_mut().push(PendingXhr { rx, obj })),
@@ -2115,9 +2144,15 @@ fn xhr_send(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     Ok(JsValue::undefined())
 }
 
-/// setRequestHeader is accepted but not yet forwarded (FetchRequest carries no
-/// headers). Kept so pages that set headers don't throw.
-fn xhr_set_request_header(_this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+fn xhr_set_request_header(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(obj) = xhr_state(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let name = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let value = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    if let Some(state) = obj.downcast_ref::<XhrState>() {
+        state.headers.borrow_mut().push((name, value));
+    }
     Ok(JsValue::undefined())
 }
 
@@ -3096,6 +3131,62 @@ mod tests {
         assert_eq!(host.eval_to_string("globalThis.log").unwrap(), "4:201:hello-xhr");
         assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "hello-xhr");
         assert!(!host.has_pending_fetches());
+    }
+
+    /// Captures the last request it received, for asserting method/headers/body.
+    struct CapturingFetch {
+        last: std::sync::Arc<std::sync::Mutex<Option<(String, Vec<(String, String)>, Option<String>)>>>,
+    }
+    impl FetchEngine for CapturingFetch {
+        fn start(&self, req: FetchRequest) -> std::sync::mpsc::Receiver<FetchResponse> {
+            *self.last.lock().unwrap() = Some((req.method.clone(), req.headers.clone(), req.body.clone()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(FetchResponse {
+                ok: true,
+                status: 200,
+                status_text: "OK".to_string(),
+                url: req.url,
+                body: "{}".to_string(),
+                error: None,
+            })
+            .unwrap();
+            rx
+        }
+    }
+
+    #[test]
+    fn fetch_and_xhr_forward_headers_and_body() {
+        let html = "<html><body></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        let last = std::sync::Arc::new(std::sync::Mutex::new(None));
+        host.set_fetch_engine(Box::new(CapturingFetch { last: last.clone() }));
+        host.set_document(document);
+
+        // fetch with method/headers/body.
+        host.eval_to_string(
+            "fetch('/p', {method:'POST', headers:{'Content-Type':'application/json','X-Test':'1'}, body:'{\"a\":1}'});",
+        )
+        .unwrap();
+        host.run_initial_load(100);
+        {
+            let (method, headers, body) = last.lock().unwrap().clone().unwrap();
+            assert_eq!(method, "POST");
+            assert_eq!(body.as_deref(), Some("{\"a\":1}"));
+            assert!(headers.iter().any(|(k, v)| k == "Content-Type" && v == "application/json"));
+            assert!(headers.iter().any(|(k, v)| k == "X-Test" && v == "1"));
+        }
+
+        // XHR setRequestHeader.
+        host.eval_to_string(
+            "var x=new XMLHttpRequest(); x.open('GET','/q'); x.setRequestHeader('Authorization','Bearer t'); x.send();",
+        )
+        .unwrap();
+        host.run_initial_load(100);
+        let (method, headers, _body) = last.lock().unwrap().clone().unwrap();
+        assert_eq!(method, "GET");
+        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer t"));
     }
 
     #[test]

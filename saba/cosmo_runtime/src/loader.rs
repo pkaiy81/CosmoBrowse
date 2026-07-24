@@ -606,6 +606,9 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
         "HEAD" => client.head(&url),
         _ => client.get(&url),
     };
+    for (name, value) in &req.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
     if let Some(body) = req.body {
         builder = builder.body(body);
     }
