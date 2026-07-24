@@ -9,7 +9,7 @@ use boa_engine::{
     Context, JsData, JsResult, JsValue, NativeFunction, Source,
 };
 use boa_engine::gc::{Finalize, Trace};
-use boa_engine::object::builtins::{JsArray, JsPromise};
+use boa_engine::object::builtins::{JsArray, JsPromise, JsProxy};
 use boa_engine::builtins::promise::ResolvingFunctions;
 use cosmo_engine::renderer::dom::api::{
     collect_text, element_closest, element_matches, get_element_by_id, get_target_element_node,
@@ -284,6 +284,7 @@ fn build_element_wrapper(node: Rc<RefCell<Node>>, context: &mut Context) -> JsOb
     );
     obj.insert_property(js_string!("classList"), accessor(element_get_class_list, None));
     obj.insert_property(js_string!("style"), accessor(element_get_style, None));
+    obj.insert_property(js_string!("dataset"), accessor(element_get_dataset, None));
     obj.insert_property(js_string!("parentNode"), accessor(element_get_parent_node, None));
     obj.insert_property(
         js_string!("parentElement"),
@@ -1063,6 +1064,134 @@ fn style_set_css_text(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResul
     // Normalize through the parser so subsequent reads are consistent.
     set_attr_of(this, "style", &serialize_style_decls(&parse_style_decls(&text)));
     Ok(JsValue::undefined())
+}
+
+/// `data-foo-bar` attribute name → `fooBar` dataset key.
+fn data_attr_to_key(attr: &str) -> Option<String> {
+    let rest = attr.strip_prefix("data-")?;
+    let mut out = String::new();
+    let mut upper = false;
+    for c in rest.chars() {
+        if c == '-' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// `fooBar` dataset key → `data-foo-bar` attribute name.
+fn key_to_data_attr(key: &str) -> String {
+    let mut out = String::from("data-");
+    for c in key.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `element.dataset` — a Proxy over the element's `data-*` attributes with
+/// camelCase keys (get/set/has/delete/enumerate). The proxy target carries the
+/// element's NodeHandle so the fn-pointer traps can reach the node via arg 0.
+fn element_get_dataset(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(node) = handle_node(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let target = JsObject::from_proto_and_data(None, NodeHandle { node });
+    let proxy = JsProxy::builder(target)
+        .get(dataset_get)
+        .set(dataset_set)
+        .has(dataset_has)
+        .delete_property(dataset_delete)
+        .own_keys(dataset_own_keys)
+        .get_own_property_descriptor(dataset_own_desc)
+        .build(ctx);
+    Ok(JsValue::from(proxy))
+}
+
+fn dataset_get(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let target = a.first().cloned().unwrap_or_default();
+    let key = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(match attr_of(&target, &key_to_data_attr(&key)) {
+        Some(v) => JsValue::from(js_string!(v.as_str())),
+        None => JsValue::undefined(),
+    })
+}
+
+fn dataset_set(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let target = a.first().cloned().unwrap_or_default();
+    let key = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    let value = a.get(2).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    set_attr_of(&target, &key_to_data_attr(&key), &value);
+    Ok(JsValue::from(true))
+}
+
+fn dataset_has(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let target = a.first().cloned().unwrap_or_default();
+    let key = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    Ok(JsValue::from(attr_of(&target, &key_to_data_attr(&key)).is_some()))
+}
+
+fn dataset_delete(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let target = a.first().cloned().unwrap_or_default();
+    let key = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    if let Some(node) = handle_node(&target) {
+        if let NodeKind::Element(ref mut e) = node.borrow_mut().kind_mut() {
+            e.remove_attribute(&key_to_data_attr(&key));
+        }
+    }
+    Ok(JsValue::from(true))
+}
+
+/// Collect the dataset's camelCase keys from the element's data-* attributes.
+fn dataset_keys(target: &JsValue) -> Vec<String> {
+    let Some(node) = handle_node(target) else {
+        return Vec::new();
+    };
+    let attrs = match node.borrow().kind() {
+        NodeKind::Element(e) => e.attributes(),
+        _ => return Vec::new(),
+    };
+    attrs
+        .iter()
+        .filter_map(|a| data_attr_to_key(&a.name()))
+        .collect()
+}
+
+fn dataset_own_keys(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let target = a.first().cloned().unwrap_or_default();
+    let arr = JsArray::new(c);
+    for key in dataset_keys(&target) {
+        arr.push(JsValue::from(js_string!(key.as_str())), c)?;
+    }
+    Ok(JsValue::from(arr))
+}
+
+/// getOwnPropertyDescriptor trap — required for Object.keys / enumeration to
+/// surface the dataset keys. Returns an enumerable, configurable data prop.
+fn dataset_own_desc(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let target = a.first().cloned().unwrap_or_default();
+    let key = a.get(1).cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
+    match attr_of(&target, &key_to_data_attr(&key)) {
+        Some(v) => {
+            let desc = ObjectInitializer::new(c)
+                .property(js_string!("value"), js_string!(v.as_str()), Attribute::all())
+                .property(js_string!("writable"), true, Attribute::all())
+                .property(js_string!("enumerable"), true, Attribute::all())
+                .property(js_string!("configurable"), true, Attribute::all())
+                .build();
+            Ok(JsValue::from(desc))
+        }
+        None => Ok(JsValue::undefined()),
+    }
 }
 
 fn class_tokens(this: &JsValue) -> Vec<String> {
@@ -2880,6 +3009,45 @@ mod tests {
         .unwrap();
         host.run_pending(100);
         assert_eq!(host.eval_to_string("frames").unwrap(), "3");
+    }
+
+    #[test]
+    fn dataset_reads_and_writes_data_attributes() {
+        let html = "<html><body><div id=\"b\" data-user-id=\"42\" data-role=\"admin\">x</div></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // Read: data-user-id -> dataset.userId (camelCase).
+        assert_eq!(host.eval_to_string("document.getElementById('b').dataset.userId").unwrap(), "42");
+        assert_eq!(host.eval_to_string("document.getElementById('b').dataset.role").unwrap(), "admin");
+        assert_eq!(host.eval_to_string("'userId' in document.getElementById('b').dataset").unwrap(), "true");
+        assert_eq!(host.eval_to_string("'missing' in document.getElementById('b').dataset").unwrap(), "false");
+
+        // Write: dataset.fooBar -> data-foo-bar attribute.
+        host.eval_to_string("document.getElementById('b').dataset.fooBar = 'yes';").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('b').getAttribute('data-foo-bar')").unwrap(),
+            "yes"
+        );
+        // Update existing.
+        host.eval_to_string("document.getElementById('b').dataset.role = 'user';").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('b').getAttribute('data-role')").unwrap(),
+            "user"
+        );
+        // Delete.
+        host.eval_to_string("delete document.getElementById('b').dataset.role;").unwrap();
+        assert_eq!(
+            host.eval_to_string("document.getElementById('b').hasAttribute('data-role')").unwrap(),
+            "false"
+        );
+        // Enumerate via Object.keys.
+        assert_eq!(
+            host.eval_to_string("Object.keys(document.getElementById('b').dataset).sort().join(',')").unwrap(),
+            "fooBar,userId"
+        );
     }
 
     #[test]

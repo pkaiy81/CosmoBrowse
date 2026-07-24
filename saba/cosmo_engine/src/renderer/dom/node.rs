@@ -243,6 +243,10 @@ impl Element {
         }
         self.attributes.push(Attribute::from_name_value(name, value));
     }
+
+    pub fn remove_attribute(&mut self, name: &str) {
+        self.attributes.retain(|attr| attr.name() != name);
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
