@@ -277,10 +277,16 @@
 >   と `js_runtime.rs` を削除。cosmo_runtime の toy フォールバック + COSMO_USE_BOA/COSMO_LEGACY_JS
 >   ゲート撤去(Boa 無条件)。cosmo_engine の `Page` は JS 非実行に(JS は cosmo_runtime/Boa のみ)。
 >   adapter_cli の verify-event-loop 診断は cosmo_script::ScriptHost に移植。engine 173→136 tests。
-> - 次: **プログレッシブ描画(item 3, 大)** — 現状 fetch はレイアウト一発 + bounded-wait なので
->   「描画→完了時に更新」ができない。BrowserSession/App が per-page で ScriptHost + DOM を
->   **永続保持**し、fetch/timer 完了で同じ host/DOM を使って relayout する lifecycle が要る。
->   関連: DOM 変異世代カウンタ(全再構築でなく差分 relayout)、Boa の実 watchdog、
+> - 🚧 **プログレッシブ描画 step 1: LivePage 骨組み (`bf08045`)** — `layout/mod.rs` に
+>   `LivePage`(ScriptHost + DOM をレイアウトパス跨ぎで永続保持)。`load()` は即時初回描画
+>   (fetch を待たない)、`has_pending_work()`、`pump_and_relayout()` が完了を drain して
+>   **HTML 再パースなしで再レイアウト**。CSS+layout+paint 部を `layout_dom` に factor(既存経路は
+>   挙動不変)。テスト: 実ローカルソケットで初回描画にデータなし→完了後の pump で描画、を実証。
+>   **未接続**: session/render loop への結線 + 完了時の UI スレッド起床が次段。ScriptHost の
+>   thread-local 状態のため当面 1 スレッド 1 アクティブ LivePage(plan D5)。
+> - 次(item 3 継続): (1) session.rs が LivePage を保持し初回描画で返す、(2) worker 完了 →
+>   renderer_native のイベントループ起床(channel/waker)、(3) 起床フレームで pump_and_relayout
+>   → 新シーンを IPC で送出。関連: DOM 変異世代カウンタ、Boa の実 watchdog、
 >   setRequestHeader のヘッダ転送、el.dataset。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
