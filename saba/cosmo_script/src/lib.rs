@@ -1284,6 +1284,11 @@ thread_local! {
     static SCRIPT_DOM: RefCell<Option<Rc<RefCell<Node>>>> = const { RefCell::new(None) };
 }
 
+/// Default per-loop iteration cap. Above realistic page-load loops but bounds
+/// a runaway `while(true)` to a few seconds (Boa is an interpreter; a
+/// thread-based timeout isn't possible because its Context is !Send).
+const DEFAULT_LOOP_ITERATION_LIMIT: u64 = 5_000_000;
+
 /// A per-page JavaScript execution context.
 pub struct ScriptHost {
     context: Context,
@@ -1300,8 +1305,23 @@ impl ScriptHost {
         let mut host = Self {
             context: Context::default(),
         };
+        // Watchdog: bound execution so a runaway loop or deep recursion throws
+        // a catchable error instead of hanging the render thread (Boa's Context
+        // is !Send, so a thread-based timeout isn't possible). These are per
+        // single loop / recursion depth, generously above legitimate page code.
+        {
+            let limits = host.context.runtime_limits_mut();
+            limits.set_loop_iteration_limit(DEFAULT_LOOP_ITERATION_LIMIT);
+            limits.set_recursion_limit(2_000);
+        }
         host.install_dom_globals();
         host
+    }
+
+    /// Override the per-loop iteration cap (watchdog). Mainly for tests that
+    /// want a runaway loop to fail fast without waiting for the default cap.
+    pub fn set_loop_iteration_limit(&mut self, n: u64) {
+        self.context.runtime_limits_mut().set_loop_iteration_limit(n);
     }
 
     /// Expose the given document root to script as `document`. Resets all
@@ -2383,6 +2403,23 @@ mod tests {
         let mut host = ScriptHost::new();
         let src = "function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); } fib(10)";
         assert_eq!(host.eval_to_string(src).unwrap(), "55");
+    }
+
+    #[test]
+    fn watchdog_bounds_runaway_loop() {
+        let mut host = ScriptHost::new();
+        // Lower the cap so the test fails fast (the production default is far
+        // higher; here we just verify the watchdog fires and stays isolated).
+        host.set_loop_iteration_limit(50_000);
+        let result = host.eval_to_string("var i=0; while(true){ i++; }");
+        assert!(result.is_err(), "runaway loop should hit the iteration limit");
+        // The host stays usable afterward (the error is isolated).
+        assert_eq!(host.eval_to_string("1 + 2").unwrap(), "3");
+        // Legitimate bounded loops well under the cap still work.
+        assert_eq!(
+            host.eval_to_string("var s=0; for(var k=0;k<1000;k++){s+=k;} s").unwrap(),
+            "499500"
+        );
     }
 
     #[test]
