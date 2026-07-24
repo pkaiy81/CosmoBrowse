@@ -118,6 +118,28 @@ pub fn build_layout_scene_with_script_runtime(
     // place, so layout below sees the post-script tree.
     let (dom_updated, mut script_diagnostics) = execute_scripts_boa(document_url, dom.clone());
 
+    let (layout_scene, render_tree) = layout_dom(dom, document_url, rect);
+    let mut diagnostics = std::mem::take(&mut script_diagnostics);
+    if dom_updated {
+        diagnostics.push("Render loop: DOM mutation -> relayout -> repaint".to_string());
+    }
+
+    ScriptLayoutResult {
+        layout_scene,
+        render_tree,
+        diagnostics,
+        dom_updated,
+    }
+}
+
+/// Resolve styles for `dom` and produce its scene + render-tree snapshot at
+/// `rect`. Shared by the one-shot pipeline and the persistent [`LivePage`], so
+/// script-driven mutations re-layout identically.
+fn layout_dom(
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    document_url: &str,
+    rect: &FrameRect,
+) -> (LayoutScene, RenderTreeSnapshot) {
     // Combine external <link rel="stylesheet"> sheets with inline <style>.
     // External sheets are applied first so a later inline <style> wins on equal
     // specificity (approximating document order). Fetching is cached by URL so
@@ -138,19 +160,79 @@ pub fn build_layout_scene_with_script_runtime(
     // stylesheet), so no global pre-substitution is needed here.
     let layout_view =
         LayoutView::new_with_viewport(dom, &cssom, rect.width.max(1), rect.height.max(0));
-
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
     let render_tree = render_tree_snapshot(&layout_view, rect);
-    let mut diagnostics = std::mem::take(&mut script_diagnostics);
-    if dom_updated {
-        diagnostics.push("Render loop: DOM mutation -> relayout -> repaint".to_string());
+    (layout_scene, render_tree)
+}
+
+/// A persistently-hosted page: keeps its Boa `ScriptHost` and DOM alive across
+/// layout passes so asynchronous work (fetch/XHR/timers) can settle *after* the
+/// first paint and drive an incremental re-layout — the basis for progressive
+/// rendering. (Skeleton: the render loop still needs to be wired to call
+/// `pump_and_relayout` when async work is pending, and to wake on completion.)
+///
+/// NB: `ScriptHost` keeps its per-page state in thread-locals, so only one
+/// `LivePage` can be the *active* document per thread at a time — the one whose
+/// `load()`/`set_document` ran last. Multi-tab concurrency needs the state
+/// moved onto the host (plan D5) and is out of scope for this skeleton.
+pub struct LivePage {
+    host: cosmo_script::ScriptHost,
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    document_url: String,
+}
+
+impl LivePage {
+    /// Parse `html`, run its scripts once (immediate first paint — no waiting on
+    /// in-flight fetches), and lay out. The host and DOM are retained so
+    /// `pump_and_relayout` can apply later async mutations.
+    pub fn load(document_url: &str, html: &str, rect: &FrameRect) -> (Self, LayoutScene) {
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let dom = window.borrow().document();
+
+        let mut host = cosmo_script::ScriptHost::new();
+        host.set_location(document_url);
+        host.set_local_storage_entries(local_storage_snapshot(document_url));
+        host.set_fetch_engine(crate::loader::make_fetch_engine(document_url));
+        host.set_document(dom.clone());
+
+        let script = get_js_content(dom.clone());
+        const MAX_SCRIPT_BYTES: usize = 512 * 1024;
+        if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
+            let _ = host.eval_to_string(&script);
+            host.run_initial_load(1000);
+        }
+        replace_local_storage(document_url, &host.local_storage_entries());
+
+        let (scene, _tree) = layout_dom(dom.clone(), document_url, rect);
+        (
+            Self {
+                host,
+                dom,
+                document_url: document_url.to_string(),
+            },
+            scene,
+        )
     }
 
-    ScriptLayoutResult {
-        layout_scene,
-        render_tree,
-        diagnostics,
-        dom_updated,
+    /// Whether asynchronous work (fetch/XHR) is still outstanding — i.e. another
+    /// `pump_and_relayout` may yield an updated scene.
+    pub fn has_pending_work(&self) -> bool {
+        self.host.has_pending_fetches()
+    }
+
+    /// Drain any settled async work (fetch/XHR completions, timers) so their
+    /// `.then`/handlers mutate the DOM, then re-lay-out the retained DOM at
+    /// `rect` and return the fresh scene. Does not re-parse the HTML.
+    pub fn pump_and_relayout(&mut self, rect: &FrameRect) -> LayoutScene {
+        self.host.run_initial_load(1000);
+        replace_local_storage(&self.document_url, &self.host.local_storage_entries());
+        let (scene, _tree) = layout_dom(self.dom.clone(), &self.document_url, rect);
+        scene
+    }
+
+    /// Drain buffered `console.*` output (diagnostics).
+    pub fn take_console_log(&self) -> Vec<String> {
+        self.host.take_console_log()
     }
 }
 
@@ -622,6 +704,58 @@ mod tests {
         let has_b = result.render_tree_contains("net-b");
         let _ = server.join();
         assert!(has_a && has_b, "fetched items not rendered; diagnostics={:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn live_page_progressive_render_after_fetch() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"items":["late-x","late-y"]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{port}/");
+        let html = "<html><head><style>body{margin:0}</style></head><body>\
+            <ul id=\"list\"></ul>\
+            <script>\
+              fetch('data.json').then(function(r){return r.json();}).then(function(d){\
+                var ul=document.getElementById('list');\
+                for(var i=0;i<d.items.length;i++){var li=document.createElement('li');li.textContent=d.items[i];ul.appendChild(li);}\
+              });\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+
+        // First paint happens immediately, before the fetch resolves.
+        let (mut page, first_scene) = LivePage::load(&base, html, &rect);
+        let first_has = first_scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-")));
+        assert!(!first_has, "fetched data should NOT be in the first paint");
+        assert!(page.has_pending_work(), "the fetch should still be in flight");
+
+        // Poll for completion (worker thread), then re-lay-out the SAME page.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut scene = first_scene;
+        while page.has_pending_work() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            scene = page.pump_and_relayout(&rect);
+        }
+        let _ = server.join();
+
+        let now_has_x = scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-x")));
+        let now_has_y = scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-y")));
+        assert!(now_has_x && now_has_y, "progressive re-layout did not render the fetched items");
     }
 }
 
