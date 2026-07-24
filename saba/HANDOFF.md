@@ -318,8 +318,15 @@
 >   マクロで各 field に `.with()` を生やし**60 箇所の呼び出しは無変更**。JS は単一スレッドなので
 >   同時1アクティブだが host ごとに独立状態→「1スレッド1host」制約が解消(frameset/iframe が
 >   各々 script host を持てる)。2 host 独立性テスト追加。全 green、reftest 12/12。
-> - 次(残課題): **true 差分 relayout(Phase 4.1)** — dirty-bit 伝播で変更サブツリーのみ再計算。
->   setRequestHeader の CORS 検証。frameset の複数 LivePage 対応(D5 で下地はできた)。
+> - 🚧 **Phase 4.1 stage 1 (`7e112fc`)** — 「安全な土台から段階的に」方針。(a) `layout_dom` を
+>   `resolve_cssom`(CSS 取得+パース)と `layout_dom_with_style` に分割し、**LivePage が CSSOM を
+>   load 時に1回パースして pump/reflow で再利用**(script の DOM 変異は通常 stylesheet を変えないので
+>   毎回の CSS 再パースを削減=最初の incremental win。動的追加の <style>/<link> は navigation まで
+>   未反映)。(b) **安全網 `COSMO_LAYOUT_ASSERT=1`**: pump_and_relayout が full レイアウトも計算して
+>   scene の byte 一致を assert(乖離は panic)。テスト: fetch 変異 pump を assert 下で検証。reftest 12/12。
+> - 次(Phase 4.1 継続): per-node layout-dirty フラグ + DOM→LayoutObject 対応 → 変更サブツリーのみ
+>   部分再計算(assert harness で常に full 一致を担保しながら)。setRequestHeader の CORS 検証。
+>   frameset の複数 LivePage 対応(D5 で下地済み)。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
