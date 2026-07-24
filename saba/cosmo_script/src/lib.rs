@@ -4,7 +4,7 @@
 
 use boa_engine::{
     js_string,
-    object::{JsObject, ObjectInitializer},
+    object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
     property::{Attribute, PropertyDescriptor},
     Context, JsData, JsResult, JsValue, NativeFunction, Source,
 };
@@ -101,6 +101,23 @@ struct PendingFetch {
     resolvers: ResolvingFunctions,
 }
 
+/// Host data on an `XMLHttpRequest` object: the request configuration set
+/// between `open()` and `send()`.
+#[derive(Trace, Finalize, JsData, Default)]
+struct XhrState {
+    #[unsafe_ignore_trace]
+    method: RefCell<String>,
+    #[unsafe_ignore_trace]
+    url: RefCell<String>,
+}
+
+/// An `XMLHttpRequest.send()` awaiting its worker response: the channel plus
+/// the XHR object to update and fire callbacks on when it arrives.
+struct PendingXhr {
+    rx: std::sync::mpsc::Receiver<FetchResponse>,
+    obj: JsObject,
+}
+
 /// A scheduled `setTimeout`/`setInterval`/`requestAnimationFrame` callback
 /// awaiting its turn.
 struct Timer {
@@ -155,6 +172,9 @@ thread_local! {
 
     /// In-flight `fetch` requests awaiting their worker response.
     static PENDING_FETCHES: RefCell<Vec<PendingFetch>> = const { RefCell::new(Vec::new()) };
+
+    /// In-flight `XMLHttpRequest.send()` requests awaiting their response.
+    static PENDING_XHR: RefCell<Vec<PendingXhr>> = const { RefCell::new(Vec::new()) };
 }
 
 fn ls_get(key: &str) -> Option<String> {
@@ -1291,6 +1311,7 @@ impl ScriptHost {
         CONSOLE_LOG.with(|l| l.borrow_mut().clear());
         POSTED_MESSAGES.with(|m| m.borrow_mut().clear());
         PENDING_FETCHES.with(|p| p.borrow_mut().clear());
+        PENDING_XHR.with(|p| p.borrow_mut().clear());
         VIRTUAL_CLOCK.with(|c| c.set(0));
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
     }
@@ -1396,6 +1417,18 @@ impl ScriptHost {
         self.context
             .register_global_property(js_string!("fetch"), fetch_fn, Attribute::all())
             .expect("register fetch");
+
+        // XMLHttpRequest (constructable).
+        let xhr_ctor = FunctionObjectBuilder::new(
+            &self.context.realm().clone(),
+            NativeFunction::from_fn_ptr(xhr_construct),
+        )
+        .name(js_string!("XMLHttpRequest"))
+        .constructor(true)
+        .build();
+        self.context
+            .register_global_property(js_string!("XMLHttpRequest"), xhr_ctor, Attribute::all())
+            .expect("register XMLHttpRequest");
 
         // location: a live view over LOCATION_HREF.
         let realm = self.context.realm().clone();
@@ -1539,10 +1572,11 @@ impl ScriptHost {
         FETCH_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
     }
 
-    /// Whether any `fetch` requests are still awaiting their response. The
+    /// Whether any `fetch`/XHR requests are still awaiting their response. The
     /// runtime uses this to decide whether another layout pass is warranted.
     pub fn has_pending_fetches(&self) -> bool {
         PENDING_FETCHES.with(|p| !p.borrow().is_empty())
+            || PENDING_XHR.with(|p| !p.borrow().is_empty())
     }
 
     /// Poll in-flight fetches; settle any whose response has arrived (resolving
@@ -1592,8 +1626,81 @@ impl ScriptHost {
                     .call(&JsValue::undefined(), &[JsValue::from(response)], &mut self.context);
             }
         }
-        if settled > 0 {
+        let xhr_settled = self.pump_xhr();
+        if settled > 0 || xhr_settled > 0 {
             self.context.run_jobs();
+        }
+        settled + xhr_settled
+    }
+
+    /// Poll in-flight XHRs; for each completed one, update its object
+    /// (status/statusText/responseText/response/readyState=4) and fire its
+    /// `onreadystatechange` then `onload` (or `onerror` on network failure).
+    fn pump_xhr(&mut self) -> usize {
+        let mut ready: Vec<(JsObject, FetchResponse)> = Vec::new();
+        PENDING_XHR.with(|p| {
+            let mut v = p.borrow_mut();
+            let mut i = 0;
+            while i < v.len() {
+                match v[i].rx.try_recv() {
+                    Ok(resp) => {
+                        let px = v.remove(i);
+                        ready.push((px.obj, resp));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let px = v.remove(i);
+                        ready.push((
+                            px.obj,
+                            FetchResponse {
+                                ok: false,
+                                status: 0,
+                                status_text: String::new(),
+                                url: String::new(),
+                                body: String::new(),
+                                error: Some("xhr worker disconnected".to_string()),
+                            },
+                        ));
+                    }
+                }
+            }
+        });
+        let settled = ready.len();
+        for (obj, resp) in ready {
+            let is_error = resp.error.is_some();
+            let set = |obj: &JsObject, key, val: JsValue, ctx: &mut Context| {
+                let _ = obj.set(key, val, false, ctx);
+            };
+            set(&obj, js_string!("status"), JsValue::from(resp.status), &mut self.context);
+            set(
+                &obj,
+                js_string!("statusText"),
+                JsValue::from(js_string!(resp.status_text.as_str())),
+                &mut self.context,
+            );
+            set(
+                &obj,
+                js_string!("responseText"),
+                JsValue::from(js_string!(resp.body.as_str())),
+                &mut self.context,
+            );
+            set(
+                &obj,
+                js_string!("response"),
+                JsValue::from(js_string!(resp.body.as_str())),
+                &mut self.context,
+            );
+            set(&obj, js_string!("readyState"), JsValue::from(4u32), &mut self.context);
+
+            let this = JsValue::from(obj.clone());
+            // onreadystatechange fires on every state change; here the terminal one.
+            for handler in ["onreadystatechange", if is_error { "onerror" } else { "onload" }] {
+                if let Ok(cb) = obj.get(js_string!(handler), &mut self.context) {
+                    if let Some(func) = cb.as_object().filter(|o| o.is_callable()) {
+                        let _ = func.call(&this, &[], &mut self.context);
+                    }
+                }
+            }
         }
         settled
     }
@@ -1912,6 +2019,114 @@ fn response_json(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<
         Ok(v) => JsValue::from(JsPromise::resolve(v, ctx)),
         Err(e) => JsValue::from(JsPromise::reject(e, ctx)),
     })
+}
+
+/// `new XMLHttpRequest()` — build an XHR instance with XhrState host data,
+/// the open/send/setRequestHeader methods, and the initial readonly-ish state
+/// (readyState 0, status 0, empty responseText, null handlers).
+fn xhr_construct(_this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let obj = JsObject::from_proto_and_data(None, XhrState::default());
+    let realm = ctx.realm().clone();
+    let method = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, name, len| {
+        let desc = PropertyDescriptor::builder()
+            .value(NativeFunction::from_fn_ptr(f).to_js_function(&realm))
+            .writable(true)
+            .enumerable(false)
+            .configurable(true)
+            .build();
+        obj.insert_property(name, desc);
+        let _ = len;
+    };
+    method(xhr_open, js_string!("open"), 2);
+    method(xhr_send, js_string!("send"), 1);
+    method(xhr_set_request_header, js_string!("setRequestHeader"), 2);
+    method(xhr_abort, js_string!("abort"), 0);
+
+    let data = |v: JsValue| {
+        PropertyDescriptor::builder()
+            .value(v)
+            .writable(true)
+            .enumerable(true)
+            .configurable(true)
+            .build()
+    };
+    obj.insert_property(js_string!("readyState"), data(JsValue::from(0u32)));
+    obj.insert_property(js_string!("status"), data(JsValue::from(0u32)));
+    obj.insert_property(js_string!("statusText"), data(JsValue::from(js_string!(""))));
+    obj.insert_property(js_string!("responseText"), data(JsValue::from(js_string!(""))));
+    obj.insert_property(js_string!("response"), data(JsValue::from(js_string!(""))));
+    obj.insert_property(js_string!("onreadystatechange"), data(JsValue::null()));
+    obj.insert_property(js_string!("onload"), data(JsValue::null()));
+    obj.insert_property(js_string!("onerror"), data(JsValue::null()));
+    Ok(JsValue::from(obj))
+}
+
+fn xhr_state(this: &JsValue) -> Option<JsObject> {
+    this.as_object()
+        .filter(|o| o.downcast_ref::<XhrState>().is_some())
+        .cloned()
+}
+
+fn xhr_open(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(obj) = xhr_state(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let method = a.first().cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
+    let url = a.get(1).cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
+    if let Some(state) = obj.downcast_ref::<XhrState>() {
+        *state.method.borrow_mut() = method;
+        *state.url.borrow_mut() = url;
+    }
+    let _ = obj.set(js_string!("readyState"), JsValue::from(1u32), false, ctx);
+    Ok(JsValue::undefined())
+}
+
+fn xhr_send(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(obj) = xhr_state(this) else {
+        return Ok(JsValue::undefined());
+    };
+    let (method, url) = {
+        let state = obj.downcast_ref::<XhrState>().unwrap();
+        let m = state.method.borrow().clone();
+        let u = state.url.borrow().clone();
+        (m, u)
+    };
+    let body = match a.first() {
+        Some(v) if !v.is_undefined() && !v.is_null() => Some(v.to_string(ctx)?.to_std_string_escaped()),
+        _ => None,
+    };
+    let started = FETCH_ENGINE.with(|e| {
+        e.borrow()
+            .as_ref()
+            .map(|eng| eng.start(FetchRequest { url, method, body }))
+    });
+    match started {
+        Some(rx) => PENDING_XHR.with(|p| p.borrow_mut().push(PendingXhr { rx, obj })),
+        None => {
+            // No backend — fire onerror on the next pump-equivalent (do it now).
+            let this_v = JsValue::from(obj.clone());
+            if let Ok(cb) = obj.get(js_string!("onerror"), ctx) {
+                if let Some(func) = cb.as_object().filter(|o| o.is_callable()) {
+                    let _ = func.call(&this_v, &[], ctx);
+                }
+            }
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+/// setRequestHeader is accepted but not yet forwarded (FetchRequest carries no
+/// headers). Kept so pages that set headers don't throw.
+fn xhr_set_request_header(_this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn xhr_abort(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    // Drop any pending request for this object.
+    if let Some(obj) = xhr_state(this) {
+        PENDING_XHR.with(|p| p.borrow_mut().retain(|px| px.obj != obj));
+    }
+    Ok(JsValue::undefined())
 }
 
 fn script_dom_root() -> Option<Rc<RefCell<Node>>> {
@@ -2842,6 +3057,44 @@ mod tests {
         assert_eq!(host.eval_to_string("globalThis.ok").unwrap(), "true");
         assert_eq!(host.eval_to_string("globalThis.done").unwrap(), "ok:3");
         assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "abc");
+        assert!(!host.has_pending_fetches());
+    }
+
+    #[test]
+    fn xhr_async_delivers_response_and_fires_handlers() {
+        let html = "<html><body><p id=\"out\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_fetch_engine(Box::new(MockFetch {
+            status: 201,
+            body: "hello-xhr".to_string(),
+        }));
+        host.set_document(document);
+
+        host.eval_to_string(
+            "globalThis.log = ''; \
+             var x = new XMLHttpRequest(); \
+             x.open('GET', '/thing'); \
+             globalThis.opened = x.readyState; \
+             x.onload = function() { \
+                 globalThis.log = x.readyState + ':' + x.status + ':' + x.responseText; \
+                 document.getElementById('out').textContent = x.responseText; \
+             }; \
+             x.send();",
+        )
+        .unwrap();
+
+        // readyState is OPENED (1) after open(); response not delivered yet.
+        assert_eq!(host.eval_to_string("globalThis.opened").unwrap(), "1");
+        assert_eq!(host.eval_to_string("globalThis.log").unwrap(), "");
+        assert!(host.has_pending_fetches());
+
+        host.run_initial_load(100);
+
+        // onload fired with DONE (4), status and body populated.
+        assert_eq!(host.eval_to_string("globalThis.log").unwrap(), "4:201:hello-xhr");
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "hello-xhr");
         assert!(!host.has_pending_fetches());
     }
 
