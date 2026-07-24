@@ -1,11 +1,8 @@
 use cosmo_engine::renderer::css::cssom::CssParser;
 use cosmo_engine::renderer::css::token::CssTokenizer;
-use cosmo_engine::renderer::dom::api::{get_js_content, get_style_content};
+use cosmo_engine::renderer::dom::api::{get_element_by_id, get_js_content, get_style_content};
 use cosmo_engine::renderer::html::parser::HtmlParser;
 use cosmo_engine::renderer::html::token::HtmlTokenizer;
-use cosmo_engine::renderer::js::ast::JsParser;
-use cosmo_engine::renderer::js::runtime::JsRuntime;
-use cosmo_engine::renderer::js::token::JsLexer;
 use cosmo_engine::renderer::layout::layout_view::LayoutView;
 use cosmo_runtime::{AppService, PageViewModel, BrowserApp};
 use std::env;
@@ -166,20 +163,24 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
     let dom = window.borrow().document();
 
     let script = get_js_content(dom.clone());
-    let mut runtime = JsRuntime::new(dom.clone());
+    let mut host = cosmo_script::ScriptHost::new();
+    host.set_document(dom.clone());
     if !script.trim().is_empty() {
-        let lexer = JsLexer::new(script);
-        let mut parser = JsParser::new(lexer);
-        let program = parser.parse_ast();
-        runtime.execute(&program);
+        if let Err(error) = host.eval_to_string(&script) {
+            eprintln!("script error: {error}");
+        }
+        host.run_initial_load(1000);
     }
 
     if let Some(target_id) = click_target_id {
         // Spec: input/change/click are dispatched through EventTarget dispatch steps.
         // https://dom.spec.whatwg.org/#concept-event-dispatch
-        runtime.dispatch_input(target_id);
-        runtime.dispatch_change(target_id);
-        runtime.dispatch_click(target_id);
+        if let Some(target) = get_element_by_id(Some(dom.clone()), &target_id.to_string()) {
+            for event in ["input", "change", "click"] {
+                host.dispatch_event(target.clone(), event);
+            }
+            host.run_initial_load(1000);
+        }
     }
 
     let style = get_style_content(dom.clone());
@@ -189,18 +190,14 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
 
     println!("fixture: {fixture_path}");
     println!("click_target_id: {}", click_target_id.unwrap_or("<none>"));
-    println!(
-        "render_pipeline_invalidated: {}",
-        runtime.render_pipeline_invalidated()
-    );
     println!("display_items: {}", display_items.len());
 
-    let diagnostics = runtime.unsupported_apis();
+    let diagnostics = host.take_console_log();
     if diagnostics.is_empty() {
-        println!("diagnostics: <none>");
+        println!("console: <none>");
     } else {
         for line in diagnostics {
-            println!("diagnostic: {line}");
+            println!("console: {line}");
         }
     }
 

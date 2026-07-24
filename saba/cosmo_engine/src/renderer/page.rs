@@ -3,7 +3,6 @@ use crate::display_item::DisplayItem;
 use crate::renderer::css::cssom::CssParser;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::css::token::CssTokenizer;
-use crate::renderer::dom::api::get_js_content;
 use crate::renderer::dom::api::get_style_content;
 use crate::renderer::dom::api::get_stylesheet_links;
 use crate::renderer::dom::api::get_title_content;
@@ -13,9 +12,6 @@ use crate::renderer::dom::node::NodeKind;
 use crate::renderer::dom::node::Window;
 use crate::renderer::html::parser::HtmlParser;
 use crate::renderer::html::token::HtmlTokenizer;
-use crate::renderer::js::ast::JsParser;
-use crate::renderer::js::runtime::JsRuntime;
-use crate::renderer::js::token::JsLexer;
 use crate::renderer::layout::layout_object::LayoutSize;
 use crate::renderer::layout::layout_view::LayoutView;
 use std::rc::Rc;
@@ -49,8 +45,9 @@ impl Page {
     }
 
     pub fn load_html(&mut self, html: String, extra_style: String, viewport_width: i64) {
+        // NOTE: this in-engine Page pipeline does not run scripts; JavaScript
+        // execution lives in cosmo_runtime via the Boa engine (cosmo_script).
         self.create_frame(html, extra_style);
-        self.execute_js();
         self.set_layout_view(viewport_width);
         self.paint_tree();
     }
@@ -58,29 +55,6 @@ impl Page {
     pub fn reflow(&mut self, viewport_width: i64) {
         self.set_layout_view(viewport_width);
         self.paint_tree();
-    }
-
-    fn execute_js(&mut self) {
-        let dom = match &self.frame {
-            Some(frame) => frame.borrow().document(),
-            None => return,
-        };
-
-        let js = get_js_content(dom.clone());
-        // Skip JS execution entirely when there's nothing meaningful to run
-        // or when the payload is large enough that parsing would take an
-        // unreasonable amount of time (CMS pages routinely ship hundreds of
-        // kilobytes of minified JS that this engine cannot execute anyway).
-        const MAX_SCRIPT_BYTES: usize = 32 * 1024;
-        if js.trim().is_empty() || js.len() > MAX_SCRIPT_BYTES {
-            return;
-        }
-        let lexer = JsLexer::new(js);
-        let mut parser = JsParser::new(lexer);
-        let ast = parser.parse_ast();
-
-        let mut runtime = JsRuntime::new(dom);
-        runtime.execute(&ast);
     }
 
     fn create_frame(&mut self, html: String, extra_style: String) {

@@ -2,7 +2,6 @@ pub mod browser;
 pub mod constants;
 pub mod display_item;
 pub mod error;
-pub mod js_runtime;
 pub mod paint_commands;
 pub mod paint_mapper;
 pub mod renderer;

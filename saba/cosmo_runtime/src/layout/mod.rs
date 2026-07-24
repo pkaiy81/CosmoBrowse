@@ -3,7 +3,6 @@ use crate::model::{
     ResolvedStyle, SceneItem,
 };
 use crate::security::{local_storage_snapshot, replace_local_storage};
-use cosmo_engine::js_runtime::JsDomRuntimeBridge;
 use cosmo_engine::renderer::css::cssom::CssParser;
 use cosmo_engine::renderer::css::token::CssTokenizer;
 use crate::loader::fetch_external_stylesheets;
@@ -13,9 +12,6 @@ use cosmo_engine::renderer::dom::api::{
 use cosmo_engine::renderer::dom::node::NodeKind;
 use cosmo_engine::renderer::html::parser::HtmlParser;
 use cosmo_engine::renderer::html::token::HtmlTokenizer;
-use cosmo_engine::renderer::js::ast::JsParser;
-use cosmo_engine::renderer::js::runtime::JsRuntime;
-use cosmo_engine::renderer::js::token::JsLexer;
 use cosmo_engine::renderer::layout::computed_style::{
     DisplayType, PositionType, TextDecoration,
 };
@@ -118,14 +114,9 @@ pub fn build_layout_scene_with_script_runtime(
     let window = HtmlParser::new(tokenizer).construct_tree();
     let dom = window.borrow().document();
 
-    // Script execution: the real Boa engine (cosmo_script) when
-    // COSMO_USE_BOA=1, otherwise the legacy toy interpreter. Both mutate the
-    // same `dom` in place, so layout below sees the post-script tree.
-    let (dom_updated, mut script_diagnostics) = if use_boa_engine() {
-        execute_scripts_boa(document_url, dom.clone())
-    } else {
-        execute_scripts_toy(document_url, dom.clone())
-    };
+    // Script execution: the real Boa engine (cosmo_script) mutates `dom` in
+    // place, so layout below sees the post-script tree.
+    let (dom_updated, mut script_diagnostics) = execute_scripts_boa(document_url, dom.clone());
 
     // Combine external <link rel="stylesheet"> sheets with inline <style>.
     // External sheets are applied first so a later inline <style> wins on equal
@@ -161,44 +152,6 @@ pub fn build_layout_scene_with_script_runtime(
         diagnostics,
         dom_updated,
     }
-}
-
-/// Whether to route script execution through the real Boa engine
-/// (`cosmo_script`). **On by default** — verified pixel-identical on the frozen
-/// fixtures (HN/MDN/Wikipedia) and the reftest corpus, and it runs real JS the
-/// toy interpreter cannot. Opt back into the legacy toy interpreter with
-/// `COSMO_USE_BOA=0` (or `COSMO_LEGACY_JS=1`) for A/B comparison.
-fn use_boa_engine() -> bool {
-    if std::env::var("COSMO_LEGACY_JS").map(|v| v == "1").unwrap_or(false) {
-        return false;
-    }
-    std::env::var("COSMO_USE_BOA").map(|v| v != "0").unwrap_or(true)
-}
-
-/// Run page scripts with the legacy toy interpreter (the default path).
-fn execute_scripts_toy(
-    document_url: &str,
-    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
-) -> (bool, Vec<String>) {
-    let script = get_js_content(dom.clone());
-    let mut runtime = JsRuntime::new(dom);
-    runtime.replace_local_storage_entries(local_storage_snapshot(document_url));
-    // Real-world pages (Wix, Squarespace, GA/GTM-instrumented sites) ship
-    // hundreds of kilobytes of minified JavaScript that this engine cannot
-    // meaningfully execute.  Even just *parsing* that volume of tokens can
-    // take many seconds and trip an infinite loop in the recursive-descent
-    // parser when fed constructs it doesn't understand.  Bail out early when
-    // the script payload exceeds a conservative size so navigation to such
-    // pages stays responsive — the engine doesn't run their JS anyway.
-    const MAX_SCRIPT_BYTES: usize = 32 * 1024;
-    if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
-        let lexer = JsLexer::new(script);
-        let mut parser = JsParser::new(lexer);
-        let program = parser.parse_ast();
-        runtime.execute(&program);
-    }
-    replace_local_storage(document_url, &runtime.local_storage_entries());
-    (runtime.dom_updated(), runtime.diagnostics())
 }
 
 /// Run page scripts with the real Boa engine (`cosmo_script`). Mutates `dom`
