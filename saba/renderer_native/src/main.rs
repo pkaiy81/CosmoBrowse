@@ -503,6 +503,11 @@ impl ApplicationHandler<UserEvent> for App {
     /// Woken by a background image fetch completing; repaint so the new image
     /// becomes visible.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        // A background fetch/XHR (or image) completed: pump any settled async
+        // work into the page (progressive rendering), then repaint.
+        if self.bridge.pump_progressive() {
+            self.scroll_y = self.scroll_y.min(self.bridge.content_height());
+        }
         self.needs_redraw = true;
         self.request_redraw();
     }
@@ -664,6 +669,10 @@ fn headless_screenshot(url: &str, out_path: &str) {
         eprintln!("[SCREENSHOT] set_viewport error: {}", e);
         return;
     }
+    // Headless capture is one-shot: settle in-flight fetch/XHR so the PNG
+    // reflects the fully-loaded page (progressive updates can't be observed
+    // across frames here).
+    bridge.settle_async(300);
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
@@ -713,6 +722,8 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
         eprintln!("[SCREENSHOT] set_viewport error: {}", e);
         return;
     }
+    // One-shot capture: settle in-flight fetch/XHR before painting.
+    bridge.settle_async(300);
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
     let chrome = ChromeState::new();
@@ -769,6 +780,8 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
         eprintln!("[SCREENSHOT] set_viewport error: {}", e);
         return;
     }
+    // One-shot capture: settle in-flight fetch/XHR before painting.
+    bridge.settle_async(300);
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
     let chrome = ChromeState::new();
@@ -891,6 +904,14 @@ fn real_main() {
     // Let the image cache wake the event loop to repaint when an
     // asynchronously-fetched image becomes available.
     app.image_cache.set_notifier(event_loop.create_proxy());
+    // Let script fetch/XHR completions wake the loop to pump + repaint
+    // (progressive rendering).
+    {
+        let proxy = event_loop.create_proxy();
+        app.bridge.set_waker(std::sync::Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::Redraw);
+        }));
+    }
 
     if let Some(url) = &url {
         app.chrome.set_url(url);

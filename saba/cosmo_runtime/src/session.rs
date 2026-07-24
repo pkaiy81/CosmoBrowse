@@ -1,5 +1,5 @@
 use crate::download::DownloadManager;
-use crate::layout::{build_layout_scene_with_script_runtime, RelayoutTrigger};
+use crate::layout::{build_static_scene, RelayoutTrigger};
 use crate::loader::{
     build_frame_id, fetch_document, parse_frameset_document, prepare_html_for_display,
     register_tls_exception_for_url, resolve_url, FramesetChild, FramesetSpec, LoadedDocument,
@@ -1061,7 +1061,11 @@ fn build_leaf_frame_view(
     // Spec mapping: HTML LS parsing + DOM Standard tree updates happen in the
     // layout/JS runtime stage, and resulting computed boxes are painted in
     // CSS Display + CSS2 visual formatting model order as `scene_items`.
-    let script_layout = build_layout_scene_with_script_runtime(current_url, html, &rect);
+    // Static layout only — scripts run in the GUI's AppBridge via a persistent
+    // LivePage (single execution on the renderer thread; the Boa Context is
+    // !Send and cannot live behind the adapter Mutex). The frame retains its
+    // html_content so AppBridge can build the LivePage from this DTO.
+    let script_layout = build_static_scene(current_url, html, &rect);
     diagnostics.extend(script_layout.diagnostics.clone());
     if script_layout.dom_updated {
         diagnostics.push(RelayoutTrigger::DomChanged.as_diagnostic().to_string());

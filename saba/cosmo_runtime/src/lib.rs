@@ -17,6 +17,8 @@ pub use model::{
     SearchResult, SecurityPolicy, SessionSnapshot, TabSessionSnapshot, TabSummary,
     SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
+pub use layout::LivePage;
+pub use loader::FetchWaker;
 pub use paint::scene_items_to_paint_commands;
 pub use session::BrowserApp;
 

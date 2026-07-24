@@ -132,6 +132,24 @@ pub fn build_layout_scene_with_script_runtime(
     }
 }
 
+/// Parse `html` and lay it out **without running scripts**. Used by the
+/// session to produce the initial frame structure/static content; the GUI's
+/// `AppBridge` then owns script execution via a persistent [`LivePage`] (so
+/// scripts run exactly once, on the renderer thread — Boa's Context is !Send
+/// and can't live behind the adapter's Mutex). Non-GUI callers that want
+/// scripts use [`build_layout_scene_with_script_runtime`] directly.
+pub fn build_static_scene(document_url: &str, html: &str, rect: &FrameRect) -> ScriptLayoutResult {
+    let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+    let dom = window.borrow().document();
+    let (layout_scene, render_tree) = layout_dom(dom, document_url, rect);
+    ScriptLayoutResult {
+        layout_scene,
+        render_tree,
+        diagnostics: Vec::new(),
+        dom_updated: false,
+    }
+}
+
 /// Resolve styles for `dom` and produce its scene + render-tree snapshot at
 /// `rect`. Shared by the one-shot pipeline and the persistent [`LivePage`], so
 /// script-driven mutations re-layout identically.
@@ -228,6 +246,13 @@ impl LivePage {
     /// `pump_and_relayout` may yield an updated scene.
     pub fn has_pending_work(&self) -> bool {
         self.host.has_pending_fetches()
+    }
+
+    /// Re-lay-out the retained DOM at `rect` **without** running scripts or
+    /// pumping async work (used on viewport resize — a reflow, not a re-run).
+    pub fn relayout(&mut self, rect: &FrameRect) -> LayoutScene {
+        let (scene, _tree) = layout_dom(self.dom.clone(), &self.document_url, rect);
+        scene
     }
 
     /// Drain any settled async work (fetch/XHR completions, timers) so their

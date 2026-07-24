@@ -1,10 +1,26 @@
 /// Bridge between the native renderer and the browser engine (NativeAdapter).
 use adapter_native::{BrowserFrameDto, BrowserPageDto, NativeAdapter};
 use cosmo_engine::paint_commands::PaintCommand;
+use cosmo_runtime::{scene_items_to_paint_commands, FetchWaker, FrameRect, LivePage, SceneItem};
+
+/// The persistent script host for the root content frame (see module note on
+/// progressive rendering). Only the single root frame is script-hosted for now
+/// — ScriptHost keeps per-page state in thread-locals, so one active host per
+/// thread (plan D5); framesets/child frames render statically.
+struct LiveRoot {
+    frame_id: String,
+    page: LivePage,
+    rect: FrameRect,
+}
 
 pub struct AppBridge {
     adapter: NativeAdapter,
     current_page: Option<BrowserPageDto>,
+    /// Script host for the current page's root frame, kept alive so async work
+    /// (fetch/XHR/timers) can settle after first paint and re-layout.
+    live_root: Option<LiveRoot>,
+    /// Fires when async work completes so the event loop wakes to pump.
+    waker: Option<FetchWaker>,
 }
 
 impl AppBridge {
@@ -12,12 +28,20 @@ impl AppBridge {
         Self {
             adapter: NativeAdapter::default(),
             current_page: None,
+            live_root: None,
+            waker: None,
         }
+    }
+
+    /// Install the wake-up callback fired when a fetch/XHR response is ready.
+    pub fn set_waker(&mut self, waker: FetchWaker) {
+        self.waker = Some(waker);
     }
 
     pub fn navigate(&mut self, url: &str) -> Result<(), String> {
         let page = self.adapter.open_url(url).map_err(|e| e.message)?;
         self.current_page = Some(page);
+        self.run_root_scripts();
         // Spec: HTML Living Standard §7.4 — scroll to the fragment anchor after navigation.
         // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
         self.apply_anchor_scroll_for(url);
@@ -27,18 +51,21 @@ impl AppBridge {
     pub fn back(&mut self) -> Result<(), String> {
         let page = self.adapter.back().map_err(|e| e.message)?;
         self.current_page = Some(page);
+        self.run_root_scripts();
         Ok(())
     }
 
     pub fn forward(&mut self) -> Result<(), String> {
         let page = self.adapter.forward().map_err(|e| e.message)?;
         self.current_page = Some(page);
+        self.run_root_scripts();
         Ok(())
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
         let page = self.adapter.reload().map_err(|e| e.message)?;
         self.current_page = Some(page);
+        self.run_root_scripts();
         Ok(())
     }
 
@@ -53,10 +80,95 @@ impl AppBridge {
             .activate_link(frame_id, href, target)
             .map_err(|e| e.message)?;
         self.current_page = Some(page);
+        self.run_root_scripts();
         // Spec: HTML Living Standard §7.4 — scroll to the fragment anchor after navigation.
         // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
         self.apply_anchor_scroll_for(href);
         Ok(())
+    }
+
+    /// Build a LivePage for the current root frame, run its scripts, and splice
+    /// the resulting scene into the page (first paint). Only single-frame pages
+    /// are script-hosted; framesets render statically.
+    fn run_root_scripts(&mut self) {
+        self.live_root = None;
+        let Some(page) = &self.current_page else {
+            return;
+        };
+        let root = &page.root_frame;
+        // Frameset pages (with child frames) stay on the static path.
+        if !root.child_frames.is_empty() {
+            return;
+        }
+        let Some(html) = root.html_content.clone() else {
+            return;
+        };
+        let rect = FrameRect {
+            x: root.rect.x,
+            y: root.rect.y,
+            width: root.rect.width,
+            height: root.rect.height,
+        };
+        let url = root.document_url.clone();
+        let frame_id = root.id.clone();
+        let (live, scene) = LivePage::load(&url, &html, &rect, self.waker.clone());
+        self.splice_root_scene(&scene.scene_items);
+        self.live_root = Some(LiveRoot {
+            frame_id,
+            page: live,
+            rect,
+        });
+    }
+
+    /// Replace the root frame's scene_items + paint_commands with `items`.
+    fn splice_root_scene(&mut self, items: &[SceneItem]) {
+        let Some(page) = &mut self.current_page else {
+            return;
+        };
+        let (list, _errors) = scene_items_to_paint_commands(items);
+        page.root_frame.scene_items = items.to_vec();
+        page.root_frame.paint_commands = list.commands;
+    }
+
+    /// Whether the current page has outstanding async work (fetch/XHR) that a
+    /// later `pump_progressive` may resolve into new content.
+    pub fn has_pending_async(&self) -> bool {
+        self.live_root
+            .as_ref()
+            .map(|r| r.page.has_pending_work())
+            .unwrap_or(false)
+    }
+
+    /// Drain settled async work on the root LivePage, re-lay-out, and splice the
+    /// updated scene. Returns true if the page was updated (caller should
+    /// repaint).
+    pub fn pump_progressive(&mut self) -> bool {
+        let Some(root) = &mut self.live_root else {
+            return false;
+        };
+        if !root.page.has_pending_work() {
+            return false;
+        }
+        let scene = root.page.pump_and_relayout(&root.rect);
+        let items = scene.scene_items;
+        self.splice_root_scene(&items);
+        true
+    }
+
+    /// Pump until async work settles or `max` iterations elapse (headless
+    /// screenshots are one-shot and must capture the settled page). Returns
+    /// whether any update occurred.
+    pub fn settle_async(&mut self, max: usize) -> bool {
+        let mut updated = false;
+        let mut i = 0;
+        while self.has_pending_async() && i < max {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if self.pump_progressive() {
+                updated = true;
+            }
+            i += 1;
+        }
+        updated
     }
 
     /// Notify the layout engine of a new viewport size and return the
@@ -78,6 +190,27 @@ impl AppBridge {
             .set_viewport(width as i64, height as i64)
             .map_err(|e| e.message)?;
         self.current_page = Some(page);
+        // The static DTO from the adapter replaced our scripted root scene;
+        // reflow the retained LivePage at the new rect and splice it back
+        // (a resize reflows — it does NOT re-run scripts).
+        if self.live_root.is_some() {
+            let new_rect = self
+                .current_page
+                .as_ref()
+                .map(|p| FrameRect {
+                    x: p.root_frame.rect.x,
+                    y: p.root_frame.rect.y,
+                    width: p.root_frame.rect.width,
+                    height: p.root_frame.rect.height,
+                })
+                .unwrap_or(FrameRect { x: 0, y: 0, width: width as i64, height: height as i64 });
+            let items = {
+                let root = self.live_root.as_mut().unwrap();
+                root.rect = new_rect.clone();
+                root.page.relayout(&new_rect).scene_items
+            };
+            self.splice_root_scene(&items);
+        }
         Ok(())
     }
 
