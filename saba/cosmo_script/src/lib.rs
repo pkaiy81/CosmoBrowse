@@ -1466,8 +1466,24 @@ impl ScriptHost {
     /// Run the event loop until it settles: Boa's promise/microtask jobs plus
     /// all due timers. Timers fire in due order on a virtual clock (delays
     /// order them but do not block), so `setTimeout(f, 0)` chains resolve.
-    /// `max_timer_fires` bounds runaway `setInterval` loops.
+    /// `max_timer_fires` bounds runaway `setInterval` loops. Intervals are
+    /// rescheduled, so this keeps the animation/interval loop running (use it
+    /// when simulating ongoing time).
     pub fn run_pending(&mut self, max_timer_fires: usize) {
+        self.drain(max_timer_fires, true);
+    }
+
+    /// Run the event loop as at initial page load: microtasks plus due
+    /// one-shot timers (setTimeout(0) chains) and one round of pending
+    /// requestAnimationFrame callbacks, but **each interval fires at most
+    /// once** — a fresh document has not accrued wall-clock time, so
+    /// `setInterval` must not spin at first paint (see HANDOFF: load-time
+    /// event-loop semantics).
+    pub fn run_initial_load(&mut self, max_timer_fires: usize) {
+        self.drain(max_timer_fires, false);
+    }
+
+    fn drain(&mut self, max_timer_fires: usize, reschedule_intervals: bool) {
         self.context.run_jobs();
         let mut fired = 0;
         while fired < max_timer_fires {
@@ -1497,18 +1513,21 @@ impl ScriptHost {
             let _ = timer
                 .callback
                 .call(&JsValue::undefined(), &args, &mut self.context);
-            // Reschedule intervals relative to the virtual clock.
-            if let Some(iv) = timer.interval {
-                let due = clock + iv.max(1);
-                TIMERS.with(|t| {
-                    t.borrow_mut().push(Timer {
-                        id: timer.id,
-                        callback: timer.callback,
-                        due,
-                        interval: Some(iv),
-                        is_raf: false,
-                    })
-                });
+            // Reschedule intervals relative to the virtual clock — unless this
+            // is an initial-load drain, where each interval fires at most once.
+            if reschedule_intervals {
+                if let Some(iv) = timer.interval {
+                    let due = clock + iv.max(1);
+                    TIMERS.with(|t| {
+                        t.borrow_mut().push(Timer {
+                            id: timer.id,
+                            callback: timer.callback,
+                            due,
+                            interval: Some(iv),
+                            is_raf: false,
+                        })
+                    });
+                }
             }
             self.context.run_jobs();
             fired += 1;
@@ -2523,6 +2542,36 @@ mod tests {
         .unwrap();
         host.run_pending(100);
         assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "AB");
+    }
+
+    #[test]
+    fn initial_load_does_not_spin_intervals() {
+        let html = "<html><body><p id=\"out\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // At initial load, a setInterval must fire at most once (no spinning
+        // to the fire cap), while setTimeout(0) chains still resolve.
+        host.eval_to_string(
+            "var n = 0; \
+             setInterval(function() { n++; document.getElementById('out').textContent += 'i'; }, 10); \
+             setTimeout(function() { document.getElementById('out').textContent += 'T'; }, 0);",
+        )
+        .unwrap();
+        host.run_initial_load(1000);
+        assert_eq!(host.eval_to_string("n").unwrap(), "1", "interval fired more than once");
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "Ti");
+
+        // By contrast, run_pending keeps the interval loop going (bounded).
+        host.eval_to_string("n = 0;").unwrap();
+        host.eval_to_string(
+            "setInterval(function() { n++; }, 10);",
+        )
+        .unwrap();
+        host.run_pending(5);
+        assert!(host.eval_to_string("n").unwrap().parse::<i32>().unwrap() >= 2, "run_pending should keep ticking");
     }
 
     #[test]

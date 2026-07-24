@@ -164,10 +164,15 @@ pub fn build_layout_scene_with_script_runtime(
 }
 
 /// Whether to route script execution through the real Boa engine
-/// (`cosmo_script`). Off by default; opt in with `COSMO_USE_BOA=1` while the
-/// legacy toy interpreter remains the reference for the frozen fixtures.
+/// (`cosmo_script`). **On by default** — verified pixel-identical on the frozen
+/// fixtures (HN/MDN/Wikipedia) and the reftest corpus, and it runs real JS the
+/// toy interpreter cannot. Opt back into the legacy toy interpreter with
+/// `COSMO_USE_BOA=0` (or `COSMO_LEGACY_JS=1`) for A/B comparison.
 fn use_boa_engine() -> bool {
-    std::env::var("COSMO_USE_BOA").map(|v| v == "1").unwrap_or(false)
+    if std::env::var("COSMO_LEGACY_JS").map(|v| v == "1").unwrap_or(false) {
+        return false;
+    }
+    std::env::var("COSMO_USE_BOA").map(|v| v != "0").unwrap_or(true)
 }
 
 /// Run page scripts with the legacy toy interpreter (the default path).
@@ -218,8 +223,10 @@ fn execute_scripts_boa(
         if let Err(e) = host.eval_to_string(&script) {
             diagnostics.push(format!("Script error: {e}"));
         }
-        // Drain microtasks and timers (bounded to cap runaway setInterval).
-        host.run_pending(1000);
+        // Drain microtasks + due one-shot timers as at initial load; each
+        // interval fires at most once (no spinning at first paint). Bounded to
+        // cap runaway setTimeout(0) chains.
+        host.run_initial_load(1000);
         true
     } else {
         false
