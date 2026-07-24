@@ -258,8 +258,20 @@
 >   `COSMO_LEGACY_JS=1` で fail = JS 経路を検証)。初期ロード過剰発火も解決:
 >   `run_initial_load()`(microtask + due one-shot を消化、setInterval は最大1回だけ発火)。
 >   `run_pending()` は従来の再スケジュール動作を維持。
+> - ✅ **fetch 実装 (`a48da29`+`30f2977`, 2026-07-24)** — GUI で end-to-end 検証済み
+>   (fetch→r.json()→DOM 構築が実描画)。cosmo_script: `fetch(url,opts)` が Promise を返し、
+>   実 IO は host 提供の `FetchEngine` trait に委譲(cosmo_script はネットワーク非依存を維持)。
+>   `ScriptHost::{set_fetch_engine,has_pending_fetches,pump_fetches}`、drain が fetch を pump
+>   して Response(ok/status/statusText/url + text()/json())で解決 or reject。runtime:
+>   `loader::RuntimeFetchEngine`(ワーカースレッド + reqwest、既存 TLS クライアント選択再利用、
+>   相対 URL 解決、http(s) のみ、body cap)。**ライフサイクルは暫定**: 一発レイアウトなので
+>   execute_scripts_boa は in-flight fetch を bounded-wait(3s、IO は別スレッド)で待ってから
+>   layout。**プログレッシブ描画(描画→完了時に更新)は persistent-host lifecycle が要る=今後**。
+>   統合テスト: ローカル TCP で実 HTTP を配信し fetch した JSON がシーンに描画されることを確認。
+>   フィクスチャ回帰なし(Wikipedia 画素一致・時間 +1.4s のみ)。**残: XMLHttpRequest 未実装**。
 > - 次: (b) Boa の実 watchdog(Context が !Send で別スレッド不可 → 反復/時間ガードの検討)。
->   (c) `renderer/js/` 玩具の削除。fetch/XHR(loader へワーカ委譲、**アーキ判断=ユーザー確認**)、
+>   (c) `renderer/js/` 玩具の削除(Boa 既定になったので安全)。XMLHttpRequest、
+>   プログレッシブ描画(persistent-host + fetch 完了で relayout)、
 >   DOM 変異世代カウンタ(全再構築でなく差分 relayout)、el.dataset。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
