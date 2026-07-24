@@ -284,10 +284,19 @@
 >   挙動不変)。テスト: 実ローカルソケットで初回描画にデータなし→完了後の pump で描画、を実証。
 >   **未接続**: session/render loop への結線 + 完了時の UI スレッド起床が次段。ScriptHost の
 >   thread-local 状態のため当面 1 スレッド 1 アクティブ LivePage(plan D5)。
-> - 次(item 3 継続): (1) session.rs が LivePage を保持し初回描画で返す、(2) worker 完了 →
->   renderer_native のイベントループ起床(channel/waker)、(3) 起床フレームで pump_and_relayout
->   → 新シーンを IPC で送出。関連: DOM 変異世代カウンタ、Boa の実 watchdog、
->   setRequestHeader のヘッダ転送、el.dataset。
+> - 🚧 **item 3 step 2a: fetch 完了 waker (`4c6e3ef`)** — `loader::FetchWaker`
+>   (`Arc<dyn Fn()+Send+Sync>`)を worker から発火、`make_fetch_engine_with_waker` /
+>   `LivePage::load(..., waker)` で貫通。既存の `UserEvent::Redraw`(画像 fetch 用)に接続する起床信号。
+> - ⚠ **item 3 の GUI 結線は「小さく」収まらない(2026-07-24 の設計知見・ユーザー決定=レンダラ
+>   スレッド保持)**: Boa Context が !Send のため LivePage は adapter(`Mutex<BrowserApp>`)越しに
+>   渡せず、**AppBridge(renderer_native, 単一スレッド)で生成必須**。だが二重スクリプト実行を
+>   避けるには**初回描画も LivePage で行う必要**があり、現状シーンは adapter が `BrowserPageDto`
+>   (事前描画済み)として生成し painter/content_height/anchor-scroll/frameset 枠/スクショ経路が
+>   全て DTO 前提。→ シーン生成を adapter から AppBridge へ移し DTO 消費側を全付け替えする大改修に
+>   なる。現状 bounded-wait は fetch 内容を正しく描画済み(遅延のみ)なので増分価値はレイテンシ改善。
+>   **推奨: フル GUI 結線は専用の集中作業として別途。** 中核ロジック(LivePage/waker)はテスト済み。
+> - 次(小さい安全な項目): Boa の実 watchdog(反復/時間ガード)、setRequestHeader のヘッダ転送
+>   (FetchRequest にヘッダ追加)、el.dataset、DOM 変異世代カウンタ。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
