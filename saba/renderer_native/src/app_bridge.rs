@@ -143,10 +143,15 @@ impl AppBridge {
         if !root.page.has_pending_work() {
             return false;
         }
-        let scene = root.page.pump_and_relayout(&root.rect);
-        let items = scene.scene_items;
-        self.splice_root_scene(&items);
-        true
+        // Only re-splice/repaint if the pump actually changed the DOM.
+        match root.page.pump_and_relayout(&root.rect) {
+            Some(scene) => {
+                let items = scene.scene_items;
+                self.splice_root_scene(&items);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Pump until async work settles or `max` iterations elapse (headless

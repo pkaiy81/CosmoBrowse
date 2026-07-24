@@ -159,6 +159,11 @@ thread_local! {
     /// Monotonic virtual clock advanced as timers fire (see run_pending).
     static VIRTUAL_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
+    /// Bumped on every DOM mutation (attribute/child-list/text change). The
+    /// runtime compares it across a pump to skip re-layout when a script tick
+    /// touched no DOM (see LivePage::pump_and_relayout).
+    static DOM_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
     /// The document URL exposed as `location`. Read by the location accessors;
     /// updated by `ScriptHost::set_location` and by assigning `location.href`.
     static LOCATION_HREF: RefCell<String> = RefCell::new(String::from("about:blank"));
@@ -229,6 +234,11 @@ fn parse_url_parts(href: &str) -> (String, String, String, String, String) {
 
 fn node_key(node: &Rc<RefCell<Node>>) -> usize {
     Rc::as_ptr(node) as usize
+}
+
+/// Record a DOM mutation so the runtime knows a re-layout is warranted.
+fn bump_dom_generation() {
+    DOM_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
 /// Wrap a DOM node as an `Element` JsObject exposing live accessors
@@ -363,6 +373,7 @@ fn set_attr_of(this: &JsValue, name: &str, value: &str) {
         if let NodeKind::Element(ref mut e) = node.borrow_mut().kind_mut() {
             e.set_attribute(name, value);
         }
+        bump_dom_generation();
     }
 }
 
@@ -391,10 +402,13 @@ fn detach_node(child: &Rc<RefCell<Node>>) {
             }
         }
     }
-    let mut cb = child.borrow_mut();
-    cb.set_parent(Weak::new());
-    cb.set_previous_sibling(Weak::new());
-    cb.set_next_sibling(None);
+    {
+        let mut cb = child.borrow_mut();
+        cb.set_parent(Weak::new());
+        cb.set_previous_sibling(Weak::new());
+        cb.set_next_sibling(None);
+    }
+    bump_dom_generation();
 }
 
 /// Append `child` as the last child of `parent` (detaching it first).
@@ -412,6 +426,7 @@ fn append_child_node(parent: &Rc<RefCell<Node>>, child: &Rc<RefCell<Node>>) {
     }
     parent.borrow_mut().set_last_child(Rc::downgrade(child));
     child.borrow_mut().set_parent(Rc::downgrade(parent));
+    bump_dom_generation();
 }
 
 /// Insert `new_node` before `ref_node` under `parent`. If `ref_node` is None,
@@ -440,6 +455,7 @@ fn insert_before_node(
     reference
         .borrow_mut()
         .set_previous_sibling(Rc::downgrade(new_node));
+    bump_dom_generation();
 }
 
 /// True if `ancestor` is a (transitive) parent of `node`.
@@ -1147,6 +1163,7 @@ fn dataset_delete(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<J
         if let NodeKind::Element(ref mut e) = node.borrow_mut().kind_mut() {
             e.remove_attribute(&key_to_data_attr(&key));
         }
+        bump_dom_generation();
     }
     Ok(JsValue::from(true))
 }
@@ -1352,6 +1369,8 @@ fn element_set_inner_html(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
             append_child_node(&target, &child);
         }
     }
+    // Covers the case of clearing to empty (no appends above).
+    bump_dom_generation();
     Ok(JsValue::undefined())
 }
 
@@ -1396,10 +1415,12 @@ fn element_set_text_content(
     // children with a single text node.
     if let NodeKind::Text(_) = node.borrow().kind() {
         *node.borrow_mut().kind_mut() = NodeKind::Text(text);
+        bump_dom_generation();
         return Ok(JsValue::undefined());
     }
     node.borrow_mut()
         .set_first_child(Some(Rc::new(RefCell::new(Node::new(NodeKind::Text(text))))));
+    bump_dom_generation();
     Ok(JsValue::undefined())
 }
 
@@ -1467,6 +1488,7 @@ impl ScriptHost {
         PENDING_FETCHES.with(|p| p.borrow_mut().clear());
         PENDING_XHR.with(|p| p.borrow_mut().clear());
         VIRTUAL_CLOCK.with(|c| c.set(0));
+        DOM_GENERATION.with(|g| g.set(0));
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
     }
 
@@ -1699,6 +1721,12 @@ impl ScriptHost {
     /// Drain and take the buffered `console.*` output.
     pub fn take_console_log(&self) -> Vec<String> {
         CONSOLE_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// The current DOM mutation generation — increments on every DOM change.
+    /// The runtime compares it across a pump to skip re-layout when unchanged.
+    pub fn dom_generation(&self) -> u64 {
+        DOM_GENERATION.with(|g| g.get())
     }
 
     /// Run the event loop until it settles: Boa's promise/microtask jobs plus
@@ -2532,6 +2560,35 @@ mod tests {
         let mut host = ScriptHost::new();
         let src = "function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); } fib(10)";
         assert_eq!(host.eval_to_string(src).unwrap(), "55");
+    }
+
+    #[test]
+    fn dom_generation_tracks_mutations() {
+        let html = "<html><body><div id=\"b\">x</div><ul id=\"l\"></ul></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        let g0 = host.dom_generation();
+        // A pure read does not bump the generation.
+        host.eval_to_string("document.getElementById('b').textContent").unwrap();
+        assert_eq!(host.dom_generation(), g0, "reads must not bump the generation");
+
+        // Each mutation bumps it.
+        host.eval_to_string("document.getElementById('b').setAttribute('data-x','1');").unwrap();
+        let g1 = host.dom_generation();
+        assert!(g1 > g0, "setAttribute should bump");
+
+        host.eval_to_string("document.getElementById('b').textContent = 'y';").unwrap();
+        let g2 = host.dom_generation();
+        assert!(g2 > g1, "textContent set should bump");
+
+        host.eval_to_string(
+            "document.getElementById('l').appendChild(document.createElement('li'));",
+        )
+        .unwrap();
+        assert!(host.dom_generation() > g2, "appendChild should bump");
     }
 
     #[test]

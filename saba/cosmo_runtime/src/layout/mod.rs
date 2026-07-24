@@ -197,6 +197,9 @@ pub struct LivePage {
     host: cosmo_script::ScriptHost,
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
     document_url: String,
+    /// DOM mutation generation at the last layout; a pump that leaves it
+    /// unchanged skips re-layout (no script tick touched the DOM).
+    last_generation: u64,
 }
 
 impl LivePage {
@@ -232,11 +235,13 @@ impl LivePage {
         replace_local_storage(document_url, &host.local_storage_entries());
 
         let (scene, _tree) = layout_dom(dom.clone(), document_url, rect);
+        let last_generation = host.dom_generation();
         (
             Self {
                 host,
                 dom,
                 document_url: document_url.to_string(),
+                last_generation,
             },
             scene,
         )
@@ -256,13 +261,20 @@ impl LivePage {
     }
 
     /// Drain any settled async work (fetch/XHR completions, timers) so their
-    /// `.then`/handlers mutate the DOM, then re-lay-out the retained DOM at
-    /// `rect` and return the fresh scene. Does not re-parse the HTML.
-    pub fn pump_and_relayout(&mut self, rect: &FrameRect) -> LayoutScene {
+    /// `.then`/handlers run. If that mutated the DOM (mutation generation
+    /// changed), re-lay-out the retained DOM at `rect` and return the fresh
+    /// scene; otherwise return `None` (nothing to repaint). Does not re-parse
+    /// the HTML.
+    pub fn pump_and_relayout(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
         self.host.run_initial_load(1000);
         replace_local_storage(&self.document_url, &self.host.local_storage_entries());
+        let generation = self.host.dom_generation();
+        if generation == self.last_generation {
+            return None;
+        }
+        self.last_generation = generation;
         let (scene, _tree) = layout_dom(self.dom.clone(), &self.document_url, rect);
-        scene
+        Some(scene)
     }
 
     /// Drain buffered `console.*` output (diagnostics).
@@ -787,20 +799,40 @@ mod tests {
         assert!(page.has_pending_work(), "the fetch should still be in flight");
 
         // Poll for completion (worker thread), then re-lay-out the SAME page.
+        // pump_and_relayout returns Some only when the DOM actually changed.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut scene = first_scene;
+        let mut relaid_out = false;
         while page.has_pending_work() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            scene = page.pump_and_relayout(&rect);
+            if let Some(updated) = page.pump_and_relayout(&rect) {
+                scene = updated;
+                relaid_out = true;
+            }
         }
         let _ = server.join();
 
+        assert!(relaid_out, "the fetch completion should have triggered a re-layout");
         let now_has_x = scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-x")));
         let now_has_y = scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("late-y")));
         assert!(now_has_x && now_has_y, "progressive re-layout did not render the fetched items");
         assert!(
             woken.load(std::sync::atomic::Ordering::SeqCst),
             "the fetch waker should have fired to wake the render loop"
+        );
+    }
+
+    #[test]
+    fn pump_without_dom_mutation_skips_relayout() {
+        // A page with no async work and no pending mutations: pumping must
+        // return None (nothing changed → no wasted re-layout).
+        let html = "<html><body><p id=\"p\">hi</p></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (mut page, _scene) = LivePage::load("about:blank", html, &rect, None);
+        assert!(!page.has_pending_work());
+        assert!(
+            page.pump_and_relayout(&rect).is_none(),
+            "an idle pump should not trigger a re-layout"
         );
     }
 }
