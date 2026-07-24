@@ -158,12 +158,22 @@ fn layout_dom(
     document_url: &str,
     rect: &FrameRect,
 ) -> (LayoutScene, RenderTreeSnapshot) {
-    // Combine external <link rel="stylesheet"> sheets with inline <style>.
-    // External sheets are applied first so a later inline <style> wins on equal
-    // specificity (approximating document order). Fetching is cached by URL so
-    // relayout does not hit the network again.
-    // Spec: CSS Cascading §6 — declaration order within the same origin.
-    // https://www.w3.org/TR/css-cascade-4/#cascade-order
+    let cssom = resolve_cssom(dom.clone(), document_url);
+    layout_dom_with_style(dom, &cssom, rect)
+}
+
+/// Fetch external `<link>` sheets + inline `<style>` and parse them into a
+/// `StyleSheet`. Split out so [`LivePage`] can parse once and reuse the CSSOM
+/// across pumps/reflows (a DOM mutation from script rarely changes the
+/// stylesheets; the expensive re-parse is skipped).
+///
+/// Spec: CSS Cascading §6 — declaration order within the same origin.
+/// External sheets are applied first so a later inline `<style>` wins on equal
+/// specificity (approximating document order). Fetching is cached by URL.
+pub(crate) fn resolve_cssom(
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    document_url: &str,
+) -> cosmo_engine::renderer::css::cssom::StyleSheet {
     let links = get_stylesheet_links(dom.clone());
     let external_css = fetch_external_stylesheets(document_url, &links);
     let inline_css = get_style_content(dom.clone());
@@ -172,12 +182,20 @@ fn layout_dom(
     } else {
         format!("{external_css}\n{inline_css}")
     };
-    let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+    CssParser::new(CssTokenizer::new(style)).parse_stylesheet()
+}
+
+/// Lay out `dom` against an already-parsed `cssom` at `rect`.
+fn layout_dom_with_style(
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    cssom: &cosmo_engine::renderer::css::cssom::StyleSheet,
+    rect: &FrameRect,
+) -> (LayoutScene, RenderTreeSnapshot) {
     // var(--token) references are resolved per element during the cascade
     // (custom properties inherit; the document root seeds from the whole
     // stylesheet), so no global pre-substitution is needed here.
     let layout_view =
-        LayoutView::new_with_viewport(dom, &cssom, rect.width.max(1), rect.height.max(0));
+        LayoutView::new_with_viewport(dom, cssom, rect.width.max(1), rect.height.max(0));
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
     let render_tree = render_tree_snapshot(&layout_view, rect);
     (layout_scene, render_tree)
@@ -197,6 +215,10 @@ pub struct LivePage {
     host: cosmo_script::ScriptHost,
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
     document_url: String,
+    /// The parsed stylesheets, resolved once at load and reused across
+    /// pumps/reflows (script DOM mutations rarely change the stylesheets, so
+    /// the expensive CSS re-parse is skipped — the first incremental win).
+    cssom: cosmo_engine::renderer::css::cssom::StyleSheet,
     /// DOM mutation generation at the last layout; a pump that leaves it
     /// unchanged skips re-layout (no script tick touched the DOM).
     last_generation: u64,
@@ -234,13 +256,15 @@ impl LivePage {
         }
         replace_local_storage(document_url, &host.local_storage_entries());
 
-        let (scene, _tree) = layout_dom(dom.clone(), document_url, rect);
+        let cssom = resolve_cssom(dom.clone(), document_url);
+        let (scene, _tree) = layout_dom_with_style(dom.clone(), &cssom, rect);
         let last_generation = host.dom_generation();
         (
             Self {
                 host,
                 dom,
                 document_url: document_url.to_string(),
+                cssom,
                 last_generation,
             },
             scene,
@@ -256,7 +280,7 @@ impl LivePage {
     /// Re-lay-out the retained DOM at `rect` **without** running scripts or
     /// pumping async work (used on viewport resize — a reflow, not a re-run).
     pub fn relayout(&mut self, rect: &FrameRect) -> LayoutScene {
-        let (scene, _tree) = layout_dom(self.dom.clone(), &self.document_url, rect);
+        let (scene, _tree) = layout_dom_with_style(self.dom.clone(), &self.cssom, rect);
         scene
     }
 
@@ -273,8 +297,28 @@ impl LivePage {
             return None;
         }
         self.last_generation = generation;
-        let (scene, _tree) = layout_dom(self.dom.clone(), &self.document_url, rect);
+        let (scene, _tree) = layout_dom_with_style(self.dom.clone(), &self.cssom, rect);
+        self.assert_matches_full(&scene, rect);
         Some(scene)
+    }
+
+    /// Safety net (plan 4.1): when `COSMO_LAYOUT_ASSERT=1`, verify that the
+    /// incrementally-produced scene (reused CSSOM / future partial relayout)
+    /// is identical to a full from-scratch layout. Panics on divergence so
+    /// bugs surface in CI/tests rather than as silent mis-renders. No-op in
+    /// normal runs.
+    fn assert_matches_full(&self, scene: &LayoutScene, rect: &FrameRect) {
+        if std::env::var("COSMO_LAYOUT_ASSERT").as_deref() != Ok("1") {
+            return;
+        }
+        let (full, _tree) = layout_dom(self.dom.clone(), &self.document_url, rect);
+        assert!(
+            full.scene_items == scene.scene_items,
+            "incremental layout diverged from full layout (COSMO_LAYOUT_ASSERT): \
+             {} incremental vs {} full scene items",
+            scene.scene_items.len(),
+            full.scene_items.len()
+        );
     }
 
     /// Drain buffered `console.*` output (diagnostics).
@@ -820,6 +864,58 @@ mod tests {
             woken.load(std::sync::atomic::Ordering::SeqCst),
             "the fetch waker should have fired to wake the render loop"
         );
+    }
+
+    #[test]
+    fn incremental_matches_full_under_assert() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A fetch completes after load and its handler mutates the DOM; under
+        // COSMO_LAYOUT_ASSERT the reused-CSSOM incremental pump must produce
+        // scene items byte-identical to a full from-scratch layout.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"items":["row0","row1","row2"]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{port}/");
+        let html = "<html><head><style>body{margin:0}li{color:#123456}</style></head><body>\
+            <ul id=\"l\"></ul>\
+            <script>\
+              fetch('d.json').then(function(r){return r.json();}).then(function(d){\
+                var ul=document.getElementById('l');\
+                for(var i=0;i<d.items.length;i++){var li=document.createElement('li');li.textContent=d.items[i];ul.appendChild(li);}\
+              });\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (mut page, _first) = LivePage::load(&base, html, &rect, None);
+
+        std::env::set_var("COSMO_LAYOUT_ASSERT", "1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut scene = None;
+        while page.has_pending_work() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Some(s) = page.pump_and_relayout(&rect) {
+                scene = Some(s);
+            }
+        }
+        std::env::remove_var("COSMO_LAYOUT_ASSERT");
+        let _ = server.join();
+
+        let scene = scene.expect("fetch mutation should trigger a re-layout (asserted == full)");
+        assert!(scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("row2"))));
     }
 
     #[test]
