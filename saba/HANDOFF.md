@@ -300,8 +300,14 @@
 > - ✅ **fetch/XHR ヘッダ転送 (`59e4e96`)** — FetchRequest にヘッダ追加。fetch は
 >   options.headers({name:value})、XHR は setRequestHeader を蓄積し、RuntimeFetchEngine が
 >   reqwest で転送。テストで method/headers/body の到達を確認。
-> - 次(小さい安全な項目): Boa の実 watchdog(反復/時間ガード)、el.dataset(JsProxy 要調査)、
->   DOM 変異世代カウンタ。**大: item 3 のフル GUI 結線(上記 ⚠ 参照、専用作業)。**
+> - ✅ **Boa watchdog (`fd2866c`)** — `RuntimeLimits`(loop_iteration_limit=5M, recursion=2000)で
+>   runaway ループ/深い再帰を catchable エラーに(!Send でスレッドタイムアウト不可の代替)。
+>   `set_loop_iteration_limit` でテストは高速失敗。バイトキャップ(parse 時)と併用。
+> - ✅ **el.dataset (`d78c80b`)** — JsProxy で data-* を camelCase 公開(get/set/has/delete/
+>   ownKeys/getOwnPropertyDescriptor、data-user-id↔userId)。`Element::remove_attribute` 追加。
+> - 次(残課題): DOM 変異世代カウンタ(全再構築でなく差分 relayout)、
+>   **plan D5: ScriptHost の thread-local 脱却**(per-page 状態を host に移す→ frameset/複数フレームの
+>   host 対応、el.dataset===等の identity 改善)。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
