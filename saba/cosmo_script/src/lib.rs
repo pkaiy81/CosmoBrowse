@@ -9,7 +9,8 @@ use boa_engine::{
     Context, JsData, JsResult, JsValue, NativeFunction, Source,
 };
 use boa_engine::gc::{Finalize, Trace};
-use boa_engine::object::builtins::JsArray;
+use boa_engine::object::builtins::{JsArray, JsPromise};
+use boa_engine::builtins::promise::ResolvingFunctions;
 use cosmo_engine::renderer::dom::api::{
     collect_text, element_closest, element_matches, get_element_by_id, get_target_element_node,
     query_selector, query_selector_all,
@@ -64,6 +65,42 @@ fn parse_capture(arg: Option<&JsValue>, ctx: &mut Context) -> bool {
     }
 }
 
+/// A network request initiated by `fetch()` / `XMLHttpRequest`, handed to the
+/// host's [`FetchEngine`]. Plain data so it can cross to a worker thread.
+pub struct FetchRequest {
+    pub url: String,
+    pub method: String,
+    pub body: Option<String>,
+}
+
+/// The result of a network request delivered back from the host's worker.
+/// `Send` (plain data) so the worker thread can post it over a channel.
+pub struct FetchResponse {
+    pub ok: bool,
+    pub status: u16,
+    pub status_text: String,
+    pub url: String,
+    pub body: String,
+    /// Set on a network-level failure (DNS, connection, CORS block); the
+    /// promise rejects rather than resolving to a Response.
+    pub error: Option<String>,
+}
+
+/// The host's network backend. `cosmo_script` stays network-free: it produces
+/// the request and consumes the response, but the runtime supplies this to do
+/// the actual IO (on a worker thread, with CORS/security enforcement). `start`
+/// must return immediately with a receiver that yields exactly one response.
+pub trait FetchEngine: 'static {
+    fn start(&self, req: FetchRequest) -> std::sync::mpsc::Receiver<FetchResponse>;
+}
+
+/// A `fetch` awaiting its worker response: the channel plus the promise's
+/// resolve/reject functions to settle once it arrives.
+struct PendingFetch {
+    rx: std::sync::mpsc::Receiver<FetchResponse>,
+    resolvers: ResolvingFunctions,
+}
+
 /// A scheduled `setTimeout`/`setInterval`/`requestAnimationFrame` callback
 /// awaiting its turn.
 struct Timer {
@@ -112,6 +149,12 @@ thread_local! {
     /// order. The runtime drains these (e.g. to handle cosmobrowse:navigate
     /// from the injected link-interception script).
     static POSTED_MESSAGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+
+    /// The host's network backend for `fetch`/XHR (None → requests reject).
+    static FETCH_ENGINE: RefCell<Option<Box<dyn FetchEngine>>> = const { RefCell::new(None) };
+
+    /// In-flight `fetch` requests awaiting their worker response.
+    static PENDING_FETCHES: RefCell<Vec<PendingFetch>> = const { RefCell::new(Vec::new()) };
 }
 
 fn ls_get(key: &str) -> Option<String> {
@@ -1247,6 +1290,7 @@ impl ScriptHost {
         WRAPPER_CACHE.with(|c| c.borrow_mut().clear());
         CONSOLE_LOG.with(|l| l.borrow_mut().clear());
         POSTED_MESSAGES.with(|m| m.borrow_mut().clear());
+        PENDING_FETCHES.with(|p| p.borrow_mut().clear());
         VIRTUAL_CLOCK.with(|c| c.set(0));
         SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
     }
@@ -1345,6 +1389,13 @@ impl ScriptHost {
                 .register_global_property(js_string!(name), func, Attribute::all())
                 .expect("register timer");
         }
+
+        // fetch(url, options?)
+        let fetch_fn =
+            NativeFunction::from_fn_ptr(js_fetch).to_js_function(&self.context.realm().clone());
+        self.context
+            .register_global_property(js_string!("fetch"), fetch_fn, Attribute::all())
+            .expect("register fetch");
 
         // location: a live view over LOCATION_HREF.
         let realm = self.context.realm().clone();
@@ -1483,8 +1534,73 @@ impl ScriptHost {
         self.drain(max_timer_fires, false);
     }
 
+    /// Install the host's network backend for `fetch`/XHR.
+    pub fn set_fetch_engine(&mut self, engine: Box<dyn FetchEngine>) {
+        FETCH_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
+    }
+
+    /// Whether any `fetch` requests are still awaiting their response. The
+    /// runtime uses this to decide whether another layout pass is warranted.
+    pub fn has_pending_fetches(&self) -> bool {
+        PENDING_FETCHES.with(|p| !p.borrow().is_empty())
+    }
+
+    /// Poll in-flight fetches; settle any whose response has arrived (resolving
+    /// with a `Response` or rejecting on network error), then run microtasks so
+    /// `.then` callbacks execute. Returns the number settled this call.
+    pub fn pump_fetches(&mut self) -> usize {
+        // Collect ready responses first (drains the receivers without holding
+        // the borrow while we call into JS).
+        let mut ready: Vec<(ResolvingFunctions, FetchResponse)> = Vec::new();
+        PENDING_FETCHES.with(|p| {
+            let mut v = p.borrow_mut();
+            let mut i = 0;
+            while i < v.len() {
+                match v[i].rx.try_recv() {
+                    Ok(resp) => {
+                        let pf = v.remove(i);
+                        ready.push((pf.resolvers, resp));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Worker dropped without sending — reject.
+                        let pf = v.remove(i);
+                        ready.push((
+                            pf.resolvers,
+                            FetchResponse {
+                                ok: false,
+                                status: 0,
+                                status_text: String::new(),
+                                url: String::new(),
+                                body: String::new(),
+                                error: Some("fetch worker disconnected".to_string()),
+                            },
+                        ));
+                    }
+                }
+            }
+        });
+        let settled = ready.len();
+        for (resolvers, resp) in ready {
+            if let Some(err) = resp.error {
+                let e = JsValue::from(js_string!(err.as_str()));
+                let _ = resolvers.reject.call(&JsValue::undefined(), &[e], &mut self.context);
+            } else {
+                let response = make_response(resp, &mut self.context);
+                let _ = resolvers
+                    .resolve
+                    .call(&JsValue::undefined(), &[JsValue::from(response)], &mut self.context);
+            }
+        }
+        if settled > 0 {
+            self.context.run_jobs();
+        }
+        settled
+    }
+
     fn drain(&mut self, max_timer_fires: usize, reschedule_intervals: bool) {
         self.context.run_jobs();
+        self.pump_fetches();
         let mut fired = 0;
         while fired < max_timer_fires {
             // Pop the earliest-due timer.
@@ -1672,6 +1788,130 @@ fn request_animation_frame(_this: &JsValue, args: &[JsValue], _ctx: &mut Context
         })
     });
     Ok(JsValue::from(id))
+}
+
+/// `fetch(url, options?)` → Promise<Response>. Delegates the network IO to the
+/// host's FetchEngine (worker thread); the returned promise settles when
+/// `pump_fetches` sees the response. With no engine installed, rejects.
+fn js_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url = args.first().cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
+    // options.method / options.body
+    let (method, body) = match args.get(1).filter(|v| v.is_object()) {
+        Some(opts) => {
+            let o = opts.as_object().unwrap();
+            let method = o
+                .get(js_string!("method"), ctx)?
+                .to_string(ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|_| "GET".to_string());
+            let body = {
+                let b = o.get(js_string!("body"), ctx)?;
+                if b.is_undefined() || b.is_null() {
+                    None
+                } else {
+                    Some(b.to_string(ctx)?.to_std_string_escaped())
+                }
+            };
+            (method, body)
+        }
+        None => ("GET".to_string(), None),
+    };
+
+    let (promise, resolvers) = JsPromise::new_pending(ctx);
+    let started = FETCH_ENGINE.with(|e| {
+        e.borrow().as_ref().map(|eng| {
+            eng.start(FetchRequest {
+                url: url.clone(),
+                method: method.clone(),
+                body: body.clone(),
+            })
+        })
+    });
+    match started {
+        Some(rx) => {
+            PENDING_FETCHES.with(|p| p.borrow_mut().push(PendingFetch { rx, resolvers }));
+        }
+        None => {
+            // No network backend — reject immediately.
+            let e = JsValue::from(js_string!("fetch: no network backend"));
+            resolvers.reject.call(&JsValue::undefined(), &[e], ctx)?;
+        }
+    }
+    Ok(JsValue::from(promise))
+}
+
+/// Build a `Response` object from a completed fetch: ok/status/statusText/url
+/// data properties plus `text()`/`json()` methods returning resolved promises.
+fn make_response(resp: FetchResponse, ctx: &mut Context) -> JsObject {
+    let realm = ctx.realm().clone();
+    let obj = ObjectInitializer::new(ctx)
+        .function(NativeFunction::from_fn_ptr(response_text), js_string!("text"), 0)
+        .function(NativeFunction::from_fn_ptr(response_json), js_string!("json"), 0)
+        .build();
+    let data = |v: JsValue| {
+        PropertyDescriptor::builder()
+            .value(v)
+            .writable(false)
+            .enumerable(true)
+            .configurable(true)
+            .build()
+    };
+    obj.insert_property(js_string!("ok"), data(JsValue::from(resp.ok)));
+    obj.insert_property(js_string!("status"), data(JsValue::from(resp.status)));
+    obj.insert_property(
+        js_string!("statusText"),
+        data(JsValue::from(js_string!(resp.status_text.as_str()))),
+    );
+    obj.insert_property(
+        js_string!("url"),
+        data(JsValue::from(js_string!(resp.url.as_str()))),
+    );
+    // Body is stashed on a non-enumerable slot for text()/json() to read.
+    obj.insert_property(
+        js_string!("_body"),
+        PropertyDescriptor::builder()
+            .value(JsValue::from(js_string!(resp.body.as_str())))
+            .writable(false)
+            .enumerable(false)
+            .configurable(false)
+            .build(),
+    );
+    let _ = realm;
+    obj
+}
+
+fn response_body(this: &JsValue, ctx: &mut Context) -> String {
+    this.as_object()
+        .and_then(|o| o.get(js_string!("_body"), ctx).ok())
+        .and_then(|v| v.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default()
+}
+
+fn response_text(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let body = response_body(this, ctx);
+    Ok(JsValue::from(JsPromise::resolve(
+        JsValue::from(js_string!(body.as_str())),
+        ctx,
+    )))
+}
+
+fn response_json(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let body = response_body(this, ctx);
+    // Parse via the built-in JSON.parse; a parse error rejects the promise.
+    let json = ctx.global_object().get(js_string!("JSON"), ctx)?;
+    let parse = json
+        .as_object()
+        .and_then(|o| o.get(js_string!("parse"), ctx).ok())
+        .and_then(|v| v.as_object().cloned());
+    let parsed = match parse {
+        Some(func) => func.call(&json, &[JsValue::from(js_string!(body.as_str()))], ctx),
+        None => Ok(JsValue::null()),
+    };
+    Ok(match parsed {
+        Ok(v) => JsValue::from(JsPromise::resolve(v, ctx)),
+        Err(e) => JsValue::from(JsPromise::reject(e, ctx)),
+    })
 }
 
 fn script_dom_root() -> Option<Rc<RefCell<Node>>> {
@@ -2542,6 +2782,84 @@ mod tests {
         .unwrap();
         host.run_pending(100);
         assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "AB");
+    }
+
+    /// A deterministic FetchEngine for tests: sends a canned response for the
+    /// URL immediately, so pump_fetches settles it on the next drain.
+    struct MockFetch {
+        status: u16,
+        body: String,
+    }
+    impl FetchEngine for MockFetch {
+        fn start(&self, req: FetchRequest) -> std::sync::mpsc::Receiver<FetchResponse> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(FetchResponse {
+                ok: (200..300).contains(&self.status),
+                status: self.status,
+                status_text: "OK".to_string(),
+                url: req.url,
+                body: self.body.clone(),
+                error: None,
+            })
+            .unwrap();
+            rx
+        }
+    }
+
+    #[test]
+    fn fetch_resolves_via_engine_and_mutates_dom() {
+        let html = "<html><body><ul id=\"out\"></ul></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_fetch_engine(Box::new(MockFetch {
+            status: 200,
+            body: r#"{"items":["a","b","c"]}"#.to_string(),
+        }));
+        host.set_document(document);
+
+        host.eval_to_string(
+            "globalThis.done = ''; \
+             fetch('/data.json') \
+                .then(function(r) { globalThis.status = r.status; globalThis.ok = r.ok; return r.json(); }) \
+                .then(function(data) { \
+                    var ul = document.getElementById('out'); \
+                    for (var i = 0; i < data.items.length; i++) { \
+                        var li = document.createElement('li'); li.textContent = data.items[i]; ul.appendChild(li); \
+                    } \
+                    globalThis.done = 'ok:' + data.items.length; \
+                });",
+        )
+        .unwrap();
+
+        // Nothing resolved until the loop is pumped.
+        assert_eq!(host.eval_to_string("globalThis.done").unwrap(), "");
+        assert!(host.has_pending_fetches());
+
+        host.run_initial_load(100);
+
+        assert_eq!(host.eval_to_string("globalThis.status").unwrap(), "200");
+        assert_eq!(host.eval_to_string("globalThis.ok").unwrap(), "true");
+        assert_eq!(host.eval_to_string("globalThis.done").unwrap(), "ok:3");
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "abc");
+        assert!(!host.has_pending_fetches());
+    }
+
+    #[test]
+    fn fetch_without_engine_rejects() {
+        let html = "<html><body></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        host.eval_to_string(
+            "globalThis.err = ''; \
+             fetch('/x').catch(function(e) { globalThis.err = 'rejected'; });",
+        )
+        .unwrap();
+        host.run_initial_load(100);
+        assert_eq!(host.eval_to_string("globalThis.err").unwrap(), "rejected");
     }
 
     #[test]
