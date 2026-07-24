@@ -8,7 +8,6 @@ use cosmo_runtime::{scene_items_to_paint_commands, FetchWaker, FrameRect, LivePa
 /// — ScriptHost keeps per-page state in thread-locals, so one active host per
 /// thread (plan D5); framesets/child frames render statically.
 struct LiveRoot {
-    frame_id: String,
     page: LivePage,
     rect: FrameRect,
 }
@@ -110,14 +109,9 @@ impl AppBridge {
             height: root.rect.height,
         };
         let url = root.document_url.clone();
-        let frame_id = root.id.clone();
         let (live, scene) = LivePage::load(&url, &html, &rect, self.waker.clone());
         self.splice_root_scene(&scene.scene_items);
-        self.live_root = Some(LiveRoot {
-            frame_id,
-            page: live,
-            rect,
-        });
+        self.live_root = Some(LiveRoot { page: live, rect });
     }
 
     /// Replace the root frame's scene_items + paint_commands with `items`.

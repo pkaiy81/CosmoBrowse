@@ -287,14 +287,16 @@
 > - 🚧 **item 3 step 2a: fetch 完了 waker (`4c6e3ef`)** — `loader::FetchWaker`
 >   (`Arc<dyn Fn()+Send+Sync>`)を worker から発火、`make_fetch_engine_with_waker` /
 >   `LivePage::load(..., waker)` で貫通。既存の `UserEvent::Redraw`(画像 fetch 用)に接続する起床信号。
-> - ⚠ **item 3 の GUI 結線は「小さく」収まらない(2026-07-24 の設計知見・ユーザー決定=レンダラ
->   スレッド保持)**: Boa Context が !Send のため LivePage は adapter(`Mutex<BrowserApp>`)越しに
->   渡せず、**AppBridge(renderer_native, 単一スレッド)で生成必須**。だが二重スクリプト実行を
->   避けるには**初回描画も LivePage で行う必要**があり、現状シーンは adapter が `BrowserPageDto`
->   (事前描画済み)として生成し painter/content_height/anchor-scroll/frameset 枠/スクショ経路が
->   全て DTO 前提。→ シーン生成を adapter から AppBridge へ移し DTO 消費側を全付け替えする大改修に
->   なる。現状 bounded-wait は fetch 内容を正しく描画済み(遅延のみ)なので増分価値はレイテンシ改善。
->   **推奨: フル GUI 結線は専用の集中作業として別途。** 中核ロジック(LivePage/waker)はテスト済み。
+> - ✅ **item 3 A: プログレッシブ描画 GUI 結線完成 (`bf17bb8`, 2026-07-24)** — session は
+>   **静的描画**(`build_static_scene`, スクリプト非実行)にし各フレームの html_content を DTO に保持。
+>   **AppBridge(renderer_native, 単一スレッド)がルートフレームの LivePage を保持し唯一のスクリプト
+>   実行者**(Boa Context が !Send=adapter Mutex に入れられないため。二重実行も回避)。navigate/back/
+>   forward/reload/activate_link で scripts 実行+シーンをスプライス(初回描画)。set_viewport は
+>   LivePage を新 rect で reflow(スクリプト再実行なし)。fetch/XHR 完了 waker → `UserEvent::Redraw`
+>   (画像 fetch の起床経路を流用)→ user_event が pump_progressive で再スプライス+再描画。
+>   ヘッドレススクショは capture 前に settle_async。**frameset/子フレームは静的**(ScriptHost の
+>   thread-local ⇒ 1スレッド1host, plan D5)。検証: reftest 12/12(js_dom 含む)、Wikipedia 画素一致、
+>   fetch/XHR GUI デモ描画。全スイート green。
 > - ✅ **fetch/XHR ヘッダ転送 (`59e4e96`)** — FetchRequest にヘッダ追加。fetch は
 >   options.headers({name:value})、XHR は setRequestHeader を蓄積し、RuntimeFetchEngine が
 >   reqwest で転送。テストで method/headers/body の到達を確認。
