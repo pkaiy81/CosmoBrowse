@@ -137,55 +137,110 @@ struct Timer {
     is_raf: bool,
 }
 
-thread_local! {
-    /// Event listeners keyed by DOM node identity (`Rc::as_ptr`). The DOM
-    /// nodes themselves stay outside Boa's GC (plan D5), so listeners live
-    /// here rather than on the node; cleared on navigation via `clear_state`.
-    static LISTENERS: RefCell<std::collections::HashMap<usize, Vec<Listener>>> =
-        RefCell::new(std::collections::HashMap::new());
-
-    /// Element-wrapper cache keyed by node identity (`Rc::as_ptr`), so repeated
-    /// lookups of the same node return the same JsObject (`el === el`). Cleared
-    /// on navigation (plan D5).
-    static WRAPPER_CACHE: RefCell<std::collections::HashMap<usize, JsObject>> =
-        RefCell::new(std::collections::HashMap::new());
-
-    /// Lines emitted by `console.*`, in order. Drained by the runtime/tests.
-    static CONSOLE_LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-
-    /// Pending timers (setTimeout/setInterval) and the next timer id.
-    static TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
-    static NEXT_TIMER_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
-    /// Monotonic virtual clock advanced as timers fire (see run_pending).
-    static VIRTUAL_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-
-    /// Bumped on every DOM mutation (attribute/child-list/text change). The
-    /// runtime compares it across a pump to skip re-layout when a script tick
-    /// touched no DOM (see LivePage::pump_and_relayout).
-    static DOM_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-
-    /// The document URL exposed as `location`. Read by the location accessors;
-    /// updated by `ScriptHost::set_location` and by assigning `location.href`.
-    static LOCATION_HREF: RefCell<String> = RefCell::new(String::from("about:blank"));
-
-    /// `localStorage` backing store: insertion-ordered key/value pairs (order
-    /// matters for `key(n)`). Seeded/snapshotted by the runtime per origin.
-    static LOCAL_STORAGE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-
-    /// Messages posted via `window.parent.postMessage`, JSON-serialized in
-    /// order. The runtime drains these (e.g. to handle cosmobrowse:navigate
-    /// from the injected link-interception script).
-    static POSTED_MESSAGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-
+/// All per-page script state (plan D5). Each [`ScriptHost`] owns its own
+/// `Rc<PageState>`; the active one is pointed to by the `ACTIVE_PAGE`
+/// thread-local while that host runs (JS is single-threaded, so exactly one
+/// host is active at a time, but each keeps independent state between runs —
+/// this is what lets multiple LivePages coexist on one thread).
+struct PageState {
+    /// The document currently exposed to script (`document`). Stays a
+    /// `Rc<RefCell<Node>>` outside Boa's GC; native fns read it from here.
+    script_dom: RefCell<Option<Rc<RefCell<Node>>>>,
+    /// Event listeners keyed by DOM node identity (`Rc::as_ptr`).
+    listeners: RefCell<std::collections::HashMap<usize, Vec<Listener>>>,
+    /// Element-wrapper cache keyed by node identity, so `el === el` holds.
+    wrapper_cache: RefCell<std::collections::HashMap<usize, JsObject>>,
+    /// Lines emitted by `console.*`, in order.
+    console_log: RefCell<Vec<String>>,
+    /// Pending timers (setTimeout/setInterval/rAF).
+    timers: RefCell<Vec<Timer>>,
+    next_timer_id: std::cell::Cell<u32>,
+    /// Monotonic virtual clock advanced as timers fire.
+    virtual_clock: std::cell::Cell<u64>,
+    /// Bumped on every DOM mutation (see LivePage::pump_and_relayout).
+    dom_generation: std::cell::Cell<u64>,
+    /// The document URL exposed as `location`.
+    location_href: RefCell<String>,
+    /// `localStorage` backing store (insertion-ordered).
+    local_storage: RefCell<Vec<(String, String)>>,
+    /// Messages posted via `window.parent.postMessage` (JSON strings).
+    posted_messages: RefCell<Vec<String>>,
     /// The host's network backend for `fetch`/XHR (None → requests reject).
-    static FETCH_ENGINE: RefCell<Option<Box<dyn FetchEngine>>> = const { RefCell::new(None) };
-
+    fetch_engine: RefCell<Option<Box<dyn FetchEngine>>>,
     /// In-flight `fetch` requests awaiting their worker response.
-    static PENDING_FETCHES: RefCell<Vec<PendingFetch>> = const { RefCell::new(Vec::new()) };
-
+    pending_fetches: RefCell<Vec<PendingFetch>>,
     /// In-flight `XMLHttpRequest.send()` requests awaiting their response.
-    static PENDING_XHR: RefCell<Vec<PendingXhr>> = const { RefCell::new(Vec::new()) };
+    pending_xhr: RefCell<Vec<PendingXhr>>,
 }
+
+impl Default for PageState {
+    fn default() -> Self {
+        Self {
+            script_dom: RefCell::new(None),
+            listeners: RefCell::new(std::collections::HashMap::new()),
+            wrapper_cache: RefCell::new(std::collections::HashMap::new()),
+            console_log: RefCell::new(Vec::new()),
+            timers: RefCell::new(Vec::new()),
+            next_timer_id: std::cell::Cell::new(1),
+            virtual_clock: std::cell::Cell::new(0),
+            dom_generation: std::cell::Cell::new(0),
+            location_href: RefCell::new(String::from("about:blank")),
+            local_storage: RefCell::new(Vec::new()),
+            posted_messages: RefCell::new(Vec::new()),
+            fetch_engine: RefCell::new(None),
+            pending_fetches: RefCell::new(Vec::new()),
+            pending_xhr: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+thread_local! {
+    /// The page whose state native functions currently see. A `ScriptHost`
+    /// sets this to its own `PageState` before running any JS (`activate`).
+    static ACTIVE_PAGE: RefCell<Option<Rc<PageState>>> = const { RefCell::new(None) };
+}
+
+/// The active page's shared state. Panics if no host has activated — every
+/// public `ScriptHost` entry point activates before running JS.
+fn active_page() -> Rc<PageState> {
+    ACTIVE_PAGE.with(|p| {
+        p.borrow()
+            .clone()
+            .expect("no active ScriptHost page (call a ScriptHost method)")
+    })
+}
+
+/// Generates a zero-sized accessor named `$konst` with a thread-local-style
+/// `.with(|&field| ...)` method routing to the active page's `$field`, so the
+/// call sites read exactly like the previous `thread_local!` statics.
+macro_rules! page_field {
+    ($konst:ident, $field:ident, $ty:ty) => {
+        #[allow(non_camel_case_types)]
+        struct $konst;
+        impl $konst {
+            #[inline]
+            fn with<R>(&self, f: impl FnOnce(&$ty) -> R) -> R {
+                let ps = active_page();
+                f(&ps.$field)
+            }
+        }
+    };
+}
+
+page_field!(SCRIPT_DOM, script_dom, RefCell<Option<Rc<RefCell<Node>>>>);
+page_field!(LISTENERS, listeners, RefCell<std::collections::HashMap<usize, Vec<Listener>>>);
+page_field!(WRAPPER_CACHE, wrapper_cache, RefCell<std::collections::HashMap<usize, JsObject>>);
+page_field!(CONSOLE_LOG, console_log, RefCell<Vec<String>>);
+page_field!(TIMERS, timers, RefCell<Vec<Timer>>);
+page_field!(NEXT_TIMER_ID, next_timer_id, std::cell::Cell<u32>);
+page_field!(VIRTUAL_CLOCK, virtual_clock, std::cell::Cell<u64>);
+page_field!(DOM_GENERATION, dom_generation, std::cell::Cell<u64>);
+page_field!(LOCATION_HREF, location_href, RefCell<String>);
+page_field!(LOCAL_STORAGE, local_storage, RefCell<Vec<(String, String)>>);
+page_field!(POSTED_MESSAGES, posted_messages, RefCell<Vec<String>>);
+page_field!(FETCH_ENGINE, fetch_engine, RefCell<Option<Box<dyn FetchEngine>>>);
+page_field!(PENDING_FETCHES, pending_fetches, RefCell<Vec<PendingFetch>>);
+page_field!(PENDING_XHR, pending_xhr, RefCell<Vec<PendingXhr>>);
 
 fn ls_get(key: &str) -> Option<String> {
     LOCAL_STORAGE.with(|s| s.borrow().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
@@ -1424,15 +1479,6 @@ fn element_set_text_content(
     Ok(JsValue::undefined())
 }
 
-thread_local! {
-    /// The document currently exposed to script. The DOM stays a
-    /// `Rc<RefCell<Node>>` outside Boa's GC (plan D5); native functions read
-    /// it from here rather than capturing it (Boa closures require Trace,
-    /// which the Rc DOM does not implement). The engine is single-threaded
-    /// per page, so a thread-local is sufficient — the same transitional
-    /// pattern used for font metrics and the styling viewport.
-    static SCRIPT_DOM: RefCell<Option<Rc<RefCell<Node>>>> = const { RefCell::new(None) };
-}
 
 /// Default per-loop iteration cap. Above realistic page-load loops but bounds
 /// a runaway `while(true)` to a few seconds (Boa is an interpreter; a
@@ -1442,6 +1488,9 @@ const DEFAULT_LOOP_ITERATION_LIMIT: u64 = 5_000_000;
 /// A per-page JavaScript execution context.
 pub struct ScriptHost {
     context: Context,
+    /// This host's own per-page state (plan D5). Made the active page before
+    /// any JS runs so native functions see it.
+    state: Rc<PageState>,
 }
 
 impl Default for ScriptHost {
@@ -1454,7 +1503,9 @@ impl ScriptHost {
     pub fn new() -> Self {
         let mut host = Self {
             context: Context::default(),
+            state: Rc::new(PageState::default()),
         };
+        host.activate();
         // Watchdog: bound execution so a runaway loop or deep recursion throws
         // a catchable error instead of hanging the render thread (Boa's Context
         // is !Send, so a thread-based timeout isn't possible). These are per
@@ -1466,6 +1517,13 @@ impl ScriptHost {
         }
         host.install_dom_globals();
         host
+    }
+
+    /// Point the `ACTIVE_PAGE` thread-local at this host's state so native
+    /// functions operate on it. Called at the start of every public entry
+    /// point that runs JS or touches page state.
+    fn activate(&self) {
+        ACTIVE_PAGE.with(|p| *p.borrow_mut() = Some(self.state.clone()));
     }
 
     /// Override the per-loop iteration cap (watchdog). Mainly for tests that
@@ -1480,6 +1538,7 @@ impl ScriptHost {
     /// are per-page and reset on navigation. `localStorage` intentionally
     /// persists (per-origin; seed it via `set_local_storage_entries`).
     pub fn set_document(&mut self, root: Rc<RefCell<Node>>) {
+        self.activate();
         LISTENERS.with(|m| m.borrow_mut().clear());
         TIMERS.with(|t| t.borrow_mut().clear());
         WRAPPER_CACHE.with(|c| c.borrow_mut().clear());
@@ -1497,6 +1556,7 @@ impl ScriptHost {
     /// `preventDefault` was not called). Used by the runtime to route real
     /// input events (click/input/submit) into script.
     pub fn dispatch_event(&mut self, target: Rc<RefCell<Node>>, event_type: &str) -> bool {
+        self.activate();
         run_dispatch(target, event_type, &mut self.context)
     }
 
@@ -1686,22 +1746,26 @@ impl ScriptHost {
     /// Drain the messages posted via `window.parent.postMessage` (JSON
     /// strings). The runtime parses these to handle e.g. link navigation.
     pub fn take_posted_messages(&self) -> Vec<String> {
+        self.activate();
         POSTED_MESSAGES.with(|m| std::mem::take(&mut *m.borrow_mut()))
     }
 
     /// Set the URL exposed to script as `location`.
     pub fn set_location(&mut self, href: &str) {
+        self.activate();
         LOCATION_HREF.with(|h| *h.borrow_mut() = href.to_string());
     }
 
     /// Snapshot the current `localStorage` contents (for per-origin
     /// persistence by the runtime).
     pub fn local_storage_entries(&self) -> Vec<(String, String)> {
+        self.activate();
         LOCAL_STORAGE.with(|s| s.borrow().clone())
     }
 
     /// Replace `localStorage` with the given entries (seed from persistence).
     pub fn set_local_storage_entries(&mut self, entries: Vec<(String, String)>) {
+        self.activate();
         LOCAL_STORAGE.with(|s| *s.borrow_mut() = entries);
     }
 
@@ -1709,6 +1773,7 @@ impl ScriptHost {
     /// display string (for smoke tests / diagnostics). Errors are returned
     /// as `Err(message)` rather than panicking.
     pub fn eval_to_string(&mut self, source: &str) -> Result<String, String> {
+        self.activate();
         match self.context.eval(Source::from_bytes(source)) {
             Ok(v) => Ok(v
                 .to_string(&mut self.context)
@@ -1720,12 +1785,14 @@ impl ScriptHost {
 
     /// Drain and take the buffered `console.*` output.
     pub fn take_console_log(&self) -> Vec<String> {
+        self.activate();
         CONSOLE_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 
     /// The current DOM mutation generation — increments on every DOM change.
     /// The runtime compares it across a pump to skip re-layout when unchanged.
     pub fn dom_generation(&self) -> u64 {
+        self.activate();
         DOM_GENERATION.with(|g| g.get())
     }
 
@@ -1751,12 +1818,14 @@ impl ScriptHost {
 
     /// Install the host's network backend for `fetch`/XHR.
     pub fn set_fetch_engine(&mut self, engine: Box<dyn FetchEngine>) {
+        self.activate();
         FETCH_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
     }
 
     /// Whether any `fetch`/XHR requests are still awaiting their response. The
     /// runtime uses this to decide whether another layout pass is warranted.
     pub fn has_pending_fetches(&self) -> bool {
+        self.activate();
         PENDING_FETCHES.with(|p| !p.borrow().is_empty())
             || PENDING_XHR.with(|p| !p.borrow().is_empty())
     }
@@ -1765,6 +1834,7 @@ impl ScriptHost {
     /// with a `Response` or rejecting on network error), then run microtasks so
     /// `.then` callbacks execute. Returns the number settled this call.
     pub fn pump_fetches(&mut self) -> usize {
+        self.activate();
         // Collect ready responses first (drains the receivers without holding
         // the borrow while we call into JS).
         let mut ready: Vec<(ResolvingFunctions, FetchResponse)> = Vec::new();
@@ -1888,6 +1958,7 @@ impl ScriptHost {
     }
 
     fn drain(&mut self, max_timer_fires: usize, reschedule_intervals: bool) {
+        self.activate();
         self.context.run_jobs();
         self.pump_fetches();
         let mut fired = 0;
@@ -2560,6 +2631,39 @@ mod tests {
         let mut host = ScriptHost::new();
         let src = "function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); } fib(10)";
         assert_eq!(host.eval_to_string(src).unwrap(), "55");
+    }
+
+    #[test]
+    fn two_hosts_keep_independent_state() {
+        // Plan D5: per-page state lives on each host, so two LivePages on the
+        // same thread don't clobber each other (the active page is swapped in
+        // on each call).
+        let html_a = "<html><body><div id=\"x\">A-doc</div></body></html>";
+        let html_b = "<html><body><div id=\"x\">B-doc</div></body></html>";
+        let doc_a = HtmlParser::new(HtmlTokenizer::new(html_a.to_string())).construct_tree().borrow().document();
+        let doc_b = HtmlParser::new(HtmlTokenizer::new(html_b.to_string())).construct_tree().borrow().document();
+
+        let mut a = ScriptHost::new();
+        let mut b = ScriptHost::new();
+        a.set_location("https://a.test/");
+        b.set_location("https://b.test/");
+        a.set_document(doc_a);
+        b.set_document(doc_b);
+
+        // Interleave: each host sees its own document, location, and variables.
+        a.eval_to_string("globalThis.who = 'A';").unwrap();
+        b.eval_to_string("globalThis.who = 'B';").unwrap();
+        assert_eq!(a.eval_to_string("document.getElementById('x').textContent").unwrap(), "A-doc");
+        assert_eq!(b.eval_to_string("document.getElementById('x').textContent").unwrap(), "B-doc");
+        assert_eq!(a.eval_to_string("globalThis.who").unwrap(), "A");
+        assert_eq!(b.eval_to_string("globalThis.who").unwrap(), "B");
+        assert_eq!(a.eval_to_string("location.host").unwrap(), "a.test");
+        assert_eq!(b.eval_to_string("location.host").unwrap(), "b.test");
+
+        // Mutations in A do not affect B's DOM.
+        a.eval_to_string("document.getElementById('x').textContent = 'A-changed';").unwrap();
+        assert_eq!(a.eval_to_string("document.getElementById('x').textContent").unwrap(), "A-changed");
+        assert_eq!(b.eval_to_string("document.getElementById('x').textContent").unwrap(), "B-doc");
     }
 
     #[test]
