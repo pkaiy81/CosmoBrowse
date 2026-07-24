@@ -305,9 +305,14 @@
 >   `set_loop_iteration_limit` でテストは高速失敗。バイトキャップ(parse 時)と併用。
 > - ✅ **el.dataset (`d78c80b`)** — JsProxy で data-* を camelCase 公開(get/set/has/delete/
 >   ownKeys/getOwnPropertyDescriptor、data-user-id↔userId)。`Element::remove_attribute` 追加。
-> - 次(残課題): DOM 変異世代カウンタ(全再構築でなく差分 relayout)、
->   **plan D5: ScriptHost の thread-local 脱却**(per-page 状態を host に移す→ frameset/複数フレームの
->   host 対応、el.dataset===等の identity 改善)。
+> - ✅ **DOM 変異世代カウンタ (`cc10fb8`)** — cosmo_script が DOM 変異(属性/子リスト/text/innerHTML/
+>   dataset)ごとに `DOM_GENERATION` を bump、`ScriptHost::dom_generation`(navigation でリセット)。
+>   `LivePage::pump_and_relayout` は `Option<LayoutScene>` を返し、変異がなければ None
+>   (=fetch/timer 完了でも DOM 未変更なら**再レイアウト・再描画をスキップ**)。AppBridge は Some 時のみ
+>   再スプライス。**注**: これは粗い版(無変化スキップ)。真の差分 relayout(変更サブツリーのみ)は
+>   Phase 4.1(dirty-bit 伝播)で別途。
+> - 次(残課題): **plan D5: ScriptHost の thread-local 脱却**(per-page 状態を host に移す→ frameset/
+>   複数フレームの host 対応)。true 差分 relayout(Phase 4.1)。setRequestHeader の CORS 検証。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
