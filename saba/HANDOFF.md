@@ -339,8 +339,19 @@
 >   LivePage**へ一般化(D5 で安全)。単一フレームは byte 一致(reftest 12/12)。iframe への布石。
 > - 📄 **Phase 4.1「真のサブツリー部分再計算」専用セッション指示書: `docs/phase-4.1-incremental-layout-brief.md`**
 >   (安全網・アプローチ・難所・撤退ラインを記載)。ROI/リスクの観点で独立セッション向き。
-> - 次(残): 真のサブツリー部分再計算(上記指示書、専用作業)、iframe の実ドキュメント描画、
->   カスタムヘッダの CORS preflight。
+> - ✅ **CORS preflight (`347356c`)** — 非 simple なクロスオリジン(非 simple メソッド/非 safelisted
+>   ヘッダ)は OPTIONS preflight を送り、Access-Control-Allow-Methods/Headers で承認された時のみ本要求。
+>   テスト3ケース。simple 要求は従来どおり preflight スキップ。
+> - ✅ **MAX_SCRIPT_BYTES 統一+緩和 (`17def7b`)** — 512KB×2 を module const 2MB に。watchdog で実行
+>   ハングは防げるので、キャップは Boa の parse 時間保護のみ(完全撤廃はせず)。
+> - **★ 近直の追跡タスクは全完了。残るは個別に大きい deferred フェーズ/機能(小さな仕上げではない):**
+>   (i) 真のサブツリー部分再計算 = Phase 4.1(`docs/phase-4.1-incremental-layout-brief.md`、専用セッション)。
+>   (ii) **iframe の実ドキュメント描画**(現状プレースホルダ、plan 2.7。ネスト browsing context の
+>   取得+レイアウト=実質新機能)。(iii) **floats/clear/BFC**(Phase 2.3、古典レイアウト最難関)。
+>   (iv) **インライン行ボックス本実装**(Phase 2.5、UAX#14、回帰面積最大)。(v) **DOM アリーナ移行**
+>   (Phase 0.8/3.0、Rc→NodeId 大改修)。(vi) **transition/@keyframes/animation**(Phase 4.4)。
+>   (vii) **マルチプロセス化**(Phase 5、最終フェーズ)。各々が独立した集中作業で、まとめて一発では
+>   終わらない。着手はフェーズ単位で。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
