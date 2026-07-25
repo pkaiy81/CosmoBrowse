@@ -105,6 +105,15 @@ pub fn diff_scene_items(previous: &[SceneItem], next: &[SceneItem]) -> SceneDiff
     }
 }
 
+/// Upper bound on the concatenated `<script>` bytes we hand to Boa. The
+/// execution watchdog (loop/recursion caps in cosmo_script) prevents runaway
+/// *execution*, but Boa still has to *parse* the whole payload up front, so a
+/// cap keeps navigation responsive on pages shipping multi-MB minified bundles
+/// the engine can't meaningfully run anyway. Raised well above typical page JS
+/// now that execution is bounded (plan 3.5 wanted this removed; a parse-time
+/// guard remains prudent).
+const MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
+
 pub fn build_layout_scene_with_script_runtime(
     document_url: &str,
     html: &str,
@@ -270,7 +279,6 @@ impl LivePage {
         host.set_document(dom.clone());
 
         let script = get_js_content(dom.clone());
-        const MAX_SCRIPT_BYTES: usize = 512 * 1024;
         if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
             let _ = host.eval_to_string(&script);
             host.run_initial_load(1000);
@@ -365,7 +373,6 @@ fn execute_scripts_boa(
 
     // Interim watchdog (see fn doc). Larger than the toy cap since Boa handles
     // far more real-world JS, but still bounded.
-    const MAX_SCRIPT_BYTES: usize = 512 * 1024;
     let ran = if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
         if let Err(e) = host.eval_to_string(&script) {
             diagnostics.push(format!("Script error: {e}"));
