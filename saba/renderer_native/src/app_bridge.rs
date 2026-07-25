@@ -146,6 +146,31 @@ impl AppBridge {
         changed
     }
 
+    /// Whether any live frame has an ongoing animation (queued timers/rAF) the
+    /// GUI should keep driving frames for.
+    pub fn has_pending_animation(&self) -> bool {
+        self.live_frames.iter().any(|f| f.page.has_pending_animation())
+    }
+
+    /// Advance one animation frame on every live frame, splicing any updated
+    /// scenes. Returns true if any frame changed (caller repaints).
+    pub fn animation_frame(&mut self) -> bool {
+        let mut updates: Vec<(String, Vec<SceneItem>)> = Vec::new();
+        for frame in &mut self.live_frames {
+            if !frame.page.has_pending_animation() {
+                continue;
+            }
+            if let Some(scene) = frame.page.animation_frame(&frame.rect) {
+                updates.push((frame.frame_id.clone(), scene.scene_items));
+            }
+        }
+        let changed = !updates.is_empty();
+        for (frame_id, items) in updates {
+            self.splice_frame_scene(&frame_id, &items);
+        }
+        changed
+    }
+
     /// Pump until async work settles or `max` iterations elapse (headless
     /// screenshots are one-shot and must capture the settled page). Returns
     /// whether any update occurred.
@@ -158,6 +183,16 @@ impl AppBridge {
                 updated = true;
             }
             i += 1;
+        }
+        // Drive any JS animations (rAF/setInterval) forward so a one-shot
+        // screenshot captures a progressed/settled animation state (bounded —
+        // an endless animation stops at the frame cap).
+        let mut frames = 0;
+        while self.has_pending_animation() && frames < max {
+            if self.animation_frame() {
+                updated = true;
+            }
+            frames += 1;
         }
         updated
     }

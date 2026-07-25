@@ -17,7 +17,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
     window::{CursorIcon, WindowAttributes, WindowId},
 };
@@ -55,6 +55,8 @@ struct App {
     status_message: String,
     pending_url: Option<String>,
     save_screenshot: bool,
+    /// Next time an animation frame should be driven (throttles to ~60fps).
+    next_anim_frame: std::time::Instant,
     /// Per-scroll-container inner offsets (x, y).
     inner_scroll_offsets: std::collections::HashMap<u32, (i64, i64)>,
     /// Scroll containers visible in the last paint: (id, x, y, w, h,
@@ -79,6 +81,7 @@ impl App {
             status_message: String::new(),
             pending_url: None,
             save_screenshot: false,
+            next_anim_frame: std::time::Instant::now(),
             inner_scroll_offsets: std::collections::HashMap::new(),
             scroll_containers: Vec::new(),
         }
@@ -510,6 +513,25 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.needs_redraw = true;
         self.request_redraw();
+    }
+
+    /// Drive JS animations (rAF loops / setInterval) at ~60fps while any are
+    /// pending; otherwise wait idle for the next event.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.bridge.has_pending_animation() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= self.next_anim_frame {
+            if self.bridge.animation_frame() {
+                self.scroll_y = self.scroll_y.min(self.bridge.content_height());
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
+            self.next_anim_frame = now + std::time::Duration::from_millis(16);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_anim_frame));
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {

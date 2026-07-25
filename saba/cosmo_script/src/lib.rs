@@ -1816,6 +1816,67 @@ impl ScriptHost {
         self.drain(max_timer_fires, false);
     }
 
+    /// Advance the virtual clock by one animation frame (`frame_ms`) and fire
+    /// every timer/`requestAnimationFrame` callback whose due time falls within
+    /// this frame, rescheduling intervals. Used by the GUI to drive continuous
+    /// JS animations (rAF loops, setInterval): call once per real frame.
+    /// `max_fires` bounds pathological bursts within a single frame.
+    pub fn run_frame(&mut self, frame_ms: u64, max_fires: usize) {
+        self.activate();
+        self.context.run_jobs();
+        self.pump_fetches();
+        let target = VIRTUAL_CLOCK.with(|c| c.get()) + frame_ms.max(1);
+        let mut fired = 0;
+        while fired < max_fires {
+            // Pop the earliest timer that is due within this frame window.
+            let next = TIMERS.with(|t| {
+                let mut v = t.borrow_mut();
+                let idx = v
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tm)| tm.due <= target)
+                    .min_by_key(|(_, tm)| tm.due)
+                    .map(|(i, _)| i);
+                idx.map(|i| v.remove(i))
+            });
+            let Some(timer) = next else { break };
+            VIRTUAL_CLOCK.with(|c| c.set(c.get().max(timer.due)));
+            let clock = VIRTUAL_CLOCK.with(|c| c.get());
+            let args: Vec<JsValue> = if timer.is_raf {
+                vec![JsValue::from(clock as f64)]
+            } else {
+                Vec::new()
+            };
+            let _ = timer
+                .callback
+                .call(&JsValue::undefined(), &args, &mut self.context);
+            if let Some(iv) = timer.interval {
+                let due = clock + iv.max(1);
+                TIMERS.with(|t| {
+                    t.borrow_mut().push(Timer {
+                        id: timer.id,
+                        callback: timer.callback,
+                        due,
+                        interval: Some(iv),
+                        is_raf: false,
+                    })
+                });
+            }
+            self.context.run_jobs();
+            fired += 1;
+        }
+        // Advance to the frame boundary even if no timer was due, so wall-clock
+        // progresses at ~real time across frames.
+        VIRTUAL_CLOCK.with(|c| c.set(c.get().max(target)));
+    }
+
+    /// Whether any timers / `requestAnimationFrame` callbacks are queued — i.e.
+    /// the page has an ongoing animation the GUI should keep driving frames for.
+    pub fn has_pending_timers(&self) -> bool {
+        self.activate();
+        TIMERS.with(|t| !t.borrow().is_empty())
+    }
+
     /// Install the host's network backend for `fetch`/XHR.
     pub fn set_fetch_engine(&mut self, engine: Box<dyn FetchEngine>) {
         self.activate();
@@ -3570,6 +3631,36 @@ mod tests {
         .unwrap();
         host.run_initial_load(100);
         assert_eq!(host.eval_to_string("globalThis.err").unwrap(), "rejected");
+    }
+
+    #[test]
+    fn run_frame_drives_raf_animation_one_step_per_frame() {
+        let html = "<html><body><p id=\"out\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document);
+
+        // A self-perpetuating rAF loop that advances a counter each frame.
+        host.eval_to_string(
+            "var frames = 0; \
+             function step(ts){ frames++; document.getElementById('out').textContent = String(frames); if (frames < 5) requestAnimationFrame(step); } \
+             requestAnimationFrame(step);",
+        )
+        .unwrap();
+        assert_eq!(host.eval_to_string("frames").unwrap(), "0");
+        assert!(host.has_pending_timers(), "a rAF is queued");
+
+        // Each run_frame advances the loop by exactly one step.
+        for expected in 1..=5 {
+            host.run_frame(16, 64);
+            assert_eq!(host.eval_to_string("frames").unwrap(), expected.to_string());
+        }
+        // After 5 frames the loop stopped requesting; no more pending work.
+        host.run_frame(16, 64);
+        assert_eq!(host.eval_to_string("frames").unwrap(), "5");
+        assert!(!host.has_pending_timers(), "the rAF loop has finished");
+        assert_eq!(host.eval_to_string("document.getElementById('out').textContent").unwrap(), "5");
     }
 
     #[test]

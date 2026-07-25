@@ -306,6 +306,26 @@ impl LivePage {
         self.host.has_pending_fetches()
     }
 
+    /// Whether the page has an ongoing animation (queued timers / rAF) that the
+    /// GUI should keep driving frames for.
+    pub fn has_pending_animation(&self) -> bool {
+        self.host.has_pending_timers()
+    }
+
+    /// Advance one animation frame (~16ms): run due timers/rAF, and if that
+    /// mutated the DOM, re-lay-out and return the fresh scene (else None). Used
+    /// by the GUI frame clock to drive JS animations.
+    pub fn animation_frame(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
+        self.host.run_frame(16, 256);
+        replace_local_storage(&self.document_url, &self.host.local_storage_entries());
+        let generation = self.host.dom_generation();
+        if generation == self.last_generation {
+            return None;
+        }
+        self.last_generation = generation;
+        Some(layout_scene_only(self.dom.clone(), &self.cssom, rect))
+    }
+
     /// Re-lay-out the retained DOM at `rect` **without** running scripts or
     /// pumping async work (used on viewport resize — a reflow, not a re-run).
     pub fn relayout(&mut self, rect: &FrameRect) -> LayoutScene {
