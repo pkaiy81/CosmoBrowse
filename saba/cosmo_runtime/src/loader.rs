@@ -578,6 +578,79 @@ impl cosmo_script::FetchEngine for RuntimeFetchEngine {
     }
 }
 
+/// CORS-safelisted request-header names (lowercased). A cross-origin request
+/// using only these (plus a simple method) needs no preflight.
+/// Spec: https://fetch.spec.whatwg.org/#cors-safelisted-request-header
+const CORS_SAFELISTED_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "content-language",
+    "content-type",
+];
+
+/// Whether a cross-origin request is "simple" (GET/HEAD/POST + only safelisted
+/// headers) and so may skip the CORS preflight.
+fn is_simple_cors_request(method: &str, headers: &[(String, String)]) -> bool {
+    let m = method.to_ascii_uppercase();
+    if !matches!(m.as_str(), "GET" | "HEAD" | "POST") {
+        return false;
+    }
+    headers
+        .iter()
+        .all(|(name, _)| CORS_SAFELISTED_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+}
+
+/// Send a CORS preflight OPTIONS and verify the server allows the intended
+/// method and headers. Returns Err(reason) if the preflight is not approved.
+fn cors_preflight(
+    client: &reqwest::blocking::Client,
+    initiator: &str,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+) -> Result<(), String> {
+    let requested_headers: Vec<String> =
+        headers.iter().map(|(n, _)| n.to_ascii_lowercase()).collect();
+    let mut builder = client
+        .request(reqwest::Method::OPTIONS, url)
+        .header("Access-Control-Request-Method", method.to_ascii_uppercase());
+    if !requested_headers.is_empty() {
+        builder = builder.header("Access-Control-Request-Headers", requested_headers.join(","));
+    }
+    let resp = builder
+        .send()
+        .map_err(|e| format!("CORS preflight failed: {e}"))?;
+
+    // Origin must be allowed.
+    if !crate::security::passes_cors(initiator, url, resp.headers()) {
+        return Err("CORS preflight blocked (origin not allowed)".to_string());
+    }
+    let header_val = |name: &str| -> String {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    // Method must be allowed.
+    let allow_methods = header_val("access-control-allow-methods");
+    let m = method.to_ascii_lowercase();
+    if allow_methods != "*" && !allow_methods.split(',').any(|x| x.trim() == m) {
+        return Err(format!("CORS preflight: method {method} not allowed"));
+    }
+    // Every requested header must be allowed.
+    let allow_headers = header_val("access-control-allow-headers");
+    if allow_headers != "*" {
+        let allowed: Vec<&str> = allow_headers.split(',').map(|x| x.trim()).collect();
+        for h in &requested_headers {
+            if !allowed.contains(&h.as_str()) {
+                return Err(format!("CORS preflight: header {h} not allowed"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchResponse {
     let reject = |url: String, msg: String| cosmo_script::FetchResponse {
         ok: false,
@@ -607,13 +680,21 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
     // via Access-Control-Allow-Origin. Only enforced when the document has a
     // real http(s) origin (opaque bases like about:blank are permissive).
     // Spec: Fetch CORS protocol. https://fetch.spec.whatwg.org/#http-cors-protocol
-    // (Simplification: no preflight for custom headers yet — the simple CORS
-    // response check is applied to all cross-origin requests.)
     let enforce_cors = (base.starts_with("http://") || base.starts_with("https://"))
         && !crate::security::is_same_origin(base, &url);
 
     let mut diagnostics = Vec::new();
     let client = select_http_client(&url, &mut diagnostics);
+
+    // A non-simple cross-origin request (non-simple method or non-safelisted
+    // header) requires a CORS preflight (OPTIONS) that the server must approve
+    // before the actual request is sent.
+    // Spec: https://fetch.spec.whatwg.org/#cors-preflight-fetch
+    if enforce_cors && !is_simple_cors_request(&req.method, &req.headers) {
+        if let Err(msg) = cors_preflight(client, base, &url, &req.method, &req.headers) {
+            return reject(url, msg);
+        }
+    }
     let mut builder = match req.method.to_ascii_uppercase().as_str() {
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
@@ -1152,6 +1233,85 @@ mod tests {
             allowed.error.is_none() && allowed.ok,
             "cross-origin with ACAO:* should succeed, got: {:?}",
             allowed.error
+        );
+    }
+
+    /// Serve up to 4 requests; answer OPTIONS (preflight) with the given
+    /// allow-headers value (None = no CORS headers → preflight fails), and GET
+    /// with a body + ACAO:*. Returns the port.
+    fn serve_preflight(allow_headers: Option<&'static str>) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Some(Ok(mut stream)) = listener.incoming().next() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let is_options = req.starts_with("OPTIONS");
+                let resp = if is_options {
+                    match allow_headers {
+                        Some(h) => format!(
+                            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: *\r\nAccess-Control-Allow-Headers: {h}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ),
+                        None => "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    }
+                } else {
+                    let body = "{\"ok\":1}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn get_with_header(base: &str, url: &str) -> cosmo_script::FetchResponse {
+        do_fetch(
+            base,
+            cosmo_script::FetchRequest {
+                url: url.to_string(),
+                method: "GET".to_string(),
+                body: None,
+                headers: vec![("X-Custom".to_string(), "1".to_string())],
+            },
+        )
+    }
+
+    #[test]
+    fn cors_preflight_gates_custom_header_requests() {
+        // Cross-origin GET with a non-safelisted header requires a preflight.
+        let base = "http://127.0.0.1:1/".to_string(); // opaque-ish distinct origin
+
+        // Preflight allows the custom header -> request succeeds.
+        let ok_port = serve_preflight(Some("x-custom"));
+        let ok = get_with_header(&base, &format!("http://127.0.0.1:{ok_port}/d"));
+        assert!(ok.error.is_none() && ok.ok, "preflight-approved request should succeed: {:?}", ok.error);
+
+        // Preflight does NOT allow the header -> request blocked.
+        let no_hdr = serve_preflight(Some("x-other"));
+        let blocked = get_with_header(&base, &format!("http://127.0.0.1:{no_hdr}/d"));
+        assert!(
+            blocked.error.as_deref().unwrap_or("").contains("preflight"),
+            "preflight without the header should block, got: {:?}",
+            blocked.error
+        );
+
+        // Preflight returns no CORS headers -> blocked.
+        let none = serve_preflight(None);
+        let blocked2 = get_with_header(&base, &format!("http://127.0.0.1:{none}/d"));
+        assert!(
+            blocked2.error.as_deref().unwrap_or("").contains("preflight"),
+            "preflight with no CORS headers should block, got: {:?}",
+            blocked2.error
         );
     }
 
