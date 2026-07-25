@@ -332,8 +332,15 @@
 >   局所性が低く、部分再計算は本番(assert OFF)で silent mis-render のリスク。stage 1/2 は「計算内容は
 >   full のまま冗長作業(CSS 再パース・render-tree)を削減」で安全に高速化済み。真の部分再計算は
 >   専用の集中作業向き。
-> - 次(残): setRequestHeader の CORS 検証、frameset の複数 LivePage 対応(D5 済み)、
->   真のサブツリー部分再計算(専用作業)。
+> - ✅ **fetch/XHR の CORS + mixed-content (`86e3021`)** — `do_fetch` がクロスオリジンを
+>   `security::passes_cors`(ACAO)でゲート、非許可は reject。同一オリジン/opaque base(about:blank)は
+>   許可。https→http mixed content もブロック。テスト4種。**簡略化: カスタムヘッダの preflight 未対応**。
+> - ✅ **frameset の複数 LivePage (`b550176`)** — AppBridge をルート専用から**各コンテンツフレームに
+>   LivePage**へ一般化(D5 で安全)。単一フレームは byte 一致(reftest 12/12)。iframe への布石。
+> - 📄 **Phase 4.1「真のサブツリー部分再計算」専用セッション指示書: `docs/phase-4.1-incremental-layout-brief.md`**
+>   (安全網・アプローチ・難所・撤退ラインを記載)。ROI/リスクの観点で独立セッション向き。
+> - 次(残): 真のサブツリー部分再計算(上記指示書、専用作業)、iframe の実ドキュメント描画、
+>   カスタムヘッダの CORS preflight。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
