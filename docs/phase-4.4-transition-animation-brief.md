@@ -17,6 +17,18 @@
 - **@keyframes 保存 + animation 再生**: `@keyframes` を CSSOM に保存し、`animation-*` で再生。
 - **フレームクロック**: イベントループのフレーム時計で rAF/補間を駆動。GUI は winit のフレーム/タイマーで定期 pump。
 
+## 宣言的 CSS transition ドライバの設計（残り作業・2026-07-25 追記）
+
+`transition` の**パースと easing コアは landing 済み**(`f798097`: `ComputedStyle::transitions()`/`transition_for()`、`Easing::apply(t)`)。**残るのはドライバ**(目標値変化の検知→補間→適用)。設計:
+
+1. **要素↔計算後スタイルの橋渡し**: `LayoutObject` は `node: Rc<RefCell<Node>>` を持つので、`LayoutView` に「各要素の (DOM ノード, 計算後 opacity, opacity の transition 設定)」を返す `collect_transition_targets()` を追加。**target は cascade 由来**(override を含めない)を返すこと。
+2. **override は cascade と分離**: LivePage が補間値を `data-cosmo-anim-opacity` 属性としてノードに設定し、**エンジンの paint はこの属性があれば opacity をそれで上書き**(cascade の計算後 opacity は「目標」として残す)。これで「目標(stylesheet) vs 適用値(override)」が混ざらない。
+3. **LivePage の transition トラッカ**: `HashMap<node_ptr, ActiveTransition{ from, to, start_ms, dur, easing }>` + `last_target: HashMap<node_ptr, f64>`。relayout 後に `collect_transition_targets` を呼び、target が last と変われば「現在の表示値→新 target」の transition を開始。
+4. **駆動**: `LivePage::animation_frame` で経過 ms を進め、各 active transition の補間 opacity を `data-cosmo-anim-opacity` に書き、relayout+repaint。`has_pending_animation` に「active transition あり」を含める(タイマー同様にフレームクロックが回る)。完了で属性除去・状態削除。
+5. **拡張**: color/transform も同様(color は補間、transform は translate/scale/rotate の数値補間)。まず opacity で成立させてから。
+
+**検証**: `transition: opacity .3s` の要素に JS で class を付けて opacity を変え、GUI(または settle でフレーム完走)で中間/最終状態が滑らかに変わることをスクショ確認。static ページは transition 無しで非回帰(reftest 12/12)。
+
 ## 難所
 
 1. 補間には「前フレームの computed 値」と「現フレームの目標値」が要る → LivePage が要素ごとのアニメ状態を持つ必要。

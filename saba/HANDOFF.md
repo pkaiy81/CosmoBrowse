@@ -355,6 +355,10 @@
 > - ✅ **Phase 4.4 の JS アニメ駆動 (`851295a`)** — rAF ループ/setInterval で style を変えるアニメが GUI で動作
 >   (`run_frame`/`has_pending_timers`、`LivePage::animation_frame`、`about_to_wait` の ~60fps フレームクロック)。
 >   static ページ非回帰(reftest 12/12)。**残: 宣言的 CSS transition/@keyframes**(4.4 ブリーフ参照)。
+> - 🚧 **Phase 4.4 CSS transition パース+easing (`f798097`)** — `transition` shorthand を
+>   `ComputedStyle::transitions()` にパース、`Easing::apply(t)`(linear/ease/in/out/in-out)。テスト済み・inert。
+>   **残: 宣言的 transition ドライバ**(要素↔計算後スタイル橋渡し + `data-cosmo-anim-opacity` paint override +
+>   LivePage の transition トラッカ)。設計は 4.4 ブリーフに精密記載。JS アニメ(rAF)は既に GUI で動作。
 > - 📄 **残る大物すべてに専用セッション指示書を整備済み**(索引: `docs/session-briefs-index.md`)。
 >   各書に 背景/ゴール/難所/段階的アプローチ/検証/撤退ライン/関連ファイルを記載。推奨着手順は索引参照。
 >   ファイル: `docs/phase-2.3-floats-bfc-brief.md`, `phase-2.5-inline-layout-brief.md`,
