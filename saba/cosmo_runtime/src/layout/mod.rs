@@ -185,20 +185,41 @@ pub(crate) fn resolve_cssom(
     CssParser::new(CssTokenizer::new(style)).parse_stylesheet()
 }
 
-/// Lay out `dom` against an already-parsed `cssom` at `rect`.
+/// Build the layout view for `dom` against an already-parsed `cssom` at `rect`.
+fn build_layout_view(
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    cssom: &cosmo_engine::renderer::css::cssom::StyleSheet,
+    rect: &FrameRect,
+) -> LayoutView {
+    // var(--token) references are resolved per element during the cascade
+    // (custom properties inherit; the document root seeds from the whole
+    // stylesheet), so no global pre-substitution is needed here.
+    LayoutView::new_with_viewport(dom, cssom, rect.width.max(1), rect.height.max(0))
+}
+
+/// Lay out `dom` against an already-parsed `cssom` at `rect`, producing both
+/// the paint scene and the render-tree snapshot.
 fn layout_dom_with_style(
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
     cssom: &cosmo_engine::renderer::css::cssom::StyleSheet,
     rect: &FrameRect,
 ) -> (LayoutScene, RenderTreeSnapshot) {
-    // var(--token) references are resolved per element during the cascade
-    // (custom properties inherit; the document root seeds from the whole
-    // stylesheet), so no global pre-substitution is needed here.
-    let layout_view =
-        LayoutView::new_with_viewport(dom, cssom, rect.width.max(1), rect.height.max(0));
+    let layout_view = build_layout_view(dom, cssom, rect);
     let layout_scene = display_items_to_scene(layout_view.paint(), rect);
     let render_tree = render_tree_snapshot(&layout_view, rect);
     (layout_scene, render_tree)
+}
+
+/// Lay out `dom` producing **only** the paint scene (skips the render-tree
+/// snapshot, which the GUI's LivePage discards — saving that whole-tree walk
+/// on every progressive update / reflow).
+fn layout_scene_only(
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    cssom: &cosmo_engine::renderer::css::cssom::StyleSheet,
+    rect: &FrameRect,
+) -> LayoutScene {
+    let layout_view = build_layout_view(dom, cssom, rect);
+    display_items_to_scene(layout_view.paint(), rect)
 }
 
 /// A persistently-hosted page: keeps its Boa `ScriptHost` and DOM alive across
@@ -257,7 +278,7 @@ impl LivePage {
         replace_local_storage(document_url, &host.local_storage_entries());
 
         let cssom = resolve_cssom(dom.clone(), document_url);
-        let (scene, _tree) = layout_dom_with_style(dom.clone(), &cssom, rect);
+        let scene = layout_scene_only(dom.clone(), &cssom, rect);
         let last_generation = host.dom_generation();
         (
             Self {
@@ -280,8 +301,7 @@ impl LivePage {
     /// Re-lay-out the retained DOM at `rect` **without** running scripts or
     /// pumping async work (used on viewport resize — a reflow, not a re-run).
     pub fn relayout(&mut self, rect: &FrameRect) -> LayoutScene {
-        let (scene, _tree) = layout_dom_with_style(self.dom.clone(), &self.cssom, rect);
-        scene
+        layout_scene_only(self.dom.clone(), &self.cssom, rect)
     }
 
     /// Drain any settled async work (fetch/XHR completions, timers) so their
@@ -297,7 +317,7 @@ impl LivePage {
             return None;
         }
         self.last_generation = generation;
-        let (scene, _tree) = layout_dom_with_style(self.dom.clone(), &self.cssom, rect);
+        let scene = layout_scene_only(self.dom.clone(), &self.cssom, rect);
         self.assert_matches_full(&scene, rect);
         Some(scene)
     }
