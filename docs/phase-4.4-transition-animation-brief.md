@@ -32,8 +32,9 @@ override は `data-cosmo-anim-opacity` として DOM 上にあるので **full �
 **この節の残り**: ① color(継承あり)/transform の補間② length 系(relayout が要る)
 ③ **`run_initial_load` が pending タイマーを全消化**するため `setTimeout` 起点の class 変更は
 初回描画前に確定してアニメしない(ロード後の fetch/XHR・フレームクロックのタイマーは動く)。
-④ `:hover` 起点(1.5 未実装)⑤ クリック等の実入力を LivePage の ScriptHost へ dispatch する配線
-(現状 AppBridge は `activate_link` = ナビゲーションのみ)。
+④ `:hover` 起点(1.5 未実装)。
+~~⑤ クリック等の実入力を LivePage へ dispatch~~ → **完了 (`ecdc07a`)**: 実クリックが JS に届き、
+ハンドラの class 変更から transition が起動する(GUI 検証済み)。
 
 ### 当初の設計メモ（実装済み・参照用）
 

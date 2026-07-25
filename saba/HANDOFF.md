@@ -377,6 +377,23 @@
 >   偶然正しい)。ロード後トリガ(fetch/XHR ハンドラ、フレームクロックのタイマー)は動く。
 >   **残: color/transform の補間**(同じ仕組みに追加)、**@keyframes/animation**(未保存)、
 >   **length 系 transition**(relayout が必要)。
+> - ✅ **実クリックの JS ディスパッチ (`ecdc07a`, 2026-07-26)** — **ページ自身の `click` リスナが
+>   GUI で動くようになった**(従来は描画済みリンク領域しか見ておらず、DOM イベントはあっても
+>   入力が流れ込んでいなかった)。`LivePage::dispatch_click` が保持レイアウトをヒットテスト →
+>   **最近傍の要素**まで遡上(テキスト箱のクリックはその要素が target)→ dispatch → ハンドラの
+>   DOM 変異を再レイアウト(=そこで class を変えれば **CSS transition が発火**しフレームクロックが回る)。
+>   `AppBridge::dispatch_click` が rect からフレームを選び、`main.rs` は**ページに先に渡し**、
+>   ページがナビゲートも preventDefault もしなかった時だけ従来のリンク領域経路にフォールバック
+>   (LivePage を持たない静的フレームは従来どおり)。
+>   **リンク遷移が設計どおりの経路に**: `prepare_html_for_display` が全文書に注入するシムが
+>   アンカーのクリックを `cosmobrowse:navigate` の postMessage に変え、`loader::parse_navigate_message`
+>   が host 側で戻す。
+>   **前提だった修正**: 合成 Event に `button` が無く、シムの定石 `if(event.button!==0)return;` が
+>   全クリックを弾いていた。`make_event` が button/buttons・修飾キー・clientX/pageX/x/offsetX(+Y)・
+>   bubbles/cancelable・`defaultPrevented` ゲッタを持ち、`dispatch_mouse_event` が座標を渡す。
+>   `COSMO_HEADLESS_CLICK=x,y` でヘッドレス capture 前に1回クリック(インタラクションのスクショ検証用)。
+>   検証: クリック→class 変更→transition 中間色 (0,122,133)、リンククリックで遷移先が描画。
+>   **残**: mousedown/mouseup/mousemove、インライン `onclick=""` 属性ハンドラ、フォーム入力。
 > - ✅ **transition ドライバのプロパティ汎用化 + background-color (`aaca6b4`)** — `AnimatedProperty`
 >   (Opacity/BackgroundColor)+ `AnimatedValue`(Number/Rgba: 補間・直列化・近似比較)をエンジンに置き、
 >   ドライバは (node, property) キーで**プロパティ非依存**に(1要素で2プロパティが独立に動く)。
