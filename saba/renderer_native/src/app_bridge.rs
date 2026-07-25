@@ -3,11 +3,13 @@ use adapter_native::{BrowserFrameDto, BrowserPageDto, NativeAdapter};
 use cosmo_engine::paint_commands::PaintCommand;
 use cosmo_runtime::{scene_items_to_paint_commands, FetchWaker, FrameRect, LivePage, SceneItem};
 
-/// The persistent script host for the root content frame (see module note on
-/// progressive rendering). Only the single root frame is script-hosted for now
-/// — ScriptHost keeps per-page state in thread-locals, so one active host per
-/// thread (plan D5); framesets/child frames render statically.
-struct LiveRoot {
+/// A persistent script host for one content frame, kept alive so async work
+/// (fetch/XHR/timers) can settle after first paint and re-layout. Each frame
+/// (root and — for framesets — every child) gets its own; ScriptHost per-page
+/// state now lives on the host (plan D5), so multiple can coexist on the
+/// renderer thread (the active one is swapped in per call).
+struct LiveFrame {
+    frame_id: String,
     page: LivePage,
     rect: FrameRect,
 }
@@ -15,9 +17,8 @@ struct LiveRoot {
 pub struct AppBridge {
     adapter: NativeAdapter,
     current_page: Option<BrowserPageDto>,
-    /// Script host for the current page's root frame, kept alive so async work
-    /// (fetch/XHR/timers) can settle after first paint and re-layout.
-    live_root: Option<LiveRoot>,
+    /// One script host per content frame (root + frameset children).
+    live_frames: Vec<LiveFrame>,
     /// Fires when async work completes so the event loop wakes to pump.
     waker: Option<FetchWaker>,
 }
@@ -27,7 +28,7 @@ impl AppBridge {
         Self {
             adapter: NativeAdapter::default(),
             current_page: None,
-            live_root: None,
+            live_frames: Vec::new(),
             waker: None,
         }
     }
@@ -86,72 +87,63 @@ impl AppBridge {
         Ok(())
     }
 
-    /// Build a LivePage for the current root frame, run its scripts, and splice
-    /// the resulting scene into the page (first paint). Only single-frame pages
-    /// are script-hosted; framesets render statically.
+    /// Build a LivePage for every content frame (root + frameset children),
+    /// run its scripts, and splice the resulting scene into that frame (first
+    /// paint). Frames without html_content stay on the static path.
     fn run_root_scripts(&mut self) {
-        self.live_root = None;
+        self.live_frames.clear();
         let Some(page) = &self.current_page else {
             return;
         };
-        let root = &page.root_frame;
-        // Frameset pages (with child frames) stay on the static path.
-        if !root.child_frames.is_empty() {
-            return;
+        let mut docs = Vec::new();
+        collect_frame_documents(&page.root_frame, &mut docs);
+        for (frame_id, url, html, rect) in docs {
+            let (live, scene) = LivePage::load(&url, &html, &rect, self.waker.clone());
+            self.splice_frame_scene(&frame_id, &scene.scene_items);
+            self.live_frames.push(LiveFrame {
+                frame_id,
+                page: live,
+                rect,
+            });
         }
-        let Some(html) = root.html_content.clone() else {
-            return;
-        };
-        let rect = FrameRect {
-            x: root.rect.x,
-            y: root.rect.y,
-            width: root.rect.width,
-            height: root.rect.height,
-        };
-        let url = root.document_url.clone();
-        let (live, scene) = LivePage::load(&url, &html, &rect, self.waker.clone());
-        self.splice_root_scene(&scene.scene_items);
-        self.live_root = Some(LiveRoot { page: live, rect });
     }
 
-    /// Replace the root frame's scene_items + paint_commands with `items`.
-    fn splice_root_scene(&mut self, items: &[SceneItem]) {
+    /// Replace the identified frame's scene_items + paint_commands with `items`.
+    fn splice_frame_scene(&mut self, frame_id: &str, items: &[SceneItem]) {
         let Some(page) = &mut self.current_page else {
             return;
         };
-        let (list, _errors) = scene_items_to_paint_commands(items);
-        page.root_frame.scene_items = items.to_vec();
-        page.root_frame.paint_commands = list.commands;
+        if let Some(frame) = find_frame_mut(&mut page.root_frame, frame_id) {
+            let (list, _errors) = scene_items_to_paint_commands(items);
+            frame.scene_items = items.to_vec();
+            frame.paint_commands = list.commands;
+        }
     }
 
     /// Whether the current page has outstanding async work (fetch/XHR) that a
     /// later `pump_progressive` may resolve into new content.
     pub fn has_pending_async(&self) -> bool {
-        self.live_root
-            .as_ref()
-            .map(|r| r.page.has_pending_work())
-            .unwrap_or(false)
+        self.live_frames.iter().any(|f| f.page.has_pending_work())
     }
 
-    /// Drain settled async work on the root LivePage, re-lay-out, and splice the
-    /// updated scene. Returns true if the page was updated (caller should
-    /// repaint).
+    /// Drain settled async work on every live frame, re-lay-out, and splice the
+    /// updated scenes. Returns true if any frame was updated (caller repaints).
     pub fn pump_progressive(&mut self) -> bool {
-        let Some(root) = &mut self.live_root else {
-            return false;
-        };
-        if !root.page.has_pending_work() {
-            return false;
-        }
-        // Only re-splice/repaint if the pump actually changed the DOM.
-        match root.page.pump_and_relayout(&root.rect) {
-            Some(scene) => {
-                let items = scene.scene_items;
-                self.splice_root_scene(&items);
-                true
+        let mut updates: Vec<(String, Vec<SceneItem>)> = Vec::new();
+        for frame in &mut self.live_frames {
+            if !frame.page.has_pending_work() {
+                continue;
             }
-            None => false,
+            // Only re-splice/repaint if the pump actually changed the DOM.
+            if let Some(scene) = frame.page.pump_and_relayout(&frame.rect) {
+                updates.push((frame.frame_id.clone(), scene.scene_items));
+            }
         }
+        let changed = !updates.is_empty();
+        for (frame_id, items) in updates {
+            self.splice_frame_scene(&frame_id, &items);
+        }
+        changed
     }
 
     /// Pump until async work settles or `max` iterations elapse (headless
@@ -189,26 +181,28 @@ impl AppBridge {
             .set_viewport(width as i64, height as i64)
             .map_err(|e| e.message)?;
         self.current_page = Some(page);
-        // The static DTO from the adapter replaced our scripted root scene;
-        // reflow the retained LivePage at the new rect and splice it back
-        // (a resize reflows — it does NOT re-run scripts).
-        if self.live_root.is_some() {
+        // The static DTO from the adapter replaced our scripted scenes; reflow
+        // each retained LivePage at its new rect and splice it back (a resize
+        // reflows — it does NOT re-run scripts).
+        let mut updates: Vec<(String, Vec<SceneItem>)> = Vec::new();
+        for frame in &mut self.live_frames {
+            // Look up this frame's fresh rect from the new static DTO.
             let new_rect = self
                 .current_page
                 .as_ref()
-                .map(|p| FrameRect {
-                    x: p.root_frame.rect.x,
-                    y: p.root_frame.rect.y,
-                    width: p.root_frame.rect.width,
-                    height: p.root_frame.rect.height,
+                .and_then(|p| find_frame(&p.root_frame, &frame.frame_id))
+                .map(|f| FrameRect {
+                    x: f.rect.x,
+                    y: f.rect.y,
+                    width: f.rect.width,
+                    height: f.rect.height,
                 })
-                .unwrap_or(FrameRect { x: 0, y: 0, width: width as i64, height: height as i64 });
-            let items = {
-                let root = self.live_root.as_mut().unwrap();
-                root.rect = new_rect.clone();
-                root.page.relayout(&new_rect).scene_items
-            };
-            self.splice_root_scene(&items);
+                .unwrap_or_else(|| frame.rect.clone());
+            frame.rect = new_rect.clone();
+            updates.push((frame.frame_id.clone(), frame.page.relayout(&new_rect).scene_items));
+        }
+        for (frame_id, items) in updates {
+            self.splice_frame_scene(&frame_id, &items);
         }
         Ok(())
     }
@@ -308,6 +302,59 @@ impl AppBridge {
             page.root_frame.scroll_position.y = y;
         }
     }
+}
+
+/// Collect (frame_id, document_url, html, rect) for every frame in the tree
+/// that has html_content, so each can be script-hosted by its own LivePage.
+fn collect_frame_documents(
+    frame: &BrowserFrameDto,
+    out: &mut Vec<(String, String, String, FrameRect)>,
+) {
+    if let Some(html) = &frame.html_content {
+        out.push((
+            frame.id.clone(),
+            frame.document_url.clone(),
+            html.clone(),
+            FrameRect {
+                x: frame.rect.x,
+                y: frame.rect.y,
+                width: frame.rect.width,
+                height: frame.rect.height,
+            },
+        ));
+    }
+    for child in &frame.child_frames {
+        collect_frame_documents(child, out);
+    }
+}
+
+/// Find a frame by id in the tree (immutable).
+fn find_frame<'a>(frame: &'a BrowserFrameDto, frame_id: &str) -> Option<&'a BrowserFrameDto> {
+    if frame.id == frame_id {
+        return Some(frame);
+    }
+    for child in &frame.child_frames {
+        if let Some(f) = find_frame(child, frame_id) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Find a frame by id in the tree (mutable).
+fn find_frame_mut<'a>(
+    frame: &'a mut BrowserFrameDto,
+    frame_id: &str,
+) -> Option<&'a mut BrowserFrameDto> {
+    if frame.id == frame_id {
+        return Some(frame);
+    }
+    for child in &mut frame.child_frames {
+        if let Some(f) = find_frame_mut(child, frame_id) {
+            return Some(f);
+        }
+    }
+    None
 }
 
 /// Detect frameset border gaps between adjacent child frames and append
