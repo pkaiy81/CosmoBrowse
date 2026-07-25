@@ -352,6 +352,12 @@
 >   (Phase 0.8/3.0、Rc→NodeId 大改修)。(vi) **transition/@keyframes/animation**(Phase 4.4)。
 >   (vii) **マルチプロセス化**(Phase 5、最終フェーズ)。各々が独立した集中作業で、まとめて一発では
 >   終わらない。着手はフェーズ単位で。
+> - 📄 **残る大物すべてに専用セッション指示書を整備済み**(索引: `docs/session-briefs-index.md`)。
+>   各書に 背景/ゴール/難所/段階的アプローチ/検証/撤退ライン/関連ファイルを記載。推奨着手順は索引参照。
+>   ファイル: `docs/phase-2.3-floats-bfc-brief.md`, `phase-2.5-inline-layout-brief.md`,
+>   `iframe-rendering-brief.md`, `phase-0.8-dom-arena-brief.md`,
+>   `phase-4.1-incremental-layout-brief.md`, `phase-4.4-transition-animation-brief.md`,
+>   `phase-5-multiprocess-brief.md`。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
