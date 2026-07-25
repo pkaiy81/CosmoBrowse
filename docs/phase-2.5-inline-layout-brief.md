@@ -2,6 +2,8 @@
 
 > 独立セッション用。着手前に `saba/HANDOFF.md` 全体と本書を読むこと。プランが **「回帰面積最大」** と位置づける項目。**1マイルストーンだけ新旧を LayoutView フラグで A/B し、reftest 比較後に旧経路削除**。
 
+> **⚠ 2.3 と結合(2026-07-25 知見)**: float の回り込み(行の利用可能幅短縮)は本実装の行ボックスが前提。**2.3 floats と一体で実施**すること。
+
 ## 背景 / 現在地
 
 - 現行のインラインは近似実装: `layout_object.rs::compute_size` の Text 経路で `split_text(text, font, bold, max_width)`(`layout/text` 系)により幅で折り返し、per-char アドバンステーブル(DejaVu 較正)で計測。行ボックスの明示概念は弱く、inline 要素の内部折り返し・ベースライン整合はパッチ的(`align_inline_baselines`)。

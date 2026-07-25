@@ -14,11 +14,13 @@
 | `phase-4.4-transition-animation-brief.md` | 4.4 | transition / @keyframes / animation | 中(動的表現) | 中〜大 |
 | `phase-5-multiprocess-brief.md` | 5 | マルチプロセス化(ADR-0001) | なし(堅牢性/分離) | 大・最大(最終フェーズ) |
 
-## 推奨着手順（描画忠実度優先の場合）
+## 推奨着手順（更新: 2026-07-25）
 
-1. **2.3 floats** → **2.5 inline**（この2つが「モダンページが正しく見える」に最も効く。相互依存するので近接して。各々 reftest 先行・A/B で安全に）
-2. **4.4 transition/animation**（動的表現。opacity/transform 先行が軽い）
-3. **iframe**（frameset 基盤の要素単位一般化）
-4. **4.1 incremental layout**（perf。2.3/2.5 後の方が安定。安全網あり）
+> **重要な結合知見**: **2.3 floats と 2.5 inline は分離不可**に近い。float の回り込み(後続の利用可能幅短縮)は size パスに float コンテキストが要り、行単位の精密回り込みは 2.5 の行ボックスが前提。**float の部分実装は現状の描画を悪化させうる**(今 `float:right` は通常フローで重なり無し。エッジへ動かすだけだと後続が同 Y・全幅で重なる)。→ **2.3 と 2.5 は1つの結合作業として扱う**こと。`float`/`clear` の**プロパティパースは landing 済み**(`b184e07`)。
+
+1. **4.4 transition/animation**（opacity/transform などレイアウト非依存プロパティ先行 = 最も安全に着手できる。まずここから）
+2. **iframe**（frameset 基盤の要素単位一般化）
+3. **4.1 incremental layout**（perf。安全網 `COSMO_LAYOUT_ASSERT` あり）
+4. **2.3 + 2.5 結合**（floats + inline 行ボックス本実装を一体で。reftest 先行・A/B・回帰面積最大。最も慎重に）
 5. **0.8 arena**（内部リファクタ。Boa 連携/4.1 dirty bit の土台。純リファクタ最リスク）
 6. **5 multiprocess**（最終。前提の security.rs per-profile 化 + IPC v2 は前倒し可）

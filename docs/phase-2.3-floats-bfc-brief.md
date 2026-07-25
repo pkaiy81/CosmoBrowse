@@ -2,6 +2,8 @@
 
 > 独立セッション用。着手前に `saba/HANDOFF.md` 全体と本書を読むこと。プランが **「古典レイアウト最難関」** と位置づける項目。**reftest 先行**で進める。
 
+> **⚠ 2.5 と結合(2026-07-25 知見)**: float の回り込みは size パスの float コンテキスト + 2.5 の行ボックスが前提で、**単独の部分実装は既存描画を悪化させうる**(今 float:right は通常フローで重なり無し)。**2.5 と一体で実施**すること。`float`/`clear` のパースは landing 済み(`b184e07`)。
+
 ## 背景 / 現在地
 
 - レイアウトは `cosmo_engine/src/renderer/layout/layout_view.rs`(`build_layout_tree` → `update_layout`)+ `layout_object.rs`(`compute_size` 上→下、`compute_position`)。
