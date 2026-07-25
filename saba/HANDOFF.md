@@ -324,9 +324,16 @@
 >   毎回の CSS 再パースを削減=最初の incremental win。動的追加の <style>/<link> は navigation まで
 >   未反映)。(b) **安全網 `COSMO_LAYOUT_ASSERT=1`**: pump_and_relayout が full レイアウトも計算して
 >   scene の byte 一致を assert(乖離は panic)。テスト: fetch 変異 pump を assert 下で検証。reftest 12/12。
-> - 次(Phase 4.1 継続): per-node layout-dirty フラグ + DOM→LayoutObject 対応 → 変更サブツリーのみ
->   部分再計算(assert harness で常に full 一致を担保しながら)。setRequestHeader の CORS 検証。
->   frameset の複数 LivePage 対応(D5 で下地済み)。
+> - 🚧 **Phase 4.1 stage 2 (`081c03f`)** — LivePage の load/relayout/pump は paint scene のみ必要なのに
+>   毎回 render-tree snapshot を計算・破棄していた。`layout_scene_only`(render-tree 走査なし)を切出し
+>   LivePage をそれ経由に。プログレッシブ更新/リサイズ reflow がツリー全走査を1つ省く。scene 不変。
+> - ⚠ **Phase 4.1 の「真のサブツリー部分再計算」は深いエンジン改修で ROI 限定的(要判断)**:
+>   `build_layout_tree` が DOM から毎回全再構築、ブロックフローは相互依存(子高さ→親高さ→兄弟位置)で
+>   局所性が低く、部分再計算は本番(assert OFF)で silent mis-render のリスク。stage 1/2 は「計算内容は
+>   full のまま冗長作業(CSS 再パース・render-tree)を削減」で安全に高速化済み。真の部分再計算は
+>   専用の集中作業向き。
+> - 次(残): setRequestHeader の CORS 検証、frameset の複数 LivePage 対応(D5 済み)、
+>   真のサブツリー部分再計算(専用作業)。
 >   cosmo_runtime の玩具 JS を cosmo_script に置換 + `renderer/js/` 削除、
 >   MAX_SCRIPT_BYTES 撤廃、**DOM 変異→再レイアウトのトリガ**(現状 script は DOM を
 >   変えるが再レイアウトされない)、innerHTML(フラグメントパース)、style(setProperty)、
