@@ -362,6 +362,12 @@ impl LayoutObject {
                         }
                     }
                 }
+                "transition" => {
+                    let specs = parse_transition_shorthand(&declaration.value);
+                    if !specs.is_empty() {
+                        self.style.set_transitions(specs);
+                    }
+                }
                 "top" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_top(*value),
                     Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
@@ -797,5 +803,114 @@ impl LayoutObject {
         parent_style: Option<ComputedStyle>,
     ) {
         self.style.defaulting(node, parent_style);
+    }
+}
+
+/// Parse the `transition` shorthand into per-property specs. Handles
+/// comma-separated declarations of `<property> <duration> [easing] [delay]`
+/// (whitespace-separated within each). Durations are `Ns`/`Nms` dimensions.
+/// Spec: CSS Transitions L1 §2.
+fn parse_transition_shorthand(values: &[ComponentValue]) -> Vec<TransitionSpec> {
+    fn dur_ms(v: f64, unit: &str) -> Option<u32> {
+        match unit {
+            "s" => Some((v * 1000.0).round().max(0.0) as u32),
+            "ms" => Some(v.round().max(0.0) as u32),
+            _ => None,
+        }
+    }
+    let is_easing = |s: &str| {
+        matches!(
+            s,
+            "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out"
+        )
+    };
+
+    let mut specs = Vec::new();
+    // Split on comma delimiters into per-property groups.
+    for group in values.split(|t| matches!(t, ComponentValue::Delim(','))) {
+        let mut property: Option<String> = None;
+        let mut durations: Vec<u32> = Vec::new();
+        let mut easing = Easing::Ease;
+        for tok in group {
+            match tok {
+                ComponentValue::Ident(s) => {
+                    let s = s.to_ascii_lowercase();
+                    if is_easing(&s) {
+                        easing = Easing::from_str(&s);
+                    } else if property.is_none() {
+                        property = Some(s);
+                    }
+                }
+                ComponentValue::Dimension(v, unit) => {
+                    if let Some(ms) = dur_ms(*v, &unit.to_ascii_lowercase()) {
+                        durations.push(ms);
+                    }
+                }
+                ComponentValue::Number(v) if *v == 0.0 => durations.push(0),
+                _ => {}
+            }
+        }
+        if let Some(property) = property {
+            specs.push(TransitionSpec {
+                property,
+                duration_ms: durations.first().copied().unwrap_or(0),
+                delay_ms: durations.get(1).copied().unwrap_or(0),
+                easing,
+            });
+        }
+    }
+    specs
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use crate::renderer::css::cssom::ComponentValue as CV;
+
+    #[test]
+    fn parse_transition_single_and_multiple() {
+        // opacity 0.3s ease-in
+        let one = parse_transition_shorthand(&[
+            CV::Ident("opacity".into()),
+            CV::Whitespace,
+            CV::Dimension(0.3, "s".into()),
+            CV::Whitespace,
+            CV::Ident("ease-in".into()),
+        ]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].property, "opacity");
+        assert_eq!(one[0].duration_ms, 300);
+        assert_eq!(one[0].easing, Easing::EaseIn);
+
+        // opacity 200ms, color 0.5s linear 0.1s
+        let two = parse_transition_shorthand(&[
+            CV::Ident("opacity".into()),
+            CV::Whitespace,
+            CV::Dimension(200.0, "ms".into()),
+            CV::Delim(','),
+            CV::Ident("color".into()),
+            CV::Whitespace,
+            CV::Dimension(0.5, "s".into()),
+            CV::Whitespace,
+            CV::Ident("linear".into()),
+            CV::Whitespace,
+            CV::Dimension(0.1, "s".into()),
+        ]);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].property, "opacity");
+        assert_eq!(two[0].duration_ms, 200);
+        assert_eq!(two[1].property, "color");
+        assert_eq!(two[1].duration_ms, 500);
+        assert_eq!(two[1].delay_ms, 100);
+        assert_eq!(two[1].easing, Easing::Linear);
+    }
+
+    #[test]
+    fn easing_curves_are_monotonic_0_to_1() {
+        for e in [Easing::Linear, Easing::Ease, Easing::EaseIn, Easing::EaseOut, Easing::EaseInOut] {
+            assert!((e.apply(0.0) - 0.0).abs() < 1e-9);
+            assert!((e.apply(1.0) - 1.0).abs() < 1e-9);
+            assert!(e.apply(0.25) <= e.apply(0.75));
+        }
     }
 }

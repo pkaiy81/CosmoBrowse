@@ -82,6 +82,7 @@ pub struct ComputedStyle {
     display: Option<DisplayType>,
     float: Option<Float>,
     clear: Option<Clear>,
+    transitions: Vec<TransitionSpec>,
     font_family: Option<String>,
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
@@ -265,6 +266,7 @@ impl ComputedStyle {
             display: None,
             float: None,
             clear: None,
+            transitions: Vec::new(),
             font_family: None,
             font_size: None,
             text_decoration: None,
@@ -1346,6 +1348,21 @@ impl ComputedStyle {
         self.clear.unwrap_or(Clear::None)
     }
 
+    pub fn set_transitions(&mut self, transitions: Vec<TransitionSpec>) {
+        self.transitions = transitions;
+    }
+
+    pub fn transitions(&self) -> &[TransitionSpec] {
+        &self.transitions
+    }
+
+    /// The transition covering `property` (or the `all` catch-all), if any.
+    pub fn transition_for(&self, property: &str) -> Option<&TransitionSpec> {
+        self.transitions
+            .iter()
+            .find(|t| t.property == property || t.property == "all")
+    }
+
     pub fn offset_top_author(&self) -> bool {
         self.offset_top_author
     }
@@ -1747,6 +1764,51 @@ impl PositionType {
                 "position {:?} is not supported yet",
                 value
             ))),
+        }
+    }
+}
+
+/// A single `transition` declaration (one property). Spec: CSS Transitions L1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransitionSpec {
+    /// Transitioned property name (e.g. "opacity", "color", "all").
+    pub property: String,
+    pub duration_ms: u32,
+    pub delay_ms: u32,
+    pub easing: Easing,
+}
+
+/// Timing function for transitions/animations (subset).
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Easing {
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+impl Easing {
+    pub fn from_str(v: &str) -> Self {
+        match v {
+            "linear" => Self::Linear,
+            "ease-in" => Self::EaseIn,
+            "ease-out" => Self::EaseOut,
+            "ease-in-out" => Self::EaseInOut,
+            _ => Self::Ease,
+        }
+    }
+
+    /// Map linear progress `t` in [0,1] to eased progress. Cubic-bezier curves
+    /// are approximated with smoothstep-family shapes (visually close enough).
+    pub fn apply(&self, t: f64) -> f64 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::EaseIn => t * t,
+            Self::EaseOut => t * (2.0 - t),
+            // ease / ease-in-out: smoothstep.
+            Self::Ease | Self::EaseInOut => t * t * (3.0 - 2.0 * t),
         }
     }
 }
