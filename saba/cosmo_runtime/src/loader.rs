@@ -597,6 +597,21 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
         return reject(url.clone(), "unsupported URL scheme".to_string());
     }
 
+    // Mixed content: an https document must not fetch http subresources.
+    // Spec: W3C Mixed Content. https://www.w3.org/TR/mixed-content/
+    if base.starts_with("https://") && url.starts_with("http://") {
+        return reject(url.clone(), "mixed content blocked (https -> http)".to_string());
+    }
+
+    // CORS: cross-origin responses are only readable when the server opts in
+    // via Access-Control-Allow-Origin. Only enforced when the document has a
+    // real http(s) origin (opaque bases like about:blank are permissive).
+    // Spec: Fetch CORS protocol. https://fetch.spec.whatwg.org/#http-cors-protocol
+    // (Simplification: no preflight for custom headers yet — the simple CORS
+    // response check is applied to all cross-origin requests.)
+    let enforce_cors = (base.starts_with("http://") || base.starts_with("https://"))
+        && !crate::security::is_same_origin(base, &url);
+
     let mut diagnostics = Vec::new();
     let client = select_http_client(&url, &mut diagnostics);
     let mut builder = match req.method.to_ascii_uppercase().as_str() {
@@ -614,6 +629,14 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
     }
     match builder.send() {
         Ok(resp) => {
+            // CORS check on the response headers before exposing the body.
+            if enforce_cors && !crate::security::passes_cors(base, &url, resp.headers()) {
+                return reject(
+                    url,
+                    "blocked by CORS policy (missing/!matching Access-Control-Allow-Origin)"
+                        .to_string(),
+                );
+            }
             let status = resp.status().as_u16();
             let status_text = resp
                 .status()
@@ -1068,6 +1091,79 @@ fn find_html_open_end_index(html: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve one HTTP request with the given extra header line (e.g. an ACAO
+    /// header) and return the bound port. Runs on a worker thread.
+    fn serve_once(extra_header: Option<&'static str>) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "{\"ok\":1}";
+                let acao = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{acao}Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn get(base: &str, url: &str) -> cosmo_script::FetchResponse {
+        do_fetch(
+            base,
+            cosmo_script::FetchRequest {
+                url: url.to_string(),
+                method: "GET".to_string(),
+                body: None,
+                headers: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn cors_allows_same_origin_and_gates_cross_origin() {
+        // Same-origin request always succeeds (no ACAO needed).
+        let a = serve_once(None);
+        let base = format!("http://127.0.0.1:{a}/");
+        let same = get(&base, &format!("http://127.0.0.1:{a}/data.json"));
+        assert!(same.error.is_none() && same.ok, "same-origin should succeed: {:?}", same.error);
+
+        // Cross-origin without ACAO is blocked.
+        let b = serve_once(None);
+        let cross = get(&base, &format!("http://127.0.0.1:{b}/data.json"));
+        assert!(
+            cross.error.as_deref().unwrap_or("").contains("CORS"),
+            "cross-origin without ACAO should be CORS-blocked, got: {:?}",
+            cross.error
+        );
+
+        // Cross-origin WITH `Access-Control-Allow-Origin: *` is allowed.
+        let c = serve_once(Some("Access-Control-Allow-Origin: *"));
+        let allowed = get(&base, &format!("http://127.0.0.1:{c}/data.json"));
+        assert!(
+            allowed.error.is_none() && allowed.ok,
+            "cross-origin with ACAO:* should succeed, got: {:?}",
+            allowed.error
+        );
+    }
+
+    #[test]
+    fn mixed_content_blocked_from_https() {
+        let r = get("https://secure.example/", "http://insecure.example/x");
+        assert!(
+            r.error.as_deref().unwrap_or("").contains("mixed content"),
+            "https->http should be blocked, got: {:?}",
+            r.error
+        );
+    }
 
     #[test]
     fn prepare_html_for_display_injects_before_case_insensitive_head_close() {
