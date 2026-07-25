@@ -3,31 +3,33 @@
 //! The engine's cascade computes the *target* value of a transitioned property;
 //! this driver notices when that target moves between layouts, interpolates
 //! from the currently-displayed value, and writes the in-between value back
-//! onto the DOM node as `data-cosmo-anim-opacity`. Style resolution picks the
-//! attribute up as the *used* value (`ComputedStyle::used_opacity`), so the
-//! declared value stays intact as the target and a full from-scratch layout
-//! reproduces the animated frame exactly (`COSMO_LAYOUT_ASSERT` keeps holding).
+//! onto the DOM node as a `data-cosmo-anim-*` attribute. Style resolution picks
+//! the attribute up as the *used* value (`ComputedStyle::used_opacity` /
+//! `used_background_color`), so the declared value stays intact as the target
+//! and a full from-scratch layout reproduces the animated frame exactly
+//! (`COSMO_LAYOUT_ASSERT` keeps holding).
 //!
 //! Spec: CSS Transitions Level 1 — https://www.w3.org/TR/css-transitions-1/
-//! Only `opacity` is driven today; colors/transforms interpolate the same way
-//! and slot in beside it.
+//! `opacity` and `background-color` are driven today; the driver itself is
+//! property-agnostic, so adding one is an `AnimatedProperty` variant plus a
+//! `used_*` accessor in the engine. Properties that change layout (width,
+//! margins) would additionally need a re-layout per frame.
 
 use cosmo_engine::renderer::dom::node::{Node, NodeKind};
-use cosmo_engine::renderer::layout::computed_style::{Easing, ANIM_OPACITY_ATTR};
+use cosmo_engine::renderer::layout::computed_style::{
+    AnimatedProperty, AnimatedValue, Easing,
+};
 use cosmo_engine::renderer::layout::layout_view::TransitionTarget;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-/// Targets closer than this count as unchanged (and interpolated values closer
-/// than this are not worth a repaint).
-const EPSILON: f64 = 0.0005;
-
-/// A transition in flight on one element.
+/// A transition in flight on one (element, property) pair.
 struct ActiveTransition {
     node: Rc<RefCell<Node>>,
-    from: f64,
-    to: f64,
+    property: AnimatedProperty,
+    from: AnimatedValue,
+    to: AnimatedValue,
     /// Clock time at which interpolation begins (start + `transition-delay`).
     start_ms: f64,
     duration_ms: f64,
@@ -36,12 +38,12 @@ struct ActiveTransition {
 
 impl ActiveTransition {
     /// The interpolated value at `now` (the start value while still delayed).
-    fn value_at(&self, now: f64) -> f64 {
+    fn value_at(&self, now: f64) -> AnimatedValue {
         if now <= self.start_ms {
-            return self.from;
+            return self.from.clone();
         }
         let progress = ((now - self.start_ms) / self.duration_ms).clamp(0.0, 1.0);
-        self.from + (self.to - self.from) * self.easing.apply(progress)
+        self.from.lerp(&self.to, self.easing.apply(progress))
     }
 
     fn finished(&self, now: f64) -> bool {
@@ -49,13 +51,16 @@ impl ActiveTransition {
     }
 }
 
-/// Per-page transition state. Keyed by DOM node identity (`Rc::as_ptr`), which
-/// is stable because the retained DOM outlives every layout pass.
+/// Identifies one animation: a DOM node (by identity — `Rc::as_ptr`, stable
+/// because the retained DOM outlives every layout pass) and the property.
+type Key = (usize, AnimatedProperty);
+
+/// Per-page transition state.
 #[derive(Default)]
 pub(crate) struct TransitionDriver {
-    active: HashMap<usize, ActiveTransition>,
-    /// Target value seen at the previous layout, per element.
-    last_target: HashMap<usize, f64>,
+    active: HashMap<Key, ActiveTransition>,
+    /// Target value seen at the previous layout, per animation.
+    last_target: HashMap<Key, AnimatedValue>,
     /// Virtual clock, advanced one frame at a time by [`Self::advance`]. Shared
     /// pacing with the script host's frame clock keeps headless runs
     /// deterministic.
@@ -74,18 +79,18 @@ impl TransitionDriver {
     /// value instead of flashing the end state.
     pub fn sync_targets(&mut self, targets: &[TransitionTarget]) -> bool {
         let mut changed = false;
-        let mut seen: HashSet<usize> = HashSet::with_capacity(targets.len());
+        let mut seen: HashSet<Key> = HashSet::with_capacity(targets.len());
         for target in targets {
-            let key = node_key(&target.node);
+            let key = (node_key(&target.node), target.property);
             seen.insert(key);
-            let previous = match self.last_target.insert(key, target.opacity) {
+            let previous = match self.last_target.insert(key, target.value.clone()) {
                 // First sighting: record the baseline, don't animate. (An
                 // element's initial style is not a transition — CSS Transitions
                 // §2: only a *change* of computed value starts one.)
                 None => continue,
                 Some(previous) => previous,
             };
-            if (previous - target.opacity).abs() <= EPSILON {
+            if previous.approx_eq(&target.value) {
                 continue;
             }
             let duration_ms = target.spec.duration_ms as f64;
@@ -93,7 +98,7 @@ impl TransitionDriver {
                 // `transition-duration: 0s` — the change applies instantly and
                 // cancels anything in flight.
                 if let Some(cancelled) = self.active.remove(&key) {
-                    clear_override(&cancelled.node);
+                    clear_override(&cancelled.node, cancelled.property);
                     changed = true;
                 }
                 continue;
@@ -105,13 +110,14 @@ impl TransitionDriver {
                 .get(&key)
                 .map(|a| a.value_at(self.clock_ms))
                 .unwrap_or(previous);
-            write_override(&target.node, from);
+            write_override(&target.node, target.property, &from);
             self.active.insert(
                 key,
                 ActiveTransition {
                     node: target.node.clone(),
+                    property: target.property,
                     from,
-                    to: target.opacity,
+                    to: target.value.clone(),
                     start_ms: self.clock_ms + target.spec.delay_ms as f64,
                     duration_ms,
                     easing: target.spec.easing,
@@ -123,7 +129,7 @@ impl TransitionDriver {
         // their `transition` declaration went away) drop their state; any
         // override they still carry is cleared so the cascade rules again.
         self.last_target.retain(|key, _| seen.contains(key));
-        let dropped: Vec<usize> = self
+        let dropped: Vec<Key> = self
             .active
             .keys()
             .filter(|key| !seen.contains(key))
@@ -131,7 +137,7 @@ impl TransitionDriver {
             .collect();
         for key in dropped {
             if let Some(a) = self.active.remove(&key) {
-                clear_override(&a.node);
+                clear_override(&a.node, a.property);
                 changed = true;
             }
         }
@@ -149,7 +155,7 @@ impl TransitionDriver {
         let mut changed = false;
         let mut finished = Vec::new();
         for (key, transition) in &self.active {
-            if write_override(&transition.node, transition.value_at(now)) {
+            if write_override(&transition.node, transition.property, &transition.value_at(now)) {
                 changed = true;
             }
             if transition.finished(now) {
@@ -160,7 +166,7 @@ impl TransitionDriver {
             if let Some(transition) = self.active.remove(&key) {
                 // The final value equals the cascade target, so dropping the
                 // override is visually a no-op — it just hands control back.
-                clear_override(&transition.node);
+                clear_override(&transition.node, transition.property);
             }
         }
         changed
@@ -173,23 +179,24 @@ fn node_key(node: &Rc<RefCell<Node>>) -> usize {
 
 /// Write the interpolated value to the node. Returns whether it actually
 /// changed (so an unmoved frame costs no re-layout).
-fn write_override(node: &Rc<RefCell<Node>>, value: f64) -> bool {
-    let text = format!("{:.4}", value.clamp(0.0, 1.0));
+fn write_override(node: &Rc<RefCell<Node>>, property: AnimatedProperty, value: &AnimatedValue) -> bool {
+    let text = value.to_attr_value();
+    let attr = property.attr_name();
     let mut borrowed = node.borrow_mut();
     if let NodeKind::Element(element) = borrowed.kind_mut() {
-        if element.get_attribute(ANIM_OPACITY_ATTR).as_deref() == Some(text.as_str()) {
+        if element.get_attribute(attr).as_deref() == Some(text.as_str()) {
             return false;
         }
-        element.set_attribute(ANIM_OPACITY_ATTR, &text);
+        element.set_attribute(attr, &text);
         return true;
     }
     false
 }
 
-fn clear_override(node: &Rc<RefCell<Node>>) {
+fn clear_override(node: &Rc<RefCell<Node>>, property: AnimatedProperty) {
     let mut borrowed = node.borrow_mut();
     if let NodeKind::Element(element) = borrowed.kind_mut() {
-        element.remove_attribute(ANIM_OPACITY_ATTR);
+        element.remove_attribute(property.attr_name());
     }
 }
 
@@ -199,6 +206,8 @@ mod tests {
     use cosmo_engine::renderer::dom::node::Element;
     use cosmo_engine::renderer::layout::computed_style::TransitionSpec;
 
+    const OPACITY: AnimatedProperty = AnimatedProperty::Opacity;
+
     fn element() -> Rc<RefCell<Node>> {
         Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
             "div",
@@ -207,11 +216,21 @@ mod tests {
     }
 
     fn target(node: &Rc<RefCell<Node>>, opacity: f64, duration_ms: u32) -> TransitionTarget {
+        typed_target(node, OPACITY, AnimatedValue::Number(opacity), duration_ms)
+    }
+
+    fn typed_target(
+        node: &Rc<RefCell<Node>>,
+        property: AnimatedProperty,
+        value: AnimatedValue,
+        duration_ms: u32,
+    ) -> TransitionTarget {
         TransitionTarget {
             node: node.clone(),
-            opacity,
+            property,
+            value,
             spec: TransitionSpec {
-                property: "opacity".to_string(),
+                property: property.css_name().to_string(),
                 duration_ms,
                 delay_ms: 0,
                 easing: Easing::Linear,
@@ -219,13 +238,15 @@ mod tests {
         }
     }
 
-    fn override_value(node: &Rc<RefCell<Node>>) -> Option<f64> {
+    fn override_attr(node: &Rc<RefCell<Node>>, property: AnimatedProperty) -> Option<String> {
         match node.borrow().kind() {
-            NodeKind::Element(e) => e
-                .get_attribute(ANIM_OPACITY_ATTR)
-                .and_then(|v| v.parse::<f64>().ok()),
+            NodeKind::Element(e) => e.get_attribute(property.attr_name()),
             _ => None,
         }
+    }
+
+    fn override_value(node: &Rc<RefCell<Node>>) -> Option<f64> {
+        override_attr(node, OPACITY).and_then(|v| v.parse::<f64>().ok())
     }
 
     #[test]
@@ -284,6 +305,26 @@ mod tests {
         assert!(!driver.sync_targets(&[target(&node, 0.0, 0)]));
         assert!(!driver.is_animating());
         assert_eq!(override_value(&node), None);
+    }
+
+    #[test]
+    fn background_color_interpolates_per_channel() {
+        // Colors interpolate channel-wise: #000000 -> #ffffff passes through
+        // the greys, and the two properties on one element are independent.
+        let node = element();
+        let mut driver = TransitionDriver::default();
+        let black = AnimatedValue::Rgba(0, 0, 0, 255);
+        let white = AnimatedValue::Rgba(255, 255, 255, 255);
+        let bg = AnimatedProperty::BackgroundColor;
+        driver.sync_targets(&[typed_target(&node, bg, black, 100)]);
+        assert!(driver.sync_targets(&[typed_target(&node, bg, white.clone(), 100)]));
+        assert_eq!(override_attr(&node, bg).as_deref(), Some("#000000"));
+
+        driver.advance(50.0);
+        assert_eq!(override_attr(&node, bg).as_deref(), Some("#808080"));
+        driver.advance(50.0);
+        assert!(!driver.is_animating());
+        assert_eq!(override_attr(&node, bg), None, "override released at the end");
     }
 
     #[test]

@@ -116,6 +116,8 @@ pub struct ComputedStyle {
     /// the interpolated value to a `data-cosmo-anim-opacity` attribute, which
     /// `defaulting` resolves into this field. `None` = not animating.
     anim_opacity: Option<f64>,
+    /// As `anim_opacity`, for a running `background-color` transition.
+    anim_background_color: Option<Color>,
     height: Option<f64>,
     height_ratio: Option<f64>,
     width: Option<f64>,
@@ -294,6 +296,7 @@ impl ComputedStyle {
             max_height: None,
             opacity: None,
             anim_opacity: None,
+            anim_background_color: None,
             height: None,
             height_ratio: None,
             width: None,
@@ -534,7 +537,7 @@ impl ComputedStyle {
         if self.opacity.is_none() {
             self.opacity = Some(1.0);
         }
-        self.resolve_animated_opacity(node, parent_opacity_target, parent_opacity_used);
+        self.resolve_animated_values(node, parent_opacity_target, parent_opacity_used);
         if self.list_style_type.is_none() {
             // UA stylesheet: list containers seed the inherited marker type.
             self.list_style_type = match node.borrow().element_tag_name().as_deref() {
@@ -899,11 +902,30 @@ impl ComputedStyle {
         self.anim_opacity.is_some()
     }
 
-    /// Resolve `data-cosmo-anim-opacity` (written by the runtime's transition
-    /// driver) into the used opacity, and propagate an animating ancestor's
-    /// override down as a ratio so descendants fade with it — mirroring how the
-    /// cascade multiplies inherited opacity.
-    fn resolve_animated_opacity(
+    /// The background color actually painted (see [`used_opacity`]).
+    pub fn used_background_color(&self) -> Color {
+        self.anim_background_color
+            .clone()
+            .unwrap_or_else(|| self.background_color())
+    }
+
+    /// The declared (cascade) value of `property` — the target a transition
+    /// animates towards. Never the animated override.
+    pub fn animated_target(&self, property: AnimatedProperty) -> AnimatedValue {
+        match property {
+            AnimatedProperty::Opacity => AnimatedValue::Number(self.opacity_or_default()),
+            AnimatedProperty::BackgroundColor => {
+                let (r, g, b, a) = self.background_color().rgba_channels();
+                AnimatedValue::Rgba(r, g, b, a)
+            }
+        }
+    }
+
+    /// Resolve the `data-cosmo-anim-*` overrides (written by the runtime's
+    /// transition driver) into the used values. Opacity additionally propagates
+    /// an animating ancestor's override down as a ratio so descendants fade
+    /// with it — mirroring how the cascade multiplies inherited opacity.
+    fn resolve_animated_values(
         &mut self,
         node: &Rc<RefCell<Node>>,
         parent_target: Option<f64>,
@@ -933,6 +955,10 @@ impl ComputedStyle {
             }
             None => None,
         };
+        // background-color doesn't inherit, so its override is purely local.
+        self.anim_background_color =
+            get_element_attribute(node, ANIM_BACKGROUND_COLOR_ATTR)
+                .and_then(|v| Color::from_code(v.trim()).ok());
     }
 
     pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {
@@ -1743,6 +1769,23 @@ impl Color {
         }
     }
 
+    /// Straight-alpha channels from the hex code (alpha 255 when the code has
+    /// no alpha byte). Used to interpolate colors during transitions.
+    pub fn rgba_channels(&self) -> (u8, u8, u8, u8) {
+        let hex = self.code.trim_start_matches('#');
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0);
+        if hex.len() >= 6 {
+            (
+                byte(0),
+                byte(2),
+                byte(4),
+                if hex.len() >= 8 { byte(6) } else { 255 },
+            )
+        } else {
+            (0, 0, 0, 255)
+        }
+    }
+
     pub fn code_u32(&self) -> u32 {
         u32::from_str_radix(self.code.trim_start_matches('#'), 16).unwrap()
     }
@@ -1839,6 +1882,81 @@ impl PositionType {
 /// reproduces the animated frame exactly (the `COSMO_LAYOUT_ASSERT` safety net
 /// keeps holding during animations).
 pub const ANIM_OPACITY_ATTR: &str = "data-cosmo-anim-opacity";
+/// As [`ANIM_OPACITY_ATTR`], for `background-color` (a hex color code).
+pub const ANIM_BACKGROUND_COLOR_ATTR: &str = "data-cosmo-anim-background-color";
+
+/// A property the transition driver knows how to interpolate. Adding one means
+/// giving it an override attribute, a target reader
+/// ([`ComputedStyle::animated_target`]) and a `used_*` accessor that painting
+/// reads instead of the cascade value.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum AnimatedProperty {
+    Opacity,
+    BackgroundColor,
+}
+
+impl AnimatedProperty {
+    /// Every property the driver can animate — iterated when collecting targets.
+    pub const ALL: [Self; 2] = [Self::Opacity, Self::BackgroundColor];
+
+    /// The CSS property name, as it appears in a `transition` declaration.
+    pub fn css_name(&self) -> &'static str {
+        match self {
+            Self::Opacity => "opacity",
+            Self::BackgroundColor => "background-color",
+        }
+    }
+
+    /// The DOM attribute the driver parks the interpolated value in.
+    pub fn attr_name(&self) -> &'static str {
+        match self {
+            Self::Opacity => ANIM_OPACITY_ATTR,
+            Self::BackgroundColor => ANIM_BACKGROUND_COLOR_ATTR,
+        }
+    }
+}
+
+/// The value of an animatable property, reduced to interpolatable components.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimatedValue {
+    Number(f64),
+    /// Straight-alpha RGBA channels.
+    Rgba(u8, u8, u8, u8),
+}
+
+impl AnimatedValue {
+    /// Linear interpolation towards `to` at eased progress `t` in [0,1].
+    /// Mismatched shapes (which the driver never produces) snap to `to`.
+    /// Spec: CSS Transitions L1 §5 — per-component interpolation; colors
+    /// interpolate in premultiplied-free sRGB here (close enough visually).
+    pub fn lerp(&self, to: &Self, t: f64) -> Self {
+        match (self, to) {
+            (Self::Number(a), Self::Number(b)) => Self::Number(a + (b - a) * t),
+            (Self::Rgba(ar, ag, ab, aa), Self::Rgba(br, bg, bb, ba)) => {
+                let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+                Self::Rgba(mix(*ar, *br), mix(*ag, *bg), mix(*ab, *bb), mix(*aa, *ba))
+            }
+            _ => to.clone(),
+        }
+    }
+
+    /// Serialized form written to the override attribute.
+    pub fn to_attr_value(&self) -> String {
+        match self {
+            Self::Number(v) => format!("{:.4}", v),
+            Self::Rgba(r, g, b, a) => Color::from_rgba(*r, *g, *b, *a).code().to_string(),
+        }
+    }
+
+    /// Whether two values are close enough to treat as the same target (and
+    /// not worth a repaint).
+    pub fn approx_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => (a - b).abs() <= 0.0005,
+            (a, b) => a == b,
+        }
+    }
+}
 
 /// A single `transition` declaration (one property). Spec: CSS Transitions L1.
 #[derive(Debug, Clone, PartialEq)]

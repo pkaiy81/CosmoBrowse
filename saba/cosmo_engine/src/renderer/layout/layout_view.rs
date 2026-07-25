@@ -10,21 +10,22 @@ use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::computed_style::PositionType;
-use crate::renderer::layout::computed_style::TransitionSpec;
+use crate::renderer::layout::computed_style::{AnimatedProperty, AnimatedValue, TransitionSpec};
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
 use std::rc::Rc;
 use std::vec::Vec;
 use std::cell::RefCell;
 
-/// One element that declares a transition on `opacity`, with the target value
-/// the cascade currently computes for it. Produced by
+/// One element/property pair covered by a `transition` declaration, with the
+/// target value the cascade currently computes for it. Produced by
 /// [`LayoutView::collect_transition_targets`].
 #[derive(Debug, Clone)]
 pub struct TransitionTarget {
     pub node: Rc<RefCell<Node>>,
-    /// Declared (cascade) opacity — the value the transition animates *to*.
-    pub opacity: f64,
+    pub property: AnimatedProperty,
+    /// Declared (cascade) value — what the transition animates *to*.
+    pub value: AnimatedValue,
     pub spec: TransitionSpec,
 }
 
@@ -1272,10 +1273,11 @@ impl LayoutView {
         self.root.clone()
     }
 
-    /// Every box declaring a `transition` that covers `opacity`, paired with its
-    /// **target** (cascade) opacity and the transition's timing. The runtime's
-    /// driver diffs these targets between layouts to start transitions, so the
-    /// value here must be the declared one, never the animated override.
+    /// Every (box, animatable property) pair covered by a `transition`
+    /// declaration, paired with its **target** (cascade) value and the
+    /// transition's timing. The runtime's driver diffs these targets between
+    /// layouts to start transitions, so the value here must be the declared
+    /// one, never the animated override.
     /// Spec: CSS Transitions L1 §2 — a transition starts when a transitionable
     /// property's computed value changes. https://www.w3.org/TR/css-transitions-1/
     pub fn collect_transition_targets(&self) -> Vec<TransitionTarget> {
@@ -1292,12 +1294,17 @@ impl LayoutView {
             {
                 let obj = n.borrow();
                 let style = obj.style();
-                if let Some(spec) = style.transition_for("opacity") {
-                    out.push(TransitionTarget {
-                        node: obj.node_ref(),
-                        opacity: style.opacity_or_default(),
-                        spec: spec.clone(),
-                    });
+                if !style.transitions().is_empty() {
+                    for property in AnimatedProperty::ALL {
+                        if let Some(spec) = style.transition_for(property.css_name()) {
+                            out.push(TransitionTarget {
+                                node: obj.node_ref(),
+                                property,
+                                value: style.animated_target(property),
+                                spec: spec.clone(),
+                            });
+                        }
+                    }
                 }
             }
             let first_child = n.borrow().first_child();

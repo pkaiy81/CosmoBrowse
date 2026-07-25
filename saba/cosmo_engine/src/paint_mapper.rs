@@ -102,7 +102,7 @@ pub fn map_display_items_to_paint_commands(
                     y: origin_y + ly,
                     width: scaled_len(ctx, layout_size.width()),
                     height: scaled_len(ctx, layout_size.height()),
-                    background_color: style.background_color().code().to_string(),
+                    background_color: style.used_background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     background_gradient: style.background_gradient().map(|g| {
                         (

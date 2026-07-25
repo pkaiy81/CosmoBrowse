@@ -551,7 +551,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     y,
                     width: lw,
                     height: lh,
-                    background_color: style.background_color().code().to_string(),
+                    background_color: style.used_background_color().code().to_string(),
                     background_image: style.background_image().map(|s| s.to_string()),
                     background_gradient: style.background_gradient().map(|g| {
                         (
@@ -774,7 +774,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
             }
             .to_string(),
             color: style.color().code().to_string(),
-            background_color: style.background_color().code().to_string(),
+            background_color: style.used_background_color().code().to_string(),
             font_px: style.font_size().px(),
             font_family: style.font_family(),
             opacity: style.used_opacity(),
@@ -1064,6 +1064,59 @@ mod tests {
             "the transition must settle on the target, got {values:?}"
         );
         assert!(!page.has_pending_animation(), "the frame clock should idle again");
+    }
+
+    /// Background color of the scene rect belonging to element `#id`.
+    fn scene_background(scene: &LayoutScene, id: &str) -> Option<String> {
+        scene.scene_items.iter().find_map(|item| match item {
+            SceneItem::Rect { anchor_id, background_color, .. }
+                if anchor_id.as_deref() == Some(id) =>
+            {
+                Some(background_color.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn css_transition_interpolates_background_color() {
+        // The driver is property-generic: a `background-color` transition walks
+        // the channels instead of snapping (black -> white through the greys).
+        let html = "<html><head><style>\
+            body{margin:0}\
+            #box{width:100px;height:100px;background-color:#000000;\
+            transition:background-color 100ms linear}\
+            #box.lit{background-color:#ffffff}\
+            </style></head><body><div id=\"box\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 200, height: 200 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(scene_background(&first, "box").as_deref(), Some("#000000"));
+
+        let _ = page
+            .host
+            .eval_to_string("document.getElementById('box').className='lit'");
+
+        let mut colors = Vec::new();
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                if let Some(color) = scene_background(&scene, "box") {
+                    colors.push(color);
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+
+        assert!(
+            colors.iter().any(|c| c != "#000000" && c != "#ffffff"),
+            "expected intermediate greys, got {colors:?}"
+        );
+        assert_eq!(
+            colors.last().map(String::as_str),
+            Some("#ffffff"),
+            "the transition must settle on the target, got {colors:?}"
+        );
     }
 
     #[test]
