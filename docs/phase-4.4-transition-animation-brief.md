@@ -1,6 +1,8 @@
 # 専用セッション指示書: Phase 4.4 「transition / @keyframes / animation」
 
-> 独立セッション用。着手前に `saba/HANDOFF.md` 全体と本書を読むこと。`requestAnimationFrame` は実装済み(`cosmo_script`)。フレームクロック駆動が鍵。
+> 独立セッション用。着手前に `saba/HANDOFF.md` 全体と本書を読むこと。フレームクロック駆動が鍵。
+
+> **✅ JS アニメーション駆動は実装済み(`851295a`, 2026-07-25)**: `ScriptHost::run_frame`(1フレーム分だけ仮想時間を進めて due タイマー/rAF を発火)+ `has_pending_timers`、`LivePage::{has_pending_animation, animation_frame}`、`AppBridge::animation_frame`、`renderer_native::about_to_wait`(`ControlFlow::WaitUntil` で ~60fps 駆動、アイドル時待機)。ヘッドレスは settle で有限アニメを完走。**rAF ループ/setInterval で style を変えるアニメは GUI で動作**(60フレームのバー成長を検証)。**本書の残りは「宣言的 CSS transition / @keyframes animation」**(下記)。static ページは非回帰(active timer 無し)。
 
 ## 背景 / 現在地
 

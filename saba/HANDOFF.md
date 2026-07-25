@@ -352,6 +352,9 @@
 >   (Phase 0.8/3.0、Rc→NodeId 大改修)。(vi) **transition/@keyframes/animation**(Phase 4.4)。
 >   (vii) **マルチプロセス化**(Phase 5、最終フェーズ)。各々が独立した集中作業で、まとめて一発では
 >   終わらない。着手はフェーズ単位で。
+> - ✅ **Phase 4.4 の JS アニメ駆動 (`851295a`)** — rAF ループ/setInterval で style を変えるアニメが GUI で動作
+>   (`run_frame`/`has_pending_timers`、`LivePage::animation_frame`、`about_to_wait` の ~60fps フレームクロック)。
+>   static ページ非回帰(reftest 12/12)。**残: 宣言的 CSS transition/@keyframes**(4.4 ブリーフ参照)。
 > - 📄 **残る大物すべてに専用セッション指示書を整備済み**(索引: `docs/session-briefs-index.md`)。
 >   各書に 背景/ゴール/難所/段階的アプローチ/検証/撤退ライン/関連ファイルを記載。推奨着手順は索引参照。
 >   ファイル: `docs/phase-2.3-floats-bfc-brief.md`, `phase-2.5-inline-layout-brief.md`,
