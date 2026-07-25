@@ -349,16 +349,34 @@
 >   (ii) **iframe の実ドキュメント描画**(現状プレースホルダ、plan 2.7。ネスト browsing context の
 >   取得+レイアウト=実質新機能)。(iii) **floats/clear/BFC**(Phase 2.3、古典レイアウト最難関)。
 >   (iv) **インライン行ボックス本実装**(Phase 2.5、UAX#14、回帰面積最大)。(v) **DOM アリーナ移行**
->   (Phase 0.8/3.0、Rc→NodeId 大改修)。(vi) **transition/@keyframes/animation**(Phase 4.4)。
+>   (Phase 0.8/3.0、Rc→NodeId 大改修)。(vi) **@keyframes/animation**(Phase 4.4 の残り。
+>   JS アニメ駆動と opacity の CSS transition は下記のとおり完了)。
 >   (vii) **マルチプロセス化**(Phase 5、最終フェーズ)。各々が独立した集中作業で、まとめて一発では
 >   終わらない。着手はフェーズ単位で。
 > - ✅ **Phase 4.4 の JS アニメ駆動 (`851295a`)** — rAF ループ/setInterval で style を変えるアニメが GUI で動作
 >   (`run_frame`/`has_pending_timers`、`LivePage::animation_frame`、`about_to_wait` の ~60fps フレームクロック)。
 >   static ページ非回帰(reftest 12/12)。**残: 宣言的 CSS transition/@keyframes**(4.4 ブリーフ参照)。
-> - 🚧 **Phase 4.4 CSS transition パース+easing (`f798097`)** — `transition` shorthand を
->   `ComputedStyle::transitions()` にパース、`Easing::apply(t)`(linear/ease/in/out/in-out)。テスト済み・inert。
->   **残: 宣言的 transition ドライバ**(要素↔計算後スタイル橋渡し + `data-cosmo-anim-opacity` paint override +
->   LivePage の transition トラッカ)。設計は 4.4 ブリーフに精密記載。JS アニメ(rAF)は既に GUI で動作。
+> - ✅ **Phase 4.4 CSS transition パース+easing (`f798097`)** — `transition` shorthand を
+>   `ComputedStyle::transitions()` にパース、`Easing::apply(t)`(linear/ease/in/out/in-out)。
+> - ✅ **Phase 4.4 宣言的 transition ドライバ (`6fa220d`, 2026-07-25)** — **opacity の CSS transition が
+>   GUI で実際に補間される**。エンジン: `ComputedStyle::anim_opacity`(defaulting が
+>   `data-cosmo-anim-opacity` 属性から解決)+ `used_opacity()`(描画が読む値)と
+>   `opacity_or_default()`(cascade の**目標**値=ドライバが差分検知に使う)を分離。override は
+>   継承 opacity と同じく子孫へ比率で伝播、transition 中の box はアニメ全体を通して stacking context
+>   (最終フレームで描画順が反転しない)。`LayoutView::collect_transition_targets()` が
+>   「opacity に transition を宣言した box + 目標値 + タイミング」を返す。
+>   runtime: `layout/transitions.rs` の `TransitionDriver` が DOM ノード identity で状態を持ち、
+>   レイアウト間で目標が動いたら開始(逆再生は表示中の値から再開)、補間値をノードへ書き戻し、
+>   完了で override を解放。`LivePage::animation_frame` が駆動し `has_pending_animation` に含めるので
+>   **既存の ~60fps winit フレームクロックが GUI 変更なしで拾う**。override が DOM 上にあるので
+>   full レイアウトがアニメフレームを完全再現 = **COSMO_LAYOUT_ASSERT がアニメ中も成立**。
+>   検証: GUI ヘッドレスで fetch ハンドラが class 付与 → 10s transition が中間状態
+>   (#ff7a7a ≒ 52%)、200ms は完走して透明。reftest 12/12、engine 138 / runtime 66。
+>   **既知の制約**: `run_initial_load` が pending タイマーを**全消化**するため、`setTimeout` で
+>   class を変えるページは初回描画前に目標が確定しアニメしない(仕様上も初期スタイルは非アニメなので
+>   偶然正しい)。ロード後トリガ(fetch/XHR ハンドラ、フレームクロックのタイマー)は動く。
+>   **残: color/transform の補間**(同じ仕組みに追加)、**@keyframes/animation**(未保存)、
+>   **length 系 transition**(relayout が必要)。
 > - 📄 **残る大物すべてに専用セッション指示書を整備済み**(索引: `docs/session-briefs-index.md`)。
 >   各書に 背景/ゴール/難所/段階的アプローチ/検証/撤退ライン/関連ファイルを記載。推奨着手順は索引参照。
 >   ファイル: `docs/phase-2.3-floats-bfc-brief.md`, `phase-2.5-inline-layout-brief.md`,

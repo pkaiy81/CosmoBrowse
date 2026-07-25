@@ -17,7 +17,22 @@
 - **@keyframes 保存 + animation 再生**: `@keyframes` を CSSOM に保存し、`animation-*` で再生。
 - **フレームクロック**: イベントループのフレーム時計で rAF/補間を駆動。GUI は winit のフレーム/タイマーで定期 pump。
 
-## 宣言的 CSS transition ドライバの設計（残り作業・2026-07-25 追記）
+## ✅ 宣言的 CSS transition ドライバ（`6fa220d`, 2026-07-25 landing 済み）
+
+下の設計どおりに実装完了。**opacity の CSS transition が GUI で補間される**:
+`ComputedStyle::{anim_opacity, used_opacity}` + `LayoutView::collect_transition_targets()`(エンジン)、
+`cosmo_runtime/src/layout/transitions.rs` の `TransitionDriver` + `LivePage::animation_frame` 駆動。
+override は `data-cosmo-anim-opacity` として DOM 上にあるので **full レイアウトがアニメフレームを再現
+= `COSMO_LAYOUT_ASSERT` がアニメ中も成立**。検証: fetch ハンドラの class 付与で 10s transition が
+ヘッドレススクショで中間状態(≒52%)、200ms は完走。reftest 12/12。
+
+**この節の残り**: ① color/transform の補間(同じ 5. の拡張)② length 系(relayout が要る)
+③ **`run_initial_load` が pending タイマーを全消化**するため `setTimeout` 起点の class 変更は
+初回描画前に確定してアニメしない(ロード後の fetch/XHR・フレームクロックのタイマーは動く)。
+④ `:hover` 起点(1.5 未実装)⑤ クリック等の実入力を LivePage の ScriptHost へ dispatch する配線
+(現状 AppBridge は `activate_link` = ナビゲーションのみ)。
+
+### 当初の設計メモ（実装済み・参照用）
 
 `transition` の**パースと easing コアは landing 済み**(`f798097`: `ComputedStyle::transitions()`/`transition_for()`、`Easing::apply(t)`)。**残るのはドライバ**(目標値変化の検知→補間→適用)。設計:
 
