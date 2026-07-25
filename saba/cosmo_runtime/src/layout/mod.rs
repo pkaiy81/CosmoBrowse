@@ -253,6 +253,39 @@ fn layout_scene_and_targets(
     (scene, targets)
 }
 
+/// What dispatching a click into a [`LivePage`] produced.
+#[derive(Debug, Default)]
+pub struct ClickOutcome {
+    /// Whether the click landed on a box at all (false = no element there, and
+    /// nothing was dispatched).
+    pub hit: bool,
+    /// A handler called `preventDefault()`: the caller must not run the default
+    /// activation behaviour (following a link).
+    pub default_prevented: bool,
+    /// Fresh scene, when the handlers mutated the DOM (else nothing to repaint).
+    pub scene: Option<LayoutScene>,
+    /// `postMessage` payloads posted while handling the click — the navigation
+    /// shim injected by `loader::prepare_html_for_display` posts its
+    /// `cosmobrowse:navigate` request here.
+    pub messages: Vec<String>,
+}
+
+/// The nearest element at or above `node` — a click that lands on a text box
+/// targets the element containing it, as in the DOM's event model.
+fn nearest_element(
+    node: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+) -> Option<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if matches!(n.borrow().kind(), NodeKind::Element(_)) {
+            return Some(n.clone());
+        }
+        let parent = n.borrow().parent().upgrade();
+        current = parent;
+    }
+    None
+}
+
 /// A persistently-hosted page: keeps its Boa `ScriptHost` and DOM alive across
 /// layout passes so asynchronous work (fetch/XHR/timers) can settle *after* the
 /// first paint and drive an incremental re-layout — the basis for progressive
@@ -357,6 +390,42 @@ impl LivePage {
     /// pumping async work (used on viewport resize — a reflow, not a re-run).
     pub fn relayout(&mut self, rect: &FrameRect) -> LayoutScene {
         self.layout_and_drive(rect)
+    }
+
+    /// Dispatch a `click` at `point` (frame-local document coordinates, i.e.
+    /// the click position with scroll and the frame's own origin already
+    /// removed). The deepest box containing the point is hit-tested against a
+    /// fresh layout, the event is fired on the nearest enclosing *element*, and
+    /// any DOM mutation the handlers made is laid out again.
+    ///
+    /// Spec: UI Events — a `click` targets an element and bubbles;
+    /// `preventDefault()` suppresses the activation behaviour (link following).
+    /// https://w3c.github.io/uievents/#event-type-click
+    pub fn dispatch_click(&mut self, point: (i64, i64), rect: &FrameRect) -> ClickOutcome {
+        let mut outcome = ClickOutcome::default();
+        let target = {
+            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            view.find_node_by_position(point)
+                .map(|object| object.borrow().node_ref())
+                .and_then(nearest_element)
+        };
+        let Some(target) = target else {
+            return outcome;
+        };
+        outcome.hit = true;
+        outcome.default_prevented =
+            !self
+                .host
+                .dispatch_mouse_event(target, "click", point.0 as f64, point.1 as f64);
+        replace_local_storage(&self.document_url, &self.host.local_storage_entries());
+        outcome.messages = self.host.take_posted_messages();
+
+        let generation = self.host.dom_generation();
+        if generation != self.last_generation {
+            self.last_generation = generation;
+            outcome.scene = Some(self.layout_and_drive(rect));
+        }
+        outcome
     }
 
     /// Lay out the retained DOM and drive declarative transitions: whenever the
@@ -1117,6 +1186,75 @@ mod tests {
             Some("#ffffff"),
             "the transition must settle on the target, got {colors:?}"
         );
+    }
+
+    #[test]
+    fn click_dispatch_runs_a_page_handler_and_relayouts() {
+        // A real click hit-tests the retained layout, fires the listener on the
+        // enclosing element, and re-lays-out the DOM the handler mutated.
+        let html = "<html><head><style>body{margin:0}\
+            #btn{width:100px;height:50px;background:#00ff00}</style></head><body>\
+            <div id=\"btn\">press</div><p id=\"out\"></p>\
+            <script>document.getElementById('btn').addEventListener('click',function(e){\
+              document.getElementById('out').textContent='clicked';e.preventDefault();});\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert!(!scene_contains_text(&first, "clicked"));
+
+        let outcome = page.dispatch_click((50, 25), &rect);
+        assert!(outcome.hit, "the click should land on #btn");
+        assert!(outcome.default_prevented, "the handler called preventDefault");
+        let scene = outcome.scene.expect("the DOM mutation should re-layout");
+        assert!(scene_contains_text(&scene, "clicked"));
+    }
+
+    #[test]
+    fn click_on_a_link_posts_a_navigate_request() {
+        // Documents are served through `prepare_html_for_display`, which injects
+        // a click shim that turns anchor activation into a `postMessage`. A
+        // dispatched click must reach it — the shim gates on `event.button`, so
+        // this also pins the synthesized event carrying the mouse fields.
+        let html = "<html><body style=\"margin:0\">\
+            <a href=\"target.html\" style=\"font-size:40px\">GO</a></body></html>";
+        let prepared =
+            crate::loader::prepare_html_for_display(html, "http://example.test/link.html", "root");
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (mut page, _) = LivePage::load("http://example.test/link.html", &prepared, &rect, None);
+
+        let outcome = page.dispatch_click((25, 25), &rect);
+        assert!(outcome.hit);
+        assert!(
+            outcome.default_prevented,
+            "the shim must preventDefault so the host owns navigation"
+        );
+        let request = outcome
+            .messages
+            .iter()
+            .find_map(|m| crate::loader::parse_navigate_message(m))
+            .expect("a navigate request should have been posted");
+        assert_eq!(request.href, "target.html");
+        assert_eq!(request.frame_id, "root");
+        assert_eq!(request.target, None);
+    }
+
+    #[test]
+    fn click_on_empty_space_dispatches_nothing() {
+        let html = "<html><body><div id=\"d\" style=\"width:10px;height:10px\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        // Far below any generated box.
+        let outcome = page.dispatch_click((280, 290), &rect);
+        assert!(!outcome.hit);
+        assert!(!outcome.default_prevented);
+        assert!(outcome.scene.is_none());
+    }
+
+    fn scene_contains_text(scene: &LayoutScene, needle: &str) -> bool {
+        scene
+            .scene_items
+            .iter()
+            .any(|item| matches!(item, SceneItem::Text { text, .. } if text.contains(needle)))
     }
 
     #[test]

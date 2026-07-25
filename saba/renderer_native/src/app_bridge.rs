@@ -1,7 +1,25 @@
 /// Bridge between the native renderer and the browser engine (NativeAdapter).
 use adapter_native::{BrowserFrameDto, BrowserPageDto, NativeAdapter};
 use cosmo_engine::paint_commands::PaintCommand;
-use cosmo_runtime::{scene_items_to_paint_commands, FetchWaker, FrameRect, LivePage, SceneItem};
+use cosmo_runtime::{
+    parse_navigate_message, scene_items_to_paint_commands, FetchWaker, FrameRect, LivePage,
+    NavigateRequest, SceneItem,
+};
+
+/// What a page did with a click dispatched into it (see
+/// [`AppBridge::dispatch_click`]).
+#[derive(Debug, Default)]
+pub struct PageClick {
+    /// The click landed on an element of a live frame.
+    pub hit: bool,
+    /// A handler called `preventDefault()` — the caller must not also follow a
+    /// link for this click.
+    pub default_prevented: bool,
+    /// The frame's scene was updated (the caller should repaint).
+    pub repainted: bool,
+    /// Link activations the injected navigation shim asked for.
+    pub navigations: Vec<NavigateRequest>,
+}
 
 /// A persistent script host for one content frame, kept alive so async work
 /// (fetch/XHR/timers) can settle after first paint and re-layout. Each frame
@@ -144,6 +162,45 @@ impl AppBridge {
             self.splice_frame_scene(&frame_id, &items);
         }
         changed
+    }
+
+    /// Dispatch a `click` into the live frame under `(doc_x, doc_y)` (document
+    /// coordinates: window position with the chrome offset and scroll already
+    /// removed). Returns what the page did with it so the caller knows whether
+    /// to still run the default link activation.
+    ///
+    /// Frames without a LivePage (static content) simply report no hit, and the
+    /// caller falls back to the paint-region link path.
+    pub fn dispatch_click(&mut self, doc_x: i64, doc_y: i64) -> PageClick {
+        let mut result = PageClick::default();
+        // Topmost frame wins; framesets lay children out side by side, so the
+        // first rect containing the point is the one that owns it.
+        let Some(index) = self.live_frames.iter().position(|frame| {
+            doc_x >= frame.rect.x
+                && doc_x < frame.rect.x + frame.rect.width
+                && doc_y >= frame.rect.y
+                && doc_y < frame.rect.y + frame.rect.height
+        }) else {
+            return result;
+        };
+        let frame = &mut self.live_frames[index];
+        let point = (doc_x - frame.rect.x, doc_y - frame.rect.y);
+        let rect = frame.rect.clone();
+        let frame_id = frame.frame_id.clone();
+        let outcome = frame.page.dispatch_click(point, &rect);
+
+        result.hit = outcome.hit;
+        result.default_prevented = outcome.default_prevented;
+        result.navigations = outcome
+            .messages
+            .iter()
+            .filter_map(|message| parse_navigate_message(message))
+            .collect();
+        if let Some(scene) = outcome.scene {
+            self.splice_frame_scene(&frame_id, &scene.scene_items);
+            result.repainted = true;
+        }
+        result
     }
 
     /// Whether any live frame has an ongoing animation (queued timers/rAF) the

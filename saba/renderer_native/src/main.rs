@@ -401,36 +401,31 @@ impl App {
             return;
         }
 
-        // Page area: hit-test links.
+        // Page area. Give the page's own scripts the click first: a live frame
+        // hit-tests it against its retained layout and fires the DOM listeners.
+        // The navigation shim injected into every document turns anchor clicks
+        // into `cosmobrowse:navigate` messages, which is how link activation
+        // arrives here when scripts handle the click.
+        let doc_y = y - CHROME_HEIGHT + self.scroll_y;
+        let page_click = self.bridge.dispatch_click(x, doc_y);
+        if page_click.repainted {
+            self.needs_redraw = true;
+        }
+        for request in &page_click.navigations {
+            self.follow_link(&request.frame_id, &request.href, request.target.as_deref());
+        }
+        if !page_click.navigations.is_empty() || page_click.default_prevented {
+            // The page handled it (or asked us not to follow the link).
+            return;
+        }
+
+        // Fall back to the painted link regions — frames with no live script
+        // host (static content) still follow links.
         if let Some(region) = hit_test(&self.hit_regions, x, y) {
             let href = region.href.clone();
             let target = region.target.clone();
             let frame_id = region.frame_id.clone();
-            // Save the current top-level URL so we can detect root navigations.
-            let prev_url = self.bridge.current_url();
-            match self
-                .bridge
-                .activate_link(&frame_id, &href, target.as_deref())
-            {
-                Ok(()) => {
-                    self.chrome.set_url(&self.bridge.current_url());
-                    // Only reset scroll when the root-level URL changes (i.e. a new
-                    // standalone page was loaded).  For child-frame-only navigations
-                    // (e.g. frameset target="right" or in-page anchor in a sub-frame)
-                    // the top-level URL stays the same and we preserve the current
-                    // scroll position so the viewport does not jump to the top.
-                    // Spec: HTML Living Standard §7.4 — navigating to a fragment.
-                    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
-                    if self.bridge.current_url() != prev_url {
-                        self.scroll_y = self.bridge.anchor_scroll_y();
-                    }
-                    self.update_nav_state();
-                }
-                Err(e) => {
-                    self.status_message = format!("Error: {}", e);
-                }
-            }
-            self.needs_redraw = true;
+            self.follow_link(&frame_id, &href, target.as_deref());
         } else {
             // Unfocus URL bar if clicking on page area.
             if self.chrome.is_focused {
@@ -438,6 +433,32 @@ impl App {
                 self.needs_redraw = true;
             }
         }
+    }
+
+    /// Navigate `frame_id` to `href`, updating the chrome and scroll position.
+    fn follow_link(&mut self, frame_id: &str, href: &str, target: Option<&str>) {
+        // Save the current top-level URL so we can detect root navigations.
+        let prev_url = self.bridge.current_url();
+        match self.bridge.activate_link(frame_id, href, target) {
+            Ok(()) => {
+                self.chrome.set_url(&self.bridge.current_url());
+                // Only reset scroll when the root-level URL changes (i.e. a new
+                // standalone page was loaded).  For child-frame-only navigations
+                // (e.g. frameset target="right" or in-page anchor in a sub-frame)
+                // the top-level URL stays the same and we preserve the current
+                // scroll position so the viewport does not jump to the top.
+                // Spec: HTML Living Standard §7.4 — navigating to a fragment.
+                // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
+                if self.bridge.current_url() != prev_url {
+                    self.scroll_y = self.bridge.anchor_scroll_y();
+                }
+                self.update_nav_state();
+            }
+            Err(e) => {
+                self.status_message = format!("Error: {}", e);
+            }
+        }
+        self.needs_redraw = true;
     }
 
     fn handle_scroll(&mut self, delta_x: f64, delta_y: f64) {
@@ -660,6 +681,12 @@ fn headless_inner_offsets() -> std::collections::HashMap<u32, (i64, i64)> {
 
 /// Scroll offset for headless screenshots, from `COSMO_SCREENSHOT_SCROLL`
 /// (pixels). Lets sticky/fixed behavior be verified without a window.
+/// Parse an `x,y` pair (the `COSMO_HEADLESS_CLICK` format).
+fn parse_point(value: &str) -> Option<(i64, i64)> {
+    let (x, y) = value.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
 fn headless_scroll() -> i64 {
     std::env::var("COSMO_SCREENSHOT_SCROLL")
         .ok()
@@ -804,6 +831,23 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     }
     // One-shot capture: settle in-flight fetch/XHR before painting.
     bridge.settle_async(300);
+    // `COSMO_HEADLESS_CLICK=x,y` clicks the page once (document coordinates)
+    // before capturing, so scripted interactions — click handlers, and the
+    // transitions they trigger — can be screenshot-tested without a window.
+    if let Some((cx, cy)) = std::env::var("COSMO_HEADLESS_CLICK")
+        .ok()
+        .and_then(|v| parse_point(&v))
+    {
+        let click = bridge.dispatch_click(cx, cy);
+        for request in &click.navigations {
+            if let Err(e) =
+                bridge.activate_link(&request.frame_id, &request.href, request.target.as_deref())
+            {
+                eprintln!("[SCREENSHOT] link activation error: {}", e);
+            }
+        }
+        bridge.settle_async(300);
+    }
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
     let chrome = ChromeState::new();

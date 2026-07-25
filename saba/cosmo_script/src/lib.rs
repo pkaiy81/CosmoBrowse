@@ -616,13 +616,24 @@ fn element_dispatch_event(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
         Some(v) => v.clone().to_string(c)?.to_std_string_escaped(),
         None => String::new(),
     };
-    let not_prevented = run_dispatch(node, &event_type, c);
+    let not_prevented = run_dispatch(node, &event_type, None, c);
     Ok(JsValue::from(not_prevented))
 }
 
 /// Build an `Event` JsObject carrying `type`, `target`, propagation flags, and
 /// the `preventDefault` / `stopPropagation` methods.
-fn make_event(target: &Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) -> JsObject {
+/// Build the `Event` object handed to listeners. `mouse` carries the pointer
+/// position for mouse events (`click` etc.), which also gain the button and
+/// modifier-key fields scripts routinely gate on — a missing `button` reads as
+/// `undefined`, and the common `if (event.button !== 0) return;` guard would
+/// then reject every synthesized click.
+/// Spec: UI Events — MouseEvent. https://w3c.github.io/uievents/#mouseevent
+fn make_event(
+    target: &Rc<RefCell<Node>>,
+    event_type: &str,
+    mouse: Option<(f64, f64)>,
+    ctx: &mut Context,
+) -> JsObject {
     let obj = JsObject::from_proto_and_data(
         None,
         EventFlags {
@@ -663,7 +674,56 @@ fn make_event(target: &Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) -
     };
     method(event_prevent_default, js_string!("preventDefault"));
     method(event_stop_propagation, js_string!("stopPropagation"));
+
+    let constant = |name, value: JsValue| {
+        obj.insert_property(
+            name,
+            PropertyDescriptor::builder()
+                .value(value)
+                .writable(false)
+                .enumerable(true)
+                .configurable(true)
+                .build(),
+        );
+    };
+    constant(js_string!("bubbles"), JsValue::from(true));
+    constant(js_string!("cancelable"), JsValue::from(true));
+    if let Some((x, y)) = mouse {
+        // Primary (left) button, no modifiers — the only kind of click the GUI
+        // synthesizes today.
+        constant(js_string!("button"), JsValue::from(0));
+        constant(js_string!("buttons"), JsValue::from(1));
+        for key in ["altKey", "ctrlKey", "metaKey", "shiftKey"] {
+            constant(js_string!(key), JsValue::from(false));
+        }
+        for key in ["clientX", "pageX", "x", "offsetX"] {
+            constant(js_string!(key), JsValue::from(x));
+        }
+        for key in ["clientY", "pageY", "y", "offsetY"] {
+            constant(js_string!(key), JsValue::from(y));
+        }
+    }
+    // `defaultPrevented` reflects the flag preventDefault() sets.
+    obj.insert_property(
+        js_string!("defaultPrevented"),
+        PropertyDescriptor::builder()
+            .get(
+                NativeFunction::from_fn_ptr(event_default_prevented)
+                    .to_js_function(&realm),
+            )
+            .enumerable(true)
+            .configurable(true)
+            .build(),
+    );
     obj
+}
+
+fn event_default_prevented(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    let prevented = this
+        .as_object()
+        .and_then(|obj| obj.downcast_ref::<EventFlags>().map(|f| f.default_prevented.get()))
+        .unwrap_or(false);
+    Ok(JsValue::from(prevented))
 }
 
 fn event_prevent_default(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
@@ -688,8 +748,13 @@ fn event_stop_propagation(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> J
 /// capture (root→target's parent), at-target (both), then bubble
 /// (parent→root). Returns `true` if `preventDefault` was NOT called (i.e. the
 /// default action runs).
-fn run_dispatch(target: Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) -> bool {
-    let event = make_event(&target, event_type, ctx);
+fn run_dispatch(
+    target: Rc<RefCell<Node>>,
+    event_type: &str,
+    mouse: Option<(f64, f64)>,
+    ctx: &mut Context,
+) -> bool {
+    let event = make_event(&target, event_type, mouse, ctx);
 
     // Propagation path: [target, parent, ..., root].
     let mut path = vec![target.clone()];
@@ -1557,7 +1622,21 @@ impl ScriptHost {
     /// input events (click/input/submit) into script.
     pub fn dispatch_event(&mut self, target: Rc<RefCell<Node>>, event_type: &str) -> bool {
         self.activate();
-        run_dispatch(target, event_type, &mut self.context)
+        run_dispatch(target, event_type, None, &mut self.context)
+    }
+
+    /// As [`dispatch_event`], for a pointer event at document coordinates
+    /// `(x, y)`: the event additionally carries `button`/modifier keys and the
+    /// coordinate fields (`clientX`/`pageX`/…) that click handlers read.
+    pub fn dispatch_mouse_event(
+        &mut self,
+        target: Rc<RefCell<Node>>,
+        event_type: &str,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        self.activate();
+        run_dispatch(target, event_type, Some((x, y)), &mut self.context)
     }
 
     fn install_dom_globals(&mut self) {
@@ -2528,7 +2607,7 @@ fn doc_dispatch_event(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResu
         Some(v) => v.clone().to_string(c)?.to_std_string_escaped(),
         None => String::new(),
     };
-    Ok(JsValue::from(run_dispatch(root, &event_type, c)))
+    Ok(JsValue::from(run_dispatch(root, &event_type, None, c)))
 }
 
 /// `window.parent.postMessage(message, targetOrigin)` — capture the message

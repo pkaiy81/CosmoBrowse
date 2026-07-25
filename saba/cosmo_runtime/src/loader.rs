@@ -789,6 +789,44 @@ pub struct DecodedDocument {
     pub diagnostics: Vec<String>,
 }
 
+/// A link activation requested by the navigation shim that
+/// [`prepare_html_for_display`] injects: the shim intercepts clicks on anchors,
+/// calls `preventDefault()`, and posts the request out to the host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavigateRequest {
+    pub frame_id: String,
+    pub href: String,
+    /// `target` attribute, if the anchor had a non-empty one.
+    pub target: Option<String>,
+}
+
+/// Parse one `postMessage` payload drained from a page. Returns `None` for
+/// anything that isn't the shim's `cosmobrowse:navigate` request (pages post
+/// their own messages too).
+pub fn parse_navigate_message(message: &str) -> Option<NavigateRequest> {
+    let value: serde_json::Value = serde_json::from_str(message).ok()?;
+    if value.get("type")?.as_str()? != "cosmobrowse:navigate" {
+        return None;
+    }
+    let href = value.get("href")?.as_str()?.to_string();
+    if href.is_empty() {
+        return None;
+    }
+    Some(NavigateRequest {
+        frame_id: value
+            .get("frameId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        href,
+        target: value
+            .get("target")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+    })
+}
+
 pub fn extract_title(html: &str) -> Option<String> {
     title_regex()
         .captures(html)
