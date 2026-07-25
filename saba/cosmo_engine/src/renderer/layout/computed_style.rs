@@ -80,6 +80,8 @@ pub struct ComputedStyle {
     background_gradient: Option<LinearGradient>,
     color: Option<Color>,
     display: Option<DisplayType>,
+    float: Option<Float>,
+    clear: Option<Clear>,
     font_family: Option<String>,
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
@@ -261,6 +263,8 @@ impl ComputedStyle {
             background_gradient: None,
             color: None,
             display: None,
+            float: None,
+            clear: None,
             font_family: None,
             font_size: None,
             text_decoration: None,
@@ -1326,6 +1330,22 @@ impl ComputedStyle {
         self.position.unwrap_or(PositionType::Static)
     }
 
+    pub fn set_float(&mut self, value: Float) {
+        self.float = Some(value);
+    }
+
+    pub fn float_or_default(&self) -> Float {
+        self.float.unwrap_or(Float::None)
+    }
+
+    pub fn set_clear(&mut self, value: Clear) {
+        self.clear = Some(value);
+    }
+
+    pub fn clear_or_default(&self) -> Clear {
+        self.clear.unwrap_or(Clear::None)
+    }
+
     pub fn offset_top_author(&self) -> bool {
         self.offset_top_author
     }
@@ -1727,6 +1747,49 @@ impl PositionType {
                 "position {:?} is not supported yet",
                 value
             ))),
+        }
+    }
+}
+
+/// CSS `float` — takes the box out of normal flow and shifts it to the left or
+/// right edge of its containing block; subsequent content flows around it.
+/// Spec: CSS2.2 §9.5. https://www.w3.org/TR/CSS22/visuren.html#floats
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+impl Float {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+/// CSS `clear` — moves the box below any preceding left/right (or both) floats.
+/// Spec: CSS2.2 §9.5.2.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+impl Clear {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "both" => Some(Self::Both),
+            _ => None,
         }
     }
 }

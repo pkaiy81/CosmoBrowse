@@ -344,6 +344,24 @@ impl LayoutObject {
                         self.style.set_position(position);
                     }
                 }
+                "float" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        if let Some(f) = crate::renderer::layout::computed_style::Float::from_str(
+                            &value.to_ascii_lowercase(),
+                        ) {
+                            self.style.set_float(f);
+                        }
+                    }
+                }
+                "clear" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        if let Some(c) = crate::renderer::layout::computed_style::Clear::from_str(
+                            &value.to_ascii_lowercase(),
+                        ) {
+                            self.style.set_clear(c);
+                        }
+                    }
+                }
                 "top" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_top(*value),
                     Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
