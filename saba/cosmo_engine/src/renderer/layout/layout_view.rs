@@ -10,11 +10,23 @@ use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::computed_style::PositionType;
+use crate::renderer::layout::computed_style::TransitionSpec;
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
 use std::rc::Rc;
 use std::vec::Vec;
 use std::cell::RefCell;
+
+/// One element that declares a transition on `opacity`, with the target value
+/// the cascade currently computes for it. Produced by
+/// [`LayoutView::collect_transition_targets`].
+#[derive(Debug, Clone)]
+pub struct TransitionTarget {
+    pub node: Rc<RefCell<Node>>,
+    /// Declared (cascade) opacity — the value the transition animates *to*.
+    pub opacity: f64,
+    pub spec: TransitionSpec,
+}
 
 // Spec: DOM tree order drives layout-tree construction.
 // The traversal keeps preorder semantics so siblings are laid out in document order.
@@ -808,7 +820,14 @@ impl LayoutView {
                     // still resolve against the surrounding context.
                     let lifted = content_base.unwrap_or(1_000_000);
                     (Some(lifted), (Some(lifted), context_base))
-                } else if b.style().opacity_or_default() < 1.0 || b.style().has_transform() {
+                } else if b.style().opacity_or_default() < 1.0
+                    // A box mid-transition is a stacking context for the whole
+                    // animation (even at the frames where the interpolated
+                    // value reaches 1), so paint order stays stable instead of
+                    // flipping on the last frame.
+                    || b.style().has_animated_opacity()
+                    || b.style().has_transform()
+                {
                     // opacity < 1 / transform form a stacking context AT the
                     // box's normal paint position (CSS Color §3.2, Transforms
                     // §6): the box doesn't lift, but descendant z-contexts
@@ -1251,6 +1270,41 @@ impl LayoutView {
 
     pub fn root(&self) -> Option<Rc<RefCell<LayoutObject>>> {
         self.root.clone()
+    }
+
+    /// Every box declaring a `transition` that covers `opacity`, paired with its
+    /// **target** (cascade) opacity and the transition's timing. The runtime's
+    /// driver diffs these targets between layouts to start transitions, so the
+    /// value here must be the declared one, never the animated override.
+    /// Spec: CSS Transitions L1 §2 — a transition starts when a transitionable
+    /// property's computed value changes. https://www.w3.org/TR/css-transitions-1/
+    pub fn collect_transition_targets(&self) -> Vec<TransitionTarget> {
+        let mut out = Vec::new();
+        Self::collect_transition_targets_node(&self.root, &mut out);
+        out
+    }
+
+    fn collect_transition_targets_node(
+        node: &Option<Rc<RefCell<LayoutObject>>>,
+        out: &mut Vec<TransitionTarget>,
+    ) {
+        if let Some(n) = node {
+            {
+                let obj = n.borrow();
+                let style = obj.style();
+                if let Some(spec) = style.transition_for("opacity") {
+                    out.push(TransitionTarget {
+                        node: obj.node_ref(),
+                        opacity: style.opacity_or_default(),
+                        spec: spec.clone(),
+                    });
+                }
+            }
+            let first_child = n.borrow().first_child();
+            Self::collect_transition_targets_node(&first_child, out);
+            let next_sibling = n.borrow().next_sibling();
+            Self::collect_transition_targets_node(&next_sibling, out);
+        }
     }
 
     pub fn find_node_by_position(&self, position: (i64, i64)) -> Option<Rc<RefCell<LayoutObject>>> {

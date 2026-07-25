@@ -18,10 +18,18 @@ use cosmo_engine::renderer::layout::computed_style::{
 use cosmo_engine::renderer::layout::layout_object::{
     compute_box_model_metrics, LayoutObject, LayoutObjectKind,
 };
-use cosmo_engine::renderer::layout::layout_view::LayoutView;
+use cosmo_engine::renderer::layout::layout_view::{LayoutView, TransitionTarget};
 use cosmo_engine::display_item::DisplayItem;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+mod transitions;
+use transitions::TransitionDriver;
+
+/// One animation frame of the GUI's ~60fps clock. The script host's virtual
+/// timer clock and the transition driver advance in the same steps so headless
+/// runs (which drive frames as fast as they can) stay deterministic.
+const FRAME_MS: u64 = 16;
 
 /// Re-layout triggers used by the app layer when deciding whether the scene tree must be rebuilt.
 ///
@@ -231,6 +239,20 @@ fn layout_scene_only(
     display_items_to_scene(layout_view.paint(), rect)
 }
 
+/// As [`layout_scene_only`], plus the transition targets the cascade computed
+/// in the same pass (the driver needs both from one layout, and building the
+/// view twice would double the cost).
+fn layout_scene_and_targets(
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    cssom: &cosmo_engine::renderer::css::cssom::StyleSheet,
+    rect: &FrameRect,
+) -> (LayoutScene, Vec<TransitionTarget>) {
+    let layout_view = build_layout_view(dom, cssom, rect);
+    let scene = display_items_to_scene(layout_view.paint(), rect);
+    let targets = layout_view.collect_transition_targets();
+    (scene, targets)
+}
+
 /// A persistently-hosted page: keeps its Boa `ScriptHost` and DOM alive across
 /// layout passes so asynchronous work (fetch/XHR/timers) can settle *after* the
 /// first paint and drive an incremental re-layout — the basis for progressive
@@ -252,6 +274,9 @@ pub struct LivePage {
     /// DOM mutation generation at the last layout; a pump that leaves it
     /// unchanged skips re-layout (no script tick touched the DOM).
     last_generation: u64,
+    /// Declarative CSS `transition` state (Phase 4.4): watches the cascade's
+    /// target values across layouts and interpolates the in-between frames.
+    transitions: TransitionDriver,
 }
 
 impl LivePage {
@@ -286,18 +311,19 @@ impl LivePage {
         replace_local_storage(document_url, &host.local_storage_entries());
 
         let cssom = resolve_cssom(dom.clone(), document_url);
-        let scene = layout_scene_only(dom.clone(), &cssom, rect);
         let last_generation = host.dom_generation();
-        (
-            Self {
-                host,
-                dom,
-                document_url: document_url.to_string(),
-                cssom,
-                last_generation,
-            },
-            scene,
-        )
+        let mut page = Self {
+            host,
+            dom,
+            document_url: document_url.to_string(),
+            cssom,
+            last_generation,
+            transitions: TransitionDriver::default(),
+        };
+        // The first layout only records the transition baselines: an element's
+        // initial style never animates (CSS Transitions §2).
+        let scene = page.layout_and_drive(rect);
+        (page, scene)
     }
 
     /// Whether asynchronous work (fetch/XHR) is still outstanding — i.e. another
@@ -306,30 +332,46 @@ impl LivePage {
         self.host.has_pending_fetches()
     }
 
-    /// Whether the page has an ongoing animation (queued timers / rAF) that the
-    /// GUI should keep driving frames for.
+    /// Whether the page has an ongoing animation the GUI should keep driving
+    /// frames for: queued timers/rAF, or a CSS transition mid-flight.
     pub fn has_pending_animation(&self) -> bool {
-        self.host.has_pending_timers()
+        self.host.has_pending_timers() || self.transitions.is_animating()
     }
 
-    /// Advance one animation frame (~16ms): run due timers/rAF, and if that
-    /// mutated the DOM, re-lay-out and return the fresh scene (else None). Used
-    /// by the GUI frame clock to drive JS animations.
+    /// Advance one animation frame (~16ms): step running CSS transitions and
+    /// run due timers/rAF; if either moved, re-lay-out and return the fresh
+    /// scene (else None). Used by the GUI frame clock.
     pub fn animation_frame(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
-        self.host.run_frame(16, 256);
+        self.host.run_frame(FRAME_MS, 256);
         replace_local_storage(&self.document_url, &self.host.local_storage_entries());
+        let transitions_moved = self.transitions.advance(FRAME_MS as f64);
         let generation = self.host.dom_generation();
-        if generation == self.last_generation {
+        if generation == self.last_generation && !transitions_moved {
             return None;
         }
         self.last_generation = generation;
-        Some(layout_scene_only(self.dom.clone(), &self.cssom, rect))
+        Some(self.layout_and_drive(rect))
     }
 
     /// Re-lay-out the retained DOM at `rect` **without** running scripts or
     /// pumping async work (used on viewport resize — a reflow, not a re-run).
     pub fn relayout(&mut self, rect: &FrameRect) -> LayoutScene {
-        layout_scene_only(self.dom.clone(), &self.cssom, rect)
+        self.layout_and_drive(rect)
+    }
+
+    /// Lay out the retained DOM and drive declarative transitions: whenever the
+    /// cascade's target for a transitioned property moved since the previous
+    /// layout, a transition starts and the interpolation's *start* value is
+    /// written back onto the DOM — so this frame paints the old value instead
+    /// of flashing the end state. That override costs one extra layout on the
+    /// frames where a transition starts or is cancelled, never on static pages.
+    fn layout_and_drive(&mut self, rect: &FrameRect) -> LayoutScene {
+        let (scene, targets) = layout_scene_and_targets(self.dom.clone(), &self.cssom, rect);
+        if self.transitions.sync_targets(&targets) {
+            layout_scene_only(self.dom.clone(), &self.cssom, rect)
+        } else {
+            scene
+        }
     }
 
     /// Drain any settled async work (fetch/XHR completions, timers) so their
@@ -345,7 +387,7 @@ impl LivePage {
             return None;
         }
         self.last_generation = generation;
-        let scene = layout_scene_only(self.dom.clone(), &self.cssom, rect);
+        let scene = self.layout_and_drive(rect);
         self.assert_matches_full(&scene, rect);
         Some(scene)
     }
@@ -520,7 +562,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                                 .collect(),
                         )
                     }),
-                    opacity: style.opacity(),
+                    opacity: style.used_opacity(),
                     // Final paint-order key from the engine's stacking pass
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
@@ -576,7 +618,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     font_family: style.font_family(),
                     underline: style.text_decoration() == TextDecoration::Underline,
                     bold,
-                    opacity: style.opacity(),
+                    opacity: style.used_opacity(),
                     href,
                     target,
                     // Final paint-order key from the engine's stacking pass
@@ -618,7 +660,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     height: lh,
                     src,
                     alt,
-                    opacity: style.opacity(),
+                    opacity: style.used_opacity(),
                     href,
                     target,
                     // Final paint-order key from the engine's stacking pass
@@ -735,7 +777,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
             background_color: style.background_color().code().to_string(),
             font_px: style.font_size().px(),
             font_family: style.font_family(),
-            opacity: style.opacity(),
+            opacity: style.used_opacity(),
             z_index: style.z_index_or_default(),
         },
         children,
@@ -963,6 +1005,78 @@ mod tests {
 
         let scene = scene.expect("fetch mutation should trigger a re-layout (asserted == full)");
         assert!(scene.scene_items.iter().any(|i| matches!(i, SceneItem::Text { text, .. } if text.contains("row2"))));
+    }
+
+    /// Opacity of the scene rect belonging to element `#id`.
+    fn scene_opacity(scene: &LayoutScene, id: &str) -> Option<f64> {
+        scene.scene_items.iter().find_map(|item| match item {
+            SceneItem::Rect { anchor_id, opacity, .. } if anchor_id.as_deref() == Some(id) => {
+                Some(*opacity)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn css_transition_interpolates_opacity_after_a_class_change() {
+        // A declarative `transition: opacity` with the target flipped by script
+        // (Phase 4.4): the frames after the class change must walk 1 -> 0
+        // instead of snapping, and the animation must end exactly on target.
+        let html = "<html><head><style>\
+            body{margin:0}\
+            #box{width:100px;height:100px;background:#ff0000;opacity:1;transition:opacity 100ms linear}\
+            #box.faded{opacity:0}\
+            </style></head><body><div id=\"box\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 200, height: 200 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(scene_opacity(&first, "box"), Some(1.0), "starts opaque");
+
+        // Script flips the target after the first paint — what a click handler
+        // or a post-load timer does in the GUI.
+        let _ = page
+            .host
+            .eval_to_string("document.getElementById('box').className='faded'");
+
+        let mut values = Vec::new();
+        // The transition runs 100ms (~7 frames of 16ms); 40 is a generous bound.
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                if let Some(opacity) = scene_opacity(&scene, "box") {
+                    values.push(opacity);
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+
+        assert!(
+            values.windows(2).all(|w| w[1] <= w[0] + 1e-9),
+            "opacity must decrease monotonically, got {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| *v > 0.01 && *v < 0.99),
+            "expected interpolated frames between the endpoints, got {values:?}"
+        );
+        assert_eq!(
+            values.last().copied(),
+            Some(0.0),
+            "the transition must settle on the target, got {values:?}"
+        );
+        assert!(!page.has_pending_animation(), "the frame clock should idle again");
+    }
+
+    #[test]
+    fn static_page_never_starts_a_transition() {
+        // A page that declares a transition but never changes the target must
+        // not animate — no frame clock, no repaints (static-page non-regression).
+        let html = "<html><head><style>#box{width:10px;height:10px;opacity:0.5;\
+            transition:opacity 1s}</style></head><body><div id=\"box\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 200, height: 200 };
+        let (mut page, scene) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(scene_opacity(&scene, "box"), Some(0.5));
+        assert!(!page.has_pending_animation());
+        assert!(page.animation_frame(&rect).is_none());
     }
 
     #[test]

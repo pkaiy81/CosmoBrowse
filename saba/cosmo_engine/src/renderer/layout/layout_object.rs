@@ -2791,6 +2791,12 @@ impl LayoutObject {
         self.node.borrow().kind().clone()
     }
 
+    /// The DOM node this box was generated from (identity is what the runtime's
+    /// transition driver keys its per-element animation state on).
+    pub fn node_ref(&self) -> Rc<RefCell<Node>> {
+        self.node.clone()
+    }
+
     pub fn set_first_child(&mut self, first_child: Option<Rc<RefCell<LayoutObject>>>) {
         self.first_child = first_child;
     }

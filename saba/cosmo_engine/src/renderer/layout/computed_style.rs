@@ -111,6 +111,11 @@ pub struct ComputedStyle {
     min_height: Option<SizeLimit>,
     max_height: Option<SizeLimit>,
     opacity: Option<f64>,
+    /// Used (animated) opacity while a CSS transition is running on this box.
+    /// The cascade's `opacity` stays the *target*; the transition driver writes
+    /// the interpolated value to a `data-cosmo-anim-opacity` attribute, which
+    /// `defaulting` resolves into this field. `None` = not animating.
+    anim_opacity: Option<f64>,
     height: Option<f64>,
     height_ratio: Option<f64>,
     width: Option<f64>,
@@ -288,6 +293,7 @@ impl ComputedStyle {
             min_height: None,
             max_height: None,
             opacity: None,
+            anim_opacity: None,
             height: None,
             height_ratio: None,
             width: None,
@@ -379,6 +385,12 @@ impl ComputedStyle {
                 self.text_align = Some(TextAlign::Left);
             }
         }
+
+        // The parent's *used* vs *target* opacity: a running transition on an
+        // ancestor scales this subtree's used opacity without disturbing the
+        // cascade values the driver compares against (see `anim_opacity`).
+        let parent_opacity_target = parent_style.as_ref().map(|p| p.opacity_or_default());
+        let parent_opacity_used = parent_style.as_ref().map(|p| p.used_opacity());
 
         if let Some(parent_style) = parent_style {
             // NOTE: background-color is NOT inherited in CSS. The transparent
@@ -522,6 +534,7 @@ impl ComputedStyle {
         if self.opacity.is_none() {
             self.opacity = Some(1.0);
         }
+        self.resolve_animated_opacity(node, parent_opacity_target, parent_opacity_used);
         if self.list_style_type.is_none() {
             // UA stylesheet: list containers seed the inherited marker type.
             self.list_style_type = match node.borrow().element_tag_name().as_deref() {
@@ -865,9 +878,61 @@ impl ComputedStyle {
         self.text_overflow_ellipsis
     }
 
-    /// Opacity without panicking on un-defaulted styles.
+    /// Opacity without panicking on un-defaulted styles. This is the *target*
+    /// (cascade) value — the transition driver compares against it to notice a
+    /// changed target. Painting uses [`used_opacity`].
     pub fn opacity_or_default(&self) -> f64 {
         self.opacity.unwrap_or(1.0)
+    }
+
+    /// The opacity actually painted: the in-flight transition's interpolated
+    /// value when one is running on this box (or inherited from an animating
+    /// ancestor), else the cascade value.
+    /// Spec: CSS Transitions L1 §3 — a running transition overrides the
+    /// declared value for the duration. https://www.w3.org/TR/css-transitions-1/
+    pub fn used_opacity(&self) -> f64 {
+        self.anim_opacity.unwrap_or_else(|| self.opacity_or_default())
+    }
+
+    /// Whether a transition override is in effect on this box.
+    pub fn has_animated_opacity(&self) -> bool {
+        self.anim_opacity.is_some()
+    }
+
+    /// Resolve `data-cosmo-anim-opacity` (written by the runtime's transition
+    /// driver) into the used opacity, and propagate an animating ancestor's
+    /// override down as a ratio so descendants fade with it — mirroring how the
+    /// cascade multiplies inherited opacity.
+    fn resolve_animated_opacity(
+        &mut self,
+        node: &Rc<RefCell<Node>>,
+        parent_target: Option<f64>,
+        parent_used: Option<f64>,
+    ) {
+        let own = get_element_attribute(node, ANIM_OPACITY_ATTR)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 1.0));
+        let parent_target = parent_target.unwrap_or(1.0);
+        let parent_used = parent_used.unwrap_or(1.0);
+        // How much the ancestors' running transitions scale this subtree. The
+        // cascade already folded `parent_target` into `self.opacity`, so only
+        // the ancestor's deviation from its target is applied here.
+        let ancestor_ratio = if (parent_used - parent_target).abs() <= f64::EPSILON {
+            1.0
+        } else if parent_target > 0.0 {
+            parent_used / parent_target
+        } else {
+            // A fully transparent target can't be scaled; use the used value.
+            parent_used
+        };
+        self.anim_opacity = match own {
+            // The attribute holds a specified (pre-inheritance) value.
+            Some(o) => Some((o * parent_used).clamp(0.0, 1.0)),
+            None if ancestor_ratio != 1.0 => {
+                Some((self.opacity_or_default() * ancestor_ratio).clamp(0.0, 1.0))
+            }
+            None => None,
+        };
     }
 
     pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {
@@ -1767,6 +1832,13 @@ impl PositionType {
         }
     }
 }
+
+/// Attribute the runtime's transition driver writes the interpolated opacity
+/// to. It lives on the DOM (rather than in the cascade) so the declared value
+/// stays readable as the transition's *target*, and so a full re-layout
+/// reproduces the animated frame exactly (the `COSMO_LAYOUT_ASSERT` safety net
+/// keeps holding during animations).
+pub const ANIM_OPACITY_ATTR: &str = "data-cosmo-anim-opacity";
 
 /// A single `transition` declaration (one property). Spec: CSS Transitions L1.
 #[derive(Debug, Clone, PartialEq)]

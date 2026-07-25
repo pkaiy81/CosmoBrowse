@@ -113,7 +113,7 @@ pub fn map_display_items_to_paint_commands(
                                 .collect(),
                         )
                     }),
-                    opacity: style.opacity(),
+                    opacity: style.used_opacity(),
                     // Final paint-order key from the engine's stacking pass
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
@@ -154,7 +154,7 @@ pub fn map_display_items_to_paint_commands(
                         text,
                         style.color().code().to_string(),
                         style.font_size().px(),
-                        style.opacity(),
+                        style.used_opacity(),
                         href.clone(),
                         style.paint_z(),
                         clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
@@ -179,7 +179,7 @@ pub fn map_display_items_to_paint_commands(
                     font_family,
                     underline: style.text_decoration() == TextDecoration::Underline,
                     bold: *bold,
-                    opacity: style.opacity(),
+                    opacity: style.used_opacity(),
                     href: href.clone(),
                     target: target.clone(),
                     // Final paint-order key from the engine's stacking pass
@@ -212,7 +212,7 @@ pub fn map_display_items_to_paint_commands(
                     height: scaled_len(ctx, layout_size.height()),
                     src: src.clone(),
                     alt: alt.clone(),
-                    opacity: style.opacity(),
+                    opacity: style.used_opacity(),
                     href: href.clone(),
                     target: target.clone(),
                     // Final paint-order key from the engine's stacking pass
