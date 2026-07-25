@@ -26,7 +26,10 @@ override は `data-cosmo-anim-opacity` として DOM 上にあるので **full �
 = `COSMO_LAYOUT_ASSERT` がアニメ中も成立**。検証: fetch ハンドラの class 付与で 10s transition が
 ヘッドレススクショで中間状態(≒52%)、200ms は完走。reftest 12/12。
 
-**この節の残り**: ① color/transform の補間(同じ 5. の拡張)② length 系(relayout が要る)
+`aaca6b4` でドライバは**プロパティ汎用**に(`AnimatedProperty`/`AnimatedValue`、キーは (node, property))、
+**background-color** も補間対象。プロパティ追加は variant + `used_*` アクセサだけ。
+
+**この節の残り**: ① color(継承あり)/transform の補間② length 系(relayout が要る)
 ③ **`run_initial_load` が pending タイマーを全消化**するため `setTimeout` 起点の class 変更は
 初回描画前に確定してアニメしない(ロード後の fetch/XHR・フレームクロックのタイマーは動く)。
 ④ `:hover` 起点(1.5 未実装)⑤ クリック等の実入力を LivePage の ScriptHost へ dispatch する配線

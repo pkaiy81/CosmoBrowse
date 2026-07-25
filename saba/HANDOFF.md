@@ -377,6 +377,12 @@
 >   偶然正しい)。ロード後トリガ(fetch/XHR ハンドラ、フレームクロックのタイマー)は動く。
 >   **残: color/transform の補間**(同じ仕組みに追加)、**@keyframes/animation**(未保存)、
 >   **length 系 transition**(relayout が必要)。
+> - ✅ **transition ドライバのプロパティ汎用化 + background-color (`aaca6b4`)** — `AnimatedProperty`
+>   (Opacity/BackgroundColor)+ `AnimatedValue`(Number/Rgba: 補間・直列化・近似比較)をエンジンに置き、
+>   ドライバは (node, property) キーで**プロパティ非依存**に(1要素で2プロパティが独立に動く)。
+>   `ComputedStyle::{animated_target, used_background_color}`、`Color::rgba_channels()`。
+>   検証: GUI ヘッドレスで 10s の `background-color:#000080→#ffcc00` が (122,98,67) ≒ 48% 地点。
+>   **プロパティ追加は `AnimatedProperty` の variant + `used_*` アクセサだけ**。
 > - 📄 **残る大物すべてに専用セッション指示書を整備済み**(索引: `docs/session-briefs-index.md`)。
 >   各書に 背景/ゴール/難所/段階的アプローチ/検証/撤退ライン/関連ファイルを記載。推奨着手順は索引参照。
 >   ファイル: `docs/phase-2.3-floats-bfc-brief.md`, `phase-2.5-inline-layout-brief.md`,
