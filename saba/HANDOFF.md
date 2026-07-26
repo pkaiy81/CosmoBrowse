@@ -372,11 +372,28 @@
 >   full レイアウトがアニメフレームを完全再現 = **COSMO_LAYOUT_ASSERT がアニメ中も成立**。
 >   検証: GUI ヘッドレスで fetch ハンドラが class 付与 → 10s transition が中間状態
 >   (#ff7a7a ≒ 52%)、200ms は完走して透明。reftest 12/12、engine 138 / runtime 66。
->   **既知の制約**: `run_initial_load` が pending タイマーを**全消化**するため、`setTimeout` で
->   class を変えるページは初回描画前に目標が確定しアニメしない(仕様上も初期スタイルは非アニメなので
->   偶然正しい)。ロード後トリガ(fetch/XHR ハンドラ、フレームクロックのタイマー)は動く。
->   **残: color/transform の補間**(同じ仕組みに追加)、**@keyframes/animation**(未保存)、
->   **length 系 transition**(relayout が必要)。
+>   → 当時の制約(`run_initial_load` のタイマー全消化)は `2117e50` で解消、対応プロパティも
+>   opacity/background-color/color/width/height に拡大(下記 `c3018a3`/`9bd07d0`)。
+> - ✅ **入力の穴を全て閉じた (`c3018a3`, `9bd07d0`, `2117e50`, 2026-07-26)** —
+>   ① **インライン `on<type>=""` 属性ハンドラ**(従来は addEventListener のみ)。要素のバブル段
+>   リスナとして `event` を引数に取る関数にコンパイルして実行、`return false` で default 抑止
+>   (`onclick="return false"` の定石)。
+>   ② **mousedown/mouseup** を click の前に発火(キャンセル可能なのは click のみ)。
+>   ③ **`:hover` を live 化** — 従来はセレクタごと `Never` に落としており hover スタイルは一切
+>   効かなかった。`PseudoClassKind::Hover` としてパースし、レンダラがスタイルパス前に公開する
+>   **hover chain**(ポインタ下の要素**とその祖先**、Selectors 4 §9.1)と照合(styling viewport と
+>   同じ暫定 thread_local パターン)。`LivePage::set_hover_point` は chain が変わった時だけ再スタイル
+>   = **hover 起点の transition もここで開始**。ナビゲーションでクリア(ノードアドレスは再利用され得る)。
+>   コスト管理: `StyleSheet::uses_hover()` により `:hover` 規則の無い文書はポインタ追跡自体をスキップ
+>   (通常ページはマウス移動で何も払わない)。`COSMO_HEADLESS_HOVER=x,y` で検証可能。
+>   ④ **transition 対応プロパティ拡大**: **color**(継承あり — 自前の color を持たない子孫が
+>   アニメ中の祖先の used 値に追随)と **width/height**(レイアウトに効く。defaulting が used 値を
+>   **その場で差し替え**、cascade 値は `width_target` へ退避 → clamp/box-sizing/layout は無改修。
+>   `animatable()` が auto/% を除外 = 補間端点が無いものは実ブラウザ同様 inert)。
+>   ⑤ **タイマーが遅延を守る**: `LivePage` は `ScriptHost::run_due`(**期限が来たものだけ**)を使い、
+>   遅延タイマーはフレームクロックが配送。`run_initial_load`(全消化)は時計を持たない一発経路用に存続。
+>   検証: hover→10s transition の中間色 (122,98,67)、`setTimeout(...,100)` が初回描画に**現れず**
+>   7フレーム後に発火してアニメ。凍結フィクスチャ3種すべて画素一致、reftest 12/12、runtime 77。
 > - ✅ **実クリックの JS ディスパッチ (`ecdc07a`, 2026-07-26)** — **ページ自身の `click` リスナが
 >   GUI で動くようになった**(従来は描画済みリンク領域しか見ておらず、DOM イベントはあっても
 >   入力が流れ込んでいなかった)。`LivePage::dispatch_click` が保持レイアウトをヒットテスト →
@@ -393,7 +410,8 @@
 >   bubbles/cancelable・`defaultPrevented` ゲッタを持ち、`dispatch_mouse_event` が座標を渡す。
 >   `COSMO_HEADLESS_CLICK=x,y` でヘッドレス capture 前に1回クリック(インタラクションのスクショ検証用)。
 >   検証: クリック→class 変更→transition 中間色 (0,122,133)、リンククリックで遷移先が描画。
->   **残**: mousedown/mouseup/mousemove、インライン `onclick=""` 属性ハンドラ、フォーム入力。
+>   **残**: フォーム入力(input/textarea/select の実入力と change/input イベント)、
+>   mousemove/mouseover 等のイベント発火(`:hover` の再スタイルは動く)。
 > - ✅ **transition ドライバのプロパティ汎用化 + background-color (`aaca6b4`)** — `AnimatedProperty`
 >   (Opacity/BackgroundColor)+ `AnimatedValue`(Number/Rgba: 補間・直列化・近似比較)をエンジンに置き、
 >   ドライバは (node, property) キーで**プロパティ非依存**に(1要素で2プロパティが独立に動く)。
