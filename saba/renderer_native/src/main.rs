@@ -504,6 +504,26 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Track the pointer for `:hover`. Pages that never style on hover skip
+    /// this entirely, so ordinary documents pay nothing for pointer motion.
+    fn update_hover(&mut self) {
+        if !self.bridge.uses_hover() {
+            return;
+        }
+        let (mx, my) = self.mouse_pos;
+        // Over the chrome: nothing in the page is hovered. Otherwise convert to
+        // document coordinates (the y the page laid its boxes out in).
+        let doc_y = if my < CHROME_HEIGHT {
+            i64::MIN
+        } else {
+            my - CHROME_HEIGHT + self.scroll_y
+        };
+        if self.bridge.set_hover(mx, doc_y) {
+            self.needs_redraw = true;
+            self.request_redraw();
+        }
+    }
+
     fn update_cursor(&self) {
         let Some(ws) = &self.window_state else {
             return;
@@ -629,6 +649,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as i64, position.y as i64);
                 self.update_cursor();
+                self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -831,6 +852,16 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     }
     // One-shot capture: settle in-flight fetch/XHR before painting.
     bridge.settle_async(300);
+    // `COSMO_HEADLESS_HOVER=x,y` parks the pointer over the page (document
+    // coordinates) so `:hover` styling — and the transitions it triggers — can
+    // be screenshot-tested.
+    if let Some((hx, hy)) = std::env::var("COSMO_HEADLESS_HOVER")
+        .ok()
+        .and_then(|v| parse_point(&v))
+    {
+        bridge.set_hover(hx, hy);
+        bridge.settle_async(300);
+    }
     // `COSMO_HEADLESS_CLICK=x,y` clicks the page once (document coordinates)
     // before capturing, so scripted interactions — click handlers, and the
     // transitions they trigger — can be screenshot-tested without a window.

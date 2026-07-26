@@ -203,6 +203,39 @@ impl AppBridge {
         result
     }
 
+    /// Whether any live frame styles anything on `:hover`. When nothing does,
+    /// the caller skips pointer tracking altogether (it costs a hit-test plus a
+    /// re-style per move that changes the hovered element).
+    pub fn uses_hover(&self) -> bool {
+        self.live_frames.iter().any(|f| f.page.uses_hover())
+    }
+
+    /// Move the `:hover` state to the element under `(doc_x, doc_y)` (document
+    /// coordinates), or clear it when the pointer is outside every live frame.
+    /// Returns true if a frame re-styled (the caller repaints).
+    pub fn set_hover(&mut self, doc_x: i64, doc_y: i64) -> bool {
+        let mut updates: Vec<(String, Vec<SceneItem>)> = Vec::new();
+        for frame in &mut self.live_frames {
+            if !frame.page.uses_hover() {
+                continue;
+            }
+            let inside = doc_x >= frame.rect.x
+                && doc_x < frame.rect.x + frame.rect.width
+                && doc_y >= frame.rect.y
+                && doc_y < frame.rect.y + frame.rect.height;
+            let point = inside.then(|| (doc_x - frame.rect.x, doc_y - frame.rect.y));
+            let rect = frame.rect.clone();
+            if let Some(scene) = frame.page.set_hover_point(point, &rect) {
+                updates.push((frame.frame_id.clone(), scene.scene_items));
+            }
+        }
+        let changed = !updates.is_empty();
+        for (frame_id, items) in updates {
+            self.splice_frame_scene(&frame_id, &items);
+        }
+        changed
+    }
+
     /// Whether any live frame has an ongoing animation (queued timers/rAF) the
     /// GUI should keep driving frames for.
     pub fn has_pending_animation(&self) -> bool {

@@ -270,6 +270,23 @@ pub struct ClickOutcome {
     pub messages: Vec<String>,
 }
 
+/// Node identities of `node` and every element ancestor, nearest first — the
+/// set `:hover` matches for a pointer over `node`.
+fn ancestor_chain(
+    node: Option<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
+) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let mut current = node;
+    while let Some(n) = current {
+        if matches!(n.borrow().kind(), NodeKind::Element(_)) {
+            chain.push(Rc::as_ptr(&n) as *const () as usize);
+        }
+        let parent = n.borrow().parent().upgrade();
+        current = parent;
+    }
+    chain
+}
+
 /// The nearest element at or above `node` — a click that lands on a text box
 /// targets the element containing it, as in the DOM's event model.
 fn nearest_element(
@@ -323,6 +340,9 @@ impl LivePage {
         rect: &FrameRect,
         waker: Option<crate::loader::FetchWaker>,
     ) -> (Self, LayoutScene) {
+        // The hover chain keys on node addresses, which a freed document can
+        // hand back to a new one — drop it before the new DOM exists.
+        cosmo_engine::renderer::style::values::set_hover_chain(&[]);
         let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
         let dom = window.borrow().document();
 
@@ -392,14 +412,16 @@ impl LivePage {
         self.layout_and_drive(rect)
     }
 
-    /// Dispatch a `click` at `point` (frame-local document coordinates, i.e.
-    /// the click position with scroll and the frame's own origin already
-    /// removed). The deepest box containing the point is hit-tested against a
-    /// fresh layout, the event is fired on the nearest enclosing *element*, and
-    /// any DOM mutation the handlers made is laid out again.
+    /// Dispatch a press at `point` (frame-local document coordinates, i.e. the
+    /// click position with scroll and the frame's own origin already removed).
+    /// The deepest box containing the point is hit-tested against a fresh
+    /// layout, the full `mousedown` → `mouseup` → `click` sequence is fired on
+    /// the nearest enclosing *element*, and any DOM mutation the handlers made
+    /// is laid out again.
     ///
-    /// Spec: UI Events — a `click` targets an element and bubbles;
-    /// `preventDefault()` suppresses the activation behaviour (link following).
+    /// Only `click` is cancellable here: `preventDefault()` on it suppresses
+    /// the activation behaviour (link following).
+    /// Spec: UI Events §3.5 — the click sequence.
     /// https://w3c.github.io/uievents/#event-type-click
     pub fn dispatch_click(&mut self, point: (i64, i64), rect: &FrameRect) -> ClickOutcome {
         let mut outcome = ClickOutcome::default();
@@ -413,10 +435,12 @@ impl LivePage {
             return outcome;
         };
         outcome.hit = true;
-        outcome.default_prevented =
-            !self
-                .host
-                .dispatch_mouse_event(target, "click", point.0 as f64, point.1 as f64);
+        let (x, y) = (point.0 as f64, point.1 as f64);
+        for event_type in ["mousedown", "mouseup"] {
+            self.host
+                .dispatch_mouse_event(target.clone(), event_type, x, y);
+        }
+        outcome.default_prevented = !self.host.dispatch_mouse_event(target, "click", x, y);
         replace_local_storage(&self.document_url, &self.host.local_storage_entries());
         outcome.messages = self.host.take_posted_messages();
 
@@ -426,6 +450,44 @@ impl LivePage {
             outcome.scene = Some(self.layout_and_drive(rect));
         }
         outcome
+    }
+
+    /// Whether this document has any `:hover` rule. Pointer motion over a page
+    /// without one changes nothing, so the renderer can skip hover tracking
+    /// (which costs a hit-test plus a re-style) entirely.
+    pub fn uses_hover(&self) -> bool {
+        self.cssom.uses_hover()
+    }
+
+    /// Point the `:hover` state at `point` (frame-local document coordinates),
+    /// or clear it with `None` when the pointer leaves. Returns a fresh scene
+    /// when the hovered element chain actually changed — which is also where a
+    /// hover-triggered CSS transition starts, since the re-style moves the
+    /// declared target.
+    ///
+    /// Spec: Selectors 4 §9.1 — `:hover` applies to the element under the
+    /// pointer *and its ancestors*. https://www.w3.org/TR/selectors-4/#the-hover-pseudo
+    pub fn set_hover_point(
+        &mut self,
+        point: Option<(i64, i64)>,
+        rect: &FrameRect,
+    ) -> Option<LayoutScene> {
+        let chain = match point {
+            None => Vec::new(),
+            Some(point) => {
+                let hovered = {
+                    let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+                    view.find_node_by_position(point)
+                        .map(|object| object.borrow().node_ref())
+                        .and_then(nearest_element)
+                };
+                ancestor_chain(hovered)
+            }
+        };
+        if !cosmo_engine::renderer::style::values::set_hover_chain(&chain) {
+            return None;
+        }
+        Some(self.layout_and_drive(rect))
     }
 
     /// Lay out the retained DOM and drive declarative transitions: whenever the
@@ -1236,6 +1298,57 @@ mod tests {
         assert_eq!(request.href, "target.html");
         assert_eq!(request.frame_id, "root");
         assert_eq!(request.target, None);
+    }
+
+    #[test]
+    fn hover_restyles_and_can_start_a_transition() {
+        // `:hover` is the commonest transition trigger. Pointing at the box
+        // must re-style it (and start the declared transition); moving away
+        // must return it to the base style.
+        let html = "<html><head><style>body{margin:0}\
+            #box{width:100px;height:100px;background-color:#000000;\
+            transition:background-color 100ms linear}\
+            #box:hover{background-color:#ffffff}</style></head>\
+            <body><div id=\"box\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert!(page.uses_hover());
+        assert_eq!(scene_background(&first, "box").as_deref(), Some("#000000"));
+
+        // Pointer enters: the target moves, so a transition starts and this
+        // frame still paints the old value.
+        let scene = page
+            .set_hover_point(Some((50, 50)), &rect)
+            .expect("entering the box must re-style it");
+        assert_eq!(scene_background(&scene, "box").as_deref(), Some("#000000"));
+        assert!(page.has_pending_animation(), "the hover transition should run");
+
+        // Same element: no change, no work.
+        assert!(
+            page.set_hover_point(Some((60, 60)), &rect).is_none(),
+            "moving within the same element must not re-style"
+        );
+
+        // Let it run to completion, then leave: it transitions back.
+        for _ in 0..40 {
+            if page.animation_frame(&rect).is_none() && !page.has_pending_animation() {
+                break;
+            }
+        }
+        let settled = page.relayout(&rect);
+        assert_eq!(scene_background(&settled, "box").as_deref(), Some("#ffffff"));
+
+        page.set_hover_point(None, &rect)
+            .expect("leaving must re-style");
+        assert!(page.has_pending_animation(), "leaving transitions back");
+    }
+
+    #[test]
+    fn page_without_hover_rules_reports_no_hover_tracking() {
+        let html = "<html><head><style>p{color:red}</style></head><body><p>x</p></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (page, _) = LivePage::load("about:blank", html, &rect, None);
+        assert!(!page.uses_hover(), "no :hover rule — the GUI can skip tracking");
     }
 
     #[test]

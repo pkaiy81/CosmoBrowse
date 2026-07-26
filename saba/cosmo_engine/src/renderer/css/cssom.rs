@@ -254,15 +254,16 @@ impl CssParser {
                             }
                         }
                     }
-                    // Interaction pseudo-classes never match in static
-                    // rendering; pseudo-elements (generated content like
-                    // ::before/::after) have no box in this engine — applying
-                    // their declarations to the element itself would leak
-                    // decoration styles. Legacy single-colon spellings of
-                    // before/after count as pseudo-elements too.
+                    // `:hover` is live (the renderer tracks the pointer and
+                    // re-styles); the other interaction pseudo-classes have no
+                    // state behind them yet and never match. Pseudo-elements
+                    // (generated content like ::before/::after) have no box in
+                    // this engine — applying their declarations to the element
+                    // itself would leak decoration styles. Legacy single-colon
+                    // spellings of before/after count as pseudo-elements too.
                     let interactive = matches!(
                         name.as_str(),
-                        "hover" | "active" | "focus" | "focus-within" | "focus-visible"
+                        "active" | "focus" | "focus-within" | "focus-visible"
                     );
                     // ::before / ::after generate content boxes; capture the
                     // kind (the rule is realized by the layout-tree builder).
@@ -284,6 +285,9 @@ impl CssParser {
                         never = true;
                     } else {
                         match name.as_str() {
+                            "hover" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Hover))
+                            }
                             "root" => {
                                 parts.push(Selector::PseudoClass(PseudoClassKind::Root))
                             }
@@ -871,6 +875,14 @@ impl StyleSheet {
         }
     }
 
+    /// Whether any rule is conditioned on `:hover`. The renderer uses this to
+    /// skip pointer tracking entirely on documents that can't react to it —
+    /// hover handling costs a hit-test plus a re-style, and most pages don't
+    /// need one.
+    pub fn uses_hover(&self) -> bool {
+        self.rules.iter().any(|rule| rule.selector.uses_hover())
+    }
+
     pub fn set_rules(&mut self, rules: Vec<QualifiedRule>) {
         self.rules = rules;
     }
@@ -988,6 +1000,10 @@ pub enum PseudoElement {
 /// Supported structural pseudo-classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudoClassKind {
+    /// `:hover` — the element under the pointer, or an ancestor of it.
+    /// Matched against the hover chain the renderer publishes before each
+    /// style pass. https://www.w3.org/TR/selectors-4/#the-hover-pseudo
+    Hover,
     /// `:root` — the document's root element (`<html>`).
     Root,
     FirstChild,
@@ -1027,6 +1043,24 @@ pub enum AttrOp {
 }
 
 impl Selector {
+    /// Whether this selector (or any part of it) tests `:hover`.
+    pub fn uses_hover(&self) -> bool {
+        match self {
+            Self::PseudoClass(PseudoClassKind::Hover) => true,
+            Self::Compound(parts) | Self::List(parts) => {
+                parts.iter().any(|part| part.uses_hover())
+            }
+            Self::Descendant(a, b)
+            | Self::Child(a, b)
+            | Self::NextSibling(a, b)
+            | Self::SubsequentSibling(a, b) => a.uses_hover() || b.uses_hover(),
+            Self::Not(inner) | Self::Is(inner) | Self::PseudoElement(inner, _) => {
+                inner.uses_hover()
+            }
+            _ => false,
+        }
+    }
+
     /// Cascade specificity packed as a single sortable integer:
     /// id count (high byte-pair), then class count, then type count, each
     /// saturated at 255. Combinators sum both sides; `List` is flattened away

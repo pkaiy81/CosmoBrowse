@@ -803,6 +803,13 @@ fn run_dispatch(
                 return false;
             }
         }
+        // An inline `on<type>="..."` attribute acts as a listener registered on
+        // the element itself, in the bubble phase.
+        // Spec: HTML LS §8.1.7 — event handler content attributes.
+        // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes
+        if want != Some(true) && !fire_inline_handler(node, event_type, event, ctx) {
+            return false;
+        }
         true
     }
 
@@ -824,6 +831,48 @@ fn run_dispatch(
     }
 
     default_allowed(&event)
+}
+
+/// Run an element's `on<type>` content attribute, if it has one. The attribute
+/// body is compiled as a function of `event` with `this` bound to the element;
+/// returning `false` cancels the default action, as in the classic
+/// `onclick="return false"` idiom. Returns false if propagation was stopped.
+fn fire_inline_handler(
+    node: &Rc<RefCell<Node>>,
+    event_type: &str,
+    event: &JsObject,
+    ctx: &mut Context,
+) -> bool {
+    let source = {
+        let borrowed = node.borrow();
+        match borrowed.kind() {
+            NodeKind::Element(element) => element.get_attribute(&format!("on{event_type}")),
+            _ => None,
+        }
+    };
+    let Some(source) = source.filter(|s| !s.trim().is_empty()) else {
+        return true;
+    };
+    // Wrap in a function so `return` is legal and the body sees `event`.
+    let wrapped = format!("(function(event){{ {source}\n }})");
+    let Ok(value) = ctx.eval(boa_engine::Source::from_bytes(wrapped.as_bytes())) else {
+        return true;
+    };
+    let Some(callback) = value.as_object() else {
+        return true;
+    };
+    let this = JsValue::from(make_element(node.clone(), ctx));
+    let returned = callback.call(&this, &[JsValue::from(event.clone())], ctx);
+    // `return false` from a content attribute cancels the default action.
+    if matches!(&returned, Ok(v) if v.as_boolean() == Some(false)) {
+        if let Some(flags) = event.downcast_ref::<EventFlags>() {
+            flags.default_prevented.set(true);
+        }
+    }
+    !event
+        .downcast_ref::<EventFlags>()
+        .map(|f| f.stop_propagation.get())
+        .unwrap_or(false)
 }
 
 fn default_allowed(event: &JsObject) -> bool {
@@ -3815,6 +3864,36 @@ mod tests {
         // Only the button's two handlers ran (B twice); the ancestor 'O' was
         // suppressed by stopPropagation.
         assert_eq!(host.eval_to_string("document.getElementById('log').textContent").unwrap(), "B");
+    }
+
+    #[test]
+    fn inline_on_attribute_handlers_run_and_can_cancel() {
+        // `onclick="..."` content attributes are the oldest way to hook an
+        // event and are still everywhere; they must fire like a bubble-phase
+        // listener on the element.
+        let html = "<html><body>\
+                    <div id=\"outer\" onclick=\"document.getElementById('log').textContent += 'O';\">\
+                    <button id=\"btn\" onclick=\"document.getElementById('log').textContent += 'B';\">x</button>\
+                    </div><p id=\"log\"></p></body></html>";
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        let mut host = ScriptHost::new();
+        host.set_document(document.clone());
+
+        let btn = get_element_by_id(Some(document.clone()), &"btn".to_string()).unwrap();
+        assert!(host.dispatch_event(btn.clone(), "click"), "default not prevented");
+        // Target's attribute first, then the ancestor's as the event bubbles.
+        assert_eq!(
+            host.eval_to_string("document.getElementById('log').textContent").unwrap(),
+            "BO"
+        );
+
+        // The classic `return false` idiom cancels the default action.
+        host.eval_to_string(
+            "document.getElementById('btn').setAttribute('onclick', 'return false;');",
+        )
+        .unwrap();
+        assert!(!host.dispatch_event(btn, "click"), "return false must prevent the default");
     }
 
     #[test]

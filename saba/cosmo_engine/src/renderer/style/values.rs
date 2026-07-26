@@ -9,6 +9,7 @@ use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
 
 use std::cell::Cell;
+use std::cell::RefCell;
 
 thread_local! {
     /// Viewport (width, height) for resolving vw/vh units during styling.
@@ -16,10 +17,39 @@ thread_local! {
     /// single-threaded per page so a thread-local is sufficient (same
     /// transitional pattern as the font-metrics provider).
     static STYLING_VIEWPORT: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
+
+    /// Node identities (`Rc::as_ptr`) of the element under the pointer and its
+    /// ancestors — everything `:hover` currently matches. Published by the
+    /// renderer before a style pass, same transitional pattern as the viewport
+    /// above. Empty = nothing hovered.
+    /// Spec: Selectors 4 §9.1 — `:hover` matches an element *and* its
+    /// ancestors. https://www.w3.org/TR/selectors-4/#the-hover-pseudo
+    static HOVER_CHAIN: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn set_styling_viewport(width: i64, height: i64) {
     STYLING_VIEWPORT.with(|v| v.set((width, height)));
+}
+
+/// Publish the hover chain (element under the pointer first, then ancestors)
+/// for subsequent style passes. Pass an empty slice when the pointer leaves the
+/// page. Returns whether the chain actually changed — the renderer only needs
+/// to re-style when it did.
+pub fn set_hover_chain(chain: &[usize]) -> bool {
+    HOVER_CHAIN.with(|c| {
+        let mut current = c.borrow_mut();
+        if *current == chain {
+            return false;
+        }
+        current.clear();
+        current.extend_from_slice(chain);
+        true
+    })
+}
+
+/// Whether `node_key` (an `Rc::as_ptr` identity) is in the hover chain.
+pub(crate) fn is_hovered(node_key: usize) -> bool {
+    HOVER_CHAIN.with(|c| c.borrow().contains(&node_key))
 }
 
 pub(crate) fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64> {

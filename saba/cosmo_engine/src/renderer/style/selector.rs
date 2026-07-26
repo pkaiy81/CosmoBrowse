@@ -87,6 +87,13 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
                 return false;
             }
             use crate::renderer::css::cssom::PseudoClassKind;
+            // `:hover` consults the pointer state the renderer published for
+            // this style pass (the hovered element and its ancestors).
+            if matches!(kind, PseudoClassKind::Hover) {
+                return crate::renderer::style::values::is_hovered(
+                    Rc::as_ptr(node) as *const () as usize
+                );
+            }
             // `:root` is the <html> element (it has no element parent).
             if matches!(kind, PseudoClassKind::Root) {
                 let parent_is_element = node
@@ -141,7 +148,9 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
                 }
             };
             return match kind {
-                PseudoClassKind::Root => unreachable!("handled above"),
+                PseudoClassKind::Hover | PseudoClassKind::Root => {
+                    unreachable!("handled above")
+                }
                 PseudoClassKind::FirstChild => index == 1,
                 PseudoClassKind::LastChild => index == total,
                 PseudoClassKind::OnlyChild => total == 1,
