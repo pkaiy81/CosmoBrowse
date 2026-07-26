@@ -1296,6 +1296,9 @@ impl LayoutView {
                 let style = obj.style();
                 if !style.transitions().is_empty() {
                     for property in AnimatedProperty::ALL {
+                        if !style.animatable(property) {
+                            continue;
+                        }
                         if let Some(spec) = style.transition_for(property.css_name()) {
                             out.push(TransitionTarget {
                                 node: obj.node_ref(),

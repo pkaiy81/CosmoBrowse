@@ -118,6 +118,17 @@ pub struct ComputedStyle {
     anim_opacity: Option<f64>,
     /// As `anim_opacity`, for a running `background-color` transition.
     anim_background_color: Option<Color>,
+    /// As `anim_opacity`, for a running `color` transition. `color` inherits,
+    /// so this also carries an animating ancestor's used value down to
+    /// descendants that declared no color of their own.
+    anim_color: Option<Color>,
+    /// Cascade `width`/`height` saved before an animation override replaced
+    /// them. Unlike the other animated properties, sizes are overridden *in
+    /// place* — every consumer (min/max clamps, box-sizing, layout) then sees
+    /// the animated value with no further plumbing — so the target the driver
+    /// diffs against is stashed here instead.
+    width_target: Option<f64>,
+    height_target: Option<f64>,
     height: Option<f64>,
     height_ratio: Option<f64>,
     width: Option<f64>,
@@ -297,6 +308,9 @@ impl ComputedStyle {
             opacity: None,
             anim_opacity: None,
             anim_background_color: None,
+            anim_color: None,
+            width_target: None,
+            height_target: None,
             height: None,
             height_ratio: None,
             width: None,
@@ -394,6 +408,11 @@ impl ComputedStyle {
         // cascade values the driver compares against (see `anim_opacity`).
         let parent_opacity_target = parent_style.as_ref().map(|p| p.opacity_or_default());
         let parent_opacity_used = parent_style.as_ref().map(|p| p.used_opacity());
+        // `color` inherits, so an animating ancestor's *used* color has to flow
+        // to descendants that declare none of their own. Captured before the
+        // inheritance block below fills `self.color` from the parent's target.
+        let color_declared = self.color.is_some();
+        let parent_anim_color = parent_style.as_ref().and_then(|p| p.anim_color.clone());
 
         if let Some(parent_style) = parent_style {
             // NOTE: background-color is NOT inherited in CSS. The transparent
@@ -537,7 +556,6 @@ impl ComputedStyle {
         if self.opacity.is_none() {
             self.opacity = Some(1.0);
         }
-        self.resolve_animated_values(node, parent_opacity_target, parent_opacity_used);
         if self.list_style_type.is_none() {
             // UA stylesheet: list containers seed the inherited marker type.
             self.list_style_type = match node.borrow().element_tag_name().as_deref() {
@@ -567,6 +585,13 @@ impl ComputedStyle {
         if self.width.is_none() {
             self.width = Some(0.0);
         }
+        self.resolve_animated_values(
+            node,
+            parent_opacity_target,
+            parent_opacity_used,
+            color_declared,
+            parent_anim_color,
+        );
         // <center> tag implies text-align: center for children.
         if node.borrow().element_kind() == Some(ElementKind::Center) && self.text_align.is_none() {
             self.text_align = Some(TextAlign::Center);
@@ -909,6 +934,11 @@ impl ComputedStyle {
             .unwrap_or_else(|| self.background_color())
     }
 
+    /// The text color actually painted (see [`used_opacity`]).
+    pub fn used_color(&self) -> Color {
+        self.anim_color.clone().unwrap_or_else(|| self.color())
+    }
+
     /// The declared (cascade) value of `property` — the target a transition
     /// animates towards. Never the animated override.
     pub fn animated_target(&self, property: AnimatedProperty) -> AnimatedValue {
@@ -918,6 +948,29 @@ impl ComputedStyle {
                 let (r, g, b, a) = self.background_color().rgba_channels();
                 AnimatedValue::Rgba(r, g, b, a)
             }
+            AnimatedProperty::Color => {
+                let (r, g, b, a) = self.color().rgba_channels();
+                AnimatedValue::Rgba(r, g, b, a)
+            }
+            AnimatedProperty::Width => {
+                AnimatedValue::Number(self.width_target.unwrap_or_else(|| self.width()))
+            }
+            AnimatedProperty::Height => {
+                AnimatedValue::Number(self.height_target.unwrap_or_else(|| self.height()))
+            }
+        }
+    }
+
+    /// Whether `property` currently has an interpolable value on this box.
+    /// Sizes only qualify when the author gave a definite length: `auto` and
+    /// percentages have no numeric value to animate between.
+    /// Spec: CSS Transitions L1 §2 — only values of an animatable *type* with
+    /// both endpoints interpolable start a transition.
+    pub fn animatable(&self, property: AnimatedProperty) -> bool {
+        match property {
+            AnimatedProperty::Width => self.width_author && self.width_ratio.is_none(),
+            AnimatedProperty::Height => self.height_author && self.height_ratio.is_none(),
+            _ => true,
         }
     }
 
@@ -930,6 +983,8 @@ impl ComputedStyle {
         node: &Rc<RefCell<Node>>,
         parent_target: Option<f64>,
         parent_used: Option<f64>,
+        color_declared: bool,
+        parent_anim_color: Option<Color>,
     ) {
         let own = get_element_attribute(node, ANIM_OPACITY_ATTR)
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -959,6 +1014,40 @@ impl ComputedStyle {
         self.anim_background_color =
             get_element_attribute(node, ANIM_BACKGROUND_COLOR_ATTR)
                 .and_then(|v| Color::from_code(v.trim()).ok());
+        // color does inherit: without an override of its own, an element that
+        // declared no color follows an animating ancestor's used value.
+        self.anim_color = get_element_attribute(node, ANIM_COLOR_ATTR)
+            .and_then(|v| Color::from_code(v.trim()).ok())
+            .or(if color_declared { None } else { parent_anim_color });
+
+        // Sizes are overridden in place (see `width_target`): the cascade value
+        // steps aside as the target and the animated length becomes the used
+        // one, so clamps/box-sizing/layout need no knowledge of animation.
+        for (attr, target, used, author) in [
+            (
+                ANIM_WIDTH_ATTR,
+                &mut self.width_target,
+                &mut self.width,
+                &mut self.width_author,
+            ),
+            (
+                ANIM_HEIGHT_ATTR,
+                &mut self.height_target,
+                &mut self.height,
+                &mut self.height_author,
+            ),
+        ] {
+            let Some(animated) = get_element_attribute(node, attr)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+            else {
+                *target = None;
+                continue;
+            };
+            *target = *used;
+            *used = Some(animated);
+            *author = true;
+        }
     }
 
     pub fn set_final_clip(&mut self, clip: (f64, f64, f64, f64)) {
@@ -1884,6 +1973,11 @@ impl PositionType {
 pub const ANIM_OPACITY_ATTR: &str = "data-cosmo-anim-opacity";
 /// As [`ANIM_OPACITY_ATTR`], for `background-color` (a hex color code).
 pub const ANIM_BACKGROUND_COLOR_ATTR: &str = "data-cosmo-anim-background-color";
+/// As [`ANIM_OPACITY_ATTR`], for `color` (a hex color code).
+pub const ANIM_COLOR_ATTR: &str = "data-cosmo-anim-color";
+/// As [`ANIM_OPACITY_ATTR`], for `width` / `height` (pixel lengths).
+pub const ANIM_WIDTH_ATTR: &str = "data-cosmo-anim-width";
+pub const ANIM_HEIGHT_ATTR: &str = "data-cosmo-anim-height";
 
 /// A property the transition driver knows how to interpolate. Adding one means
 /// giving it an override attribute, a target reader
@@ -1893,17 +1987,29 @@ pub const ANIM_BACKGROUND_COLOR_ATTR: &str = "data-cosmo-anim-background-color";
 pub enum AnimatedProperty {
     Opacity,
     BackgroundColor,
+    Color,
+    Width,
+    Height,
 }
 
 impl AnimatedProperty {
     /// Every property the driver can animate — iterated when collecting targets.
-    pub const ALL: [Self; 2] = [Self::Opacity, Self::BackgroundColor];
+    pub const ALL: [Self; 5] = [
+        Self::Opacity,
+        Self::BackgroundColor,
+        Self::Color,
+        Self::Width,
+        Self::Height,
+    ];
 
     /// The CSS property name, as it appears in a `transition` declaration.
     pub fn css_name(&self) -> &'static str {
         match self {
             Self::Opacity => "opacity",
             Self::BackgroundColor => "background-color",
+            Self::Color => "color",
+            Self::Width => "width",
+            Self::Height => "height",
         }
     }
 
@@ -1912,6 +2018,9 @@ impl AnimatedProperty {
         match self {
             Self::Opacity => ANIM_OPACITY_ATTR,
             Self::BackgroundColor => ANIM_BACKGROUND_COLOR_ATTR,
+            Self::Color => ANIM_COLOR_ATTR,
+            Self::Width => ANIM_WIDTH_ATTR,
+            Self::Height => ANIM_HEIGHT_ATTR,
         }
     }
 }

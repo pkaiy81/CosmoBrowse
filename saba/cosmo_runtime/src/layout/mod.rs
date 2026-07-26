@@ -744,7 +744,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     x,
                     y,
                     text,
-                    color: style.color().code().to_string(),
+                    color: style.used_color().code().to_string(),
                     font_px: font_px_scaled,
                     font_family: style.font_family(),
                     underline: style.text_decoration() == TextDecoration::Underline,
@@ -904,7 +904,7 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
                 PositionType::Sticky => "sticky",
             }
             .to_string(),
-            color: style.color().code().to_string(),
+            color: style.used_color().code().to_string(),
             background_color: style.used_background_color().code().to_string(),
             font_px: style.font_size().px(),
             font_family: style.font_family(),
@@ -1341,6 +1341,116 @@ mod tests {
         page.set_hover_point(None, &rect)
             .expect("leaving must re-style");
         assert!(page.has_pending_animation(), "leaving transitions back");
+    }
+
+    /// Text color of the scene text item containing `needle`.
+    fn scene_text_color(scene: &LayoutScene, needle: &str) -> Option<String> {
+        scene.scene_items.iter().find_map(|item| match item {
+            SceneItem::Text { text, color, .. } if text.contains(needle) => Some(color.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn color_transition_interpolates_and_inherits_to_children() {
+        // `color` inherits, so an animating element must drag along descendants
+        // that declared no color of their own — the child's text has to fade
+        // with the parent even though only the parent has the transition.
+        let html = "<html><head><style>body{margin:0}\
+            #wrap{color:#000000;transition:color 100ms linear}\
+            #wrap.lit{color:#ffffff}</style></head>\
+            <body><div id=\"wrap\">PARENT<span>CHILD</span></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(scene_text_color(&first, "PARENT").as_deref(), Some("#000000"));
+        assert_eq!(scene_text_color(&first, "CHILD").as_deref(), Some("#000000"));
+
+        let _ = page
+            .host
+            .eval_to_string("document.getElementById('wrap').className='lit'");
+
+        let mut midpoints = Vec::new();
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                let parent = scene_text_color(&scene, "PARENT");
+                let child = scene_text_color(&scene, "CHILD");
+                assert_eq!(parent, child, "the child must inherit the animated color");
+                if let Some(c) = parent {
+                    if c != "#000000" && c != "#ffffff" {
+                        midpoints.push(c);
+                    }
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+        assert!(!midpoints.is_empty(), "expected interpolated colors");
+        let settled = page.relayout(&rect);
+        assert_eq!(scene_text_color(&settled, "CHILD").as_deref(), Some("#ffffff"));
+    }
+
+    /// Width of the scene rect belonging to element `#id`.
+    fn scene_width(scene: &LayoutScene, id: &str) -> Option<i64> {
+        scene.scene_items.iter().find_map(|item| match item {
+            SceneItem::Rect { anchor_id, width, .. } if anchor_id.as_deref() == Some(id) => {
+                Some(*width)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn width_transition_relayouts_each_frame() {
+        // A length transition changes layout, not just paint. The override
+        // replaces the used width at its source, so clamps and layout see the
+        // animated value with no extra plumbing.
+        let html = "<html><head><style>body{margin:0}\
+            #bar{width:100px;height:20px;background:#ff0000;transition:width 100ms linear}\
+            #bar.wide{width:300px}</style></head>\
+            <body><div id=\"bar\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(scene_width(&first, "bar"), Some(100));
+
+        let _ = page
+            .host
+            .eval_to_string("document.getElementById('bar').className='wide'");
+
+        let mut widths = Vec::new();
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                if let Some(w) = scene_width(&scene, "bar") {
+                    widths.push(w);
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+        assert!(
+            widths.windows(2).all(|w| w[1] >= w[0]),
+            "width must grow monotonically, got {widths:?}"
+        );
+        assert!(
+            widths.iter().any(|w| *w > 100 && *w < 300),
+            "expected intermediate widths, got {widths:?}"
+        );
+        assert_eq!(widths.last().copied(), Some(300), "must settle on the target");
+    }
+
+    #[test]
+    fn auto_width_never_starts_a_transition() {
+        // `auto` has no numeric value to interpolate from, so a declared
+        // `transition: width` on an auto-sized box must stay inert.
+        let html = "<html><head><style>body{margin:0}\
+            #b{height:10px;transition:width 1s}#b.w{background:#00ff00}</style></head>\
+            <body><div id=\"b\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        let _ = page.host.eval_to_string("document.getElementById('b').className='w'");
+        page.animation_frame(&rect);
+        assert!(!page.has_pending_animation(), "auto width is not interpolable");
     }
 
     #[test]
