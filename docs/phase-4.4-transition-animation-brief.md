@@ -29,12 +29,14 @@ override は `data-cosmo-anim-opacity` として DOM 上にあるので **full �
 `aaca6b4` でドライバは**プロパティ汎用**に(`AnimatedProperty`/`AnimatedValue`、キーは (node, property))、
 **background-color** も補間対象。プロパティ追加は variant + `used_*` アクセサだけ。
 
-**この節の残り**: ① color(継承あり)/transform の補間② length 系(relayout が要る)
-③ **`run_initial_load` が pending タイマーを全消化**するため `setTimeout` 起点の class 変更は
-初回描画前に確定してアニメしない(ロード後の fetch/XHR・フレームクロックのタイマーは動く)。
-④ `:hover` 起点(1.5 未実装)。
-~~⑤ クリック等の実入力を LivePage へ dispatch~~ → **完了 (`ecdc07a`)**: 実クリックが JS に届き、
-ハンドラの class 変更から transition が起動する(GUI 検証済み)。
+**トリガと対応プロパティは出揃った** (`9bd07d0`, `2117e50`, `c3018a3`, `ecdc07a`):
+実クリック / インライン `onclick` / **`:hover`** が JS とスタイルに届き、遅延 `setTimeout` は
+フレームクロックが配送する。補間対象は **opacity / background-color / color(継承) /
+width / height(レイアウトに効く)**。
+
+**この節の残り**: ① `transform` の補間(translate/scale/rotate の数値補間。エンジンの transform
+サポート自体が近似なので効果は限定的)② `@keyframes` 保存 + `animation-*` 再生(下の 1. のまま未着手)
+③ `:active`/`:focus`(状態の置き場は `:hover` と同じ hover chain 方式で拡張可能)。
 
 ### 当初の設計メモ（実装済み・参照用）
 
