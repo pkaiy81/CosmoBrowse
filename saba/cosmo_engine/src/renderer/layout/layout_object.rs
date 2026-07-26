@@ -2797,6 +2797,45 @@ impl LayoutObject {
         self.node.clone()
     }
 
+    /// Whether this box establishes a block formatting context: floats inside
+    /// it are contained by it, and floats outside never intrude.
+    ///
+    /// Spec: CSS 2.2 §9.4.1 — the root element, floats, absolutely positioned
+    /// boxes, inline-blocks, table cells, and boxes with `overflow` other than
+    /// `visible` all establish one. Flex and grid containers do too (their
+    /// children are not in a block formatting context at all).
+    /// https://www.w3.org/TR/CSS22/visuren.html#block-formatting
+    pub fn establishes_block_formatting_context(&self) -> bool {
+        use crate::renderer::layout::computed_style::{DisplayType, Float, PositionType};
+        if self.parent.upgrade().is_none() {
+            return true; // the layout-tree root
+        }
+        if self.style.float_or_default() != Float::None {
+            return true;
+        }
+        if matches!(
+            self.style.position(),
+            PositionType::Absolute | PositionType::Fixed
+        ) {
+            return true;
+        }
+        if self.style.overflow_clip() || self.style.overflow_scrollable() {
+            return true;
+        }
+        // Table cells establish one too, but this engine has no cell kind —
+        // cells are Blocks tagged by their element, so check the node.
+        if matches!(
+            self.node.borrow().element_kind(),
+            Some(ElementKind::Td) | Some(ElementKind::Th)
+        ) {
+            return true;
+        }
+        matches!(
+            self.style.display(),
+            DisplayType::InlineBlock | DisplayType::Flex | DisplayType::Grid
+        )
+    }
+
     /// A detached box over the same node carrying `style`, for evaluating
     /// declarations against this element's computed style without disturbing
     /// the real one — `@keyframes` blocks are resolved this way, so they go
