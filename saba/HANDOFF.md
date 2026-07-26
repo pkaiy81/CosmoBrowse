@@ -373,6 +373,29 @@
 >   (#ff7a7a ≒ 52%)、200ms は完走して透明。reftest 12/12、engine 138 / runtime 66。
 >   → 当時の制約(`run_initial_load` のタイマー全消化)は `2117e50` で解消、対応プロパティも
 >   opacity/background-color/color/width/height に拡大(下記 `c3018a3`/`9bd07d0`)。
+> - 🚧 **Phase 2.5 インライン整形コンテキスト本体 (`814a375`, `a313b28`, `e3cbac4`, 2026-07-26)** —
+>   **既定を新経路に切替**(`COSMO_LEGACY_INLINE=1` で旧経路)。旧経路は各テキストノードを
+>   **containing block 全幅**で独立に折り返していたため、1行を共有する物が絡むと破綻していた:
+>   reftest golden がそれを露骨に示していた(`inline_wrap` は "bold inline runs"/"an inline anchor"/
+>   次の見出しが**重なって描画**、`modern_bits` は2文が重畳)。両方とも正しく流れるようになり、
+>   `block_flow`/`inline_flow_cursor` は行を最後まで埋めるようになった。
+>   構成: `collect_inline_items`(inline 要素を貫通して item 列に平坦化。純インラインでなければ拒否)/
+>   サイズパスが子確定後に IFC を実行し**行から高さを取る**(`compute_size` 内ではなく
+>   `calculate_node_size` から駆動 — item 収集が子のテキストを読み、それがブロックへ遡るので
+>   可変借用中だと panic)/ 各 box に `inline_offset`(**自分の親**基準。inline 要素が二重適用されない)、
+>   テキストは行ごとの `inline_fragments` を持ち **行途中から始まり次行は左端に続く**描画が可能に
+>   (box 原点からの行スタックでは表現不能だった)/ inline 要素 box は内側フラグメントの union
+>   (背景・下線がラン全体を覆う)。
+>   **IFC がまだ所有しない文脈は旧経路にフォールバック**(A/B で1件ずつ発見): テーブル(列サイズが
+>   幅を決めるので再分割すると単語が hard-break される)、リスト項目(外側マーカー)、
+>   flex/grid コンテナ(item は blockify されるので inline span の集合でも IFC ではない)、
+>   `white-space: nowrap/pre`・ellipsis。ベースラインはエンジン既存の規約(box 上端から1font-size)に合わせた。
+>   A/B(全 reftest + HN/MDN/Wikipedia): HN 8px、flex_grid/table_auto 他は画素一致。golden 4件を再ベースライン。
+>   **残**: UAX#14(`unicode-linebreak`)、float 帯の接続(2.3 合流)、テーブル/リスト/flex の IFC 化、
+>   計測と描画のズレ(インライン要素前の余白。本作業以前から存在)。
+> - ✅ **Phase 2.3 土台 (`4b6f4a6`)** — `FloatContext`(`place`/`band`/`clearance`/`lowest_bottom`、10テスト)
+>   + `establishes_block_formatting_context`(CSS2.2 §9.4.1)。**IFC が既に `band` を参照する形で書かれており**、
+>   float を配置すれば行が短くなる結線は済んでいる(float 側の配置パスが残り)。
 > - ✅ **Phase 4.4 完了: @keyframes + animation (`6c50b5f`, 2026-07-26)** — 宣言的アニメが全て動く。
 >   **パース**: `@keyframes name{from|to|N%{...}}` を(セレクタでなくオフセット鍵の)別テーブルに保持
 >   (`StyleSheet::keyframes_named`)、`animation` shorthand と `animation-*` 7種の longhand を
