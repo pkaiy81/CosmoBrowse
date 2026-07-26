@@ -252,6 +252,38 @@ impl LayoutObject {
                     let target = self.link_target();
 
                     let bold = self.style.is_bold();
+                    // Phase 2.5: when the inline formatting context placed this
+                    // run, paint its fragments where they were placed — a run
+                    // that starts mid-line and continues at the left edge below
+                    // cannot be expressed by stacking lines at the box origin.
+                    if !self.inline_fragments.is_empty() {
+                        let href = self.link_href();
+                        let target = self.link_target();
+                        for (text, dx, dy) in self.inline_fragments.clone() {
+                            v.push(DisplayItem::Text {
+                                text,
+                                style: self.style(),
+                                layout_point: LayoutPoint::new(
+                                    self.point().x() + dx,
+                                    self.point().y() + dy,
+                                ),
+                                href: href.clone(),
+                                target: target.clone(),
+                                paint_order: PaintOrder {
+                                    stacking_context: self.stacking_context_level(),
+                                    z_index: self.style.z_index_or_default(),
+                                },
+                                clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
+                                    x: x as i64,
+                                    y: y as i64,
+                                    width: w as i64,
+                                    height: h as i64,
+                                }),
+                                bold,
+                            });
+                        }
+                        return v;
+                    }
                     for (i, line) in lines.into_iter().enumerate() {
                         let item = DisplayItem::Text {
                             text: line,

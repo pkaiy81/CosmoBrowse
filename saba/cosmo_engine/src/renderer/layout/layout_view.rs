@@ -9,6 +9,7 @@ use crate::renderer::layout::layout_object::compute_box_model_metrics;
 use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
+use crate::renderer::layout::layout_object::use_new_inline;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::{
     AnimatedProperty, AnimatedValue, AnimationSpec, ComputedStyle, TransitionSpec,
@@ -302,6 +303,15 @@ impl LayoutView {
             Self::calculate_node_size(&next_sibling, parent_size);
 
             n.borrow_mut().compute_size(parent_size);
+
+            // Phase 2.5: with the children sized, a block whose content is all
+            // inline gets a real inline formatting context — shared line boxes
+            // that break across child boundaries and against the room each line
+            // actually has, instead of every text node wrapping independently
+            // against the full block width.
+            if use_new_inline() {
+                LayoutObject::layout_inline_context(n);
+            }
         }
     }
 

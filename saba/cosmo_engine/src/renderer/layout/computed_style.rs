@@ -1389,6 +1389,11 @@ impl ComputedStyle {
             && matches!(self.height, Some(h) if h == 0.0)
     }
 
+    /// Whether the author declared a `height` (so content must not override it).
+    pub fn has_author_height(&self) -> bool {
+        self.height_author
+    }
+
     /// See `explicit_zero_height`.
     pub fn explicit_zero_width(&self) -> bool {
         self.width_author

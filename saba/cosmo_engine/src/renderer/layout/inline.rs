@@ -51,6 +51,12 @@ pub enum InlineItem {
 }
 
 impl InlineItem {
+    /// Where this item's baseline sits below its own top edge — public so the
+    /// layout tree can shift a fragment onto its line's shared baseline.
+    pub fn baseline_offset(&self) -> i64 {
+        self.baseline()
+    }
+
     fn height(&self) -> i64 {
         match self {
             Self::Text(run) => run.line_height,
@@ -58,25 +64,19 @@ impl InlineItem {
         }
     }
 
-    /// Where this item's baseline sits below its own top edge. Text sits on the
-    /// baseline with the half-leading above it (CSS 2.2 §10.8.1).
+    /// Where this item's baseline sits below its own top edge.
+    ///
+    /// The engine paints a text run from its box top and treats the baseline as
+    /// one font-size below that — the convention `align_inline_baselines` uses.
+    /// Line boxes must agree with it, or runs of different sizes on one line end
+    /// up a pixel apart from where the rest of the engine expects them.
     fn baseline(&self) -> i64 {
         match self {
-            Self::Text(run) => {
-                let ascent = (run.font_size.px() as f64 * ASCENT_RATIO) as i64;
-                let half_leading = (run.line_height - run.font_size.px()) / 2;
-                half_leading + ascent
-            }
+            Self::Text(run) => run.font_size.px(),
             Self::Atomic { baseline, .. } => *baseline,
         }
     }
 }
-
-/// Fraction of the em box above the baseline. The engine's metrics provider
-/// exposes per-font ascent, but line boxes only need a consistent ratio to
-/// align items against each other; this matches the DejaVu-calibrated tables
-/// the legacy path uses.
-const ASCENT_RATIO: f64 = 0.8;
 
 /// A piece of one item placed on a line. A text item breaking over three lines
 /// yields three fragments.
@@ -112,6 +112,15 @@ impl LineBox {
     }
 }
 
+/// How the line's leftover space is distributed.
+/// Spec: CSS 2.2 §16.2 — `text-align`. https://www.w3.org/TR/CSS22/text.html#alignment
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineAlign {
+    Start,
+    Center,
+    End,
+}
+
 /// Lays `items` out into line boxes starting at `start_y`, inside a content box
 /// `content_width` wide, with each line's usable span taken from `floats`.
 ///
@@ -123,6 +132,19 @@ pub fn layout_inline_items(
     content_width: i64,
     start_y: i64,
     start_x: i64,
+) -> Vec<LineBox> {
+    layout_inline_items_aligned(items, floats, content_width, start_y, start_x, LineAlign::Start)
+}
+
+/// As [`layout_inline_items`], distributing each line's leftover space per
+/// `align`.
+pub fn layout_inline_items_aligned(
+    items: &[InlineItem],
+    floats: &FloatContext,
+    content_width: i64,
+    start_y: i64,
+    start_x: i64,
+    align: LineAlign,
 ) -> Vec<LineBox> {
     let mut lines: Vec<LineBox> = Vec::new();
     let mut current = OpenLine::new(start_y, start_x);
@@ -212,6 +234,21 @@ pub fn layout_inline_items(
     }
     if !current.is_empty() {
         lines.push(current.close());
+    }
+    if align != LineAlign::Start {
+        for line in &mut lines {
+            let band = band_for(floats, content_width, line.y, line.height);
+            let used = line.end_x() - line.fragments.first().map(|f| f.x).unwrap_or(0);
+            let free = (band.right - band.left - used).max(0);
+            let shift = match align {
+                LineAlign::Center => free / 2,
+                LineAlign::End => free,
+                LineAlign::Start => 0,
+            };
+            for fragment in &mut line.fragments {
+                fragment.x += shift;
+            }
+        }
     }
     lines
 }

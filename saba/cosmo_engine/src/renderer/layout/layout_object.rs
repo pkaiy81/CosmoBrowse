@@ -23,6 +23,8 @@ use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
+use crate::renderer::layout::floats::FloatContext;
+use crate::renderer::layout::inline::{layout_inline_items_aligned, InlineItem, LineAlign, TextRun};
 use std::format;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -444,6 +446,17 @@ pub struct LayoutObject {
     // Spec: CSS2.2 §9.4.2 — inline formatting context line construction.
     // https://www.w3.org/TR/CSS22/visuren.html#inline-formatting
     pub(crate) text_line_max_width: i64,
+    /// Line fragments assigned by the inline formatting context (Phase 2.5),
+    /// as (text, x, y) relative to this box's own origin. Empty on the legacy
+    /// path, where paint re-splits the text against `text_line_max_width`.
+    /// A run breaking over three lines has three fragments, each with its own
+    /// x — which is what lets a run start mid-line and continue at the left
+    /// edge below.
+    pub(crate) inline_fragments: Vec<(String, i64, i64)>,
+    /// Offset from the containing block's content origin assigned by the
+    /// inline formatting context. When set, `compute_position` uses it instead
+    /// of anchoring against the previous sibling.
+    pub(crate) inline_offset: Option<(i64, i64)>,
     /// Flow-end cursor of a wrapped text run: width of the LAST line, the
     /// number of lines, and the line height used. A following inline sibling
     /// continues after the last line, not at the bounding box's top-right.
@@ -489,6 +502,8 @@ impl LayoutObject {
             point: LayoutPoint::new(0, 0),
             size: LayoutSize::new(0, 0),
             text_line_max_width: 0,
+            inline_fragments: Vec::new(),
+            inline_offset: None,
             text_last_line_width: 0,
             text_line_count: 0,
             text_line_height: 0,
@@ -2473,6 +2488,15 @@ impl LayoutObject {
         previous_sibling_point: Option<LayoutPoint>,
         previous_sibling_size: Option<LayoutSize>,
     ) {
+        // A box placed by the inline formatting context already knows where it
+        // goes relative to its containing block; pairwise sibling anchoring
+        // would undo that.
+        if let Some((dx, dy)) = self.inline_offset {
+            self.point.set_x(parent_point.x() + dx);
+            self.point.set_y(parent_point.y() + dy);
+            return;
+        }
+
         let mut point = LayoutPoint::new(0, 0);
         let metrics = compute_box_model_metrics(&self.style);
 
@@ -2797,6 +2821,189 @@ impl LayoutObject {
         self.node.clone()
     }
 
+    /// Gather this box's inline-level content as a flat item list for an
+    /// inline formatting context, together with the boxes each item came from.
+    /// Returns `None` when the box does not establish one — any block-level
+    /// child means its children stack vertically and the old path applies.
+    ///
+    /// Inline *elements* are flattened: their leaf children become the items,
+    /// which is how a line can hold text from several elements. An inline box
+    /// with no children of its own (an image, a sized span) is atomic.
+    /// Spec: CSS 2.2 §9.2.2. https://www.w3.org/TR/CSS22/visuren.html#inline-boxes
+    pub(crate) fn collect_inline_items(
+        &self,
+    ) -> Option<(Vec<Rc<RefCell<LayoutObject>>>, Vec<InlineItem>)> {
+        let mut boxes = Vec::new();
+        let mut items = Vec::new();
+        let mut child = self.first_child();
+        while let Some(c) = child {
+            if c.borrow().kind().normal_flow_spec().stacks_vertically {
+                return None;
+            }
+            if !collect_inline_items_from(&c, &mut boxes, &mut items) {
+                return None;
+            }
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
+        if items.is_empty() {
+            None
+        } else {
+            Some((boxes, items))
+        }
+    }
+
+    /// Lay this block's inline children out as line boxes `content_width` wide,
+    /// writing each participating box its position (and, for text, its per-line
+    /// fragments). Returns the content height the lines occupy, or `None` when
+    /// the box has no inline formatting context to lay out.
+    ///
+    /// Takes the boxes by handle rather than `&mut self`: collecting the items
+    /// reads each child's text, and that reaches back up to this box to decide
+    /// whitespace collapsing — which would panic against an outstanding mutable
+    /// borrow.
+    fn layout_inline_context_inner(
+        boxes: Vec<Rc<RefCell<LayoutObject>>>,
+        items: Vec<InlineItem>,
+        content_width: i64,
+        align: LineAlign,
+    ) -> Option<i64> {
+        let floats = FloatContext::new(content_width);
+        let lines =
+            layout_inline_items_aligned(&items, &floats, content_width, 0, 0, align);
+
+        // Fragments per item, in block coordinates, shifted onto their line's
+        // shared baseline so items of different heights line up.
+        let mut fragments: Vec<Vec<(String, i64, i64)>> = vec![Vec::new(); boxes.len()];
+        for line in &lines {
+            for fragment in &line.fragments {
+                let y = fragment.y + (line.baseline - items[fragment.item].baseline_offset());
+                fragments[fragment.item].push((
+                    fragment.text.clone().unwrap_or_default(),
+                    fragment.x,
+                    y,
+                ));
+            }
+        }
+
+        // Every participating box's rect in block coordinates: a leaf's is the
+        // union of its fragments, an inline element's the union of everything
+        // inside it (so its background/underline covers the whole run).
+        let mut rects: Vec<(*const LayoutObject, Rect)> = Vec::new();
+        for (index, boxed) in boxes.iter().enumerate() {
+            let Some(rect) = fragment_rect(boxed, &fragments[index]) else {
+                continue;
+            };
+            union_into(&mut rects, boxed, rect);
+            for ancestor in inline_ancestors(boxed) {
+                union_into(&mut rects, &ancestor, rect);
+            }
+        }
+        let rect_of = |node: &Rc<RefCell<LayoutObject>>| -> Option<Rect> {
+            let key = node.as_ptr() as *const LayoutObject;
+            rects.iter().find(|(k, _)| *k == key).map(|(_, r)| *r)
+        };
+
+        // Offsets are expressed against each box's *own* parent, because that
+        // is what the position pass adds them to: an inline element between a
+        // run and the block would otherwise be applied twice.
+        let mut assign = |node: &Rc<RefCell<LayoutObject>>| -> Option<Rect> {
+            let rect = rect_of(node)?;
+            let origin = node
+                .borrow()
+                .parent
+                .upgrade()
+                .and_then(|p| rect_of(&p))
+                .map(|r| (r.x, r.y))
+                .unwrap_or((0, 0));
+            node.borrow_mut().inline_offset = Some((rect.x - origin.0, rect.y - origin.1));
+            Some(rect)
+        };
+
+        for (index, boxed) in boxes.iter().enumerate() {
+            let Some(rect) = assign(boxed) else { continue };
+            let mut b = boxed.borrow_mut();
+            // Fragment positions are stored relative to the box's own origin so
+            // paint can emit them without knowing the containing block.
+            b.inline_fragments = fragments[index]
+                .iter()
+                .map(|(text, x, y)| (text.clone(), x - rect.x, y - rect.y))
+                .collect();
+            if b.kind() == LayoutObjectKind::Text {
+                b.size.set_width(rect.width());
+                b.size.set_height(rect.height());
+                b.text_line_count = fragments[index].len() as i64;
+                b.text_line_height = styled_line_height(&b.style);
+            }
+        }
+        for boxed in boxes.iter() {
+            for ancestor in inline_ancestors(boxed) {
+                let Some(rect) = assign(&ancestor) else { continue };
+                let mut b = ancestor.borrow_mut();
+                b.size.set_width(rect.width());
+                b.size.set_height(rect.height());
+            }
+        }
+        Some(lines.iter().map(|l| l.height).sum())
+    }
+
+    /// Run the inline formatting context for `block`, if it establishes one,
+    /// and give the block the height its lines occupy. Borrows are taken and
+    /// released around each step so children can reach back up to the block.
+    pub(crate) fn layout_inline_context(block: &Rc<RefCell<LayoutObject>>) -> bool {
+        {
+            let b = block.borrow();
+            if b.kind() != LayoutObjectKind::Block {
+                return false;
+            }
+            // Contexts this pass does not own yet:
+            //  - tables size their columns from content, so re-breaking text at
+            //    the assigned cell width hard-breaks words the column algorithm
+            //    sized to fit;
+            //  - list items carry an outside marker box that is not part of the
+            //    inline flow.
+            if b.is_table() || b.is_table_row() || b.is_table_cell() || b.is_row_group() {
+                return false;
+            }
+            if matches!(b.node.borrow().element_kind(), Some(ElementKind::Li)) {
+                return false;
+            }
+            // A flex or grid container's children are flex/grid items — they
+            // are blockified regardless of their `display`, so a container of
+            // inline `<span>`s is emphatically NOT an inline formatting
+            // context. Spec: CSS Flexbox §4 / Grid §6 (blockification).
+            if b.is_flex_container()
+                || matches!(
+                    b.style.display(),
+                    DisplayType::Grid | DisplayType::Contents
+                )
+            {
+                return false;
+            }
+        }
+        let content_width = block.borrow().content_size().width();
+        let Some((boxes, items)) = block.borrow().collect_inline_items() else {
+            return false;
+        };
+        let align = match block.borrow().style.text_align() {
+            TextAlign::Center => LineAlign::Center,
+            TextAlign::Right => LineAlign::End,
+            _ => LineAlign::Start,
+        };
+        let Some(height) = Self::layout_inline_context_inner(boxes, items, content_width, align)
+        else {
+            return false;
+        };
+        let mut b = block.borrow_mut();
+        // An explicit height wins over the content's own.
+        if b.style.has_author_height() {
+            return true;
+        }
+        let metrics = compute_box_model_metrics(&b.style);
+        b.size.set_height((height + metrics.inner_vertical()).max(0));
+        true
+    }
+
     /// Whether this box establishes a block formatting context: floats inside
     /// it are contained by it, and floats outside never intrude.
     ///
@@ -3098,6 +3305,179 @@ impl LayoutSize {
         self.height = height;
     }
 }
+
+
+/// Whether the Phase 2.5 inline formatting context replaces the legacy
+/// per-text-node wrapping. On by default; `COSMO_LEGACY_INLINE=1` (or
+/// `COSMO_NEW_INLINE=0`) restores the old path for A/B comparison.
+pub(crate) fn use_new_inline() -> bool {
+    if std::env::var("COSMO_LEGACY_INLINE").as_deref() == Ok("1") {
+        return false;
+    }
+    std::env::var("COSMO_NEW_INLINE").as_deref() != Ok("0")
+}
+
+/// Walk one inline-level box into the item list, flattening inline elements.
+/// Returns false when something block-level turns up (the caller falls back to
+/// the legacy path).
+fn collect_inline_items_from(
+    node: &Rc<RefCell<LayoutObject>>,
+    boxes: &mut Vec<Rc<RefCell<LayoutObject>>>,
+    items: &mut Vec<InlineItem>,
+) -> bool {
+    let kind = node.borrow().kind();
+    if kind.normal_flow_spec().stacks_vertically {
+        return false;
+    }
+    if kind == LayoutObjectKind::Text {
+        {
+            // Preserved / non-wrapping white-space and ellipsis truncation are
+            // the legacy path's business: the line breaker here always wraps at
+            // break opportunities, so a `nowrap` run would be split and a `pre`
+            // run would lose its newlines. Fall back for the whole block.
+            let b = node.borrow();
+            if b.style.white_space_nowrap()
+                || b.style.white_space_preserves_newlines()
+                || b.style.white_space_preserves_spaces()
+                || b.style.text_overflow_ellipsis()
+            {
+                return false;
+            }
+        }
+        let text = match node.borrow().node_kind() {
+            NodeKind::Text(t) => node.borrow().display_text(&t),
+            _ => String::new(),
+        };
+        if text.is_empty() {
+            return true;
+        }
+        let b = node.borrow();
+        boxes.push(node.clone());
+        items.push(InlineItem::Text(TextRun {
+            text,
+            font_size: b.style.font_size(),
+            bold: b.style.is_bold(),
+            line_height: styled_line_height(&b.style),
+        }));
+        return true;
+    }
+    // An inline box with children contributes its children; one without (an
+    // image, a sized span) is atomic.
+    let first_child = node.borrow().first_child();
+    if first_child.is_none() {
+        let b = node.borrow();
+        let size = b.size();
+        boxes.push(node.clone());
+        items.push(InlineItem::Atomic {
+            width: size.width(),
+            height: size.height(),
+            baseline: size.height(),
+        });
+        return true;
+    }
+    let mut child = first_child;
+    while let Some(c) = child {
+        if !collect_inline_items_from(&c, boxes, items) {
+            return false;
+        }
+        let next = c.borrow().next_sibling();
+        child = next;
+    }
+    true
+}
+
+/// A rect in the inline formatting context's (block-relative) coordinates.
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    x: i64,
+    y: i64,
+    right: i64,
+    bottom: i64,
+}
+
+impl Rect {
+    fn width(&self) -> i64 {
+        (self.right - self.x).max(0)
+    }
+
+    fn height(&self) -> i64 {
+        (self.bottom - self.y).max(0)
+    }
+
+    fn union(self, other: Rect) -> Rect {
+        Rect {
+            x: self.x.min(other.x),
+            y: self.y.min(other.y),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+}
+
+/// The union of `placed`, measured in `node`'s own font for text.
+fn fragment_rect(node: &Rc<RefCell<LayoutObject>>, placed: &[(String, i64, i64)]) -> Option<Rect> {
+    let first = placed.first()?;
+    let b = node.borrow();
+    let is_text = b.kind() == LayoutObjectKind::Text;
+    let (font_size, bold) = (b.style.font_size(), b.style.is_bold());
+    let line_height = styled_line_height(&b.style);
+    let (own_width, own_height) = (b.size().width(), b.size().height());
+    drop(b);
+    let extent = |text: &str| {
+        if is_text {
+            (measure_text_width(text, font_size, bold), line_height)
+        } else {
+            (own_width, own_height)
+        }
+    };
+    let (w, h) = extent(&first.0);
+    let mut rect = Rect {
+        x: first.1,
+        y: first.2,
+        right: first.1 + w,
+        bottom: first.2 + h,
+    };
+    for (text, x, y) in placed.iter().skip(1) {
+        let (w, h) = extent(text);
+        rect = rect.union(Rect {
+            x: *x,
+            y: *y,
+            right: x + w,
+            bottom: y + h,
+        });
+    }
+    Some(rect)
+}
+
+/// Merge `rect` into `node`'s entry.
+fn union_into(
+    rects: &mut Vec<(*const LayoutObject, Rect)>,
+    node: &Rc<RefCell<LayoutObject>>,
+    rect: Rect,
+) {
+    let key = node.as_ptr() as *const LayoutObject;
+    match rects.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, existing)) => *existing = existing.union(rect),
+        None => rects.push((key, rect)),
+    }
+}
+
+/// The inline element boxes between `node` and its block container.
+fn inline_ancestors(node: &Rc<RefCell<LayoutObject>>) -> Vec<Rc<RefCell<LayoutObject>>> {
+    let mut chain = Vec::new();
+    let mut ancestor = node.borrow().parent.upgrade();
+    while let Some(a) = ancestor {
+        if a.borrow().kind() == LayoutObjectKind::Block {
+            break;
+        }
+        chain.push(a.clone());
+        let next = a.borrow().parent.upgrade();
+        ancestor = next;
+    }
+    chain
+}
+
+
 
 #[cfg(test)]
 mod tests {
