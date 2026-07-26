@@ -1944,6 +1944,16 @@ impl ScriptHost {
         self.drain(max_timer_fires, false);
     }
 
+    /// Run everything that is due *now*: microtasks, settled fetches, and any
+    /// timer whose delay has already elapsed — without jumping the clock
+    /// forward to flush later ones the way [`run_initial_load`] does. Callers
+    /// that own a frame clock (the GUI's `LivePage`) use this so a
+    /// `setTimeout(f, 2000)` actually waits two seconds instead of firing
+    /// before the first paint.
+    pub fn run_due(&mut self, max_fires: usize) {
+        self.run_frame(0, max_fires);
+    }
+
     /// Advance the virtual clock by one animation frame (`frame_ms`) and fire
     /// every timer/`requestAnimationFrame` callback whose due time falls within
     /// this frame, rescheduling intervals. Used by the GUI to drive continuous

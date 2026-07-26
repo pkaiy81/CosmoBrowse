@@ -359,7 +359,12 @@ impl LivePage {
         let script = get_js_content(dom.clone());
         if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
             let _ = host.eval_to_string(&script);
-            host.run_initial_load(1000);
+            // Only what is due at t=0. A retained page has a frame clock
+            // (`animation_frame`) to deliver delayed timers on schedule, so
+            // unlike the one-shot pipeline it must not flush them up front —
+            // that would make timed UI (and the transitions it triggers) snap
+            // to its end state before the first paint.
+            host.run_due(1000);
         }
         replace_local_storage(document_url, &host.local_storage_entries());
 
@@ -511,7 +516,7 @@ impl LivePage {
     /// scene; otherwise return `None` (nothing to repaint). Does not re-parse
     /// the HTML.
     pub fn pump_and_relayout(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
-        self.host.run_initial_load(1000);
+        self.host.run_due(1000);
         replace_local_storage(&self.document_url, &self.host.local_storage_entries());
         let generation = self.host.dom_generation();
         if generation == self.last_generation {
@@ -1451,6 +1456,46 @@ mod tests {
         let _ = page.host.eval_to_string("document.getElementById('b').className='w'");
         page.animation_frame(&rect);
         assert!(!page.has_pending_animation(), "auto width is not interpolable");
+    }
+
+    #[test]
+    fn delayed_timer_fires_on_the_frame_clock_not_at_load() {
+        // A retained page owns a frame clock, so a delayed timer must wait
+        // rather than being flushed before the first paint — otherwise timed
+        // UI (and any transition it triggers) snaps to its end state.
+        let html = "<html><head><style>body{margin:0}\
+            #box{width:50px;height:50px;background-color:#000000;\
+            transition:background-color 100ms linear}\
+            #box.lit{background-color:#ffffff}</style></head><body>\
+            <div id=\"box\"></div><script>setTimeout(function(){\
+              document.getElementById('box').className='lit';},100);</script>\
+            </body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 200, height: 200 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(
+            scene_background(&first, "box").as_deref(),
+            Some("#000000"),
+            "the timer must not have fired before the first paint"
+        );
+
+        // ~7 frames of 16ms reach the 100ms deadline; the class change then
+        // starts the transition, which takes another 100ms.
+        let mut colors = Vec::new();
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                if let Some(color) = scene_background(&scene, "box") {
+                    colors.push(color);
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+        assert!(
+            colors.iter().any(|c| c != "#000000" && c != "#ffffff"),
+            "the timer should fire on the clock and transition, got {colors:?}"
+        );
+        assert_eq!(colors.last().map(String::as_str), Some("#ffffff"));
     }
 
     #[test]
