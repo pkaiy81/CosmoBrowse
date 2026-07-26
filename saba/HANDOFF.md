@@ -349,8 +349,7 @@
 >   (ii) **iframe の実ドキュメント描画**(現状プレースホルダ、plan 2.7。ネスト browsing context の
 >   取得+レイアウト=実質新機能)。(iii) **floats/clear/BFC**(Phase 2.3、古典レイアウト最難関)。
 >   (iv) **インライン行ボックス本実装**(Phase 2.5、UAX#14、回帰面積最大)。(v) **DOM アリーナ移行**
->   (Phase 0.8/3.0、Rc→NodeId 大改修)。(vi) **@keyframes/animation**(Phase 4.4 の残り。
->   JS アニメ駆動と opacity の CSS transition は下記のとおり完了)。
+>   (Phase 0.8/3.0、Rc→NodeId 大改修)。~~(vi) Phase 4.4~~ → **完了**(下記)。
 >   (vii) **マルチプロセス化**(Phase 5、最終フェーズ)。各々が独立した集中作業で、まとめて一発では
 >   終わらない。着手はフェーズ単位で。
 > - ✅ **Phase 4.4 の JS アニメ駆動 (`851295a`)** — rAF ループ/setInterval で style を変えるアニメが GUI で動作
@@ -374,6 +373,23 @@
 >   (#ff7a7a ≒ 52%)、200ms は完走して透明。reftest 12/12、engine 138 / runtime 66。
 >   → 当時の制約(`run_initial_load` のタイマー全消化)は `2117e50` で解消、対応プロパティも
 >   opacity/background-color/color/width/height に拡大(下記 `c3018a3`/`9bd07d0`)。
+> - ✅ **Phase 4.4 完了: @keyframes + animation (`6c50b5f`, 2026-07-26)** — 宣言的アニメが全て動く。
+>   **パース**: `@keyframes name{from|to|N%{...}}` を(セレクタでなくオフセット鍵の)別テーブルに保持
+>   (`StyleSheet::keyframes_named`)、`animation` shorthand と `animation-*` 7種の longhand を
+>   `AnimationSpec`(name/duration/delay/easing/iteration(infinite可)/direction/fill-mode)に。
+>   **解決**: キーフレームの宣言を要素の計算後スタイルのコピーに適用して `animated_target` で読み戻す
+>   = **キーフレーム値も通常宣言と同じカスケードを通る**(単位・色関数・継承すべて)。コピー元は
+>   `without_animation_overrides()`(これが無いと2フレーム目で両端が同値に潰れ再生が止まる)。
+>   **再生**: `KeyframeDriver` が要素ごとの開始時刻を持ち、毎フレーム iteration+進捗を算出、
+>   direction(alternate 含む)/fill-mode を尊重して前後キーフレームを補間。transition と**同じ**
+>   `data-cosmo-anim-*` に書くので paint/layout/COSMO_LAYOUT_ASSERT はどちらのドライバか知らない。
+>   終了後は `forwards` なら値を保持しつつフレーム要求を止め、`infinite` は回り続ける。
+>   **途中で見つけたトークナイザのバグ**: `@` の次が英字の時しか at-keyword にならず、
+>   **ベンダプレフィクス at-rule(`@-webkit-keyframes`)は全て delim 扱いでブロックが規則として漏れていた**
+>   (CSS Syntax §4.3.1: ident は `-` で始まれる)。
+>   検証: 3段キーフレームが background-color と width を同時にアニメし中間キーフレーム
+>   (245,0,5 / 196px)で撮影、短いものは #ffcc00 / 300px に到達。凍結フィクスチャ画素一致、
+>   reftest 12/12、engine 140 / runtime 80。
 > - ✅ **入力の穴を全て閉じた (`c3018a3`, `9bd07d0`, `2117e50`, 2026-07-26)** —
 >   ① **インライン `on<type>=""` 属性ハンドラ**(従来は addEventListener のみ)。要素のバブル段
 >   リスナとして `event` を引数に取る関数にコンパイルして実行、`return false` で default 抑止

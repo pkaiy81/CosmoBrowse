@@ -34,9 +34,12 @@ override は `data-cosmo-anim-opacity` として DOM 上にあるので **full �
 フレームクロックが配送する。補間対象は **opacity / background-color / color(継承) /
 width / height(レイアウトに効く)**。
 
-**この節の残り**: ① `transform` の補間(translate/scale/rotate の数値補間。エンジンの transform
-サポート自体が近似なので効果は限定的)② `@keyframes` 保存 + `animation-*` 再生(下の 1. のまま未着手)
-③ `:active`/`:focus`(状態の置き場は `:hover` と同じ hover chain 方式で拡張可能)。
+**② `@keyframes` + `animation` も完了 (`6c50b5f`)** — パース/要素ごとの値解決/`KeyframeDriver` 再生。
+→ **Phase 4.4 はクローズ**。
+
+**残った小粒**: ① `transform` の補間(translate/scale/rotate。エンジンの transform サポート自体が
+近似なので効果は限定的)③ `:active`/`:focus`(hover chain と同じ方式で拡張可能)
+④ `steps()`/`cubic-bezier()` の easing(現状は5種のキーワードを近似)。
 
 ### 当初の設計メモ（実装済み・参照用）
 
