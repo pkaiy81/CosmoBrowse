@@ -368,6 +368,26 @@ impl LayoutObject {
                         self.style.set_transitions(specs);
                     }
                 }
+                "animation" => {
+                    let specs = parse_animation_shorthand(&declaration.value);
+                    if !specs.is_empty() {
+                        self.style.set_animations(specs);
+                    }
+                }
+                // Longhands set the corresponding field on every declared
+                // animation, seeding one from `animation-name` if the
+                // shorthand hasn't run. Spec: CSS Animations L1 §3.
+                "animation-name"
+                | "animation-duration"
+                | "animation-delay"
+                | "animation-timing-function"
+                | "animation-iteration-count"
+                | "animation-direction"
+                | "animation-fill-mode" => {
+                    let mut specs = self.style.animations().to_vec();
+                    apply_animation_longhand(&mut specs, &declaration.property, &declaration.value);
+                    self.style.set_animations(specs);
+                }
                 "top" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_top(*value),
                     Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
@@ -811,20 +831,6 @@ impl LayoutObject {
 /// (whitespace-separated within each). Durations are `Ns`/`Nms` dimensions.
 /// Spec: CSS Transitions L1 §2.
 fn parse_transition_shorthand(values: &[ComponentValue]) -> Vec<TransitionSpec> {
-    fn dur_ms(v: f64, unit: &str) -> Option<u32> {
-        match unit {
-            "s" => Some((v * 1000.0).round().max(0.0) as u32),
-            "ms" => Some(v.round().max(0.0) as u32),
-            _ => None,
-        }
-    }
-    let is_easing = |s: &str| {
-        matches!(
-            s,
-            "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out"
-        )
-    };
-
     let mut specs = Vec::new();
     // Split on comma delimiters into per-property groups.
     for group in values.split(|t| matches!(t, ComponentValue::Delim(','))) {
@@ -835,14 +841,14 @@ fn parse_transition_shorthand(values: &[ComponentValue]) -> Vec<TransitionSpec> 
             match tok {
                 ComponentValue::Ident(s) => {
                     let s = s.to_ascii_lowercase();
-                    if is_easing(&s) {
+                    if is_easing_keyword(&s) {
                         easing = Easing::from_str(&s);
                     } else if property.is_none() {
                         property = Some(s);
                     }
                 }
                 ComponentValue::Dimension(v, unit) => {
-                    if let Some(ms) = dur_ms(*v, &unit.to_ascii_lowercase()) {
+                    if let Some(ms) = duration_ms(*v, &unit.to_ascii_lowercase()) {
                         durations.push(ms);
                     }
                 }
@@ -860,6 +866,176 @@ fn parse_transition_shorthand(values: &[ComponentValue]) -> Vec<TransitionSpec> 
         }
     }
     specs
+}
+
+/// Parse the `animation` shorthand: comma-separated
+/// `<duration> [easing] [delay] [count] [direction] [fill-mode] <name>` in any
+/// order (the first time value is the duration, the second the delay — the one
+/// ordering rule the shorthand imposes).
+/// Spec: CSS Animations L1 §3.6. https://www.w3.org/TR/css-animations-1/#animation
+fn parse_animation_shorthand(values: &[ComponentValue]) -> Vec<AnimationSpec> {
+    let mut specs = Vec::new();
+    for group in values.split(|t| matches!(t, ComponentValue::Delim(','))) {
+        let mut spec = AnimationSpec {
+            name: String::new(),
+            duration_ms: 0,
+            delay_ms: 0,
+            easing: Easing::Ease,
+            iterations: Some(1.0),
+            direction: AnimationDirection::Normal,
+            fill_mode: AnimationFillMode::None,
+        };
+        let mut times: Vec<u32> = Vec::new();
+        for token in group {
+            match token {
+                ComponentValue::Ident(raw) => {
+                    let word = raw.to_ascii_lowercase();
+                    if is_easing_keyword(&word) {
+                        spec.easing = Easing::from_str(&word);
+                    } else if word == "infinite" {
+                        spec.iterations = None;
+                    } else if let Some(direction) = AnimationDirection::from_str(&word) {
+                        spec.direction = direction;
+                    } else if let Some(fill) = AnimationFillMode::from_str(&word) {
+                        // `none` is ambiguous with animation-name: none; as a
+                        // fill mode it is also the default, so nothing is lost.
+                        spec.fill_mode = fill;
+                    } else if spec.name.is_empty() {
+                        // Names are case-sensitive custom idents — keep the
+                        // author's spelling.
+                        spec.name = raw.clone();
+                    }
+                }
+                ComponentValue::Dimension(value, unit) => {
+                    if let Some(ms) = duration_ms(*value, &unit.to_ascii_lowercase()) {
+                        times.push(ms);
+                    }
+                }
+                // A bare number is the iteration count (`0s` durations arrive
+                // as a Number too, but only ever as the first time value).
+                ComponentValue::Number(value) => {
+                    if *value == 0.0 && times.is_empty() {
+                        times.push(0);
+                    } else {
+                        spec.iterations = Some(value.max(0.0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        spec.duration_ms = times.first().copied().unwrap_or(0);
+        spec.delay_ms = times.get(1).copied().unwrap_or(0);
+        if !spec.name.is_empty() {
+            specs.push(spec);
+        }
+    }
+    specs
+}
+
+/// Apply one `animation-*` longhand across the declared animations, seeding a
+/// list from `animation-name` when the shorthand hasn't run.
+fn apply_animation_longhand(
+    specs: &mut Vec<AnimationSpec>,
+    property: &str,
+    values: &[ComponentValue],
+) {
+    if property == "animation-name" {
+        let names: Vec<String> = values
+            .iter()
+            .filter_map(|token| match token {
+                ComponentValue::Ident(raw) if !raw.eq_ignore_ascii_case("none") => {
+                    Some(raw.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        // Keep any timing already declared by earlier longhands.
+        let template = specs.first().cloned();
+        *specs = names
+            .into_iter()
+            .map(|name| {
+                let mut spec = template.clone().unwrap_or(AnimationSpec {
+                    name: String::new(),
+                    duration_ms: 0,
+                    delay_ms: 0,
+                    easing: Easing::Ease,
+                    iterations: Some(1.0),
+                    direction: AnimationDirection::Normal,
+                    fill_mode: AnimationFillMode::None,
+                });
+                spec.name = name;
+                spec
+            })
+            .collect();
+        return;
+    }
+    if specs.is_empty() {
+        // Timing declared before the name: hold it on a placeholder that
+        // `animation-name` will complete.
+        specs.push(AnimationSpec {
+            name: String::new(),
+            duration_ms: 0,
+            delay_ms: 0,
+            easing: Easing::Ease,
+            iterations: Some(1.0),
+            direction: AnimationDirection::Normal,
+            fill_mode: AnimationFillMode::None,
+        });
+    }
+    for spec in specs.iter_mut() {
+        for token in values {
+            match (property, token) {
+                ("animation-duration", ComponentValue::Dimension(v, unit)) => {
+                    if let Some(ms) = duration_ms(*v, &unit.to_ascii_lowercase()) {
+                        spec.duration_ms = ms;
+                    }
+                }
+                ("animation-delay", ComponentValue::Dimension(v, unit)) => {
+                    if let Some(ms) = duration_ms(*v, &unit.to_ascii_lowercase()) {
+                        spec.delay_ms = ms;
+                    }
+                }
+                ("animation-timing-function", ComponentValue::Ident(word)) => {
+                    spec.easing = Easing::from_str(&word.to_ascii_lowercase());
+                }
+                ("animation-iteration-count", ComponentValue::Ident(word))
+                    if word.eq_ignore_ascii_case("infinite") =>
+                {
+                    spec.iterations = None;
+                }
+                ("animation-iteration-count", ComponentValue::Number(v)) => {
+                    spec.iterations = Some(v.max(0.0));
+                }
+                ("animation-direction", ComponentValue::Ident(word)) => {
+                    if let Some(d) = AnimationDirection::from_str(&word.to_ascii_lowercase()) {
+                        spec.direction = d;
+                    }
+                }
+                ("animation-fill-mode", ComponentValue::Ident(word)) => {
+                    if let Some(f) = AnimationFillMode::from_str(&word.to_ascii_lowercase()) {
+                        spec.fill_mode = f;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `Ns` / `Nms` to milliseconds.
+fn duration_ms(value: f64, unit: &str) -> Option<u32> {
+    match unit {
+        "s" => Some((value * 1000.0).round().max(0.0) as u32),
+        "ms" => Some(value.round().max(0.0) as u32),
+        _ => None,
+    }
+}
+
+fn is_easing_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out"
+    )
 }
 
 #[cfg(test)]

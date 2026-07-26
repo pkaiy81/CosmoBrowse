@@ -173,13 +173,17 @@ impl TransitionDriver {
     }
 }
 
-fn node_key(node: &Rc<RefCell<Node>>) -> usize {
+pub(super) fn node_key(node: &Rc<RefCell<Node>>) -> usize {
     Rc::as_ptr(node) as *const () as usize
 }
 
 /// Write the interpolated value to the node. Returns whether it actually
 /// changed (so an unmoved frame costs no re-layout).
-fn write_override(node: &Rc<RefCell<Node>>, property: AnimatedProperty, value: &AnimatedValue) -> bool {
+pub(super) fn write_override(
+    node: &Rc<RefCell<Node>>,
+    property: AnimatedProperty,
+    value: &AnimatedValue,
+) -> bool {
     let text = value.to_attr_value();
     let attr = property.attr_name();
     let mut borrowed = node.borrow_mut();
@@ -193,7 +197,7 @@ fn write_override(node: &Rc<RefCell<Node>>, property: AnimatedProperty, value: &
     false
 }
 
-fn clear_override(node: &Rc<RefCell<Node>>, property: AnimatedProperty) {
+pub(super) fn clear_override(node: &Rc<RefCell<Node>>, property: AnimatedProperty) {
     let mut borrowed = node.borrow_mut();
     if let NodeKind::Element(element) = borrowed.kind_mut() {
         element.remove_attribute(property.attr_name());

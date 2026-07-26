@@ -2797,6 +2797,16 @@ impl LayoutObject {
         self.node.clone()
     }
 
+    /// A detached box over the same node carrying `style`, for evaluating
+    /// declarations against this element's computed style without disturbing
+    /// the real one — `@keyframes` blocks are resolved this way, so they go
+    /// through the ordinary cascade.
+    pub fn scratch_with_style(&self, style: ComputedStyle) -> LayoutObject {
+        let mut scratch = LayoutObject::new(self.node.clone(), &None);
+        scratch.style = style;
+        scratch
+    }
+
     pub fn set_first_child(&mut self, first_child: Option<Rc<RefCell<LayoutObject>>>) {
         self.first_child = first_child;
     }

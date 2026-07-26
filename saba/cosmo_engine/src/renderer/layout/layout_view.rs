@@ -10,12 +10,27 @@ use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::computed_style::PositionType;
-use crate::renderer::layout::computed_style::{AnimatedProperty, AnimatedValue, TransitionSpec};
+use crate::renderer::layout::computed_style::{
+    AnimatedProperty, AnimatedValue, AnimationSpec, ComputedStyle, TransitionSpec,
+};
+use crate::renderer::css::cssom::KeyframesRule;
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
 use std::rc::Rc;
 use std::vec::Vec;
 use std::cell::RefCell;
+
+/// One `@keyframes` animation running on one element, with its timeline
+/// already resolved to concrete values for this element. Produced by
+/// [`LayoutView::collect_animation_targets`].
+#[derive(Debug, Clone)]
+pub struct AnimationTarget {
+    pub node: Rc<RefCell<Node>>,
+    pub spec: AnimationSpec,
+    /// Per property, the frames that mention it as (offset, value), sorted by
+    /// offset. Only properties the driver can interpolate appear.
+    pub timelines: Vec<(AnimatedProperty, Vec<(f64, AnimatedValue)>)>,
+}
 
 /// One element/property pair covered by a `transition` declaration, with the
 /// target value the cascade currently computes for it. Produced by
@@ -27,6 +42,56 @@ pub struct TransitionTarget {
     /// Declared (cascade) value — what the transition animates *to*.
     pub value: AnimatedValue,
     pub spec: TransitionSpec,
+}
+
+/// Resolve one `@keyframes` rule's blocks into per-property value timelines for
+/// the element `obj` (whose computed style is `base`). See
+/// [`LayoutView::collect_animation_targets`].
+fn resolve_keyframe_timelines(
+    obj: &LayoutObject,
+    base: &ComputedStyle,
+    rule: &KeyframesRule,
+) -> Vec<(AnimatedProperty, Vec<(f64, AnimatedValue)>)> {
+    // Which animatable properties the rule actually mentions.
+    let mentioned: Vec<AnimatedProperty> = AnimatedProperty::ALL
+        .into_iter()
+        .filter(|property| {
+            rule.frames.iter().any(|frame| {
+                frame
+                    .declarations
+                    .iter()
+                    .any(|d| d.property == property.css_name())
+            })
+        })
+        .collect();
+    if mentioned.is_empty() {
+        return Vec::new();
+    }
+
+    let mut timelines: Vec<(AnimatedProperty, Vec<(f64, AnimatedValue)>)> =
+        mentioned.iter().map(|p| (*p, Vec::new())).collect();
+    // Start from the element's style with any in-flight override stripped, so
+    // a frame's value never depends on where the previous frame left the box.
+    let clean = base.without_animation_overrides();
+    for frame in &rule.frames {
+        // Apply this block's declarations over the element's own style, so a
+        // keyframe that sets only some properties inherits the rest.
+        let mut resolved = obj.scratch_with_style(clean.clone());
+        resolved.cascading_style(frame.declarations.clone(), base.font_size());
+        let frame_style = resolved.style();
+        for (property, timeline) in timelines.iter_mut() {
+            let declared = frame
+                .declarations
+                .iter()
+                .any(|d| d.property == property.css_name());
+            if declared && frame_style.animatable(*property) {
+                timeline.push((frame.offset, frame_style.animated_target(*property)));
+            }
+        }
+    }
+    // A property needs at least two frames to interpolate between.
+    timelines.retain(|(_, timeline)| timeline.len() >= 2);
+    timelines
 }
 
 // Spec: DOM tree order drives layout-tree construction.
@@ -1314,6 +1379,56 @@ impl LayoutView {
             Self::collect_transition_targets_node(&first_child, out);
             let next_sibling = n.borrow().next_sibling();
             Self::collect_transition_targets_node(&next_sibling, out);
+        }
+    }
+
+    /// Every element running a `@keyframes` animation, with each animated
+    /// property's timeline resolved against *this element's* computed style.
+    ///
+    /// Resolution reuses the cascade: a keyframe's declarations are applied to
+    /// a copy of the element's own style, and the result read back through
+    /// `animated_target`. That way keyframe values go through exactly the same
+    /// parsing as any other declaration — relative units, colour functions and
+    /// inheritance all behave as they do elsewhere.
+    /// Spec: CSS Animations L1 §4.1 — keyframe declarations are computed
+    /// against the element. https://www.w3.org/TR/css-animations-1/#keyframes
+    pub fn collect_animation_targets(&self, cssom: &StyleSheet) -> Vec<AnimationTarget> {
+        let mut out = Vec::new();
+        Self::collect_animation_targets_node(&self.root, cssom, &mut out);
+        out
+    }
+
+    fn collect_animation_targets_node(
+        node: &Option<Rc<RefCell<LayoutObject>>>,
+        cssom: &StyleSheet,
+        out: &mut Vec<AnimationTarget>,
+    ) {
+        if let Some(n) = node {
+            {
+                let obj = n.borrow();
+                let style = obj.style();
+                for spec in style.animations() {
+                    if spec.name.is_empty() || spec.duration_ms == 0 {
+                        continue;
+                    }
+                    let Some(rule) = cssom.keyframes_named(&spec.name) else {
+                        continue;
+                    };
+                    let timelines = resolve_keyframe_timelines(&obj, &style, rule);
+                    if timelines.is_empty() {
+                        continue;
+                    }
+                    out.push(AnimationTarget {
+                        node: obj.node_ref(),
+                        spec: spec.clone(),
+                        timelines,
+                    });
+                }
+            }
+            let first_child = n.borrow().first_child();
+            Self::collect_animation_targets_node(&first_child, cssom, out);
+            let next_sibling = n.borrow().next_sibling();
+            Self::collect_animation_targets_node(&next_sibling, cssom, out);
         }
     }
 

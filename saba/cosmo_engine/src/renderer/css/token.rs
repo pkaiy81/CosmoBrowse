@@ -244,12 +244,21 @@ impl Iterator for CssTokenizer {
                     }
                 }
                 '@' => {
-                    // If the next three characters are valid string token, create the <at-keyword-token> and return it.
-                    // Otherwise, return <delim-token>
-                    if self.input[self.pos + 1].is_ascii_alphabetic()
-                        && self.input[self.pos + 2].is_alphanumeric()
-                        && self.input[self.pos + 3].is_alphanumeric()
-                    {
+                    // `@` starts an at-keyword when what follows would start an
+                    // identifier. Spec: CSS Syntax §4.3.1 — an identifier may
+                    // begin with `-` (or `--`), which is how every vendor-
+                    // prefixed at-rule is spelled: requiring a letter here made
+                    // `@-webkit-keyframes` a delim, so the parser never saw an
+                    // at-rule and the block's contents leaked into the sheet.
+                    // https://www.w3.org/TR/css-syntax-3/#would-start-an-identifier
+                    let ident_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+                    let (first, second) = (self.input[self.pos + 1], self.input[self.pos + 2]);
+                    let would_start_ident = if first == '-' {
+                        ident_start(second) || second == '-'
+                    } else {
+                        ident_start(first)
+                    };
+                    if would_start_ident {
                         // skip @
                         self.pos += 1;
                         let t = CssToken::AtKeyword(self.consume_ident_token());

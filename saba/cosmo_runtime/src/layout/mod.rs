@@ -18,12 +18,14 @@ use cosmo_engine::renderer::layout::computed_style::{
 use cosmo_engine::renderer::layout::layout_object::{
     compute_box_model_metrics, LayoutObject, LayoutObjectKind,
 };
-use cosmo_engine::renderer::layout::layout_view::{LayoutView, TransitionTarget};
+use cosmo_engine::renderer::layout::layout_view::{AnimationTarget, LayoutView, TransitionTarget};
 use cosmo_engine::display_item::DisplayItem;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+mod keyframes;
 mod transitions;
+use keyframes::KeyframeDriver;
 use transitions::TransitionDriver;
 
 /// One animation frame of the GUI's ~60fps clock. The script host's virtual
@@ -246,11 +248,12 @@ fn layout_scene_and_targets(
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
     cssom: &cosmo_engine::renderer::css::cssom::StyleSheet,
     rect: &FrameRect,
-) -> (LayoutScene, Vec<TransitionTarget>) {
+) -> (LayoutScene, Vec<TransitionTarget>, Vec<AnimationTarget>) {
     let layout_view = build_layout_view(dom, cssom, rect);
     let scene = display_items_to_scene(layout_view.paint(), rect);
-    let targets = layout_view.collect_transition_targets();
-    (scene, targets)
+    let transitions = layout_view.collect_transition_targets();
+    let animations = layout_view.collect_animation_targets(cssom);
+    (scene, transitions, animations)
 }
 
 /// What dispatching a click into a [`LivePage`] produced.
@@ -327,6 +330,8 @@ pub struct LivePage {
     /// Declarative CSS `transition` state (Phase 4.4): watches the cascade's
     /// target values across layouts and interpolates the in-between frames.
     transitions: TransitionDriver,
+    /// `@keyframes` playback state (Phase 4.4): plays declared timelines.
+    keyframes: KeyframeDriver,
 }
 
 impl LivePage {
@@ -377,6 +382,7 @@ impl LivePage {
             cssom,
             last_generation,
             transitions: TransitionDriver::default(),
+            keyframes: KeyframeDriver::default(),
         };
         // The first layout only records the transition baselines: an element's
         // initial style never animates (CSS Transitions §2).
@@ -393,7 +399,9 @@ impl LivePage {
     /// Whether the page has an ongoing animation the GUI should keep driving
     /// frames for: queued timers/rAF, or a CSS transition mid-flight.
     pub fn has_pending_animation(&self) -> bool {
-        self.host.has_pending_timers() || self.transitions.is_animating()
+        self.host.has_pending_timers()
+            || self.transitions.is_animating()
+            || self.keyframes.is_animating()
     }
 
     /// Advance one animation frame (~16ms): step running CSS transitions and
@@ -403,8 +411,9 @@ impl LivePage {
         self.host.run_frame(FRAME_MS, 256);
         replace_local_storage(&self.document_url, &self.host.local_storage_entries());
         let transitions_moved = self.transitions.advance(FRAME_MS as f64);
+        let keyframes_moved = self.keyframes.advance(FRAME_MS as f64);
         let generation = self.host.dom_generation();
-        if generation == self.last_generation && !transitions_moved {
+        if generation == self.last_generation && !transitions_moved && !keyframes_moved {
             return None;
         }
         self.last_generation = generation;
@@ -502,8 +511,12 @@ impl LivePage {
     /// of flashing the end state. That override costs one extra layout on the
     /// frames where a transition starts or is cancelled, never on static pages.
     fn layout_and_drive(&mut self, rect: &FrameRect) -> LayoutScene {
-        let (scene, targets) = layout_scene_and_targets(self.dom.clone(), &self.cssom, rect);
-        if self.transitions.sync_targets(&targets) {
+        let (scene, transitions, animations) =
+            layout_scene_and_targets(self.dom.clone(), &self.cssom, rect);
+        // `@keyframes` playback first: it may write overrides that the
+        // transition driver should then see as the current displayed value.
+        let animated = self.keyframes.sync(&animations);
+        if self.transitions.sync_targets(&transitions) | animated {
             layout_scene_only(self.dom.clone(), &self.cssom, rect)
         } else {
             scene
@@ -1496,6 +1509,93 @@ mod tests {
             "the timer should fire on the clock and transition, got {colors:?}"
         );
         assert_eq!(colors.last().map(String::as_str), Some("#ffffff"));
+    }
+
+    #[test]
+    fn keyframes_animation_plays_and_holds_with_fill_forwards() {
+        // A declared `@keyframes` plays on its own — no target change needed —
+        // and `forwards` holds the last frame after the iteration count runs
+        // out (without asking the GUI to keep driving frames).
+        let html = "<html><head><style>body{margin:0}\
+            @keyframes grow{from{width:100px}to{width:300px}}\
+            #bar{width:100px;height:20px;background:#ff0000;\
+            animation:grow 100ms linear forwards}</style></head>\
+            <body><div id=\"bar\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert_eq!(scene_width(&first, "bar"), Some(100), "starts at the first frame");
+        assert!(page.has_pending_animation(), "playback starts on its own");
+
+        let mut widths = Vec::new();
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                if let Some(w) = scene_width(&scene, "bar") {
+                    widths.push(w);
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+        assert!(
+            widths.windows(2).all(|w| w[1] >= w[0]),
+            "must grow monotonically, got {widths:?}"
+        );
+        assert!(
+            widths.iter().any(|w| *w > 100 && *w < 300),
+            "expected intermediate widths, got {widths:?}"
+        );
+        assert_eq!(widths.last().copied(), Some(300), "fill:forwards holds the end");
+        assert!(!page.has_pending_animation(), "a finished animation idles");
+    }
+
+    #[test]
+    fn keyframes_alternate_direction_returns_to_the_start() {
+        // `alternate` runs the second iteration backwards, so two iterations
+        // end where the first began.
+        let html = "<html><head><style>body{margin:0}\
+            @keyframes pulse{from{background-color:#000000}to{background-color:#ffffff}}\
+            #box{width:50px;height:50px;background-color:#000000;\
+            animation:pulse 100ms linear 2 alternate}</style></head>\
+            <body><div id=\"box\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 200, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+
+        let mut colors = Vec::new();
+        for _ in 0..40 {
+            if let Some(scene) = page.animation_frame(&rect) {
+                if let Some(c) = scene_background(&scene, "box") {
+                    colors.push(c);
+                }
+            }
+            if !page.has_pending_animation() {
+                break;
+            }
+        }
+        assert!(
+            colors.iter().any(|c| c != "#000000" && c != "#ffffff"),
+            "expected interpolated greys, got {colors:?}"
+        );
+        // No fill mode, so after the last iteration the cascade value rules.
+        let settled = page.relayout(&rect);
+        assert_eq!(scene_background(&settled, "box").as_deref(), Some("#000000"));
+    }
+
+    #[test]
+    fn infinite_animation_keeps_the_frame_clock_alive() {
+        let html = "<html><head><style>\
+            @keyframes blink{from{opacity:1}to{opacity:0}}\
+            #d{width:10px;height:10px;animation:blink 50ms linear infinite}\
+            </style></head><body><div id=\"d\"></div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 200, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        for _ in 0..30 {
+            page.animation_frame(&rect);
+        }
+        assert!(
+            page.has_pending_animation(),
+            "an infinite animation never stops asking for frames"
+        );
     }
 
     #[test]

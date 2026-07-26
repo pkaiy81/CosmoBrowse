@@ -14,6 +14,8 @@ pub struct CssParser {
     /// Conditions collected from `@media` preludes; `QualifiedRule::media`
     /// indexes into this.
     media_conditions: Vec<MediaQueryList>,
+    /// `@keyframes` rules collected while parsing.
+    keyframes: Vec<KeyframesRule>,
 }
 
 impl CssParser {
@@ -21,6 +23,7 @@ impl CssParser {
         Self {
             t: t.peekable(),
             media_conditions: Vec::new(),
+            keyframes: Vec::new(),
         }
     }
 
@@ -568,13 +571,25 @@ impl CssParser {
                         rules.push(rule);
                     }
                 }
+                CssToken::AtKeyword(ref keyword)
+                    if keyword == "keyframes" || keyword.ends_with("-keyframes") =>
+                {
+                    // `@keyframes name { 0% {..} to {..} }` — kept aside from
+                    // the rule list (its blocks are keyed by offset, not by
+                    // selector) for `animation-name` to look up.
+                    // Vendor-prefixed spellings (`@-webkit-keyframes`) are
+                    // common and parse identically.
+                    self.t.next();
+                    if let Some(rule) = self.consume_keyframes_rule() {
+                        self.keyframes.push(rule);
+                    }
+                }
                 CssToken::AtKeyword(_keyword) => {
                     // Skip every other at-rule wholesale. The engine can't
-                    // evaluate `@supports` / `@font-face` / `@import` /
-                    // `@keyframes` preludes yet, and parsing their contents
-                    // as top-level rules would leak spurious rules (the
-                    // historical @media bug that collapsed HN's desktop
-                    // layout).
+                    // evaluate `@supports` / `@font-face` / `@import`
+                    // preludes yet, and parsing their contents as top-level
+                    // rules would leak spurious rules (the historical @media
+                    // bug that collapsed HN's desktop layout).
                     self.consume_at_rule();
                 }
                 _ => {
@@ -586,6 +601,65 @@ impl CssParser {
                 }
             }
         }
+    }
+
+    /// Consume `@keyframes <name> { <selector> { <declarations> } ... }`.
+    /// Keyframe selectors are percentages (or `from`/`to`), so each block is
+    /// stored against its offset in 0..=1 rather than a CSS selector.
+    /// Spec: CSS Animations L1 §4. https://www.w3.org/TR/css-animations-1/#keyframes
+    fn consume_keyframes_rule(&mut self) -> Option<KeyframesRule> {
+        self.skip_whitespace();
+        let name = match self.t.next() {
+            Some(CssToken::Ident(name)) => name,
+            Some(CssToken::StringToken(name)) => name,
+            _ => return None,
+        };
+        self.skip_whitespace();
+        if self.t.next() != Some(CssToken::OpenCurly) {
+            return None;
+        }
+        let mut frames: Vec<Keyframe> = Vec::new();
+        loop {
+            self.skip_whitespace();
+            match self.t.peek() {
+                None => break,
+                Some(CssToken::CloseCurly) => {
+                    self.t.next();
+                    break;
+                }
+                _ => {}
+            }
+            // Selector: a comma-separated list of percentages / from / to.
+            let mut offsets = Vec::new();
+            loop {
+                match self.t.next() {
+                    None => return finish_keyframes(name, frames),
+                    Some(CssToken::OpenCurly) => break,
+                    Some(CssToken::Ident(word)) => {
+                        match word.to_ascii_lowercase().as_str() {
+                            "from" => offsets.push(0.0),
+                            "to" => offsets.push(1.0),
+                            _ => {}
+                        }
+                    }
+                    // Percentages tokenize as a Dimension with unit "%".
+                    Some(CssToken::Dimension(value, unit)) if unit == "%" => {
+                        offsets.push(value / 100.0)
+                    }
+                    // Bare numbers appear in sloppy sheets (`50 { }`).
+                    Some(CssToken::Number(value)) => offsets.push(value / 100.0),
+                    _ => {}
+                }
+            }
+            let declarations = self.consume_list_of_declarations();
+            for offset in offsets {
+                frames.push(Keyframe {
+                    offset: offset.clamp(0.0, 1.0),
+                    declarations: declarations.clone(),
+                });
+            }
+        }
+        finish_keyframes(name, frames)
     }
 
     /// Consume and discard an at-rule: its prelude up to either a `;`
@@ -640,6 +714,7 @@ impl CssParser {
         }
         sheet.set_rules(rules);
         sheet.media_conditions = core::mem::take(&mut self.media_conditions);
+        sheet.keyframes = core::mem::take(&mut self.keyframes);
         sheet
     }
 }
@@ -865,6 +940,8 @@ pub struct StyleSheet {
     pub rules: Vec<QualifiedRule>,
     /// `@media` conditions referenced by `QualifiedRule::media`.
     pub media_conditions: Vec<MediaQueryList>,
+    /// `@keyframes` rules, looked up by `animation-name`.
+    pub keyframes: Vec<KeyframesRule>,
 }
 
 impl StyleSheet {
@@ -872,7 +949,14 @@ impl StyleSheet {
         Self {
             rules: Vec::new(),
             media_conditions: Vec::new(),
+            keyframes: Vec::new(),
         }
+    }
+
+    /// The `@keyframes` rule named `name`, if the document declares one. A
+    /// later declaration of the same name wins (CSS Animations L1 §4).
+    pub fn keyframes_named(&self, name: &str) -> Option<&KeyframesRule> {
+        self.keyframes.iter().rev().find(|rule| rule.name == name)
     }
 
     /// Whether any rule is conditioned on `:hover`. The renderer uses this to
@@ -908,6 +992,9 @@ impl StyleSheet {
                 })
                 .collect(),
             media_conditions: Vec::new(),
+            // Keyframes are unconditional (a `@keyframes` inside `@media` is
+            // skipped by the parser), so they survive the filter as-is.
+            keyframes: self.keyframes.clone(),
         }
     }
 }
@@ -1040,6 +1127,48 @@ pub enum AttrOp {
     Suffix,
     /// `[name*=v]` — value contains v.
     Substring,
+}
+
+/// One `@keyframes name { ... }` rule: its blocks keyed by offset rather than
+/// by selector. Spec: CSS Animations L1 §4.
+/// https://www.w3.org/TR/css-animations-1/#keyframes
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyframesRule {
+    /// The `animation-name` this rule is addressed by (case-sensitive, as in
+    /// the spec's custom-ident matching).
+    pub name: String,
+    /// Frames sorted by offset, each offset appearing once (a later block for
+    /// the same offset replaces the earlier one, per document order).
+    pub frames: Vec<Keyframe>,
+}
+
+/// One block inside `@keyframes`, at `offset` in 0..=1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keyframe {
+    pub offset: f64,
+    pub declarations: Vec<Declaration>,
+}
+
+/// Sort/dedupe the collected frames and reject a rule with nothing usable.
+fn finish_keyframes(name: String, mut frames: Vec<Keyframe>) -> Option<KeyframesRule> {
+    if frames.is_empty() {
+        return None;
+    }
+    // A later block at the same offset wins, so keep the last of each.
+    frames.sort_by(|a, b| {
+        a.offset
+            .partial_cmp(&b.offset)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    frames.dedup_by(|later, earlier| {
+        if (later.offset - earlier.offset).abs() < f64::EPSILON {
+            earlier.declarations = core::mem::take(&mut later.declarations);
+            true
+        } else {
+            false
+        }
+    });
+    Some(KeyframesRule { name, frames })
 }
 
 impl Selector {
@@ -1356,6 +1485,36 @@ mod tests {
         let phone_rules = cssom.filter_for_media(&phone).rules;
         assert_eq!(phone_rules.len(), 3);
         assert!(phone_rules.iter().all(|r| r.media.is_none()));
+    }
+
+    #[test]
+    fn keyframes_are_parsed_and_looked_up_by_name() {
+        let style = "p{color:red} @keyframes fade { from { opacity: 1; } 50% { opacity: 0.5; } \
+                     to { opacity: 0; } } h1{color:blue}"
+            .to_string();
+        let sheet = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+
+        // The at-rule must not leak its blocks into the rule list.
+        assert_eq!(sheet.rules.len(), 2, "only p and h1 are qualified rules");
+
+        let frames = &sheet.keyframes_named("fade").expect("@keyframes fade").frames;
+        let offsets: Vec<f64> = frames.iter().map(|f| f.offset).collect();
+        assert_eq!(offsets, vec![0.0, 0.5, 1.0], "from/50%/to sorted by offset");
+        assert_eq!(frames[1].declarations[0].property, "opacity");
+        assert!(sheet.keyframes_named("missing").is_none());
+    }
+
+    #[test]
+    fn keyframes_selector_lists_and_vendor_prefixes() {
+        let style = "@-webkit-keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }"
+            .to_string();
+        let sheet = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
+        let frames = &sheet.keyframes_named("pulse").expect("prefixed rule").frames;
+        // `0%, 100%` declares both ends in one block.
+        assert_eq!(
+            frames.iter().map(|f| f.offset).collect::<Vec<_>>(),
+            vec![0.0, 0.5, 1.0]
+        );
     }
 
     #[test]

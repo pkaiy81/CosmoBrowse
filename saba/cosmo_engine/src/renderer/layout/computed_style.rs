@@ -83,6 +83,7 @@ pub struct ComputedStyle {
     float: Option<Float>,
     clear: Option<Clear>,
     transitions: Vec<TransitionSpec>,
+    animations: Vec<AnimationSpec>,
     font_family: Option<String>,
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
@@ -285,6 +286,7 @@ impl ComputedStyle {
             float: None,
             clear: None,
             transitions: Vec::new(),
+            animations: Vec::new(),
             font_family: None,
             font_size: None,
             text_decoration: None,
@@ -961,6 +963,24 @@ impl ComputedStyle {
         }
     }
 
+    /// A copy with every animation override removed: sizes restored to their
+    /// cascade targets and the colour/opacity overrides dropped. Keyframe
+    /// declarations are resolved against this, so a frame's value never
+    /// depends on where a previous frame happened to leave the element.
+    pub fn without_animation_overrides(&self) -> Self {
+        let mut clean = self.clone();
+        if let Some(width) = clean.width_target.take() {
+            clean.width = Some(width);
+        }
+        if let Some(height) = clean.height_target.take() {
+            clean.height = Some(height);
+        }
+        clean.anim_opacity = None;
+        clean.anim_background_color = None;
+        clean.anim_color = None;
+        clean
+    }
+
     /// Whether `property` currently has an interpolable value on this box.
     /// Sizes only qualify when the author gave a definite length: `auto` and
     /// percentages have no numeric value to animate between.
@@ -1352,6 +1372,7 @@ impl ComputedStyle {
         self.height = Some(height);
         self.height_author = true;
         self.height_ratio = None;
+            self.height_target = None;
     }
 
     pub fn set_height_ratio(&mut self, ratio: f64) {
@@ -1387,6 +1408,8 @@ impl ComputedStyle {
         self.width = Some(width);
         self.width_author = true;
         self.width_ratio = None;
+        // A declared width replaces whatever an animation was heading towards.
+        self.width_target = None;
     }
 
     pub fn set_width_ratio(&mut self, ratio: f64) {
@@ -1530,6 +1553,14 @@ impl ComputedStyle {
 
     pub fn set_transitions(&mut self, transitions: Vec<TransitionSpec>) {
         self.transitions = transitions;
+    }
+
+    pub fn set_animations(&mut self, animations: Vec<AnimationSpec>) {
+        self.animations = animations;
+    }
+
+    pub fn animations(&self) -> &[AnimationSpec] {
+        &self.animations
     }
 
     pub fn transitions(&self) -> &[TransitionSpec] {
@@ -2064,6 +2095,84 @@ impl AnimatedValue {
             (Self::Number(a), Self::Number(b)) => (a - b).abs() <= 0.0005,
             (a, b) => a == b,
         }
+    }
+}
+
+/// A single `animation` declaration (one `@keyframes` playback).
+/// Spec: CSS Animations L1 §3. https://www.w3.org/TR/css-animations-1/
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimationSpec {
+    /// The `@keyframes` rule to play.
+    pub name: String,
+    pub duration_ms: u32,
+    pub delay_ms: u32,
+    pub easing: Easing,
+    /// `animation-iteration-count`; `None` = `infinite`.
+    pub iterations: Option<f64>,
+    pub direction: AnimationDirection,
+    pub fill_mode: AnimationFillMode,
+}
+
+/// `animation-direction` — which end each iteration runs from.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AnimationDirection {
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+impl AnimationDirection {
+    pub fn from_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "normal" => Self::Normal,
+            "reverse" => Self::Reverse,
+            "alternate" => Self::Alternate,
+            "alternate-reverse" => Self::AlternateReverse,
+            _ => return None,
+        })
+    }
+
+    /// Whether iteration `index` (0-based) plays backwards.
+    pub fn reversed(&self, index: u32) -> bool {
+        match self {
+            Self::Normal => false,
+            Self::Reverse => true,
+            Self::Alternate => index % 2 == 1,
+            Self::AlternateReverse => index % 2 == 0,
+        }
+    }
+}
+
+/// `animation-fill-mode` — whether the animated values apply outside the
+/// active period.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AnimationFillMode {
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+impl AnimationFillMode {
+    pub fn from_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "none" => Self::None,
+            "forwards" => Self::Forwards,
+            "backwards" => Self::Backwards,
+            "both" => Self::Both,
+            _ => return None,
+        })
+    }
+
+    /// Whether the first keyframe applies during `animation-delay`.
+    pub fn fills_backwards(&self) -> bool {
+        matches!(self, Self::Backwards | Self::Both)
+    }
+
+    /// Whether the last keyframe sticks after the animation finishes.
+    pub fn fills_forwards(&self) -> bool {
+        matches!(self, Self::Forwards | Self::Both)
     }
 }
 
