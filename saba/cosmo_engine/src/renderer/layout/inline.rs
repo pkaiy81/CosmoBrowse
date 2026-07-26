@@ -146,6 +146,7 @@ pub fn layout_inline_items_aligned(
     start_x: i64,
     align: LineAlign,
 ) -> Vec<LineBox> {
+    let items = &collapse_across_items(items);
     let mut lines: Vec<LineBox> = Vec::new();
     let mut current = OpenLine::new(start_y, start_x);
     // Provisional line height so the float band query has a height to test
@@ -251,6 +252,43 @@ pub fn layout_inline_items_aligned(
         }
     }
     lines
+}
+
+/// Collapse white space *across* item boundaries: a space that ends one run and
+/// starts the next is one space, not two. Each run has already had its own runs
+/// of white space collapsed, but nothing could see across the boundary while
+/// every text node wrapped independently — which is why an inline element used
+/// to be preceded by a visible double space.
+/// Spec: CSS Text §4.1.1 — the white-space processing model.
+/// https://www.w3.org/TR/css-text-3/#white-space-phase-1
+fn collapse_across_items(items: &[InlineItem]) -> Vec<InlineItem> {
+    let mut out: Vec<InlineItem> = Vec::with_capacity(items.len());
+    let mut previous_ended_with_space = true; // a line's leading space is dropped
+    for item in items {
+        match item {
+            InlineItem::Text(run) => {
+                let mut text = run.text.as_str();
+                if previous_ended_with_space {
+                    text = text.trim_start_matches(is_break_space);
+                }
+                if text.is_empty() {
+                    // Nothing left: the run was pure white space already
+                    // represented by the preceding one.
+                    continue;
+                }
+                previous_ended_with_space = text.ends_with(is_break_space);
+                out.push(InlineItem::Text(TextRun {
+                    text: text.to_string(),
+                    ..run.clone()
+                }));
+            }
+            atomic => {
+                previous_ended_with_space = false;
+                out.push(atomic.clone());
+            }
+        }
+    }
+    out
 }
 
 /// The usable span at `y` for a line `height` tall.
