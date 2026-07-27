@@ -173,6 +173,10 @@ pub fn layout_inline_items_aligned(
                 }, item);
             }
             InlineItem::Text(run) => {
+                // Break opportunities for the whole run, computed once: they
+                // are a property of the text, not of the line it lands on, and
+                // recomputing per line would be quadratic on a long run.
+                let breaks = break_opportunities(&run.text);
                 let mut rest = run.text.as_str();
                 loop {
                     let band = band_for(
@@ -182,7 +186,9 @@ pub fn layout_inline_items_aligned(
                         run.line_height.max(probe_height),
                     );
                     let available = (band.right - current.x).max(0);
-                    let (head, tail) = break_text(rest, run, available, current.is_empty());
+                    let base = run.text.len() - rest.len();
+                    let (head, tail) =
+                        break_text(rest, base, &breaks, run, available, current.is_empty());
                     if head.is_empty() {
                         // Nothing fits on what's left of this line. If the line
                         // already holds something, move on.
@@ -223,13 +229,23 @@ pub fn layout_inline_items_aligned(
                         );
                         rest = remainder;
                     } else {
+                        // White space at a line break hangs: drop it from the
+                        // fragment so it neither widens the line nor shifts an
+                        // alignment. A fragment that does NOT end a line keeps
+                        // its trailing space — that space separates it from
+                        // whatever follows on the same line.
+                        let painted = if tail.is_empty() {
+                            head
+                        } else {
+                            head.trim_end_matches(is_break_space)
+                        };
                         current.push(
                             Fragment {
                                 item: index,
-                                text: Some(head.to_string()),
+                                text: Some(painted.to_string()),
                                 x: current.x,
                                 y: current.y,
-                                width: measure_text_width(head, run.font_size, run.bold),
+                                width: measure_text_width(painted, run.font_size, run.bold),
                                 height: run.line_height,
                             },
                             item,
@@ -330,43 +346,81 @@ fn next_y(lines: &[LineBox]) -> i64 {
     lines.last().map(|l| l.y + l.height).unwrap_or(0)
 }
 
-/// Split `text` at the last break opportunity that fits in `available`.
-/// Returns (what goes on this line, what is left). A break at a space consumes
-/// it. When `line_empty` and not even one word fits, the text is hard-broken so
-/// layout always progresses.
+/// The UAX #14 break opportunities in `text`, as byte offsets at which a line
+/// may end (the offset is the start of the next line). Computed once per run.
+///
+/// Spec: UAX #14, Unicode Line Breaking Algorithm. https://www.unicode.org/reports/tr14/
+fn break_opportunities(text: &str) -> Vec<usize> {
+    unicode_linebreak::linebreaks(text)
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+/// Split `text` — the untaken remainder of a run starting at byte `base` within
+/// it — at the last break opportunity whose content fits in `available`.
+/// Returns (what goes on this line, what is left).
+///
+/// Trailing white space at the break does not count against the width: a line
+/// may end with spaces that hang past the edge rather than pushing the next
+/// word down (CSS Text §4.1, hanging white space). When `line_empty` and not
+/// even the first opportunity fits, the text is hard-broken so layout always
+/// progresses.
 fn break_text<'a>(
     text: &'a str,
+    base: usize,
+    breaks: &[usize],
     run: &TextRun,
     available: i64,
     line_empty: bool,
 ) -> (&'a str, &'a str) {
+    // Walk once, recording each opportunity together with the width of the
+    // content up to it excluding any trailing spaces.
     let mut width = 0i64;
-    // Last break opportunity seen: (end of the fitting text, start of the rest).
-    let mut last_break: Option<(usize, usize)> = None;
-    for (index, ch) in text.char_indices() {
-        let advance = char_advance(ch, run.font_size, run.bold);
-        if width + advance > available {
-            // The overflow is itself a break opportunity: the line ends here
-            // and the space is dropped — a trailing space at a break never
-            // forces the word after it down (CSS Text §4.1, hanging spaces).
-            if is_break_space(ch) {
-                return (&text[..index], &text[index + ch.len_utf8()..]);
+    let mut width_without_trailing_space = 0i64;
+    let mut best: Option<usize> = None;
+    let mut next_break = breaks.partition_point(|b| *b <= base);
+    let mut hard_break_at: Option<usize> = None;
+
+    for (offset, ch) in text.char_indices() {
+        let absolute = base + offset;
+        // Opportunities at or before this character are now measurable.
+        while next_break < breaks.len() && breaks[next_break] <= absolute {
+            if width_without_trailing_space <= available {
+                best = Some(breaks[next_break] - base);
             }
-            return match last_break {
-                Some((end, next)) => (&text[..end], &text[next..]),
-                // No break opportunity fits. On an empty line, hard-break
-                // before the overflowing character (never produce nothing, or
-                // the caller would spin).
-                None if line_empty && index > 0 => (&text[..index], &text[index..]),
-                None => ("", text),
-            };
+            next_break += 1;
         }
-        width += advance;
-        if is_break_space(ch) {
-            last_break = Some((index, index + ch.len_utf8()));
+        if width_without_trailing_space > available {
+            // Nothing further can fit; stop rather than scanning the rest.
+            break;
+        }
+        if hard_break_at.is_none() && width + char_advance(ch, run.font_size, run.bold) > available
+        {
+            hard_break_at = Some(offset);
+        }
+        width += char_advance(ch, run.font_size, run.bold);
+        if !is_break_space(ch) {
+            width_without_trailing_space = width;
         }
     }
-    (text, "")
+    // The end of the run is itself an opportunity.
+    while next_break < breaks.len() && breaks[next_break] <= base + text.len() {
+        if width_without_trailing_space <= available {
+            best = Some(breaks[next_break] - base);
+        }
+        next_break += 1;
+    }
+
+    match best {
+        Some(end) => (&text[..end], &text[end..]),
+        // No opportunity fits. On an empty line the word is longer than the
+        // line, so hard-break it rather than produce nothing.
+        None if line_empty => match hard_break_at.filter(|at| *at > 0) {
+            Some(at) => (&text[..at], &text[at..]),
+            None => ("", text),
+        },
+        None => ("", text),
+    }
 }
 
 /// A line being filled.
@@ -560,6 +614,67 @@ mod tests {
         // The tall atomic sets the baseline; the line is at least that tall.
         assert_eq!(lines[0].baseline, 40);
         assert!(lines[0].height >= 40);
+    }
+
+    #[test]
+    fn uax14_keeps_punctuation_off_the_start_of_a_line() {
+        // A Japanese full stop may not begin a line (UAX #14 class CL): the
+        // break has to happen before the character it follows instead. The old
+        // space-only rule broke anywhere and stranded it.
+        let items = vec![InlineItem::Text(TextRun {
+            text: "本日は晴天なり。".to_string(),
+            font_size: FontSize::Medium,
+            bold: false,
+            line_height: 20,
+        })];
+        // Room for roughly seven of the eight double-width characters.
+        let narrow = measure_text_width("本日は晴天なり", FontSize::Medium, false);
+        let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
+        let first: String = lines[0]
+            .fragments
+            .iter()
+            .filter_map(|f| f.text.clone())
+            .collect();
+        assert!(
+            !lines[1..]
+                .iter()
+                .flat_map(|l| l.fragments.iter())
+                .filter_map(|f| f.text.as_deref())
+                .any(|t| t.starts_with('。')),
+            "a full stop must not start a line, got {:?}",
+            lines_text(&lines)
+        );
+        assert!(first.ends_with('。') || first.len() < "本日は晴天なり。".len());
+    }
+
+    #[test]
+    fn uax14_does_not_break_inside_a_word_with_an_apostrophe() {
+        // "don't" is one word: the only break opportunities are around it.
+        let items = vec![text("well don't stop")];
+        let available = width_of("well don't");
+        let lines = layout_inline_items(&items, &FloatContext::default(), available, 0, 0);
+        assert_eq!(
+            lines_text(&lines),
+            vec![vec!["well don't".to_string()], vec!["stop".to_string()]]
+        );
+    }
+
+    #[test]
+    fn uax14_breaks_after_a_hyphen() {
+        // A hyphen offers a break after it, which the space-only rule missed.
+        let items = vec![text("state-of-the-art design")];
+        let available = width_of("state-of-");
+        let lines = layout_inline_items(&items, &FloatContext::default(), available, 0, 0);
+        assert!(lines.len() > 1);
+        assert!(
+            lines[0]
+                .fragments
+                .iter()
+                .filter_map(|f| f.text.as_deref())
+                .any(|t| t.ends_with('-')),
+            "expected the first line to end at a hyphen, got {:?}",
+            lines_text(&lines)
+        );
     }
 
     #[test]
