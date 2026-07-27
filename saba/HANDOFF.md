@@ -393,9 +393,19 @@
 >   A/B(全 reftest + HN/MDN/Wikipedia): HN 8px、flex_grid/table_auto 他は画素一致。golden 4件を再ベースライン。
 >   **残**: UAX#14(`unicode-linebreak`)、float 帯の接続(2.3 合流)、テーブル/リスト/flex の IFC 化、
 >   計測と描画のズレ(インライン要素前の余白。本作業以前から存在)。
-> - ✅ **Phase 2.3 土台 (`4b6f4a6`)** — `FloatContext`(`place`/`band`/`clearance`/`lowest_bottom`、10テスト)
->   + `establishes_block_formatting_context`(CSS2.2 §9.4.1)。**IFC が既に `band` を参照する形で書かれており**、
->   float を配置すれば行が短くなる結線は済んでいる(float 側の配置パスが残り)。
+> - 🚧 **Phase 2.3 float 配置 (`4b6f4a6` 土台 + `7966dfd` 結線)** — `FloatContext`
+>   (`place`/`band`/`clearance`/`lowest_bottom`、10テスト)+ `establishes_block_formatting_context`
+>   (CSS2.2 §9.4.1)。IFC が各行の使用可能幅を context に問う形で書かれていたので、**float された子を
+>   item 列から外して context に置くだけで回り込みが成立**。新 reftest `floats`: 左右 float に挟まれた
+>   行が下端を過ぎると幅を取り戻す / float が端に積まれ入らなければ落ちる / `overflow:hidden` が
+>   float を内包し通常ブロックははみ出させる(§10.6.7)。
+>   **適用範囲(明示)**: 非 float の中身が**全てインライン**のブロック(= よくある
+>   `<div><img style="float:left">text…</div>`)。**ブロックレベルの兄弟があると context 自体が無効**になり
+>   float は通常フローに落ちる(reftest の4ケース目がその状態を固定)。ここで推測しないのは、
+>   float を out-of-flow にしつつ兄弟ブロックの行を短くしないと**テキストが float の下に潜る**ため
+>   (2.3 ブリーフが警告する回帰そのもの)。
+>   **残**: ブロックレベルの回り込み(FloatContext をブロック配置パスに通す)、`clear` のブロック適用、
+>   BFC ごとの context 継承。
 > - ✅ **Phase 4.4 完了: @keyframes + animation (`6c50b5f`, 2026-07-26)** — 宣言的アニメが全て動く。
 >   **パース**: `@keyframes name{from|to|N%{...}}` を(セレクタでなくオフセット鍵の)別テーブルに保持
 >   (`StyleSheet::keyframes_named`)、`animation` shorthand と `animation-*` 7種の longhand を
