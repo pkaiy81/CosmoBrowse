@@ -2991,12 +2991,9 @@ impl LayoutObject {
             //  - tables size their columns from content, so re-breaking text at
             //    the assigned cell width hard-breaks words the column algorithm
             //    sized to fit;
-            //  - list items carry an outside marker box that is not part of the
-            //    inline flow.
+            //  - (list items are fine: their marker is painted by the item
+            //    itself, outside its content box, not as a child in the flow.)
             if b.is_table() || b.is_table_row() || b.is_table_cell() || b.is_row_group() {
-                return false;
-            }
-            if matches!(b.node.borrow().element_kind(), Some(ElementKind::Li)) {
                 return false;
             }
             // A flex or grid container's children are flex/grid items — they
