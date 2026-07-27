@@ -2995,7 +2995,7 @@ impl LayoutObject {
             //    sized to fit;
             //  - (list items are fine: their marker is painted by the item
             //    itself, outside its content box, not as a child in the flow.)
-            if b.is_table() || b.is_table_row() || b.is_table_cell() || b.is_row_group() {
+            if b.is_table() || b.is_table_row() || b.is_row_group() {
                 return false;
             }
             // A flex or grid container's children are flex/grid items — they
@@ -3048,7 +3048,16 @@ impl LayoutObject {
             height
         };
         let metrics = compute_box_model_metrics(&b.style);
-        b.size.set_height((height + metrics.inner_vertical()).max(0));
+        // Table cells carry cellpadding on top of the box model's own padding
+        // (see the Block arm of compute_size); content_origin/content_size
+        // inset children by it, so the outer box has to include it here too.
+        let cellpadding = if b.is_table_cell() {
+            2 * b.ancestor_table_cellpadding()
+        } else {
+            0
+        };
+        b.size
+            .set_height((height + metrics.inner_vertical() + cellpadding).max(0));
         true
     }
 

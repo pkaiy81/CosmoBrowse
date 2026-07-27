@@ -87,6 +87,10 @@ impl InlineItem {
 pub struct Fragment {
     /// Index into the item list this fragment came from.
     pub item: usize,
+    /// Width of the run of white space this fragment ends with, if any. A line
+    /// drops it when it closes: white space at the end of a line hangs rather
+    /// than counting towards the line's width (CSS Text §4.1).
+    pub trailing_space_width: i64,
     /// The text actually on this line (`None` for atomic items).
     pub text: Option<String>,
     pub x: i64,
@@ -196,6 +200,7 @@ pub fn layout_inline_items_aligned(
                 }
                 current.push(Fragment {
                     item: index,
+                    trailing_space_width: 0,
                     text: None,
                     x: current.x,
                     y: current.y,
@@ -262,6 +267,7 @@ pub fn layout_inline_items_aligned(
                         current.push(
                             Fragment {
                                 item: index,
+                                trailing_space_width: 0,
                                 text: Some(forced.to_string()),
                                 x: current.x,
                                 y: current.y,
@@ -272,23 +278,17 @@ pub fn layout_inline_items_aligned(
                         );
                         rest = remainder;
                     } else {
-                        // White space at a line break hangs: drop it from the
-                        // fragment so it neither widens the line nor shifts an
-                        // alignment. A fragment that does NOT end a line keeps
-                        // its trailing space — that space separates it from
-                        // whatever follows on the same line.
-                        let painted = if tail.is_empty() {
-                            head
-                        } else {
-                            head.trim_end_matches(is_break_space)
-                        };
+                        let trimmed = head.trim_end_matches(is_break_space);
+                        let full = measure_text_width(head, run.font_size, run.bold);
+                        let without = measure_text_width(trimmed, run.font_size, run.bold);
                         current.push(
                             Fragment {
                                 item: index,
-                                text: Some(painted.to_string()),
+                                trailing_space_width: full - without,
+                                text: Some(head.to_string()),
                                 x: current.x,
                                 y: current.y,
-                                width: measure_text_width(painted, run.font_size, run.bold),
+                                width: full,
                                 height: run.line_height,
                             },
                             item,
@@ -422,7 +422,6 @@ fn break_text<'a>(
     let mut width_without_trailing_space = 0i64;
     let mut best: Option<usize> = None;
     let mut next_break = breaks.partition_point(|b| *b <= base);
-    let mut hard_break_at: Option<usize> = None;
 
     for (offset, ch) in text.char_indices() {
         let absolute = base + offset;
@@ -436,10 +435,6 @@ fn break_text<'a>(
         if width_without_trailing_space > available {
             // Nothing further can fit; stop rather than scanning the rest.
             break;
-        }
-        if hard_break_at.is_none() && width + char_advance(ch, run.font_size, run.bold) > available
-        {
-            hard_break_at = Some(offset);
         }
         width += char_advance(ch, run.font_size, run.bold);
         if !is_break_space(ch) {
@@ -456,12 +451,22 @@ fn break_text<'a>(
 
     match best {
         Some(end) => (&text[..end], &text[end..]),
-        // No opportunity fits. On an empty line the word is longer than the
-        // line, so hard-break it rather than produce nothing.
-        None if line_empty => match hard_break_at.filter(|at| *at > 0) {
-            Some(at) => (&text[..at], &text[at..]),
-            None => ("", text),
-        },
+        // No opportunity fits and the line is empty: the word is wider than the
+        // line. With `overflow-wrap: normal` — the default — it overflows
+        // rather than being split mid-word, so take it up to its first break
+        // opportunity. (Splitting it produced "delt"/"a" in a narrow table cell
+        // and "1"/"." in a rank column.) Progress is still guaranteed: the word
+        // is non-empty. Spec: CSS Text §5.5.
+        // https://www.w3.org/TR/css-text-3/#overflow-wrap-property
+        None if line_empty => {
+            let first = breaks
+                .iter()
+                .copied()
+                .find(|b| *b > base)
+                .map(|b| b - base)
+                .unwrap_or(text.len());
+            (&text[..first], &text[first..])
+        }
         None => ("", text),
     }
 }
@@ -507,11 +512,22 @@ impl OpenLine {
         self.fragments.push(fragment);
     }
 
-    /// Finish the line: shift every fragment so their baselines coincide.
+    /// Finish the line: place every fragment on the shared baseline and let the
+    /// last one's trailing white space hang past the edge (CSS Text §4.1) so it
+    /// neither widens the line nor shifts an alignment.
     fn close(mut self) -> LineBox {
         let baseline = self.baseline;
         for fragment in &mut self.fragments {
             fragment.y = self.y;
+        }
+        if let Some(last) = self.fragments.last_mut() {
+            if last.trailing_space_width > 0 {
+                last.width -= last.trailing_space_width;
+                if let Some(text) = &mut last.text {
+                    let trimmed = text.trim_end_matches(is_break_space).to_string();
+                    *text = trimmed;
+                }
+            }
         }
         LineBox {
             y: self.y,
@@ -596,17 +612,35 @@ mod tests {
     }
 
     #[test]
-    fn a_word_too_long_for_the_line_is_hard_broken() {
+    fn a_word_too_long_for_the_line_overflows_rather_than_splitting() {
+        // `overflow-wrap: normal` (the default) keeps a word whole even when it
+        // is wider than the line — it overflows. Splitting it was what turned
+        // "delta" into "delt"/"a" in a narrow table cell.
         let items = vec![text("abcdefgh")];
         let narrow = width_of("abc");
         let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
-        assert!(lines.len() > 1, "must break rather than overflow");
-        let rejoined: String = lines_text(&lines)
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .concat();
-        assert_eq!(rejoined, "abcdefgh", "no characters lost");
+        assert_eq!(
+            lines_text(&lines),
+            vec![vec!["abcdefgh".to_string()]],
+            "the word stays whole"
+        );
+        assert!(lines[0].end_x() > narrow, "and overflows the line");
+    }
+
+    #[test]
+    fn a_long_word_still_starts_on_its_own_line() {
+        // Overflowing must not mean "join whatever is already on the line":
+        // the oversized word moves to a fresh line first.
+        let items = vec![text("hi "), text("abcdefghijklmnop")];
+        let narrow = width_of("hi abc");
+        let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
+        assert_eq!(
+            lines_text(&lines),
+            vec![
+                vec!["hi".to_string()],
+                vec!["abcdefghijklmnop".to_string()]
+            ]
+        );
     }
 
     #[test]
