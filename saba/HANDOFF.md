@@ -391,7 +391,13 @@
 >   flex/grid コンテナ(item は blockify されるので inline span の集合でも IFC ではない)、
 >   `white-space: nowrap/pre`・ellipsis。ベースラインはエンジン既存の規約(box 上端から1font-size)に合わせた。
 >   A/B(全 reftest + HN/MDN/Wikipedia): HN 8px、flex_grid/table_auto 他は画素一致。golden 4件を再ベースライン。
->   **残**: UAX#14(`unicode-linebreak`)、float 帯の接続(2.3 合流)、テーブル/リスト/flex の IFC 化、
+>   ✅ **UAX#14 行分割 (`c19eba2`, ブランチ `wip/inline-uax14-linebreak-2026-07-27`)** —
+>   `unicode-linebreak` で実際の分割機会を取得(**ラン単位で1回**計算。行ごとだと長文で O(n²))。
+>   日本語の句点が行頭に来なくなり(UAX#14 class CL。golden に 「。」の行頭孤立が写っていた)、
+>   `don't` が1語になり、ハイフン後で分割できる。行末の空白は**幅に数えず hang**(CSS Text §4.1)、
+>   ただし行末**でない**フラグメントは後続との区切りなので保持。golden 2件再ベースライン、
+>   HN/MDN 画素一致・Wikipedia 435px、debug ビルドで約 +3.5%。
+>   **残**: float 帯の接続(2.3 合流)、テーブル/リスト/flex の IFC 化、
 >   計測と描画のズレ(インライン要素前の余白。本作業以前から存在)。
 > - 🚧 **Phase 2.3 float 配置 (`4b6f4a6` 土台 + `7966dfd` 結線)** — `FloatContext`
 >   (`place`/`band`/`clearance`/`lowest_bottom`、10テスト)+ `establishes_block_formatting_context`
