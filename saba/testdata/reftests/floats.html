@@ -30,11 +30,17 @@
     contain its float instead of letting it hang out of the bottom.
   </div>
 
-  <!-- NOT YET: a block-level sibling disables the float context, so these two
-       fall back to normal flow (stacked) instead of floating. Kept so the
-       golden shows the change when block-level flow-around lands. -->
+  <!-- NOT YET: a block-level sibling disables the float context, so these fall
+       back to normal flow (stacked) instead of floating. Making them float
+       needs each block's real flow position — margin collapsing included —
+       which only the position pass knows; estimating it in the size pass made
+       Wikipedia's paragraphs overlap. Kept so the golden shows the change when
+       single-pass block layout lands. -->
   <div class="wrap"><div class="fl"></div><div class="fr"></div>
     <div class="cleared">block sibling: floats fall back to normal flow</div>
+  </div>
+  <div class="wrap"><div class="fl"></div>
+    <p>Paragraph beside a float — not shortened yet (see above).</p>
   </div>
 </body>
 </html>

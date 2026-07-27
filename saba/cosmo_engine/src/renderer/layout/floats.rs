@@ -187,12 +187,30 @@ impl FloatContext {
     }
 
     /// The lowest edge of the floats below `y`, used to step the search down.
-    fn next_edge_below(&self, y: i64) -> Option<i64> {
+    /// Also how a line box that cannot fit beside the floats finds the next Y
+    /// worth trying (CSS 2.2 §9.5).
+    pub fn next_edge_below(&self, y: i64) -> Option<i64> {
         self.floats
             .iter()
             .map(PlacedFloat::bottom)
             .filter(|bottom| *bottom > y)
             .min()
+    }
+
+    /// A copy with every float shifted up by `dy`, i.e. re-expressed in the
+    /// coordinates of a descendant box that starts `dy` below this context's
+    /// origin. Floats belong to their block formatting context, not to the
+    /// block that happens to contain the text flowing around them, so a
+    /// descendant asks its questions in its own coordinates against this.
+    pub fn translated(&self, dy: i64) -> Self {
+        Self {
+            content_width: self.content_width,
+            floats: self
+                .floats
+                .iter()
+                .map(|f| PlacedFloat { y: f.y - dy, ..*f })
+                .collect(),
+        }
     }
 
     /// The bottom of the lowest float — a BFC root contains its floats, so this
@@ -297,6 +315,17 @@ mod tests {
         c.place(FloatSide::Left, 50, 0, 0, Clear::None);
         assert_eq!(c.band(0, 10), Band { left: 0, right: 100 });
         assert_eq!(c.clearance(Clear::Both, 0), 0);
+    }
+
+    #[test]
+    fn translating_re_expresses_floats_for_a_descendant() {
+        let mut c = ctx();
+        c.place(FloatSide::Left, 30, 50, 0, Clear::None);
+        // A box starting 20 below sees the float's remaining 30.
+        let inner = c.translated(20);
+        assert_eq!(inner.band(0, 10), Band { left: 30, right: 100 });
+        assert_eq!(inner.band(29, 1), Band { left: 30, right: 100 });
+        assert_eq!(inner.band(30, 10), Band { left: 0, right: 100 });
     }
 
     #[test]

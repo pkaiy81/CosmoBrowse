@@ -2972,6 +2972,16 @@ impl LayoutObject {
     /// and give the block the height its lines occupy. Borrows are taken and
     /// released around each step so children can reach back up to the block.
     pub(crate) fn layout_inline_context(block: &Rc<RefCell<LayoutObject>>) -> bool {
+        Self::layout_inline_context_with(block, None)
+    }
+
+    /// As [`layout_inline_context`], starting from `inherited` — the floats of
+    /// an enclosing block formatting context, already translated into this
+    /// box's coordinates.
+    pub(crate) fn layout_inline_context_with(
+        block: &Rc<RefCell<LayoutObject>>,
+        inherited: Option<&FloatContext>,
+    ) -> bool {
         {
             let b = block.borrow();
             if b.kind() != LayoutObjectKind::Block {
@@ -3013,8 +3023,11 @@ impl LayoutObject {
         };
         // Place this context's floats first: the lines below then flow around
         // them, because line breaking asks the same context for each line's
-        // usable span. Spec: CSS 2.2 §9.5.
-        let floats = Self::place_floats(block, content_width);
+        // usable span. Spec: CSS 2.2 §9.5. Floats declared by an ancestor in
+        // the same formatting context are inherited (already re-expressed in
+        // this box's coordinates).
+        let mut floats = inherited.cloned().unwrap_or_else(|| FloatContext::new(content_width));
+        Self::place_floats_into(block, &mut floats);
         let Some(height) =
             Self::layout_inline_context_inner(boxes, items, content_width, align, &floats)
         else {
@@ -3037,31 +3050,45 @@ impl LayoutObject {
         true
     }
 
-    /// Place each floated child in a fresh context for this block and give it
-    /// its position. Sizes come from the size pass, which has already run for
-    /// the children.
-    fn place_floats(block: &Rc<RefCell<LayoutObject>>, content_width: i64) -> FloatContext {
-        let mut context = FloatContext::new(content_width);
-        for child in block.borrow().collect_floats() {
-            let (side, width, height, clear) = {
-                let c = child.borrow();
-                let Some(side) = FloatSide::from_float(c.style.float_or_default()) else {
-                    continue;
-                };
-                let metrics = compute_box_model_metrics(&c.style);
-                (
-                    side,
-                    c.size().width() + metrics.margin.left + metrics.margin.right,
-                    c.size().height() + metrics.margin.top + metrics.margin.bottom,
-                    c.style.clear_or_default(),
-                )
+    /// Place a single floated box into `context` at or below `top`.
+    fn place_one_float(
+        child: &Rc<RefCell<LayoutObject>>,
+        context: &mut FloatContext,
+        top: i64,
+    ) {
+        let (side, width, height, clear, margin) = {
+            let c = child.borrow();
+            let Some(side) = FloatSide::from_float(c.style.float_or_default()) else {
+                return;
             };
-            let placed = context.place(side, width, height, 0, clear);
-            let metrics = compute_box_model_metrics(&child.borrow().style);
-            child.borrow_mut().inline_offset =
-                Some((placed.x + metrics.margin.left, placed.y + metrics.margin.top));
+            let metrics = compute_box_model_metrics(&c.style);
+            (
+                side,
+                c.size().width() + metrics.margin.left + metrics.margin.right,
+                c.size().height() + metrics.margin.top + metrics.margin.bottom,
+                c.style.clear_or_default(),
+                (metrics.margin.left, metrics.margin.top),
+            )
+        };
+        let placed = context.place(side, width, height, top, clear);
+        child.borrow_mut().inline_offset = Some((placed.x + margin.0, placed.y + margin.1));
+    }
+
+    /// Place each floated child into `context`, giving it its position. Sizes
+    /// come from the size pass, which has already run for the children.
+    fn place_floats_into(block: &Rc<RefCell<LayoutObject>>, context: &mut FloatContext) {
+        Self::place_floats_at(block, context, 0);
+    }
+
+    /// As `place_floats_into`, placing no higher than `top`.
+    fn place_floats_at(
+        block: &Rc<RefCell<LayoutObject>>,
+        context: &mut FloatContext,
+        top: i64,
+    ) {
+        for child in block.borrow().collect_floats() {
+            Self::place_one_float(&child, context, top);
         }
-        context
     }
 
     /// Whether this box establishes a block formatting context: floats inside

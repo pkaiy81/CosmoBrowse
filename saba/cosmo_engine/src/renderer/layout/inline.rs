@@ -185,15 +185,27 @@ pub fn layout_inline_items_aligned(
                     let (head, tail) = break_text(rest, run, available, current.is_empty());
                     if head.is_empty() {
                         // Nothing fits on what's left of this line. If the line
-                        // already holds something, move on; if it is empty the
-                        // band itself is too narrow, so take one character to
-                        // guarantee progress rather than loop forever.
+                        // already holds something, move on.
                         if !current.is_empty() {
                             lines.push(current.close());
                             let y = next_y(&lines);
                             current = OpenLine::new(y, band_left(floats, content_width, y, run.line_height));
                             continue;
                         }
+                        // The line is empty and still nothing fits: the floats
+                        // beside it leave too little room, so the line moves
+                        // *down* past them rather than being squeezed to
+                        // nothing (CSS 2.2 §9.5 — a line box that cannot fit
+                        // next to floats is moved down until it fits).
+                        if let Some(below) = floats.next_edge_below(current.y) {
+                            current = OpenLine::new(
+                                below,
+                                band_left(floats, content_width, below, run.line_height),
+                            );
+                            continue;
+                        }
+                        // No floats left to clear: take one character so
+                        // layout always progresses.
                         let mut chars = rest.char_indices();
                         chars.next();
                         let split = chars.next().map(|(i, _)| i).unwrap_or(rest.len());
