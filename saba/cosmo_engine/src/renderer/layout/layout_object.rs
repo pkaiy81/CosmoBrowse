@@ -25,7 +25,9 @@ use crate::renderer::layout::computed_style::GridTrack;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::floats::{FloatContext, FloatSide};
-use crate::renderer::layout::inline::{layout_inline_items_aligned, InlineItem, LineAlign, TextRun};
+use crate::renderer::layout::inline::{
+    layout_inline_items_aligned, InlineItem, LineAlign, LineOptions, TextRun,
+};
 use std::format;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -2887,11 +2889,11 @@ impl LayoutObject {
         boxes: Vec<Rc<RefCell<LayoutObject>>>,
         items: Vec<InlineItem>,
         content_width: i64,
-        align: LineAlign,
+        options: LineOptions,
         floats: &FloatContext,
     ) -> Option<i64> {
         let lines =
-            layout_inline_items_aligned(&items, floats, content_width, 0, 0, align);
+            layout_inline_items_aligned(&items, floats, content_width, 0, 0, options);
 
         // Fragments per item, in block coordinates, shifted onto their line's
         // shared baseline so items of different heights line up.
@@ -3013,10 +3015,13 @@ impl LayoutObject {
         let Some((boxes, items)) = block.borrow().collect_inline_items() else {
             return false;
         };
-        let align = match block.borrow().style.text_align() {
-            TextAlign::Center => LineAlign::Center,
-            TextAlign::Right => LineAlign::End,
-            _ => LineAlign::Start,
+        let options = LineOptions {
+            align: match block.borrow().style.text_align() {
+                TextAlign::Center => LineAlign::Center,
+                TextAlign::Right => LineAlign::End,
+                _ => LineAlign::Start,
+            },
+            wrap: !block.borrow().style.white_space_nowrap(),
         };
         // Place this context's floats first: the lines below then flow around
         // them, because line breaking asks the same context for each line's
@@ -3026,7 +3031,7 @@ impl LayoutObject {
         let mut floats = inherited.cloned().unwrap_or_else(|| FloatContext::new(content_width));
         Self::place_floats_into(block, &mut floats);
         let Some(height) =
-            Self::layout_inline_context_inner(boxes, items, content_width, align, &floats)
+            Self::layout_inline_context_inner(boxes, items, content_width, options, &floats)
         else {
             return false;
         };
@@ -3415,15 +3420,16 @@ fn collect_inline_items_from(
     }
     if kind == LayoutObjectKind::Text {
         {
-            // Preserved / non-wrapping white-space and ellipsis truncation are
-            // the legacy path's business: the line breaker here always wraps at
-            // break opportunities, so a `nowrap` run would be split and a `pre`
-            // run would lose its newlines. Fall back for the whole block.
+            // Preserved white-space is still the legacy path's business (a
+            // `pre` run would lose its newlines here), as is ellipsis
+            // truncation, which paint applies against a clipping ancestor and
+            // cannot see once fragments are placed. `nowrap` on its own is
+            // handled: the run is simply unbreakable.
             let b = node.borrow();
-            if b.style.white_space_nowrap()
-                || b.style.white_space_preserves_newlines()
+            if b.style.white_space_preserves_newlines()
                 || b.style.white_space_preserves_spaces()
                 || b.style.text_overflow_ellipsis()
+                || b.ellipsis_clip_width().is_some()
             {
                 return false;
             }
@@ -3442,6 +3448,7 @@ fn collect_inline_items_from(
             font_size: b.style.font_size(),
             bold: b.style.is_bold(),
             line_height: styled_line_height(&b.style),
+            breakable: !b.style.white_space_nowrap(),
         }));
         return true;
     }

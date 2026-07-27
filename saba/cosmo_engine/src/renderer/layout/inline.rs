@@ -33,6 +33,9 @@ pub struct TextRun {
     pub bold: bool,
     /// Used line-height: the height this run contributes to a line box.
     pub line_height: i64,
+    /// False for `white-space: nowrap`: the run is placed whole and allowed to
+    /// overflow rather than wrapped. Spec: CSS Text §3.1.
+    pub breakable: bool,
 }
 
 /// One inline-level thing to place on a line.
@@ -121,6 +124,26 @@ pub enum LineAlign {
     End,
 }
 
+/// How a block wants its inline content laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineOptions {
+    pub align: LineAlign,
+    /// False for `white-space: nowrap`: the content stays on one line and
+    /// overflows. Wrapping is a property of the containing block, so it has to
+    /// suppress breaks *between* items too, not just inside a run.
+    /// Spec: CSS Text §3.1. https://www.w3.org/TR/css-text-3/#white-space-property
+    pub wrap: bool,
+}
+
+impl Default for LineOptions {
+    fn default() -> Self {
+        Self {
+            align: LineAlign::Start,
+            wrap: true,
+        }
+    }
+}
+
 /// Lays `items` out into line boxes starting at `start_y`, inside a content box
 /// `content_width` wide, with each line's usable span taken from `floats`.
 ///
@@ -133,19 +156,27 @@ pub fn layout_inline_items(
     start_y: i64,
     start_x: i64,
 ) -> Vec<LineBox> {
-    layout_inline_items_aligned(items, floats, content_width, start_y, start_x, LineAlign::Start)
+    layout_inline_items_aligned(
+        items,
+        floats,
+        content_width,
+        start_y,
+        start_x,
+        LineOptions::default(),
+    )
 }
 
-/// As [`layout_inline_items`], distributing each line's leftover space per
-/// `align`.
+/// As [`layout_inline_items`], with the containing block's alignment and
+/// wrapping mode.
 pub fn layout_inline_items_aligned(
     items: &[InlineItem],
     floats: &FloatContext,
     content_width: i64,
     start_y: i64,
     start_x: i64,
-    align: LineAlign,
+    options: LineOptions,
 ) -> Vec<LineBox> {
+    let align = options.align;
     let items = &collapse_across_items(items);
     let mut lines: Vec<LineBox> = Vec::new();
     // Provisional line height so the float band query has a height to test
@@ -159,7 +190,7 @@ pub fn layout_inline_items_aligned(
         match item {
             InlineItem::Atomic { width, height, .. } => {
                 let band = band_for(floats, content_width, current.y, (*height).max(probe_height));
-                if current.needs_break(*width, band.right) {
+                if options.wrap && current.needs_break(*width, band.right) {
                     lines.push(current.close());
                     current = OpenLine::new(next_y(&lines), band_left(floats, content_width, next_y(&lines), *height));
                 }
@@ -176,7 +207,13 @@ pub fn layout_inline_items_aligned(
                 // Break opportunities for the whole run, computed once: they
                 // are a property of the text, not of the line it lands on, and
                 // recomputing per line would be quadratic on a long run.
-                let breaks = break_opportunities(&run.text);
+                // A nowrap run offers no break opportunity but its own end,
+                // so it is placed whole and overflows.
+                let breaks = if options.wrap && run.breakable {
+                    break_opportunities(&run.text)
+                } else {
+                    vec![run.text.len()]
+                };
                 let mut rest = run.text.as_str();
                 loop {
                     let band = band_for(
@@ -185,7 +222,13 @@ pub fn layout_inline_items_aligned(
                         current.y,
                         run.line_height.max(probe_height),
                     );
-                    let available = (band.right - current.x).max(0);
+                    // Without wrapping the run always "fits": it is placed
+                    // whole and allowed to overflow the band.
+                    let available = if options.wrap {
+                        (band.right - current.x).max(0)
+                    } else {
+                        i64::MAX / 4
+                    };
                     let base = run.text.len() - rest.len();
                     let (head, tail) =
                         break_text(rest, base, &breaks, run, available, current.is_empty());
@@ -491,6 +534,7 @@ mod tests {
             font_size: FontSize::Medium,
             bold: false,
             line_height: 20,
+            breakable: true,
         })
     }
 
@@ -626,6 +670,7 @@ mod tests {
             font_size: FontSize::Medium,
             bold: false,
             line_height: 20,
+            breakable: true,
         })];
         // Room for roughly seven of the eight double-width characters.
         let narrow = measure_text_width("本日は晴天なり", FontSize::Medium, false);
@@ -674,6 +719,33 @@ mod tests {
                 .any(|t| t.ends_with('-')),
             "expected the first line to end at a hyphen, got {:?}",
             lines_text(&lines)
+        );
+    }
+
+    #[test]
+    fn nowrap_keeps_every_item_on_one_overflowing_line() {
+        // Wrapping is the containing block's property, so `nowrap` has to
+        // suppress breaks *between* items too — not just inside a run, which
+        // would still push the second item onto a new line.
+        let items = vec![text("first run "), text("second run "), text("third run")];
+        let narrow = width_of("first");
+        let lines = layout_inline_items_aligned(
+            &items,
+            &FloatContext::default(),
+            narrow,
+            0,
+            0,
+            LineOptions { align: LineAlign::Start, wrap: false },
+        );
+        assert_eq!(lines.len(), 1, "nowrap must produce a single line");
+        assert_eq!(
+            lines[0].fragments.len(),
+            3,
+            "each run keeps its own fragment on that line"
+        );
+        assert!(
+            lines[0].end_x() > narrow,
+            "the line overflows rather than wrapping"
         );
     }
 
