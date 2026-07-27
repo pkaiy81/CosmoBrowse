@@ -148,10 +148,12 @@ pub fn layout_inline_items_aligned(
 ) -> Vec<LineBox> {
     let items = &collapse_across_items(items);
     let mut lines: Vec<LineBox> = Vec::new();
-    let mut current = OpenLine::new(start_y, start_x);
     // Provisional line height so the float band query has a height to test
     // against before anything is on the line.
     let probe_height = items.first().map(InlineItem::height).unwrap_or(1);
+    // The first line begins after any float already occupying the left edge.
+    let first_x = start_x.max(band_left(floats, content_width, start_y, probe_height));
+    let mut current = OpenLine::new(start_y, first_x);
 
     for (index, item) in items.iter().enumerate() {
         match item {

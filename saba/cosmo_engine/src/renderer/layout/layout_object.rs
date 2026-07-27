@@ -19,11 +19,12 @@ use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::EdgeSize;
 use crate::renderer::layout::computed_style::FlexDirection;
+use crate::renderer::layout::computed_style::Float;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
-use crate::renderer::layout::floats::FloatContext;
+use crate::renderer::layout::floats::{FloatContext, FloatSide};
 use crate::renderer::layout::inline::{layout_inline_items_aligned, InlineItem, LineAlign, TextRun};
 use std::format;
 use std::rc::Rc;
@@ -2837,11 +2838,17 @@ impl LayoutObject {
         let mut items = Vec::new();
         let mut child = self.first_child();
         while let Some(c) = child {
-            if c.borrow().kind().normal_flow_spec().stacks_vertically {
-                return None;
-            }
-            if !collect_inline_items_from(&c, &mut boxes, &mut items) {
-                return None;
+            // Floats are out of flow: they are placed separately and the lines
+            // flow *around* them, so they contribute no inline item — and a
+            // floated block child must not disqualify the context either.
+            let floated = c.borrow().style.float_or_default() != Float::None;
+            if !floated {
+                if c.borrow().kind().normal_flow_spec().stacks_vertically {
+                    return None;
+                }
+                if !collect_inline_items_from(&c, &mut boxes, &mut items) {
+                    return None;
+                }
             }
             let next = c.borrow().next_sibling();
             child = next;
@@ -2851,6 +2858,20 @@ impl LayoutObject {
         } else {
             Some((boxes, items))
         }
+    }
+
+    /// This block's floated children, in document order.
+    fn collect_floats(&self) -> Vec<Rc<RefCell<LayoutObject>>> {
+        let mut floats = Vec::new();
+        let mut child = self.first_child();
+        while let Some(c) = child {
+            if c.borrow().style.float_or_default() != Float::None {
+                floats.push(c.clone());
+            }
+            let next = c.borrow().next_sibling();
+            child = next;
+        }
+        floats
     }
 
     /// Lay this block's inline children out as line boxes `content_width` wide,
@@ -2867,10 +2888,10 @@ impl LayoutObject {
         items: Vec<InlineItem>,
         content_width: i64,
         align: LineAlign,
+        floats: &FloatContext,
     ) -> Option<i64> {
-        let floats = FloatContext::new(content_width);
         let lines =
-            layout_inline_items_aligned(&items, &floats, content_width, 0, 0, align);
+            layout_inline_items_aligned(&items, floats, content_width, 0, 0, align);
 
         // Fragments per item, in block coordinates, shifted onto their line's
         // shared baseline so items of different heights line up.
@@ -2990,7 +3011,12 @@ impl LayoutObject {
             TextAlign::Right => LineAlign::End,
             _ => LineAlign::Start,
         };
-        let Some(height) = Self::layout_inline_context_inner(boxes, items, content_width, align)
+        // Place this context's floats first: the lines below then flow around
+        // them, because line breaking asks the same context for each line's
+        // usable span. Spec: CSS 2.2 §9.5.
+        let floats = Self::place_floats(block, content_width);
+        let Some(height) =
+            Self::layout_inline_context_inner(boxes, items, content_width, align, &floats)
         else {
             return false;
         };
@@ -2999,9 +3025,43 @@ impl LayoutObject {
         if b.style.has_author_height() {
             return true;
         }
+        // A box that establishes a block formatting context contains its
+        // floats; an ordinary block lets them overflow (CSS 2.2 §10.6.7).
+        let height = if b.establishes_block_formatting_context() {
+            height.max(floats.lowest_bottom())
+        } else {
+            height
+        };
         let metrics = compute_box_model_metrics(&b.style);
         b.size.set_height((height + metrics.inner_vertical()).max(0));
         true
+    }
+
+    /// Place each floated child in a fresh context for this block and give it
+    /// its position. Sizes come from the size pass, which has already run for
+    /// the children.
+    fn place_floats(block: &Rc<RefCell<LayoutObject>>, content_width: i64) -> FloatContext {
+        let mut context = FloatContext::new(content_width);
+        for child in block.borrow().collect_floats() {
+            let (side, width, height, clear) = {
+                let c = child.borrow();
+                let Some(side) = FloatSide::from_float(c.style.float_or_default()) else {
+                    continue;
+                };
+                let metrics = compute_box_model_metrics(&c.style);
+                (
+                    side,
+                    c.size().width() + metrics.margin.left + metrics.margin.right,
+                    c.size().height() + metrics.margin.top + metrics.margin.bottom,
+                    c.style.clear_or_default(),
+                )
+            };
+            let placed = context.place(side, width, height, 0, clear);
+            let metrics = compute_box_model_metrics(&child.borrow().style);
+            child.borrow_mut().inline_offset =
+                Some((placed.x + metrics.margin.left, placed.y + metrics.margin.top));
+        }
+        context
     }
 
     /// Whether this box establishes a block formatting context: floats inside
