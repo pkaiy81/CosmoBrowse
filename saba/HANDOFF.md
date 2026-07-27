@@ -404,8 +404,16 @@
 >   float は通常フローに落ちる(reftest の4ケース目がその状態を固定)。ここで推測しないのは、
 >   float を out-of-flow にしつつ兄弟ブロックの行を短くしないと**テキストが float の下に潜る**ため
 >   (2.3 ブリーフが警告する回帰そのもの)。
->   **残**: ブロックレベルの回り込み(FloatContext をブロック配置パスに通す)、`clear` のブロック適用、
->   BFC ごとの context 継承。
+>   ✅ 追加 (`16a9497`): **行が float の脇に入らない時は下へ送る**(CSS2.2 §9.5)。これが無いと
+>   「進行保証の hard break」に落ちて**1行1文字**に砕ける(Wikipedia の導入段落で実際に発生)。
+>   `FloatContext::translated`(子孫座標系への読み替え)も追加。
+>   ⚠ **試して撤退した**: ブロックレベルの子に対する float 配置を「サイズパスで各子の flow 位置を
+>   推定」して実装 → **margin collapsing 等 `compute_position` の仕事を推定しきれず**、
+>   結果を子に強制すると位置パスを上書きしてしまう。floats reftest は正しく見えたが
+>   **Wikipedia の段落が重なった**ため revert。**ブロックレベルの回り込みには実位置が要る
+>   = レイアウトを単一の top-down パスにする改修が前提**(2.3 ブリーフの ⚠ が言うとおり)。
+>   reftest の該当ケースに「NOT YET」として固定済み。
+>   **残**: 単一パス化 → ブロックレベル回り込み / `clear` のブロック適用 / BFC ごとの context 継承。
 > - ✅ **Phase 4.4 完了: @keyframes + animation (`6c50b5f`, 2026-07-26)** — 宣言的アニメが全て動く。
 >   **パース**: `@keyframes name{from|to|N%{...}}` を(セレクタでなくオフセット鍵の)別テーブルに保持
 >   (`StyleSheet::keyframes_named`)、`animation` shorthand と `animation-*` 7種の longhand を
