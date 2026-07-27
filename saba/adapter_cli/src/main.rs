@@ -169,6 +169,9 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
         if let Err(error) = host.eval_to_string(&script) {
             eprintln!("script error: {error}");
         }
+        // The document is parsed by now: fire DOMContentLoaded so handlers
+        // registered for it run, as the parser does at "the end".
+        host.fire_dom_content_loaded();
         host.run_initial_load(1000);
     }
 
@@ -191,6 +194,13 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
     println!("fixture: {fixture_path}");
     println!("click_target_id: {}", click_target_id.unwrap_or("<none>"));
     println!("display_items: {}", display_items.len());
+    // Whether the scripts mutated the DOM, i.e. whether the render pipeline has
+    // to run again. The DOM mutation generation is what the runtime itself uses
+    // to decide that (`LivePage::pump_and_relayout`).
+    println!(
+        "render_pipeline_invalidated: {}",
+        host.dom_generation() > 0
+    );
 
     let diagnostics = host.take_console_log();
     if diagnostics.is_empty() {

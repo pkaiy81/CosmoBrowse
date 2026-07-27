@@ -364,6 +364,9 @@ impl LivePage {
         let script = get_js_content(dom.clone());
         if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
             let _ = host.eval_to_string(&script);
+            // The document is parsed by the time we get here, so the handlers
+            // the scripts just registered for it fire now.
+            host.fire_dom_content_loaded();
             // Only what is due at t=0. A retained page has a frame clock
             // (`animation_frame`) to deliver delayed timers on schedule, so
             // unlike the one-shot pipeline it must not flush them up front —
@@ -588,6 +591,8 @@ fn execute_scripts_boa(
         if let Err(e) = host.eval_to_string(&script) {
             diagnostics.push(format!("Script error: {e}"));
         }
+        // The document is parsed by now, so its DOMContentLoaded handlers run.
+        host.fire_dom_content_loaded();
         // Drain microtasks + due one-shot timers as at initial load; each
         // interval fires at most once (no spinning at first paint). Bounded to
         // cap runaway setTimeout(0) chains.

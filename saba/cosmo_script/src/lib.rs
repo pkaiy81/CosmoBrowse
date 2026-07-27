@@ -1944,6 +1944,19 @@ impl ScriptHost {
         self.drain(max_timer_fires, false);
     }
 
+    /// Fire `DOMContentLoaded` at the document, as the parser does once the
+    /// document has been parsed and its scripts have run. Pages routinely hang
+    /// all of their startup off this event, so nothing they set up runs without
+    /// it. Spec: HTML LS §13.2.7 "the end".
+    /// https://html.spec.whatwg.org/multipage/parsing.html#the-end
+    pub fn fire_dom_content_loaded(&mut self) {
+        self.activate();
+        let Some(document) = SCRIPT_DOM.with(|d| d.borrow().clone()) else {
+            return;
+        };
+        run_dispatch(document, "DOMContentLoaded", None, &mut self.context);
+    }
+
     /// Run everything that is due *now*: microtasks, settled fetches, and any
     /// timer whose delay has already elapsed — without jumping the clock
     /// forward to flush later ones the way [`run_initial_load`] does. Callers
