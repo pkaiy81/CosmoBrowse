@@ -33,6 +33,9 @@ pub struct TextRun {
     pub bold: bool,
     /// Used line-height: the height this run contributes to a line box.
     pub line_height: i64,
+    /// False for `white-space: nowrap`: the run is placed whole and allowed to
+    /// overflow rather than wrapped. Spec: CSS Text §3.1.
+    pub breakable: bool,
 }
 
 /// One inline-level thing to place on a line.
@@ -84,6 +87,10 @@ impl InlineItem {
 pub struct Fragment {
     /// Index into the item list this fragment came from.
     pub item: usize,
+    /// Width of the run of white space this fragment ends with, if any. A line
+    /// drops it when it closes: white space at the end of a line hangs rather
+    /// than counting towards the line's width (CSS Text §4.1).
+    pub trailing_space_width: i64,
     /// The text actually on this line (`None` for atomic items).
     pub text: Option<String>,
     pub x: i64,
@@ -121,6 +128,26 @@ pub enum LineAlign {
     End,
 }
 
+/// How a block wants its inline content laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineOptions {
+    pub align: LineAlign,
+    /// False for `white-space: nowrap`: the content stays on one line and
+    /// overflows. Wrapping is a property of the containing block, so it has to
+    /// suppress breaks *between* items too, not just inside a run.
+    /// Spec: CSS Text §3.1. https://www.w3.org/TR/css-text-3/#white-space-property
+    pub wrap: bool,
+}
+
+impl Default for LineOptions {
+    fn default() -> Self {
+        Self {
+            align: LineAlign::Start,
+            wrap: true,
+        }
+    }
+}
+
 /// Lays `items` out into line boxes starting at `start_y`, inside a content box
 /// `content_width` wide, with each line's usable span taken from `floats`.
 ///
@@ -133,19 +160,27 @@ pub fn layout_inline_items(
     start_y: i64,
     start_x: i64,
 ) -> Vec<LineBox> {
-    layout_inline_items_aligned(items, floats, content_width, start_y, start_x, LineAlign::Start)
+    layout_inline_items_aligned(
+        items,
+        floats,
+        content_width,
+        start_y,
+        start_x,
+        LineOptions::default(),
+    )
 }
 
-/// As [`layout_inline_items`], distributing each line's leftover space per
-/// `align`.
+/// As [`layout_inline_items`], with the containing block's alignment and
+/// wrapping mode.
 pub fn layout_inline_items_aligned(
     items: &[InlineItem],
     floats: &FloatContext,
     content_width: i64,
     start_y: i64,
     start_x: i64,
-    align: LineAlign,
+    options: LineOptions,
 ) -> Vec<LineBox> {
+    let align = options.align;
     let items = &collapse_across_items(items);
     let mut lines: Vec<LineBox> = Vec::new();
     // Provisional line height so the float band query has a height to test
@@ -159,12 +194,13 @@ pub fn layout_inline_items_aligned(
         match item {
             InlineItem::Atomic { width, height, .. } => {
                 let band = band_for(floats, content_width, current.y, (*height).max(probe_height));
-                if current.needs_break(*width, band.right) {
+                if options.wrap && current.needs_break(*width, band.right) {
                     lines.push(current.close());
                     current = OpenLine::new(next_y(&lines), band_left(floats, content_width, next_y(&lines), *height));
                 }
                 current.push(Fragment {
                     item: index,
+                    trailing_space_width: 0,
                     text: None,
                     x: current.x,
                     y: current.y,
@@ -173,6 +209,16 @@ pub fn layout_inline_items_aligned(
                 }, item);
             }
             InlineItem::Text(run) => {
+                // Break opportunities for the whole run, computed once: they
+                // are a property of the text, not of the line it lands on, and
+                // recomputing per line would be quadratic on a long run.
+                // A nowrap run offers no break opportunity but its own end,
+                // so it is placed whole and overflows.
+                let breaks = if options.wrap && run.breakable {
+                    break_opportunities(&run.text)
+                } else {
+                    vec![run.text.len()]
+                };
                 let mut rest = run.text.as_str();
                 loop {
                     let band = band_for(
@@ -181,8 +227,16 @@ pub fn layout_inline_items_aligned(
                         current.y,
                         run.line_height.max(probe_height),
                     );
-                    let available = (band.right - current.x).max(0);
-                    let (head, tail) = break_text(rest, run, available, current.is_empty());
+                    // Without wrapping the run always "fits": it is placed
+                    // whole and allowed to overflow the band.
+                    let available = if options.wrap {
+                        (band.right - current.x).max(0)
+                    } else {
+                        i64::MAX / 4
+                    };
+                    let base = run.text.len() - rest.len();
+                    let (head, tail) =
+                        break_text(rest, base, &breaks, run, available, current.is_empty());
                     if head.is_empty() {
                         // Nothing fits on what's left of this line. If the line
                         // already holds something, move on.
@@ -213,6 +267,7 @@ pub fn layout_inline_items_aligned(
                         current.push(
                             Fragment {
                                 item: index,
+                                trailing_space_width: 0,
                                 text: Some(forced.to_string()),
                                 x: current.x,
                                 y: current.y,
@@ -223,13 +278,17 @@ pub fn layout_inline_items_aligned(
                         );
                         rest = remainder;
                     } else {
+                        let trimmed = head.trim_end_matches(is_break_space);
+                        let full = measure_text_width(head, run.font_size, run.bold);
+                        let without = measure_text_width(trimmed, run.font_size, run.bold);
                         current.push(
                             Fragment {
                                 item: index,
+                                trailing_space_width: full - without,
                                 text: Some(head.to_string()),
                                 x: current.x,
                                 y: current.y,
-                                width: measure_text_width(head, run.font_size, run.bold),
+                                width: full,
                                 height: run.line_height,
                             },
                             item,
@@ -330,43 +389,86 @@ fn next_y(lines: &[LineBox]) -> i64 {
     lines.last().map(|l| l.y + l.height).unwrap_or(0)
 }
 
-/// Split `text` at the last break opportunity that fits in `available`.
-/// Returns (what goes on this line, what is left). A break at a space consumes
-/// it. When `line_empty` and not even one word fits, the text is hard-broken so
-/// layout always progresses.
+/// The UAX #14 break opportunities in `text`, as byte offsets at which a line
+/// may end (the offset is the start of the next line). Computed once per run.
+///
+/// Spec: UAX #14, Unicode Line Breaking Algorithm. https://www.unicode.org/reports/tr14/
+fn break_opportunities(text: &str) -> Vec<usize> {
+    unicode_linebreak::linebreaks(text)
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+/// Split `text` — the untaken remainder of a run starting at byte `base` within
+/// it — at the last break opportunity whose content fits in `available`.
+/// Returns (what goes on this line, what is left).
+///
+/// Trailing white space at the break does not count against the width: a line
+/// may end with spaces that hang past the edge rather than pushing the next
+/// word down (CSS Text §4.1, hanging white space). When `line_empty` and not
+/// even the first opportunity fits, the text is hard-broken so layout always
+/// progresses.
 fn break_text<'a>(
     text: &'a str,
+    base: usize,
+    breaks: &[usize],
     run: &TextRun,
     available: i64,
     line_empty: bool,
 ) -> (&'a str, &'a str) {
+    // Walk once, recording each opportunity together with the width of the
+    // content up to it excluding any trailing spaces.
     let mut width = 0i64;
-    // Last break opportunity seen: (end of the fitting text, start of the rest).
-    let mut last_break: Option<(usize, usize)> = None;
-    for (index, ch) in text.char_indices() {
-        let advance = char_advance(ch, run.font_size, run.bold);
-        if width + advance > available {
-            // The overflow is itself a break opportunity: the line ends here
-            // and the space is dropped — a trailing space at a break never
-            // forces the word after it down (CSS Text §4.1, hanging spaces).
-            if is_break_space(ch) {
-                return (&text[..index], &text[index + ch.len_utf8()..]);
+    let mut width_without_trailing_space = 0i64;
+    let mut best: Option<usize> = None;
+    let mut next_break = breaks.partition_point(|b| *b <= base);
+
+    for (offset, ch) in text.char_indices() {
+        let absolute = base + offset;
+        // Opportunities at or before this character are now measurable.
+        while next_break < breaks.len() && breaks[next_break] <= absolute {
+            if width_without_trailing_space <= available {
+                best = Some(breaks[next_break] - base);
             }
-            return match last_break {
-                Some((end, next)) => (&text[..end], &text[next..]),
-                // No break opportunity fits. On an empty line, hard-break
-                // before the overflowing character (never produce nothing, or
-                // the caller would spin).
-                None if line_empty && index > 0 => (&text[..index], &text[index..]),
-                None => ("", text),
-            };
+            next_break += 1;
         }
-        width += advance;
-        if is_break_space(ch) {
-            last_break = Some((index, index + ch.len_utf8()));
+        if width_without_trailing_space > available {
+            // Nothing further can fit; stop rather than scanning the rest.
+            break;
+        }
+        width += char_advance(ch, run.font_size, run.bold);
+        if !is_break_space(ch) {
+            width_without_trailing_space = width;
         }
     }
-    (text, "")
+    // The end of the run is itself an opportunity.
+    while next_break < breaks.len() && breaks[next_break] <= base + text.len() {
+        if width_without_trailing_space <= available {
+            best = Some(breaks[next_break] - base);
+        }
+        next_break += 1;
+    }
+
+    match best {
+        Some(end) => (&text[..end], &text[end..]),
+        // No opportunity fits and the line is empty: the word is wider than the
+        // line. With `overflow-wrap: normal` — the default — it overflows
+        // rather than being split mid-word, so take it up to its first break
+        // opportunity. (Splitting it produced "delt"/"a" in a narrow table cell
+        // and "1"/"." in a rank column.) Progress is still guaranteed: the word
+        // is non-empty. Spec: CSS Text §5.5.
+        // https://www.w3.org/TR/css-text-3/#overflow-wrap-property
+        None if line_empty => {
+            let first = breaks
+                .iter()
+                .copied()
+                .find(|b| *b > base)
+                .map(|b| b - base)
+                .unwrap_or(text.len());
+            (&text[..first], &text[first..])
+        }
+        None => ("", text),
+    }
 }
 
 /// A line being filled.
@@ -410,11 +512,22 @@ impl OpenLine {
         self.fragments.push(fragment);
     }
 
-    /// Finish the line: shift every fragment so their baselines coincide.
+    /// Finish the line: place every fragment on the shared baseline and let the
+    /// last one's trailing white space hang past the edge (CSS Text §4.1) so it
+    /// neither widens the line nor shifts an alignment.
     fn close(mut self) -> LineBox {
         let baseline = self.baseline;
         for fragment in &mut self.fragments {
             fragment.y = self.y;
+        }
+        if let Some(last) = self.fragments.last_mut() {
+            if last.trailing_space_width > 0 {
+                last.width -= last.trailing_space_width;
+                if let Some(text) = &mut last.text {
+                    let trimmed = text.trim_end_matches(is_break_space).to_string();
+                    *text = trimmed;
+                }
+            }
         }
         LineBox {
             y: self.y,
@@ -437,6 +550,7 @@ mod tests {
             font_size: FontSize::Medium,
             bold: false,
             line_height: 20,
+            breakable: true,
         })
     }
 
@@ -498,17 +612,35 @@ mod tests {
     }
 
     #[test]
-    fn a_word_too_long_for_the_line_is_hard_broken() {
+    fn a_word_too_long_for_the_line_overflows_rather_than_splitting() {
+        // `overflow-wrap: normal` (the default) keeps a word whole even when it
+        // is wider than the line — it overflows. Splitting it was what turned
+        // "delta" into "delt"/"a" in a narrow table cell.
         let items = vec![text("abcdefgh")];
         let narrow = width_of("abc");
         let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
-        assert!(lines.len() > 1, "must break rather than overflow");
-        let rejoined: String = lines_text(&lines)
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .concat();
-        assert_eq!(rejoined, "abcdefgh", "no characters lost");
+        assert_eq!(
+            lines_text(&lines),
+            vec![vec!["abcdefgh".to_string()]],
+            "the word stays whole"
+        );
+        assert!(lines[0].end_x() > narrow, "and overflows the line");
+    }
+
+    #[test]
+    fn a_long_word_still_starts_on_its_own_line() {
+        // Overflowing must not mean "join whatever is already on the line":
+        // the oversized word moves to a fresh line first.
+        let items = vec![text("hi "), text("abcdefghijklmnop")];
+        let narrow = width_of("hi abc");
+        let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
+        assert_eq!(
+            lines_text(&lines),
+            vec![
+                vec!["hi".to_string()],
+                vec!["abcdefghijklmnop".to_string()]
+            ]
+        );
     }
 
     #[test]
@@ -560,6 +692,95 @@ mod tests {
         // The tall atomic sets the baseline; the line is at least that tall.
         assert_eq!(lines[0].baseline, 40);
         assert!(lines[0].height >= 40);
+    }
+
+    #[test]
+    fn uax14_keeps_punctuation_off_the_start_of_a_line() {
+        // A Japanese full stop may not begin a line (UAX #14 class CL): the
+        // break has to happen before the character it follows instead. The old
+        // space-only rule broke anywhere and stranded it.
+        let items = vec![InlineItem::Text(TextRun {
+            text: "本日は晴天なり。".to_string(),
+            font_size: FontSize::Medium,
+            bold: false,
+            line_height: 20,
+            breakable: true,
+        })];
+        // Room for roughly seven of the eight double-width characters.
+        let narrow = measure_text_width("本日は晴天なり", FontSize::Medium, false);
+        let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
+        let first: String = lines[0]
+            .fragments
+            .iter()
+            .filter_map(|f| f.text.clone())
+            .collect();
+        assert!(
+            !lines[1..]
+                .iter()
+                .flat_map(|l| l.fragments.iter())
+                .filter_map(|f| f.text.as_deref())
+                .any(|t| t.starts_with('。')),
+            "a full stop must not start a line, got {:?}",
+            lines_text(&lines)
+        );
+        assert!(first.ends_with('。') || first.len() < "本日は晴天なり。".len());
+    }
+
+    #[test]
+    fn uax14_does_not_break_inside_a_word_with_an_apostrophe() {
+        // "don't" is one word: the only break opportunities are around it.
+        let items = vec![text("well don't stop")];
+        let available = width_of("well don't");
+        let lines = layout_inline_items(&items, &FloatContext::default(), available, 0, 0);
+        assert_eq!(
+            lines_text(&lines),
+            vec![vec!["well don't".to_string()], vec!["stop".to_string()]]
+        );
+    }
+
+    #[test]
+    fn uax14_breaks_after_a_hyphen() {
+        // A hyphen offers a break after it, which the space-only rule missed.
+        let items = vec![text("state-of-the-art design")];
+        let available = width_of("state-of-");
+        let lines = layout_inline_items(&items, &FloatContext::default(), available, 0, 0);
+        assert!(lines.len() > 1);
+        assert!(
+            lines[0]
+                .fragments
+                .iter()
+                .filter_map(|f| f.text.as_deref())
+                .any(|t| t.ends_with('-')),
+            "expected the first line to end at a hyphen, got {:?}",
+            lines_text(&lines)
+        );
+    }
+
+    #[test]
+    fn nowrap_keeps_every_item_on_one_overflowing_line() {
+        // Wrapping is the containing block's property, so `nowrap` has to
+        // suppress breaks *between* items too — not just inside a run, which
+        // would still push the second item onto a new line.
+        let items = vec![text("first run "), text("second run "), text("third run")];
+        let narrow = width_of("first");
+        let lines = layout_inline_items_aligned(
+            &items,
+            &FloatContext::default(),
+            narrow,
+            0,
+            0,
+            LineOptions { align: LineAlign::Start, wrap: false },
+        );
+        assert_eq!(lines.len(), 1, "nowrap must produce a single line");
+        assert_eq!(
+            lines[0].fragments.len(),
+            3,
+            "each run keeps its own fragment on that line"
+        );
+        assert!(
+            lines[0].end_x() > narrow,
+            "the line overflows rather than wrapping"
+        );
     }
 
     #[test]

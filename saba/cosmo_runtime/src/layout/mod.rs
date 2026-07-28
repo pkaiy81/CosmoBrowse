@@ -1040,8 +1040,21 @@ mod tests {
         assert!(has_a && has_b, "fetched items not rendered; diagnostics={:?}", result.diagnostics);
     }
 
+    /// Serializes the tests that pump a `LivePage`. `COSMO_LAYOUT_ASSERT` is
+    /// process-wide, so the test that switches it on changes what every
+    /// concurrently-running pump does — which showed up as either fetch test
+    /// failing intermittently depending on which one happened to overlap.
+    static LAYOUT_ASSERT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_layout_assert_env() -> std::sync::MutexGuard<'static, ()> {
+        LAYOUT_ASSERT_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn live_page_progressive_render_after_fetch() {
+        let _env = lock_layout_assert_env();
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -1087,10 +1100,13 @@ mod tests {
 
         // Poll for completion (worker thread), then re-lay-out the SAME page.
         // pump_and_relayout returns Some only when the DOM actually changed.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut scene = first_scene;
         let mut relaid_out = false;
-        while page.has_pending_work() && std::time::Instant::now() < deadline {
+        // Wait for the outcome, not for `has_pending_work()` to go false: the
+        // worker thread clears that the instant it hands the response over, so
+        // polling on it can exit the loop before the `.then` chain has run.
+        while !relaid_out && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
             if let Some(updated) = page.pump_and_relayout(&rect) {
                 scene = updated;
@@ -1111,6 +1127,7 @@ mod tests {
 
     #[test]
     fn incremental_matches_full_under_assert() {
+        let _env = lock_layout_assert_env();
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -1146,9 +1163,11 @@ mod tests {
         let (mut page, _first) = LivePage::load(&base, html, &rect, None);
 
         std::env::set_var("COSMO_LAYOUT_ASSERT", "1");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut scene = None;
-        while page.has_pending_work() && std::time::Instant::now() < deadline {
+        // See the note in live_page_progressive_render_after_fetch: wait for
+        // the re-layout, not for the pending-work flag.
+        while scene.is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
             if let Some(s) = page.pump_and_relayout(&rect) {
                 scene = Some(s);
@@ -1645,6 +1664,7 @@ mod tests {
 
     #[test]
     fn pump_without_dom_mutation_skips_relayout() {
+        let _env = lock_layout_assert_env();
         // A page with no async work and no pending mutations: pumping must
         // return None (nothing changed → no wasted re-layout).
         let html = "<html><body><p id=\"p\">hi</p></body></html>";

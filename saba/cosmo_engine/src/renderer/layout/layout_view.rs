@@ -512,6 +512,54 @@ impl LayoutView {
     /// CSS 2.2 §17.5.3: "The height of each row is determined by the cells it
     /// contains." After that equalization, all cells in the same row share the
     /// same rendered height, which is the only way to produce aligned borders.
+    /// Lay out every table cell's inline content now that the column pass has
+    /// given it its final width. Returns whether any cell was laid out.
+    fn layout_table_cell_contents(node: &Option<Rc<RefCell<LayoutObject>>>) -> bool {
+        let Some(n) = node else { return false };
+        let mut changed = false;
+        if n.borrow().is_table_cell() {
+            changed |= LayoutObject::layout_inline_context(n);
+        }
+        let first_child = n.borrow().first_child();
+        changed |= Self::layout_table_cell_contents(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        changed |= Self::layout_table_cell_contents(&next_sibling);
+        changed
+    }
+
+    /// Recompute each row's height from its cells and each table's from its
+    /// rows. The size pass already did this, but laying out cell contents at
+    /// the final column widths can change how many lines a cell needs.
+    fn rebuild_table_heights(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(n) = node else { return };
+        // Depth first: inner tables settle before the rows that contain them.
+        let first_child = n.borrow().first_child();
+        Self::rebuild_table_heights(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        Self::rebuild_table_heights(&next_sibling);
+
+        if n.borrow().is_table_row() {
+            let mut tallest = 0;
+            let mut cell = n.borrow().first_child();
+            while let Some(c) = cell {
+                if c.borrow().is_table_cell() {
+                    tallest = tallest.max(c.borrow().size().height());
+                }
+                let next = c.borrow().next_sibling();
+                cell = next;
+            }
+            if tallest > n.borrow().size().height() {
+                n.borrow_mut().force_set_height(tallest);
+            }
+        } else if n.borrow().is_table() {
+            let rows = Self::collect_logical_rows(n);
+            let total: i64 = rows.iter().map(|r| r.borrow().size().height()).sum();
+            if total > n.borrow().size().height() {
+                n.borrow_mut().force_set_height(total);
+            }
+        }
+    }
+
     fn equalize_cell_heights_in_rows(node: &Option<Rc<RefCell<LayoutObject>>>) {
         let Some(n) = node else { return };
 
@@ -753,6 +801,15 @@ impl LayoutView {
         Self::adjust_rowspan_heights(&self.root);
         Self::equalize_cell_heights_in_rows(&self.root);
         Self::equalize_column_widths_in_tables(&self.root);
+        // Table cells only learn their final width from the column pass above,
+        // so their inline content is laid out here rather than during the size
+        // pass — then the row and table heights are rebuilt from whatever the
+        // new line counts made the cells.
+        if use_new_inline() && Self::layout_table_cell_contents(&self.root) {
+            Self::rebuild_table_heights(&self.root);
+            Self::adjust_rowspan_heights(&self.root);
+            Self::equalize_cell_heights_in_rows(&self.root);
+        }
         Self::calculate_node_position(
             &self.root,
             LayoutPoint::new(0, 0),

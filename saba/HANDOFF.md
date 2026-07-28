@@ -391,7 +391,27 @@
 >   flex/grid コンテナ(item は blockify されるので inline span の集合でも IFC ではない)、
 >   `white-space: nowrap/pre`・ellipsis。ベースラインはエンジン既存の規約(box 上端から1font-size)に合わせた。
 >   A/B(全 reftest + HN/MDN/Wikipedia): HN 8px、flex_grid/table_auto 他は画素一致。golden 4件を再ベースライン。
->   **残**: UAX#14(`unicode-linebreak`)、float 帯の接続(2.3 合流)、テーブル/リスト/flex の IFC 化、
+>   ✅ **UAX#14 行分割 (`c19eba2`, ブランチ `wip/inline-uax14-linebreak-2026-07-27`)** —
+>   `unicode-linebreak` で実際の分割機会を取得(**ラン単位で1回**計算。行ごとだと長文で O(n²))。
+>   日本語の句点が行頭に来なくなり(UAX#14 class CL。golden に 「。」の行頭孤立が写っていた)、
+>   `don't` が1語になり、ハイフン後で分割できる。行末の空白は**幅に数えず hang**(CSS Text §4.1)、
+>   ただし行末**でない**フラグメントは後続との区切りなので保持。golden 2件再ベースライン、
+>   HN/MDN 画素一致・Wikipedia 435px、debug ビルドで約 +3.5%。
+>   ✅ **IFC の適用範囲拡大 (`70419e3`/`f8c15de`/`8536b68`)** —
+>   **`<li>`**: マーカーは li 自身が content box の外に描くので子として流れに入らない(除外は前提の誤り
+>   だった)。MDN サイドバーが1行分コンパクトに(旧経路は li の高さを過大に確保していた)。
+>   **`white-space: nowrap`**: 折返し可否は**含みブロックの性質**なので、ラン内だけでなく
+>   **アイテム間の改行も抑止**(`LineOptions`)。ラン単位で unbreakable にするだけでは
+>   2つ目のアイテムが次行に落ちる。
+>   **テーブルセル**: 最終列幅は `equalize_column_widths_in_tables`(サイズパスの**後**)で決まるので、
+>   セルの inline レイアウトはそこで実行し、行/テーブル高さを再構築
+>   (`equalize_cell_heights_in_rows` はセルを行高に**伸ばす**だけで逆はしない)。
+>   セル高さは Block 経路と同じ `2 × cellpadding` を保持(これが無いと全行 2px 詰まり列幅テスト3件が落ちる)。
+>   **超過幅の単語は分割せず溢れる**(`overflow-wrap: normal` = 既定。hard-break は旧 splitter 由来の私のバグ)。
+>   `delta`→`delt`/`a`、`1.`→`1`/`.`、MDN サイドバーの `positionin`/`g` はこれが原因だった。
+>   → **HANDOFF 既知の HN コスメ回帰(1024px で nav の submit が2行目に折返す)が解消**。
+>   reftest 13/13(再ベースライン不要)。
+>   **残**: float 帯のブロックレベル接続(2.3 合流)、`pre`/ellipsis の IFC 化、flex/grid コンテナ、
 >   計測と描画のズレ(インライン要素前の余白。本作業以前から存在)。
 > - 🚧 **Phase 2.3 float 配置 (`4b6f4a6` 土台 + `7966dfd` 結線)** — `FloatContext`
 >   (`place`/`band`/`clearance`/`lowest_bottom`、10テスト)+ `establishes_block_formatting_context`
