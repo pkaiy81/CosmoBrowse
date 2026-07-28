@@ -7,3 +7,4 @@ Cargo.lock
 smoke-artifacts/
 release-artifacts/
 
+saba/testdata/reftests/failures/
