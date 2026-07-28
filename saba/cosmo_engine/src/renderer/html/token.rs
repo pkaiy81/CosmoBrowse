@@ -1,0 +1,1007 @@
+use crate::renderer::html::attribute::Attribute;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtmlToken {
+    // Start tag token
+    StartTag {
+        tag: String,
+        self_closing: bool,
+        attributes: Vec<Attribute>,
+    },
+    // End tag token
+    EndTag {
+        tag: String,
+    },
+    // String token
+    Char(char),
+    // End of file
+    Eof,
+}
+
+// 13.2.5 Tokenization
+// There are 80 states in the HTML specification.
+// But I will implement only the states that are necessary for the rendering engine.
+// TemporaryBuffer is not a state, but it is used in the specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    /// https://html.spec.whatwg.org/multipage/parsing.html#data-state
+    Data,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#tag-open-state
+    TagOpen,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#end-tag-open-state
+    EndTagOpen,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#tag-name-state
+    TagName,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#before-attribute-name-state
+    BeforeAttributeName,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#attribute-name-state
+    AttributeName,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#after-attribute-name-state
+    AfterAttributeName,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#before-attribute-value-state
+    BeforeAttributeValue,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#attribute-value-(double-quoted)-state
+    AttributeValueDoubleQuoted,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#attribute-value-(single-quoted)-state
+    AttributeValueSingleQuoted,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#attribute-value-(unquoted)-state
+    AttributeValueUnquoted,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#after-attribute-value-(quoted)-state
+    AfterAttributeValueQuoted,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#self-closing-start-tag-state
+    SelfClosingStartTag,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#script-data-state
+    ScriptData,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#script-data-less-than-sign-state
+    ScriptDataLessThanSign,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#script-data-end-tag-open-state
+    ScriptDataEndTagOpen,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#script-data-end-tag-name-state
+    ScriptDataEndTagName,
+    /// https://html.spec.whatwg.org/multipage/parsing.html#temporary-buffer
+    TemporaryBuffer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlTokenizer {
+    state: State,
+    pos: usize,
+    reconsume: bool,
+    latest_token: Option<HtmlToken>,
+    input: Vec<char>,
+    buf: String,
+    /// Queue for characters produced by entity decoding (returned one at a time).
+    pending_chars: Vec<char>,
+}
+
+impl HtmlTokenizer {
+    pub fn new(html: String) -> Self {
+        Self {
+            state: State::Data,
+            pos: 0,
+            reconsume: false,
+            latest_token: None,
+            input: html.chars().collect(),
+            buf: String::new(),
+            pending_chars: Vec::new(),
+        }
+    }
+
+    /// Try to decode a character reference starting after '&'.
+    /// Returns decoded char(s) or the raw '&' + consumed chars if not a valid reference.
+    fn try_decode_entity(&mut self) -> Vec<char> {
+        let start = self.pos;
+
+        // Collect chars until ';' or a non-entity char (max 32 chars to avoid runaway).
+        let mut entity = String::new();
+        let mut found_semicolon = false;
+        while self.pos < self.input.len() && entity.len() < 32 {
+            let ch = self.input[self.pos];
+            self.pos += 1;
+            if ch == ';' {
+                found_semicolon = true;
+                break;
+            }
+            if !ch.is_ascii_alphanumeric() && ch != '#' {
+                // Not a valid entity character — rewind and return '&' as-is.
+                self.pos = start;
+                return vec!['&'];
+            }
+            entity.push(ch);
+        }
+
+        if !found_semicolon {
+            self.pos = start;
+            return vec!['&'];
+        }
+
+        // Numeric reference: &#123; or &#xAB;
+        if entity.starts_with('#') {
+            let num_part = &entity[1..];
+            let code_point = if num_part.starts_with('x') || num_part.starts_with('X') {
+                u32::from_str_radix(&num_part[1..], 16).ok()
+            } else {
+                num_part.parse::<u32>().ok()
+            };
+            if let Some(cp) = code_point {
+                if let Some(ch) = char::from_u32(cp) {
+                    return vec![ch];
+                }
+            }
+            // Invalid numeric reference — return raw text.
+            self.pos = start;
+            return vec!['&'];
+        }
+
+        // Named entity lookup.
+        if let Some(decoded) = decode_named_entity(&entity) {
+            decoded.chars().collect()
+        } else {
+            self.pos = start;
+            vec!['&']
+        }
+    }
+
+    // HTML "ASCII whitespace": space, tab, LF, FF, CR — the tag/attribute
+    // states must treat ALL of these as separators, not just ' '. Pretty-
+    // printed HTML routinely breaks lines INSIDE tags.
+    // https://infra.spec.whatwg.org/#ascii-whitespace
+    fn is_html_ws(c: char) -> bool {
+        matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+    }
+
+    // Check if the current position is the end of the file
+    fn is_eof(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+
+    // Current position moved to the next character.  Returns '\0' if past EOF
+    // — callers should consult is_eof() to terminate, but this guard prevents
+    // an out-of-bounds index panic if a state branch forgets to.
+    fn consume_next_input(&mut self) -> char {
+        let c = if self.pos < self.input.len() {
+            self.input[self.pos]
+        } else {
+            '\0'
+        };
+        self.pos += 1;
+        c
+    }
+
+    // Create a tag
+    // If start_tag_token is true, create a StartTag token
+    // Otherwise, create an EndTag token
+    fn create_tag(&mut self, start_tag_token: bool) {
+        if start_tag_token {
+            self.latest_token = Some(HtmlToken::StartTag {
+                tag: String::new(),
+                self_closing: false,
+                attributes: Vec::new(),
+            });
+        } else {
+            self.latest_token = Some(HtmlToken::EndTag { tag: String::new() })
+        }
+    }
+
+    // Set reconsume flag to false
+    // Return the character before the current position
+    fn reconsume_input(&mut self) -> char {
+        self.reconsume = false;
+        self.input[self.pos - 1]
+    }
+
+    // Append the character to the tag name in the latest_token created by create_tag
+    fn append_tag_name(&mut self, c: char) {
+        assert!(self.latest_token.is_some());
+
+        if let Some(t) = self.latest_token.as_mut() {
+            match t {
+                HtmlToken::StartTag {
+                    ref mut tag,
+                    self_closing: _, // Ignore self_closing
+                    attributes: _,   // Ignore attributes
+                }
+                | HtmlToken::EndTag { ref mut tag } => tag.push(c),
+                // Real-world HTML can drive the state machine into shapes the
+                // tokenizer doesn't anticipate; swallow rather than crash.
+                _ => {}
+            }
+        }
+    }
+
+    // Take the latest_token and return it
+    fn take_latest_token(&mut self) -> Option<HtmlToken> {
+        assert!(self.latest_token.is_some());
+
+        let t = self.latest_token.as_ref().cloned();
+        self.latest_token = None;
+        assert!(self.latest_token.is_none());
+
+        t
+    }
+
+    // Emit the latest token and move to the correct follow-up state.
+    //
+    // A `<script>` start tag must transition into the *script data* state so
+    // the JavaScript inside is consumed as raw text. Otherwise minified JS —
+    // which is dense with `<`, `>` and `</` (e.g. `a<b`, `e>6e4`, regex
+    // literals) — is tokenized as HTML, producing hundreds of thousands of
+    // bogus elements. That explodes the DOM and the CSS cascade in
+    // `LayoutView::new` then effectively hangs the renderer on real-world
+    // pages. All other tags fall back to the data state as before.
+    // Spec: https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-incdata
+    fn emit_latest_token(&mut self) -> Option<HtmlToken> {
+        let token = self.take_latest_token();
+        self.state = match token {
+            Some(HtmlToken::StartTag { ref tag, .. }) if tag.eq_ignore_ascii_case("script") => {
+                State::ScriptData
+            }
+            _ => State::Data,
+        };
+        token
+    }
+
+    // Start a new attribute
+    // Create a new Attribute and append it to the latest_token
+    fn start_new_attribute(&mut self) {
+        assert!(self.latest_token.is_some());
+
+        if let Some(t) = self.latest_token.as_mut() {
+            match t {
+                HtmlToken::StartTag {
+                    tag: _,
+                    self_closing: _, // Ignore self_closing
+                    ref mut attributes,
+                } => {
+                    attributes.push(Attribute::new());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Append the attribute to the latest_token created by create_tag
+    fn append_attribute(&mut self, c: char, is_name: bool) {
+        assert!(self.latest_token.is_some());
+
+        if let Some(t) = self.latest_token.as_mut() {
+            match t {
+                HtmlToken::StartTag {
+                    tag: _,
+                    self_closing: _, // Ignore self_closing
+                    ref mut attributes,
+                } => {
+                    let len = attributes.len();
+                    assert!(len > 0);
+
+                    attributes[len - 1].add_char(c, is_name);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Set the self_closing flag to true when the latest_token is a StartTag
+    fn set_self_closing_flag(&mut self) {
+        assert!(self.latest_token.is_some());
+
+        if let Some(t) = self.latest_token.as_mut() {
+            match t {
+                HtmlToken::StartTag {
+                    tag: _,
+                    ref mut self_closing,
+                    attributes: _,
+                } => *self_closing = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+// Implement the Iterator trait for HtmlTokenizer
+// https://doc.rust-lang.org/std/iter/trait.Iterator.html
+impl Iterator for HtmlTokenizer {
+    type Item = HtmlToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Return queued characters from entity decoding first.
+        if !self.pending_chars.is_empty() {
+            let ch = self.pending_chars.remove(0);
+            return Some(HtmlToken::Char(ch));
+        }
+
+        if self.pos >= self.input.len() {
+            return None;
+        }
+
+        loop {
+            let c = match self.reconsume {
+                true => self.reconsume_input(),
+                false => self.consume_next_input(),
+            };
+
+            // Implement the states here
+            match self.state {
+                State::Data => {
+                    // If character is '<', switch to TagOpen state
+                    // Also, if character is EOF, return Eof token
+                    // Otherwise, return Char token
+                    if c == '<' {
+                        self.state = State::TagOpen;
+                        continue;
+                    }
+
+                    // EOF only when the consume ran PAST the end (pos is
+                    // already incremented, so pos == len means `c` is the
+                    // real final character — it must still be emitted, not
+                    // swallowed).
+                    if self.pos > self.input.len() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    // Character reference (entity) decoding.
+                    if c == '&' {
+                        let decoded = self.try_decode_entity();
+                        let first = decoded[0];
+                        for ch in decoded.into_iter().skip(1) {
+                            self.pending_chars.push(ch);
+                        }
+                        return Some(HtmlToken::Char(first));
+                    }
+
+                    return Some(HtmlToken::Char(c));
+                }
+
+                State::TagOpen => {
+                    // If character is '/', switch to EndTagOpen state
+                    // If character is an ASCII letter, switch to TagName state
+                    // Otherwise, return Char token
+                    if c == '/' {
+                        self.state = State::EndTagOpen;
+                        continue;
+                    }
+
+                    // Handle markup declarations: comments (<!--) and DOCTYPE (<!DOCTYPE).
+                    if c == '!' {
+                        // Peek ahead for comment start "--".
+                        if self.pos + 1 < self.input.len()
+                            && self.input[self.pos] == '-'
+                            && self.input[self.pos + 1] == '-'
+                        {
+                            // Skip the two dashes.
+                            self.pos += 2;
+                            // Consume until "-->" or EOF.
+                            loop {
+                                if self.pos + 2 < self.input.len()
+                                    && self.input[self.pos] == '-'
+                                    && self.input[self.pos + 1] == '-'
+                                    && self.input[self.pos + 2] == '>'
+                                {
+                                    self.pos += 3;
+                                    break;
+                                }
+                                if self.pos >= self.input.len() {
+                                    break;
+                                }
+                                self.pos += 1;
+                            }
+                            self.state = State::Data;
+                            continue;
+                        }
+                        // Skip <!DOCTYPE ...> or other <! declarations.
+                        loop {
+                            if self.pos >= self.input.len() {
+                                break;
+                            }
+                            if self.input[self.pos] == '>' {
+                                self.pos += 1;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                        self.state = State::Data;
+                        continue;
+                    }
+
+                    // `<?` begins a bogus comment (e.g. a stray processing
+                    // instruction like `<?>` or `<?xml ...?>`): consume up to
+                    // and including the next `>` and discard it. Otherwise the
+                    // `?` and the closing `>` leaked into the page as text.
+                    // https://html.spec.whatwg.org/multipage/parsing.html#tag-open-state
+                    if c == '?' {
+                        loop {
+                            if self.is_eof() {
+                                break;
+                            }
+                            if self.input[self.pos] == '>' {
+                                self.pos += 1;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                        self.state = State::Data;
+                        continue;
+                    }
+
+                    if c.is_ascii_alphabetic() {
+                        self.reconsume = true;
+                        self.state = State::TagName;
+                        self.create_tag(true);
+                        continue;
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::Data;
+                }
+
+                // EndTagOpen state handles end tags.
+                // If character achieves the end of file, return Eof token.
+                // If character is an ASCII letter, switch to TagName state
+                State::EndTagOpen => {
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    if c.is_ascii_alphabetic() {
+                        self.reconsume = true;
+                        self.state = State::TagName;
+                        self.create_tag(false);
+                        continue;
+                    }
+                }
+
+                // TagName state handles tag names.
+                // 1. If character is a whitespace character, switch to BeforeAttributeName state
+                // 2. If character is '/', switch to SelfClosingStartTag state
+                // 3. If character is '>', switch to Data state and return the latest_token created by create_tag
+                // 4. If character is an ASCII alpha, append the character to the tag name
+                // 5. IF character achieves the end of file, return Eof token
+                // 6. Otherwise, append the character to the tag name
+                State::TagName => {
+                    if Self::is_html_ws(c) {
+                        self.state = State::BeforeAttributeName;
+                        continue;
+                    }
+
+                    if c == '/' {
+                        self.state = State::SelfClosingStartTag;
+                        continue;
+                    }
+
+                    if c == '>' {
+                        return self.emit_latest_token();
+                    }
+
+                    if c.is_ascii_uppercase() {
+                        self.append_tag_name(c.to_ascii_lowercase());
+                        continue;
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    self.append_tag_name(c);
+                }
+
+                // BeforeAttributeName state handles attributes.
+                // 1. If character is '/' or '>' or EOF, set the reconsume flag to true and switch to AfterAttributeName state.
+                // 2. Otherwise, switch to AttributeName state and call start_new_attribute method.
+                State::BeforeAttributeName => {
+                    if c == '/' || c == '>' || self.is_eof() {
+                        self.reconsume = true;
+                        self.state = State::AfterAttributeName;
+                        continue;
+                    }
+
+                    if Self::is_html_ws(c) {
+                        // Ignore whitespace between attributes.
+                        continue;
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::AttributeName;
+                    self.start_new_attribute();
+                }
+
+                // AttributeName state handles attribute names.
+                // 1. If character is a whitespace, '/', '>', or EOF, switch to AfterAttributeName state.
+                //    Then, set the reconsume flag to true.
+                // 2. If character is '=', switch to BeforeAttributeValue state.
+                // 3. Otherwise, call append_attribute method.
+                State::AttributeName => {
+                    if Self::is_html_ws(c) || c == '/' || c == '>' || self.is_eof() {
+                        self.reconsume = true;
+                        self.state = State::AfterAttributeName;
+                        continue;
+                    }
+
+                    if c == '=' {
+                        self.state = State::BeforeAttributeValue;
+                        continue;
+                    }
+
+                    if c.is_ascii_uppercase() {
+                        self.append_attribute(c.to_ascii_lowercase(), /* is_name = */ true);
+                        continue;
+                    }
+
+                    self.append_attribute(c, /* is_name = */ true);
+                }
+
+                // AfterAttributeName state handles attributes.
+                // 1. If character is '/', switch to SelfClosingStartTag state.
+                // 2. If character is '=', switch to BeforeAttributeValue state.
+                // 3. If character is '>', switch to Data state and return the latest_token.
+                // 4. If character is EOF, return Eof token.
+                // 5. Otherwise, set the reconsume flag to true and switch to AttributeName state.
+                //    Then, call start_new_attribute method.
+                State::AfterAttributeName => {
+                    if Self::is_html_ws(c) {
+                        // Ignore whitespace
+                        continue;
+                    }
+
+                    if c == '/' {
+                        self.state = State::SelfClosingStartTag;
+                        continue;
+                    }
+
+                    if c == '=' {
+                        self.state = State::BeforeAttributeValue;
+                        continue;
+                    }
+
+                    if c == '>' {
+                        return self.emit_latest_token();
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::AttributeName;
+                    self.start_new_attribute();
+                }
+
+                // BeforeAttributeValue state handles attribute values.
+                // 1. If character is '"', switch to AttributeValueDoubleQuoted state.
+                // 2. If character is "'", switch to AttributeValueSingleQuoted state.
+                // 3. Otherwise, set the reconsume flag to true and switch to AttributeValueUnquoted state.
+                State::BeforeAttributeValue => {
+                    if c == ' ' {
+                        // Ignore whitespace
+                        continue;
+                    }
+
+                    if c == '"' {
+                        self.state = State::AttributeValueDoubleQuoted;
+                        continue;
+                    }
+
+                    if c == '\'' {
+                        self.state = State::AttributeValueSingleQuoted;
+                        continue;
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::AttributeValueUnquoted;
+                }
+
+                // AttributeValueDoubleQuoted state handles attribute values.
+                // 1. If character is '"', switch to AfterAttributeValueQuoted state.
+                // 2. If character is EOF, return Eof token.
+                // 3. Otherwise, call append_attribute method.
+                State::AttributeValueDoubleQuoted => {
+                    if c == '"' {
+                        self.state = State::AfterAttributeValueQuoted;
+                        continue;
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    if c == '&' {
+                        let decoded = self.try_decode_entity();
+                        for ch in decoded {
+                            self.append_attribute(ch, false);
+                        }
+                        continue;
+                    }
+
+                    self.append_attribute(c, /* is_name = */ false);
+                }
+
+                // AttributeValueSingleQuoted state handles attribute values.
+                // 1. If character is "'", switch to AfterAttributeValueQuoted state.
+                // 2. If character is EOF, return Eof token.
+                // 3. Otherwise, call append_attribute method.
+                State::AttributeValueSingleQuoted => {
+                    if c == '\'' {
+                        self.state = State::AfterAttributeValueQuoted;
+                        continue;
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    if c == '&' {
+                        let decoded = self.try_decode_entity();
+                        for ch in decoded {
+                            self.append_attribute(ch, false);
+                        }
+                        continue;
+                    }
+
+                    self.append_attribute(c, /* is_name = */ false);
+                }
+
+                // AttributeValueUnquoted state handles attribute values.
+                // 1. If character is a whitespace, switch to BeforeAttributeName state.
+                // 2. If character is '>', switch to Data state and return the latest_token.
+                // 3. If character is EOF, return Eof token.
+                // 4. Otherwise, call append_attribute method.
+                State::AttributeValueUnquoted => {
+                    if Self::is_html_ws(c) {
+                        self.state = State::BeforeAttributeName;
+                        continue;
+                    }
+
+                    if c == '>' {
+                        return self.emit_latest_token();
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    self.append_attribute(c, /* is_name = */ false);
+                }
+
+                // AfterAttributeValueQuoted state handles attribute values.
+                // 1. If character is a whitespace, switch to BeforeAttributeName state.
+                // 2. If character is '/', switch to SelfClosingStartTag state.
+                // 3. If character is '>', switch to Data state and return the latest_token.
+                // 4. If character is EOF, return Eof token.
+                // 5. Otherwise, set the reconsume flag to true and switch to BeforeAttributeName state.
+                State::AfterAttributeValueQuoted => {
+                    if c == ' ' {
+                        self.state = State::BeforeAttributeName;
+                        continue;
+                    }
+
+                    if c == '/' {
+                        self.state = State::SelfClosingStartTag;
+                        continue;
+                    }
+
+                    if c == '>' {
+                        return self.emit_latest_token();
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::BeforeAttributeName;
+                }
+
+                // SelfClosingStartTag state handles self-closing tags.
+                // 1. If character is '>', call set_self_closing_flag method and switch to Data state.
+                //    Then, return the latest_token.
+                // 2. If character is EOF, return Eof token.
+                State::SelfClosingStartTag => {
+                    if c == '>' {
+                        self.set_self_closing_flag();
+                        return self.emit_latest_token();
+                    }
+
+                    if self.is_eof() {
+                        // invalid parse error
+                        return Some(HtmlToken::Eof);
+                    }
+                }
+
+                // ScriptData state handles script data.
+                // 1. If character is '<', switch to ScriptDataLessThanSign state.
+                // 2. If character is EOF, return Eof token.
+                // 3. Otherwise, return Char token.
+                State::ScriptData => {
+                    if c == '<' {
+                        self.state = State::ScriptDataLessThanSign;
+                        continue;
+                    }
+
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+
+                    return Some(HtmlToken::Char(c));
+                }
+
+                // ScriptDataLessThanSign state handles script data.
+                // This state decides if the character is '</script' or simply literal characters.
+                // 1. If character is '/', reset the temporary buffer and switch to ScriptDataEndTagOpen state.
+                // 2. Otherwise, set reconsume flag to true and switch to ScriptData state. Then, return Char token.
+                State::ScriptDataLessThanSign => {
+                    if c == '/' {
+                        // Reset the temporary buffer with an empty string
+                        self.buf = String::new();
+                        self.state = State::ScriptDataEndTagOpen;
+                        continue;
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::ScriptData;
+                    return Some(HtmlToken::Char('<'));
+                }
+
+                // ScriptDataEndTagOpen state handles script data.
+                // 1. If character is an alpabetic character, set reconsume flag to true and switch to ScriptDataEndTagName state.
+                //    Then, call create_tag method to create an EndTag.
+                // 2. Otherwise, set reconsume flag to true and switch to ScriptData state. Then, return Char token.
+                State::ScriptDataEndTagOpen => {
+                    if c.is_ascii_alphabetic() {
+                        self.reconsume = true;
+                        self.state = State::ScriptDataEndTagName;
+                        self.create_tag(false);
+                        continue;
+                    }
+
+                    self.reconsume = true;
+                    self.state = State::ScriptData;
+                    // The specification says to return '<' and '/' characters.
+                    // But I will return '<' character only.
+                    return Some(HtmlToken::Char('<'));
+                }
+
+                // ScriptDataEndTagName state handles script data.
+                // 1. If character is '>', switch to ScriptData state. Then, return the latest_token.
+                // 2. If character is an alpabetic character, set reconsume flag to true and append the character to the temporary buffer.
+                //    Then, call append_tag_name method.
+                // 3. Otherwise, switch to TemporaryBuffer state and append '</' and current character to the temporary buffer.
+                State::ScriptDataEndTagName => {
+                    // Only an *appropriate* end tag (`</script>`) terminates
+                    // script data. A stray `</div>` etc. inside JS/JSON must be
+                    // treated as literal script text — otherwise the script
+                    // closes early and its source is dumped into the page.
+                    // Spec: https://html.spec.whatwg.org/multipage/parsing.html#script-data-end-tag-name-state
+                    if c == '>' && self.buf.eq_ignore_ascii_case("script") {
+                        return self.emit_latest_token();
+                    }
+
+                    if c.is_ascii_alphabetic() {
+                        self.buf.push(c);
+                        self.append_tag_name(c.to_ascii_lowercase());
+                        continue;
+                    }
+
+                    // Not `</script>`: emit "</" + buffer (+ this char) as raw
+                    // script-data characters and resume script data.
+                    self.state = State::TemporaryBuffer;
+                    self.buf = String::from("</") + &self.buf;
+                    self.buf.push(c);
+                    continue;
+                }
+
+                // TemporaryBuffer state handles script data.
+                // This state is not in the specification.
+                State::TemporaryBuffer => {
+                    self.reconsume = true;
+
+                    if self.buf.chars().count() == 0 {
+                        self.state = State::ScriptData;
+                        continue;
+                    }
+
+                    // Delete the first character
+                    let c = self
+                        .buf
+                        .chars()
+                        .nth(0)
+                        .expect("self.buf should have at least 1 character");
+                    self.buf.remove(0);
+                    return Some(HtmlToken::Char(c));
+                }
+            }
+        }
+    }
+}
+
+fn decode_named_entity(name: &str) -> Option<&'static str> {
+    match name {
+        "amp" => Some("&"),
+        "lt" => Some("<"),
+        "gt" => Some(">"),
+        "quot" => Some("\""),
+        "apos" => Some("'"),
+        "nbsp" => Some("\u{00A0}"),
+        "copy" => Some("\u{00A9}"),
+        "reg" => Some("\u{00AE}"),
+        "trade" => Some("\u{2122}"),
+        "mdash" => Some("\u{2014}"),
+        "ndash" => Some("\u{2013}"),
+        "laquo" => Some("\u{00AB}"),
+        "raquo" => Some("\u{00BB}"),
+        "bull" => Some("\u{2022}"),
+        "hellip" => Some("\u{2026}"),
+        "prime" => Some("\u{2032}"),
+        "Prime" => Some("\u{2033}"),
+        "lsquo" => Some("\u{2018}"),
+        "rsquo" => Some("\u{2019}"),
+        "ldquo" => Some("\u{201C}"),
+        "rdquo" => Some("\u{201D}"),
+        "ensp" => Some("\u{2002}"),
+        "emsp" => Some("\u{2003}"),
+        "thinsp" => Some("\u{2009}"),
+        "times" => Some("\u{00D7}"),
+        "divide" => Some("\u{00F7}"),
+        "minus" => Some("\u{2212}"),
+        "plusmn" => Some("\u{00B1}"),
+        "deg" => Some("\u{00B0}"),
+        "micro" => Some("\u{00B5}"),
+        "para" => Some("\u{00B6}"),
+        "middot" => Some("\u{00B7}"),
+        "frac12" => Some("\u{00BD}"),
+        "frac14" => Some("\u{00BC}"),
+        "frac34" => Some("\u{00BE}"),
+        "iexcl" => Some("\u{00A1}"),
+        "iquest" => Some("\u{00BF}"),
+        "cent" => Some("\u{00A2}"),
+        "pound" => Some("\u{00A3}"),
+        "yen" => Some("\u{00A5}"),
+        "euro" => Some("\u{20AC}"),
+        "sect" => Some("\u{00A7}"),
+        "larr" => Some("\u{2190}"),
+        "uarr" => Some("\u{2191}"),
+        "rarr" => Some("\u{2192}"),
+        "darr" => Some("\u{2193}"),
+        "hearts" => Some("\u{2665}"),
+        "diams" => Some("\u{2666}"),
+        "clubs" => Some("\u{2663}"),
+        "spades" => Some("\u{2660}"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::string::ToString;
+    use std::vec;
+
+    #[test]
+    fn test_empty() {
+        let html = "".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        assert!(tokenizer.next().is_none());
+    }
+
+    #[test]
+    fn test_start_and_end_tag() {
+        let html = "<body></body>".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let expected = [
+            HtmlToken::StartTag {
+                tag: "body".to_string(),
+                self_closing: false,
+                attributes: Vec::new(),
+            },
+            HtmlToken::EndTag {
+                tag: "body".to_string(),
+            },
+        ];
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_attributes() {
+        let html = "<p class=\"A\" id='B' foo=bar></p>".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let mut attr1 = Attribute::new();
+        attr1.add_char('c', true);
+        attr1.add_char('l', true);
+        attr1.add_char('a', true);
+        attr1.add_char('s', true);
+        attr1.add_char('s', true);
+        attr1.add_char('A', false);
+
+        let mut attr2 = Attribute::new();
+        attr2.add_char('i', true);
+        attr2.add_char('d', true);
+        attr2.add_char('B', false);
+
+        let mut attr3 = Attribute::new();
+        attr3.add_char('f', true);
+        attr3.add_char('o', true);
+        attr3.add_char('o', true);
+        attr3.add_char('b', false);
+        attr3.add_char('a', false);
+        attr3.add_char('r', false);
+
+        let expected = [
+            HtmlToken::StartTag {
+                tag: "p".to_string(),
+                self_closing: false,
+                attributes: vec![attr1, attr2, attr3],
+            },
+            HtmlToken::EndTag {
+                tag: "p".to_string(),
+            },
+        ];
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_self_closing_tag() {
+        let html = "<img />".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let expected = [HtmlToken::StartTag {
+            tag: "img".to_string(),
+            self_closing: true,
+            attributes: Vec::new(),
+        }];
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_script_tag() {
+        let html = "<script>js code;</script>".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let expected = [
+            HtmlToken::StartTag {
+                tag: "script".to_string(),
+                self_closing: false,
+                attributes: Vec::new(),
+            },
+            HtmlToken::Char('j'),
+            HtmlToken::Char('s'),
+            HtmlToken::Char(' '),
+            HtmlToken::Char('c'),
+            HtmlToken::Char('o'),
+            HtmlToken::Char('d'),
+            HtmlToken::Char('e'),
+            HtmlToken::Char(';'),
+            HtmlToken::EndTag {
+                tag: "script".to_string(),
+            },
+        ];
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_bogus_comment_question_mark_is_discarded() {
+        // `<?>` and `<?xml ...?>` are bogus comments: nothing between `<?`
+        // and the next `>` reaches the token stream.
+        let html = "a<?>b<?xml version=\"1.0\"?>c".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let mut chars = String::new();
+        while let Some(tok) = tokenizer.next() {
+            match tok {
+                HtmlToken::Char(c) => chars.push(c),
+                HtmlToken::Eof => break,
+                other => panic!("unexpected token: {:?}", other),
+            }
+        }
+        assert_eq!(chars, "abc");
+    }
+}

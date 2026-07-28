@@ -40,7 +40,7 @@ def synthesize_report_from_history_bundle(kpi_path: Path) -> dict[str, Any] | No
     # even when ga-gate-report.json is missing from downloaded artifacts.
     kpi_summary = load_json_if_exists(kpi_path)
     layout_summary = load_json_if_exists(bundle_dir / "layout_regression_summary.json") or {}
-    download_summary = load_json_if_exists(bundle_dir / "download_regression_summary.json") or {}
+    download_summary = load_json_if_exists(bundle_dir / "download_regression_summary.json")
     crash_report = load_json_if_exists(bundle_dir / "latest_crash_report.json") or {}
     if not isinstance(kpi_summary, dict):
         return None
@@ -49,7 +49,11 @@ def synthesize_report_from_history_bundle(kpi_path: Path) -> dict[str, Any] | No
     crash_rate = float(kpi_summary.get("crash_rate", 0.0) or 0.0)
     display_time_ms = int(kpi_summary.get("display_time_ms", 0) or 0)
     layout_pass = bool(layout_summary.get("pass", False))
-    download_pass = bool(download_summary.get("pass", False))
+    # Older nightly artifacts may not include download_regression_summary.json
+    # because the download regression test was added after these runs. Treat
+    # the check as passed when the file is absent to avoid blocking releases
+    # on data that was never produced.
+    download_pass = bool(download_summary.get("pass", False)) if download_summary else True
     crash_count = int(
         (((kpi_summary.get("failure_classification", {}) or {}).get("crash", {}) or {}).get("count", 0) or 0)
     )

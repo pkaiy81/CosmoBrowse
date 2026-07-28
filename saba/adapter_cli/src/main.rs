@@ -1,13 +1,10 @@
-use cosmo_core::nebula_renderer::css::cssom::CssParser;
-use cosmo_core::nebula_renderer::css::token::CssTokenizer;
-use cosmo_core::nebula_renderer::dom::api::{get_js_content, get_style_content};
-use cosmo_core::nebula_renderer::html::parser::HtmlParser;
-use cosmo_core::nebula_renderer::html::token::HtmlTokenizer;
-use cosmo_core::nebula_renderer::js::ast::JsParser;
-use cosmo_core::nebula_renderer::js::runtime::JsRuntime;
-use cosmo_core::nebula_renderer::js::token::JsLexer;
-use cosmo_core::nebula_renderer::layout::layout_view::LayoutView;
-use cosmo_runtime::{AppService, PageViewModel, StarshipApp};
+use cosmo_engine::renderer::css::cssom::CssParser;
+use cosmo_engine::renderer::css::token::CssTokenizer;
+use cosmo_engine::renderer::dom::api::{get_element_by_id, get_js_content, get_style_content};
+use cosmo_engine::renderer::html::parser::HtmlParser;
+use cosmo_engine::renderer::html::token::HtmlTokenizer;
+use cosmo_engine::renderer::layout::layout_view::LayoutView;
+use cosmo_runtime::{AppService, PageViewModel, BrowserApp};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -101,7 +98,7 @@ fn optional_arg(args: &[String], index: usize) -> Option<String> {
 }
 
 fn open_url(url: &str) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     match app.open_url(url) {
         Ok(view) => {
             print_page_summary(&view);
@@ -115,7 +112,7 @@ fn open_url(url: &str) -> Result<(), ()> {
 }
 
 fn get_snapshot(url: &str) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -127,7 +124,7 @@ fn get_snapshot(url: &str) -> Result<(), ()> {
 }
 
 fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -146,7 +143,7 @@ fn activate_link(url: &str, frame_id: &str, href: &str, target: Option<&str>) ->
 }
 
 fn show_metrics(url: &str) -> Result<(), ()> {
-    let mut app = StarshipApp::default();
+    let mut app = BrowserApp::default();
     if let Err(error) = app.open_url(url) {
         eprintln!("open_url failed [{}]: {}", error.code, error.message);
         return Err(());
@@ -166,20 +163,27 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
     let dom = window.borrow().document();
 
     let script = get_js_content(dom.clone());
-    let mut runtime = JsRuntime::new(dom.clone());
+    let mut host = cosmo_script::ScriptHost::new();
+    host.set_document(dom.clone());
     if !script.trim().is_empty() {
-        let lexer = JsLexer::new(script);
-        let mut parser = JsParser::new(lexer);
-        let program = parser.parse_ast();
-        runtime.execute(&program);
+        if let Err(error) = host.eval_to_string(&script) {
+            eprintln!("script error: {error}");
+        }
+        // The document is parsed by now: fire DOMContentLoaded so handlers
+        // registered for it run, as the parser does at "the end".
+        host.fire_dom_content_loaded();
+        host.run_initial_load(1000);
     }
 
     if let Some(target_id) = click_target_id {
         // Spec: input/change/click are dispatched through EventTarget dispatch steps.
         // https://dom.spec.whatwg.org/#concept-event-dispatch
-        runtime.dispatch_input(target_id);
-        runtime.dispatch_change(target_id);
-        runtime.dispatch_click(target_id);
+        if let Some(target) = get_element_by_id(Some(dom.clone()), &target_id.to_string()) {
+            for event in ["input", "change", "click"] {
+                host.dispatch_event(target.clone(), event);
+            }
+            host.run_initial_load(1000);
+        }
     }
 
     let style = get_style_content(dom.clone());
@@ -189,18 +193,21 @@ fn verify_event_loop(fixture_path: &str, click_target_id: Option<&str>) -> Resul
 
     println!("fixture: {fixture_path}");
     println!("click_target_id: {}", click_target_id.unwrap_or("<none>"));
+    println!("display_items: {}", display_items.len());
+    // Whether the scripts mutated the DOM, i.e. whether the render pipeline has
+    // to run again. The DOM mutation generation is what the runtime itself uses
+    // to decide that (`LivePage::pump_and_relayout`).
     println!(
         "render_pipeline_invalidated: {}",
-        runtime.render_pipeline_invalidated()
+        host.dom_generation() > 0
     );
-    println!("display_items: {}", display_items.len());
 
-    let diagnostics = runtime.unsupported_apis();
+    let diagnostics = host.take_console_log();
     if diagnostics.is_empty() {
-        println!("diagnostics: <none>");
+        println!("console: <none>");
     } else {
         for line in diagnostics {
-            println!("diagnostic: {line}");
+            println!("console: {line}");
         }
     }
 

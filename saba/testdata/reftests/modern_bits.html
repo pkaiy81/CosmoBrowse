@@ -1,0 +1,23 @@
+<html>
+<head>
+<style>
+  body { background-color: #f0f2f5; }
+  .card { width: 300px; background-color: #ffffff; border-radius: 12px; box-shadow: 2px 3px 8px #99a; padding: 14px; margin: 16px; }
+  .pill { display: inline-block; background-color: #4488ee; color: #ffffff; padding: 4px; border-radius: 8px; }
+  .clipbox { width: 220px; white-space: nowrap; overflow-x: hidden; text-overflow: ellipsis; background-color: #ffffff; }
+  .deco::before { content: "★ "; }
+  .deco::after { content: " ✔"; }
+  .spun { width: 120px; background-color: #cc4444; color: #ffffff; transform: rotate(6deg); padding: 6px; }
+  .varbox { --brand: #227755; color: var(--brand); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="pill">rounded pill</span>
+    <p class="deco">generated content around this line</p>
+    <div class="clipbox">this single line is too long to fit and must be ellipsized</div>
+    <p class="varbox">custom-property colored text</p>
+  </div>
+  <div class="spun">rotated box</div>
+</body>
+</html>

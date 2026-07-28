@@ -12,7 +12,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SABA_DIR = REPO_ROOT / "saba"
-FRONTEND_DIR = REPO_ROOT / "saba" / "ui" / "cosmo-browse-ui"
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,11 +20,6 @@ def parse_args() -> argparse.Namespace:
         "--skip-rust",
         action="store_true",
         help="Skip Rust checks (cargo check/test)",
-    )
-    parser.add_argument(
-        "--skip-frontend",
-        action="store_true",
-        help="Skip frontend checks (npm ci/build)",
     )
     parser.add_argument(
         "--skip-smoke",
@@ -86,9 +80,9 @@ def main() -> int:
                 "cargo",
                 "check",
                 "-p",
-                "cosmo_core_legacy",
+                "cosmo_engine",
                 "-p",
-                "cosmo_app_legacy",
+                "cosmo_runtime",
                 "-p",
                 "adapter_cli",
             ],
@@ -99,18 +93,14 @@ def main() -> int:
                 "cargo",
                 "test",
                 "-p",
-                "cosmo_core_legacy",
+                "cosmo_engine",
                 "-p",
-                "cosmo_app_legacy",
+                "cosmo_runtime",
                 "-p",
                 "adapter_cli",
             ],
             cwd=SABA_DIR,
         )
-
-    if not args.skip_frontend:
-        run(["npm", "ci"], cwd=FRONTEND_DIR)
-        run(["npm", "run", "build"], cwd=FRONTEND_DIR)
 
     if not args.skip_smoke:
         pr_artifacts = REPO_ROOT / "smoke-artifacts" / "pr"

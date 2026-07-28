@@ -1,0 +1,324 @@
+use crate::renderer::dom::node::Element;
+use crate::renderer::dom::node::ElementKind;
+use crate::renderer::dom::node::Node;
+use crate::renderer::dom::node::NodeKind;
+use std::rc::Rc;
+use std::string::String;
+use std::string::ToString;
+use std::vec::Vec;
+use std::cell::RefCell;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomEventType {
+    DomContentLoaded,
+    Click,
+    Input,
+    Change,
+}
+
+impl DomEventType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "DOMContentLoaded" => Some(Self::DomContentLoaded),
+            "click" => Some(Self::Click),
+            "input" => Some(Self::Input),
+            "change" => Some(Self::Change),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DomApiBinding {
+    root: Rc<RefCell<Node>>,
+    listeners: Vec<(Rc<RefCell<Node>>, DomEventType, String)>,
+}
+
+impl DomApiBinding {
+    pub fn new(root: Rc<RefCell<Node>>) -> Self {
+        Self {
+            root,
+            listeners: Vec::new(),
+        }
+    }
+
+    pub fn document_get_element_by_id(&self, id_name: &str) -> Option<Rc<RefCell<Node>>> {
+        get_element_by_id(Some(self.root.clone()), &id_name.to_string())
+    }
+
+    // Spec: `textContent` setter replaces descendants with a text node.
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    pub fn element_set_text_content(&mut self, target: Rc<RefCell<Node>>, text: &str) {
+        target
+            .borrow_mut()
+            .set_first_child(Some(Rc::new(RefCell::new(Node::new(NodeKind::Text(
+                text.to_string(),
+            ))))));
+    }
+
+    // Spec: event listeners are registered against an event target.
+    // https://dom.spec.whatwg.org/#concept-event-listener
+    pub fn element_add_event_listener(
+        &mut self,
+        target: Rc<RefCell<Node>>,
+        event: DomEventType,
+        callback: String,
+    ) {
+        self.listeners.push((target, event, callback));
+    }
+
+    // Spec: event dispatch invokes listeners registered on the target.
+    // https://dom.spec.whatwg.org/#concept-event-dispatch
+    pub fn dispatch_event(&self, target: Rc<RefCell<Node>>, event: DomEventType) -> Vec<String> {
+        let mut callbacks = Vec::new();
+        for (registered_target, registered_event, callback) in &self.listeners {
+            if Rc::ptr_eq(registered_target, &target) && *registered_event == event {
+                callbacks.push(callback.clone());
+            }
+        }
+        callbacks
+    }
+}
+
+pub fn get_element_by_id(
+    node: Option<Rc<RefCell<Node>>>,
+    id_name: &String,
+) -> Option<Rc<RefCell<Node>>> {
+    match node {
+        Some(n) => {
+            if let NodeKind::Element(e) = n.borrow().kind() {
+                for attr in &e.attributes() {
+                    if attr.name() == "id" && attr.value() == *id_name {
+                        return Some(n.clone());
+                    }
+                }
+            }
+            let result1 = get_element_by_id(n.borrow().first_child(), id_name);
+            let result2 = get_element_by_id(n.borrow().next_sibling(), id_name);
+            if result1.is_none() {
+                return result2;
+            }
+            result1
+        }
+        None => None,
+    }
+}
+
+pub fn get_target_element_node(
+    node: Option<Rc<RefCell<Node>>>,
+    element_kind: ElementKind,
+) -> Option<Rc<RefCell<Node>>> {
+    match node {
+        Some(n) => {
+            if n.borrow().kind()
+                == NodeKind::Element(Element::new(&element_kind.to_string(), Vec::new()))
+            {
+                return Some(n.clone());
+            }
+            let result1 = get_target_element_node(n.borrow().first_child(), element_kind);
+            let result2 = get_target_element_node(n.borrow().next_sibling(), element_kind);
+            if result1.is_none() && result2.is_none() {
+                return None;
+            }
+            if result1.is_none() {
+                return result2;
+            }
+            result1
+        }
+        None => None,
+    }
+}
+
+/// Append the concatenated text of `node` and its descendants to `output`
+/// (the DOM `textContent` read algorithm, simplified).
+pub fn collect_text(node: Option<Rc<RefCell<Node>>>, output: &mut String) {
+    let Some(node) = node else {
+        return;
+    };
+
+    if let NodeKind::Text(text) = node.borrow().kind() {
+        output.push_str(&text);
+    }
+
+    collect_text(node.borrow().first_child(), output);
+    collect_text(node.borrow().next_sibling(), output);
+}
+
+fn collect_tag_texts(node: Option<Rc<RefCell<Node>>>, kind: ElementKind, output: &mut Vec<String>) {
+    let Some(node) = node else {
+        return;
+    };
+
+    if node.borrow().element_kind() == Some(kind) {
+        let mut text = String::new();
+        collect_text(node.borrow().first_child(), &mut text);
+        if !text.is_empty() {
+            output.push(text);
+        }
+    }
+
+    collect_tag_texts(node.borrow().first_child(), kind, output);
+    collect_tag_texts(node.borrow().next_sibling(), kind, output);
+}
+
+fn collect_stylesheet_links_internal(node: Option<Rc<RefCell<Node>>>, output: &mut Vec<String>) {
+    let Some(node) = node else {
+        return;
+    };
+
+    if let NodeKind::Element(element) = node.borrow().kind() {
+        if element.kind() == ElementKind::Link {
+            let rel = element.get_attribute("rel").unwrap_or_default();
+            if rel.eq_ignore_ascii_case("stylesheet") {
+                if let Some(href) = element.get_attribute("href") {
+                    output.push(href);
+                }
+            }
+        }
+    }
+
+    collect_stylesheet_links_internal(node.borrow().first_child(), output);
+    collect_stylesheet_links_internal(node.borrow().next_sibling(), output);
+}
+
+pub fn get_style_content(root: Rc<RefCell<Node>>) -> String {
+    let mut styles = Vec::new();
+    collect_tag_texts(Some(root), ElementKind::Style, &mut styles);
+    styles.join("\n")
+}
+
+pub fn get_js_content(root: Rc<RefCell<Node>>) -> String {
+    // Only collect <script> elements whose `type` is a JavaScript MIME type
+    // (or unset, which per HTML defaults to JavaScript).  CMS pages embed
+    // large JSON/`application/ld+json` blobs inside <script> tags as a way
+    // to ship configuration to their runtime — those payloads must not be
+    // fed to our JavaScript parser, which would either crash or loop
+    // trying to make sense of them.
+    // Spec: HTML Living Standard §4.12.1 — script types.
+    // https://html.spec.whatwg.org/multipage/scripting.html#the-script-element
+    let mut scripts = Vec::new();
+    collect_javascript_texts(Some(root), &mut scripts);
+    scripts.join("\n")
+}
+
+fn collect_javascript_texts(node: Option<Rc<RefCell<Node>>>, output: &mut Vec<String>) {
+    let Some(node) = node else {
+        return;
+    };
+    if let NodeKind::Element(element) = node.borrow().kind() {
+        if element.kind() == ElementKind::Script {
+            let is_js = match element.get_attribute("type") {
+                None => true,
+                Some(t) => {
+                    let t = t.trim().to_ascii_lowercase();
+                    t.is_empty()
+                        || t == "text/javascript"
+                        || t == "application/javascript"
+                        || t == "application/ecmascript"
+                        || t == "module"
+                }
+            };
+            if is_js {
+                let mut text = String::new();
+                collect_text(node.borrow().first_child(), &mut text);
+                if !text.is_empty() {
+                    output.push(text);
+                }
+            }
+        }
+    }
+    collect_javascript_texts(node.borrow().first_child(), output);
+    collect_javascript_texts(node.borrow().next_sibling(), output);
+}
+
+pub fn get_title_content(root: Rc<RefCell<Node>>) -> Option<String> {
+    let mut titles = Vec::new();
+    collect_tag_texts(Some(root), ElementKind::Title, &mut titles);
+    titles
+        .into_iter()
+        .find(|title| !title.trim().is_empty())
+        .map(|title| title.trim().to_string())
+}
+
+pub fn get_stylesheet_links(root: Rc<RefCell<Node>>) -> Vec<String> {
+    let mut links = Vec::new();
+    collect_stylesheet_links_internal(Some(root), &mut links);
+    links
+}
+
+
+/// `querySelectorAll`: every element in `root`'s subtree (document order)
+/// matching the CSS selector string. Reuses the layout engine's selector
+/// matcher; the selector is parsed by wrapping it in an empty rule. A
+/// selector list (`a, .b`) matches the union.
+pub fn query_selector_all(
+    root: Rc<RefCell<Node>>,
+    selector: &str,
+) -> Vec<Rc<RefCell<Node>>> {
+    use crate::renderer::css::cssom::CssParser;
+    use crate::renderer::css::token::CssTokenizer;
+    use crate::renderer::style::selector::dom_node_selected;
+
+    let css = format!("{selector}{{}}");
+    let sheet = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
+    let mut out: Vec<Rc<RefCell<Node>>> = Vec::new();
+    fn walk(
+        node: Option<Rc<RefCell<Node>>>,
+        rules: &[crate::renderer::css::cssom::QualifiedRule],
+        out: &mut Vec<Rc<RefCell<Node>>>,
+    ) {
+        use crate::renderer::style::selector::dom_node_selected;
+        let Some(n) = node else { return };
+        if matches!(n.borrow().kind(), NodeKind::Element(_))
+            && rules.iter().any(|r| dom_node_selected(&n, &r.selector))
+        {
+            out.push(n.clone());
+        }
+        let (first, next) = {
+            let b = n.borrow();
+            (b.first_child(), b.next_sibling())
+        };
+        walk(first, rules, out);
+        walk(next, rules, out);
+    }
+    let _ = dom_node_selected; // (used inside walk)
+    walk(Some(root), &sheet.rules, &mut out);
+    out
+}
+
+/// `querySelector`: the first `query_selector_all` match, or None.
+pub fn query_selector(root: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<RefCell<Node>>> {
+    query_selector_all(root, selector).into_iter().next()
+}
+
+/// `element.matches(selector)`: does `node` match the CSS selector? Reuses the
+/// engine's selector matcher (same parse-into-empty-rule trick as
+/// `query_selector_all`). Non-element nodes never match.
+pub fn element_matches(node: &Rc<RefCell<Node>>, selector: &str) -> bool {
+    use crate::renderer::css::cssom::CssParser;
+    use crate::renderer::css::token::CssTokenizer;
+    use crate::renderer::style::selector::dom_node_selected;
+
+    if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+        return false;
+    }
+    let css = format!("{selector}{{}}");
+    let sheet = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
+    sheet
+        .rules
+        .iter()
+        .any(|r| dom_node_selected(node, &r.selector))
+}
+
+/// `element.closest(selector)`: the nearest inclusive ancestor of `node`
+/// (starting with `node` itself) that matches the selector, or None.
+pub fn element_closest(node: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<RefCell<Node>>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if element_matches(&n, selector) {
+            return Some(n);
+        }
+        current = n.borrow().parent().upgrade();
+    }
+    None
+}

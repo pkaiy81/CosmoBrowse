@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import resource
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -101,6 +103,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
 class IpcSession:
     def __init__(self, saba_dir: Path, ipc_cli_path: Path, log_path: Path) -> None:
+        # Run against a session snapshot of our own: a snapshot left by an
+        # earlier run points at that run's ephemeral fixture port, and restoring
+        # it emits a failure event before the first response.
+        env = dict(os.environ)
+        self._snapshot = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._snapshot.close()
+        os.unlink(self._snapshot.name)
+        env["COSMO_SESSION_SNAPSHOT_PATH"] = self._snapshot.name
         self._process = subprocess.Popen(
             [str(ipc_cli_path), "stdin"],
             cwd=saba_dir,
@@ -109,6 +119,7 @@ class IpcSession:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
         self._log_path = log_path
         self._recent_non_json_lines: deque[str] = deque(maxlen=40)
@@ -140,9 +151,17 @@ class IpcSession:
                 continue
             self._append_log(f"<<< {response}")
             try:
-                return json.loads(response)
+                message = json.loads(response)
             except json.JSONDecodeError:
                 self._recent_non_json_lines.append(response)
+                continue
+            # The app also emits unsolicited event notifications on this
+            # stream; only a reply carries a "type". Returning the first JSON
+            # line made whichever event happened to arrive first look like the
+            # response to the request we just sent.
+            if isinstance(message, dict) and "type" not in message:
+                continue
+            return message
 
     def close(self) -> None:
         if self._process.poll() is not None:

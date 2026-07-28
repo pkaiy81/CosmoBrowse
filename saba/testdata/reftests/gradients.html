@@ -1,0 +1,22 @@
+<html>
+<head>
+<style>
+  body { background-color: #ffffff; }
+  .g { width: 300px; height: 60px; margin: 12px; color: #ffffff; }
+  .down { background: linear-gradient(#ff5500, #114488); }
+  .right { background: linear-gradient(to right, #000000, #ffffff); }
+  .angle { background: linear-gradient(45deg, #cc0044, #4400cc); }
+  .stops { background: linear-gradient(to right, #ff0000 0%, #00ff00 50%, #0000ff 100%); }
+  .rounded { background: linear-gradient(to right, #22aa22, #113311); border-radius: 14px; }
+  .oncolor { background-color: #999999; background-image: linear-gradient(to bottom, #ffffff00, #000000); }
+</style>
+</head>
+<body>
+  <div class="g down">to bottom (default)</div>
+  <div class="g right">to right</div>
+  <div class="g angle">45deg</div>
+  <div class="g stops">three stops with positions</div>
+  <div class="g rounded">rounded gradient</div>
+  <div class="g oncolor">gradient over a color</div>
+</body>
+</html>

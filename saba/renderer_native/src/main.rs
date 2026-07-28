@@ -1,0 +1,1024 @@
+mod app_bridge;
+mod color;
+mod hit_test;
+mod painter;
+mod text_render;
+mod ui_chrome;
+
+use std::num::NonZeroU32;
+use std::rc::Rc;
+
+use app_bridge::AppBridge;
+use hit_test::hit_test;
+use painter::{render_commands, ImageCache};
+use text_render::TextRenderer;
+use ui_chrome::{ChromeAction, ChromeState, CHROME_HEIGHT};
+use winit::{
+    application::ApplicationHandler,
+    dpi::{LogicalSize, PhysicalPosition},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, NamedKey},
+    window::{CursorIcon, WindowAttributes, WindowId},
+};
+
+const DEFAULT_WIDTH: u32 = 1024;
+const DEFAULT_HEIGHT: u32 = 768;
+
+/// Custom event delivered to the winit event loop from background threads.
+/// `Redraw` is sent by the image cache when an asynchronously-fetched image
+/// has finished decoding, so the window repaints to show it.
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    Redraw,
+}
+
+/// Holds the winit Window and softbuffer Surface together, sharing the
+/// same `Rc<winit::window::Window>`.
+struct WindowState {
+    window: Rc<winit::window::Window>,
+    surface: softbuffer::Surface<Rc<winit::window::Window>, Rc<winit::window::Window>>,
+}
+
+struct App {
+    window_state: Option<WindowState>,
+    text_renderer: TextRenderer,
+    image_cache: ImageCache,
+    bridge: AppBridge,
+    chrome: ChromeState,
+    scroll_y: i64,
+    hit_regions: Vec<hit_test::HitRegion>,
+    mouse_pos: (i64, i64),
+    viewport_width: u32,
+    viewport_height: u32,
+    needs_redraw: bool,
+    status_message: String,
+    pending_url: Option<String>,
+    save_screenshot: bool,
+    /// Next time an animation frame should be driven (throttles to ~60fps).
+    next_anim_frame: std::time::Instant,
+    /// Per-scroll-container inner offsets (x, y).
+    inner_scroll_offsets: std::collections::HashMap<u32, (i64, i64)>,
+    /// Scroll containers visible in the last paint: (id, x, y, w, h,
+    /// content_w, content_h) in page coordinates.
+    scroll_containers: Vec<(u32, i64, i64, i64, i64, i64, i64)>,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            window_state: None,
+            text_renderer: TextRenderer::new(),
+            image_cache: ImageCache::new(),
+            bridge: AppBridge::new(),
+            chrome: ChromeState::new(),
+            scroll_y: 0,
+            hit_regions: Vec::new(),
+            mouse_pos: (0, 0),
+            viewport_width: DEFAULT_WIDTH,
+            viewport_height: DEFAULT_HEIGHT,
+            needs_redraw: true,
+            status_message: String::new(),
+            pending_url: None,
+            save_screenshot: false,
+            next_anim_frame: std::time::Instant::now(),
+            inner_scroll_offsets: std::collections::HashMap::new(),
+            scroll_containers: Vec::new(),
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(ws) = &self.window_state {
+            ws.window.request_redraw();
+        }
+    }
+
+    fn navigate(&mut self, url: &str) {
+        self.status_message = format!("Loading {}...", url);
+        self.needs_redraw = true;
+        self.redraw();
+
+        match self.bridge.navigate(url) {
+            Ok(()) => {
+                // Sync the layout engine's viewport with the current window size.
+                // The session snapshot may carry a stale viewport from a previous run.
+                let _ = self.bridge.set_viewport(self.viewport_width, self.viewport_height);
+                self.chrome.set_url(&self.bridge.current_url());
+                // Spec: HTML Living Standard §7.4 — scroll to fragment anchor if present.
+                // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
+                self.scroll_y = self.bridge.anchor_scroll_y();
+                self.update_nav_state();
+                self.status_message.clear();
+                if let Some(ws) = &self.window_state {
+                    let title = self.bridge.current_title();
+                    let display_title = if title.is_empty() {
+                        "CosmoBrowse".to_string()
+                    } else {
+                        format!("{} - CosmoBrowse", title)
+                    };
+                    ws.window.set_title(&display_title);
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Error: {}", e);
+            }
+        }
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    /// Refresh back/forward button states from the navigation history.
+    fn update_nav_state(&mut self) {
+        self.chrome.can_back = self.bridge.can_go_back();
+        self.chrome.can_forward = self.bridge.can_go_forward();
+    }
+
+    fn redraw(&mut self) {
+        let Some(ws) = &mut self.window_state else {
+            return;
+        };
+
+        let width = self.viewport_width;
+        let height = self.viewport_height;
+
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let mut pixmap = match tiny_skia::Pixmap::new(width, height) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Fill background white.
+        pixmap.fill(tiny_skia::Color::WHITE);
+
+        // Draw chrome.
+        ui_chrome::draw_chrome(&mut pixmap, &mut self.text_renderer, &self.chrome, width);
+
+        // Pull in any images that finished fetching on background threads
+        // since the last paint.
+        self.image_cache.integrate_results();
+
+        // Draw page content.
+        let mut all_hit_regions = Vec::new();
+        let frame_commands = self.bridge.collect_paint_commands();
+        // Refresh the scroll-container registry from the fresh commands.
+        self.scroll_containers.clear();
+        for (_, _, commands) in &frame_commands {
+            for cmd in commands {
+                if let cosmo_engine::paint_commands::PaintCommand::DrawRect(r) = cmd {
+                    if let Some((id, content_w, content_h)) = r.scroll_container_def {
+                        self.scroll_containers
+                            .push((id, r.x, r.y, r.width, r.height, content_w, content_h));
+                    }
+                }
+            }
+        }
+        for (frame_id, frame_url, commands) in &frame_commands {
+            let regions = render_commands(
+                &mut pixmap,
+                commands,
+                &mut self.text_renderer,
+                &mut self.image_cache,
+                frame_url,
+                self.scroll_y,
+                CHROME_HEIGHT,
+                frame_id,
+                &self.inner_scroll_offsets,
+            );
+            all_hit_regions.extend(regions);
+        }
+        self.hit_regions = all_hit_regions;
+
+        // Draw frameset borders (raised 3-D effect: light top/left, dark bottom/right).
+        let borders = self.bridge.collect_frameset_borders();
+        for (bx, _by, bw, bh) in &borders {
+            // Fill the border area with the standard mid-gray frameset color.
+            let mid = tiny_skia::Color::from_rgba8(0xC0, 0xC0, 0xC0, 255);
+            let light = tiny_skia::Color::from_rgba8(0xFF, 0xFF, 0xFF, 255);
+            let dark = tiny_skia::Color::from_rgba8(0x80, 0x80, 0x80, 255);
+            let sby = CHROME_HEIGHT - self.scroll_y;
+
+            let fill_rect = tiny_skia::Rect::from_xywh(
+                *bx as f32,
+                sby as f32,
+                *bw as f32,
+                *bh as f32,
+            );
+            if let Some(r) = fill_rect {
+                let mut p = tiny_skia::Paint::default();
+                p.set_color(mid);
+                pixmap.fill_rect(r, &p, tiny_skia::Transform::identity(), None);
+            }
+            // 1-px highlight on the left/top edge.
+            let hi_rect = tiny_skia::Rect::from_xywh(*bx as f32, sby as f32, 1.0, *bh as f32);
+            if let Some(r) = hi_rect {
+                let mut p = tiny_skia::Paint::default();
+                p.set_color(light);
+                pixmap.fill_rect(r, &p, tiny_skia::Transform::identity(), None);
+            }
+            // 1-px shadow on the right/bottom edge.
+            let sh_rect = tiny_skia::Rect::from_xywh(
+                (bx + bw - 1) as f32,
+                sby as f32,
+                1.0,
+                *bh as f32,
+            );
+            if let Some(r) = sh_rect {
+                let mut p = tiny_skia::Paint::default();
+                p.set_color(dark);
+                pixmap.fill_rect(r, &p, tiny_skia::Transform::identity(), None);
+            }
+        }
+
+        // Draw scrollbar over the page area.
+        let content_height = self.bridge.content_height();
+        ui_chrome::draw_scrollbar(&mut pixmap, self.scroll_y, content_height, width, height);
+
+        // Draw status message.
+        if !self.status_message.is_empty() {
+            let status_y = height as i64 - 4;
+            self.text_renderer.draw_text(
+                &mut pixmap,
+                &self.status_message,
+                8,
+                status_y,
+                12,
+                0x66,
+                0x66,
+                0x66,
+                200,
+                0,
+                false,
+            );
+        }
+
+        // Present to window.
+        ws.surface
+            .resize(
+                NonZeroU32::new(width).unwrap(),
+                NonZeroU32::new(height).unwrap(),
+            )
+            .expect("Failed to resize surface");
+
+        let mut buffer = ws.surface.buffer_mut().expect("Failed to get buffer");
+        let data = pixmap.data();
+        for i in 0..(width * height) as usize {
+            let idx = i * 4;
+            let r = data[idx] as u32;
+            let g = data[idx + 1] as u32;
+            let b = data[idx + 2] as u32;
+            buffer[i] = (r << 16) | (g << 8) | b;
+        }
+        buffer.present().expect("Failed to present buffer");
+        self.needs_redraw = false;
+
+        // Save a PNG snapshot if requested (e.g. via Ctrl+S).
+        if self.save_screenshot {
+            self.save_screenshot = false;
+            let path = "/tmp/cosmo_screenshot.png";
+            match pixmap.save_png(path) {
+                Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", path),
+                Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+            }
+        }
+    }
+
+    fn handle_key(&mut self, event: KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key.as_ref() {
+            Key::Named(NamedKey::Enter) => {
+                if self.chrome.is_focused {
+                    let url = self.chrome.get_url().to_string();
+                    self.chrome.is_focused = false;
+                    if !url.is_empty() {
+                        let url = if url.contains("://") {
+                            url
+                        } else {
+                            format!("https://{}", url)
+                        };
+                        self.navigate(&url);
+                    }
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if self.chrome.is_focused {
+                    self.chrome.backspace();
+                    self.needs_redraw = true;
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if self.chrome.is_focused {
+                    self.chrome.delete_forward();
+                    self.needs_redraw = true;
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if self.chrome.is_focused {
+                    self.chrome.move_left();
+                    self.needs_redraw = true;
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if self.chrome.is_focused {
+                    self.chrome.move_right();
+                    self.needs_redraw = true;
+                }
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.chrome.is_focused = false;
+                self.needs_redraw = true;
+            }
+            Key::Character(ch) => {
+                // Ctrl+L: focus URL bar.
+                if ch.eq("l") && !event.repeat && is_ctrl_pressed(&event) {
+                    self.chrome.is_focused = true;
+                    self.chrome.select_all();
+                    self.needs_redraw = true;
+                    return;
+                }
+                // Ctrl+S: save screenshot to /tmp/cosmo_screenshot.png.
+                if ch.eq("s") && !event.repeat && is_ctrl_pressed(&event) {
+                    self.save_screenshot = true;
+                    self.needs_redraw = true;
+                    return;
+                }
+
+                if self.chrome.is_focused {
+                    for c in ch.chars() {
+                        if !c.is_control() {
+                            self.chrome.insert_char(c);
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_click(&mut self, x: i64, y: i64) {
+        // Chrome area click.
+        if y < CHROME_HEIGHT {
+            let action = ui_chrome::handle_chrome_click(x, y, self.viewport_width, &self.chrome);
+            match action {
+                ChromeAction::Back => {
+                    if self.bridge.back().is_ok() {
+                        self.chrome.set_url(&self.bridge.current_url());
+                        self.update_nav_state();
+                        self.scroll_y = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                ChromeAction::Forward => {
+                    if self.bridge.forward().is_ok() {
+                        self.chrome.set_url(&self.bridge.current_url());
+                        self.update_nav_state();
+                        self.scroll_y = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                ChromeAction::Reload => {
+                    if self.bridge.reload().is_ok() {
+                        self.chrome.set_url(&self.bridge.current_url());
+                    }
+                    self.needs_redraw = true;
+                }
+                ChromeAction::FocusUrlBar => {
+                    self.chrome.is_focused = true;
+                    self.chrome.select_all();
+                    self.needs_redraw = true;
+                }
+                ChromeAction::Navigate(url) => {
+                    self.navigate(&url);
+                }
+                ChromeAction::None => {}
+            }
+            return;
+        }
+
+        // Page area. Give the page's own scripts the click first: a live frame
+        // hit-tests it against its retained layout and fires the DOM listeners.
+        // The navigation shim injected into every document turns anchor clicks
+        // into `cosmobrowse:navigate` messages, which is how link activation
+        // arrives here when scripts handle the click.
+        let doc_y = y - CHROME_HEIGHT + self.scroll_y;
+        let page_click = self.bridge.dispatch_click(x, doc_y);
+        if page_click.repainted {
+            self.needs_redraw = true;
+        }
+        for request in &page_click.navigations {
+            self.follow_link(&request.frame_id, &request.href, request.target.as_deref());
+        }
+        if !page_click.navigations.is_empty() || page_click.default_prevented {
+            // The page handled it (or asked us not to follow the link).
+            return;
+        }
+
+        // Fall back to the painted link regions — frames with no live script
+        // host (static content) still follow links.
+        if let Some(region) = hit_test(&self.hit_regions, x, y) {
+            let href = region.href.clone();
+            let target = region.target.clone();
+            let frame_id = region.frame_id.clone();
+            self.follow_link(&frame_id, &href, target.as_deref());
+        } else {
+            // Unfocus URL bar if clicking on page area.
+            if self.chrome.is_focused {
+                self.chrome.is_focused = false;
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    /// Navigate `frame_id` to `href`, updating the chrome and scroll position.
+    fn follow_link(&mut self, frame_id: &str, href: &str, target: Option<&str>) {
+        // Save the current top-level URL so we can detect root navigations.
+        let prev_url = self.bridge.current_url();
+        match self.bridge.activate_link(frame_id, href, target) {
+            Ok(()) => {
+                self.chrome.set_url(&self.bridge.current_url());
+                // Only reset scroll when the root-level URL changes (i.e. a new
+                // standalone page was loaded).  For child-frame-only navigations
+                // (e.g. frameset target="right" or in-page anchor in a sub-frame)
+                // the top-level URL stays the same and we preserve the current
+                // scroll position so the viewport does not jump to the top.
+                // Spec: HTML Living Standard §7.4 — navigating to a fragment.
+                // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
+                if self.bridge.current_url() != prev_url {
+                    self.scroll_y = self.bridge.anchor_scroll_y();
+                }
+                self.update_nav_state();
+            }
+            Err(e) => {
+                self.status_message = format!("Error: {}", e);
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn handle_scroll(&mut self, delta_x: f64, delta_y: f64) {
+        let step_x = delta_x as i64 * 40;
+        let step_y = delta_y as i64 * 40;
+        // Route the wheel to the topmost scroll container under the cursor
+        // (overflow:scroll/auto with overflowing content); otherwise scroll
+        // the page. Containers were collected from the last paint.
+        let (mx, my) = self.mouse_pos;
+        let page_x = mx;
+        let page_y = my - CHROME_HEIGHT + self.scroll_y;
+        let target = self
+            .scroll_containers
+            .iter()
+            .rev()
+            .find(|(_, x, y, w, h, content_w, content_h)| {
+                (content_h > h || content_w > w)
+                    && page_x >= *x
+                    && page_x < x + w
+                    && page_y >= *y
+                    && page_y < y + h
+            })
+            .copied();
+        if let Some((id, _, _, w, h, content_w, content_h)) = target {
+            let max_y = (content_h - h).max(0);
+            let max_x = (content_w - w).max(0);
+            let entry = self.inner_scroll_offsets.entry(id).or_insert((0, 0));
+            let next = (
+                (entry.0 - step_x).clamp(0, max_x),
+                (entry.1 - step_y).clamp(0, max_y),
+            );
+            if next != *entry {
+                *entry = next;
+                self.needs_redraw = true;
+                return;
+            }
+            // At the container's end: fall through to page scrolling.
+        }
+        let page_height = self.viewport_height as i64 - CHROME_HEIGHT;
+        let content_height = self.bridge.content_height();
+        let max_scroll = (content_height - page_height).max(0);
+        self.scroll_y = (self.scroll_y - step_y).max(0).min(max_scroll);
+        self.needs_redraw = true;
+    }
+
+    /// Track the pointer for `:hover`. Pages that never style on hover skip
+    /// this entirely, so ordinary documents pay nothing for pointer motion.
+    fn update_hover(&mut self) {
+        if !self.bridge.uses_hover() {
+            return;
+        }
+        let (mx, my) = self.mouse_pos;
+        // Over the chrome: nothing in the page is hovered. Otherwise convert to
+        // document coordinates (the y the page laid its boxes out in).
+        let doc_y = if my < CHROME_HEIGHT {
+            i64::MIN
+        } else {
+            my - CHROME_HEIGHT + self.scroll_y
+        };
+        if self.bridge.set_hover(mx, doc_y) {
+            self.needs_redraw = true;
+            self.request_redraw();
+        }
+    }
+
+    fn update_cursor(&self) {
+        let Some(ws) = &self.window_state else {
+            return;
+        };
+        let (mx, my) = self.mouse_pos;
+
+        if my < CHROME_HEIGHT {
+            ws.window.set_cursor(CursorIcon::Default);
+            return;
+        }
+
+        if hit_test(&self.hit_regions, mx, my).is_some() {
+            ws.window.set_cursor(CursorIcon::Pointer);
+        } else {
+            ws.window.set_cursor(CursorIcon::Default);
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    /// Woken by a background image fetch completing; repaint so the new image
+    /// becomes visible.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        // A background fetch/XHR (or image) completed: pump any settled async
+        // work into the page (progressive rendering), then repaint.
+        if self.bridge.pump_progressive() {
+            self.scroll_y = self.scroll_y.min(self.bridge.content_height());
+        }
+        self.needs_redraw = true;
+        self.request_redraw();
+    }
+
+    /// Drive JS animations (rAF loops / setInterval) at ~60fps while any are
+    /// pending; otherwise wait idle for the next event.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.bridge.has_pending_animation() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= self.next_anim_frame {
+            if self.bridge.animation_frame() {
+                self.scroll_y = self.scroll_y.min(self.bridge.content_height());
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
+            self.next_anim_frame = now + std::time::Duration::from_millis(16);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_anim_frame));
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window_state.is_some() {
+            return;
+        }
+
+        let attrs = WindowAttributes::default()
+            .with_title("CosmoBrowse")
+            .with_inner_size(LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        let window = Rc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("Failed to create window"),
+        );
+        let context =
+            softbuffer::Context::new(window.clone()).expect("Failed to create softbuffer context");
+        let surface =
+            softbuffer::Surface::new(&context, window.clone()).expect("Failed to create surface");
+
+        self.window_state = Some(WindowState { window, surface });
+
+        // Navigate to the pending URL if one was provided on the command line.
+        if let Some(url) = self.pending_url.take() {
+            self.navigate(&url);
+        }
+        self.request_redraw();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+            WindowEvent::Resized(size) => {
+                self.viewport_width = size.width;
+                self.viewport_height = size.height;
+                // Notify the layout engine so it can reflow content against
+                // the new viewport width.
+                // Spec: CSS2.2 §10.1 — viewport is the containing block for
+                // the initial block formatting context.
+                // https://www.w3.org/TR/CSS22/visudet.html#containing-block-details
+                if let Err(e) = self.bridge.set_viewport(size.width, size.height) {
+                    self.status_message = format!("Viewport error: {}", e);
+                }
+                self.needs_redraw = true;
+                self.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.handle_key(event);
+                if self.needs_redraw {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.mouse_pos;
+                self.handle_mouse_click(x, y);
+                if self.needs_redraw {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x as i64, position.y as i64);
+                self.update_cursor();
+                self.update_hover();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                    MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
+                        (x / 40.0, y / 40.0)
+                    }
+                };
+                self.handle_scroll(dx, dy);
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_ctrl_pressed(event: &KeyEvent) -> bool {
+    // winit 0.30: when Ctrl is held, `text` is typically None for letter keys.
+    event.text.is_none()
+}
+
+/// Headless screenshot mode: render `url` to a PNG at `out_path` without opening a window.
+
+/// Inner scroll offsets for headless screenshots, from
+/// `COSMO_INNER_SCROLL` ("id:px[,id:px...]"). Verifies overflow containers.
+fn headless_inner_offsets() -> std::collections::HashMap<u32, (i64, i64)> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(v) = std::env::var("COSMO_INNER_SCROLL") {
+        for part in v.split(',') {
+            let fields: Vec<&str> = part.split(':').collect();
+            match fields.as_slice() {
+                [id, dy] => {
+                    if let (Ok(id), Ok(dy)) = (id.trim().parse(), dy.trim().parse()) {
+                        map.insert(id, (0, dy));
+                    }
+                }
+                [id, dx, dy] => {
+                    if let (Ok(id), Ok(dx), Ok(dy)) =
+                        (id.trim().parse(), dx.trim().parse(), dy.trim().parse())
+                    {
+                        map.insert(id, (dx, dy));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
+/// Scroll offset for headless screenshots, from `COSMO_SCREENSHOT_SCROLL`
+/// (pixels). Lets sticky/fixed behavior be verified without a window.
+/// Parse an `x,y` pair (the `COSMO_HEADLESS_CLICK` format).
+fn parse_point(value: &str) -> Option<(i64, i64)> {
+    let (x, y) = value.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+fn headless_scroll() -> i64 {
+    std::env::var("COSMO_SCREENSHOT_SCROLL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn headless_screenshot(url: &str, out_path: &str) {
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+
+    let width = DEFAULT_WIDTH;
+    let height = DEFAULT_HEIGHT;
+
+    let mut text_renderer = TextRenderer::new();
+    let mut image_cache = ImageCache::new();
+    let mut bridge = AppBridge::new();
+
+    if let Err(e) = bridge.navigate(&url) {
+        eprintln!("[SCREENSHOT] navigate error: {}", e);
+        return;
+    }
+    // set_viewport must be called after navigate (requires a loaded page)
+    // to override any stale viewport from the session snapshot.
+    if let Err(e) = bridge.set_viewport(width, height) {
+        eprintln!("[SCREENSHOT] set_viewport error: {}", e);
+        return;
+    }
+    // Headless capture is one-shot: settle in-flight fetch/XHR so the PNG
+    // reflects the fully-loaded page (progressive updates can't be observed
+    // across frames here).
+    bridge.settle_async(300);
+
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    pixmap.fill(tiny_skia::Color::WHITE);
+
+    let chrome = ChromeState::new();
+    ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
+
+    let frame_commands = bridge.collect_paint_commands();
+    for (frame_id, frame_url, commands) in &frame_commands {
+        render_commands(
+            &mut pixmap,
+            commands,
+            &mut text_renderer,
+            &mut image_cache,
+            frame_url,
+            headless_scroll(),
+            CHROME_HEIGHT,
+            frame_id,
+            &headless_inner_offsets(),
+        );
+    }
+
+    let content_height = bridge.content_height();
+    ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+
+    match pixmap.save_png(out_path) {
+        Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
+        Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+    }
+}
+
+fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+    let height = DEFAULT_HEIGHT;
+    let mut text_renderer = TextRenderer::new();
+    let mut image_cache = ImageCache::new();
+    let mut bridge = AppBridge::new();
+    if let Err(e) = bridge.navigate(&url) {
+        eprintln!("[SCREENSHOT] navigate error: {}", e);
+        return;
+    }
+    if let Err(e) = bridge.set_viewport(width, height) {
+        eprintln!("[SCREENSHOT] set_viewport error: {}", e);
+        return;
+    }
+    // One-shot capture: settle in-flight fetch/XHR before painting.
+    bridge.settle_async(300);
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    pixmap.fill(tiny_skia::Color::WHITE);
+    let chrome = ChromeState::new();
+    ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
+    let frame_commands = bridge.collect_paint_commands();
+    if std::env::var("COSMO_DEBUG_DUMP").is_ok() {
+        for (_fid, _furl, commands) in &frame_commands {
+            for cmd in commands {
+                match cmd {
+                    cosmo_engine::paint_commands::PaintCommand::DrawText(t) => {
+                        let s: String = t.text.chars().take(48).collect();
+                        eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
+                    }
+                    cosmo_engine::paint_commands::PaintCommand::DrawRect(r) => {
+                        eprintln!(
+                            "RECT x={} y={} w={} h={} bg={}{}",
+                            r.x, r.y, r.width, r.height, r.background_color,
+                            r.background_image.as_deref().map(|s| format!(" img={}", s)).unwrap_or_default(),
+                        );
+                    }
+                    cosmo_engine::paint_commands::PaintCommand::DrawImage(i) => {
+                        eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
+                    }
+                }
+            }
+        }
+    }
+    for (frame_id, frame_url, commands) in &frame_commands {
+        render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
+            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id, &headless_inner_offsets());
+    }
+    let content_height = bridge.content_height();
+    ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+    match pixmap.save_png(out_path) {
+        Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
+        Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+    }
+}
+
+fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+    let mut text_renderer = TextRenderer::new();
+    let mut image_cache = ImageCache::new();
+    let mut bridge = AppBridge::new();
+    if let Err(e) = bridge.navigate(&url) {
+        eprintln!("[SCREENSHOT] navigate error: {}", e);
+        return;
+    }
+    if let Err(e) = bridge.set_viewport(width, height) {
+        eprintln!("[SCREENSHOT] set_viewport error: {}", e);
+        return;
+    }
+    // One-shot capture: settle in-flight fetch/XHR before painting.
+    bridge.settle_async(300);
+    // `COSMO_HEADLESS_HOVER=x,y` parks the pointer over the page (document
+    // coordinates) so `:hover` styling — and the transitions it triggers — can
+    // be screenshot-tested.
+    if let Some((hx, hy)) = std::env::var("COSMO_HEADLESS_HOVER")
+        .ok()
+        .and_then(|v| parse_point(&v))
+    {
+        bridge.set_hover(hx, hy);
+        bridge.settle_async(300);
+    }
+    // `COSMO_HEADLESS_CLICK=x,y` clicks the page once (document coordinates)
+    // before capturing, so scripted interactions — click handlers, and the
+    // transitions they trigger — can be screenshot-tested without a window.
+    if let Some((cx, cy)) = std::env::var("COSMO_HEADLESS_CLICK")
+        .ok()
+        .and_then(|v| parse_point(&v))
+    {
+        let click = bridge.dispatch_click(cx, cy);
+        for request in &click.navigations {
+            if let Err(e) =
+                bridge.activate_link(&request.frame_id, &request.href, request.target.as_deref())
+            {
+                eprintln!("[SCREENSHOT] link activation error: {}", e);
+            }
+        }
+        bridge.settle_async(300);
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    pixmap.fill(tiny_skia::Color::WHITE);
+    let chrome = ChromeState::new();
+    ui_chrome::draw_chrome(&mut pixmap, &mut text_renderer, &chrome, width);
+    let frame_commands = bridge.collect_paint_commands();
+    if std::env::var("COSMO_DEBUG_DUMP").is_ok() {
+        for (_fid, _furl, commands) in &frame_commands {
+            for cmd in commands {
+                match cmd {
+                    cosmo_engine::paint_commands::PaintCommand::DrawText(t) => {
+                        let s: String = t.text.chars().take(48).collect();
+                        eprintln!("TEXT x={} y={} fp={} {:?}", t.x, t.y, t.font_px, s);
+                    }
+                    cosmo_engine::paint_commands::PaintCommand::DrawRect(r) => {
+                        eprintln!(
+                            "RECT x={} y={} w={} h={} bg={}{}",
+                            r.x, r.y, r.width, r.height, r.background_color,
+                            r.background_image.as_deref().map(|s| format!(" img={}", s)).unwrap_or_default(),
+                        );
+                    }
+                    cosmo_engine::paint_commands::PaintCommand::DrawImage(i) => {
+                        eprintln!("IMG  x={} y={} w={} h={} {:?}", i.x, i.y, i.width, i.height, i.src);
+                    }
+                }
+            }
+        }
+    }
+    for (frame_id, frame_url, commands) in &frame_commands {
+        render_commands(&mut pixmap, commands, &mut text_renderer, &mut image_cache,
+            frame_url, headless_scroll(), CHROME_HEIGHT, frame_id, &headless_inner_offsets());
+    }
+    let content_height = bridge.content_height();
+    ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+    match pixmap.save_png(out_path) {
+        Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
+        Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
+    }
+}
+
+fn main() {
+    // Real-world web pages (especially CMS-built sites like Wix, Squarespace)
+    // produce extremely deep DOM trees — single pages routinely nest 50+
+    // levels of <div>. The HTML/CSS/layout/paint pipeline is recursive
+    // descent, so each nesting level consumes a stack frame. The default
+    // 8 MiB main-thread stack on Linux is not enough; transfer work to a
+    // worker thread with a 64 MiB stack so navigation to such pages
+    // doesn't crash the renderer.
+    let join = std::thread::Builder::new()
+        .name("cosmo-renderer-main".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn renderer thread");
+    if let Err(payload) = join.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn real_main() {
+    // Layout must measure with the same fonts the painter draws with.
+    // COSMO_LEGACY_METRICS=1 keeps the engine's built-in advance tables
+    // (useful for A/B-ing layout diffs against the old estimates).
+    if std::env::var("COSMO_LEGACY_METRICS").ok().as_deref() != Some("1") {
+        let _ = cosmo_engine::renderer::text::provider::set_font_metrics_provider(Box::new(
+            text_render::FontdueMetricsProvider::new(),
+        ));
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+
+    // --screenshot <url> [out.png] [width]
+    if args.get(1).map(|s| s.as_str()) == Some("--screenshot") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
+        let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
+        headless_screenshot(url, out);
+        return;
+    }
+    // --screenshot-w <url> <out.png> <width>
+    if args.get(1).map(|s| s.as_str()) == Some("--screenshot-w") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
+        let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
+        let w: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_WIDTH);
+        headless_screenshot_w(url, out, w);
+        return;
+    }
+    // --screenshot-wh <url> <out.png> <width> <height>
+    if args.get(1).map(|s| s.as_str()) == Some("--screenshot-wh") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("about:blank");
+        let out = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/cosmo_screenshot.png");
+        let w: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_WIDTH);
+        let h: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_HEIGHT);
+        headless_screenshot_wh(url, out, w, h);
+        return;
+    }
+
+    let url = args.get(1).cloned();
+
+    // `real_main` runs on the 64 MiB worker thread (see `main`), not the OS
+    // main thread. winit normally rejects creating an event loop off the main
+    // thread; opt into `any_thread` so the worker can own it. This is sound on
+    // X11/Wayland; if this renderer is ever ported beyond Linux, the event
+    // loop must instead be created on the true main thread.
+    let event_loop = {
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::EventLoopBuilderExtWayland;
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            let mut builder = EventLoop::<UserEvent>::with_user_event();
+            EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+            EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
+            builder.build().expect("Failed to create event loop")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            EventLoop::<UserEvent>::with_user_event()
+                .build()
+                .expect("Failed to create event loop")
+        }
+    };
+    let mut app = App::new();
+    // Let the image cache wake the event loop to repaint when an
+    // asynchronously-fetched image becomes available.
+    app.image_cache.set_notifier(event_loop.create_proxy());
+    // Let script fetch/XHR completions wake the loop to pump + repaint
+    // (progressive rendering).
+    {
+        let proxy = event_loop.create_proxy();
+        app.bridge.set_waker(std::sync::Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::Redraw);
+        }));
+    }
+
+    if let Some(url) = &url {
+        app.chrome.set_url(url);
+        let url = if url.contains("://") {
+            url.clone()
+        } else {
+            format!("https://{}", url)
+        };
+        app.pending_url = Some(url);
+    }
+
+    event_loop.run_app(&mut app).expect("Event loop failed");
+}

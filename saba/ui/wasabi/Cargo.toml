@@ -1,8 +1,0 @@
-[package]
-name = "ui_wasabi"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-cosmo_core = { path = "../../cosmo_core" }
-noli = { git = "https://github.com/hikalium/wasabi.git", branch = "for_saba" }

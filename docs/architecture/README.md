@@ -43,3 +43,7 @@
 
 - ADR-0001: Process Model / Failure Policy / IPC Boundary / Dependency Direction
   - `adr-0001-process-model-and-ipc-boundary.md`
+- ADR-0002: Origin Storage Persistence
+  - `adr-0002-origin-storage-persistence.md`
+- ADR-0003: Engine Consolidation and std Migration
+  - `adr-0003-engine-consolidation-and-std-migration.md`

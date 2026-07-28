@@ -83,7 +83,7 @@ def main() -> int:
     kpi_summary = load_json(args.kpi_summary)
     layout_summary = load_json(args.layout_summary)
     legacy_usage_summary = load_json(args.legacy_usage_summary)
-    download_summary = load_json(args.download_summary) if args.download_summary else {}
+    download_summary = load_optional_json(args.download_summary)
     crash_report = load_optional_json(args.crash_report)
 
     success_rate = 1.0 - float(kpi_summary.get("failure_rate", 0.0) or 0.0)

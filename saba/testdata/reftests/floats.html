@@ -1,0 +1,46 @@
+<html>
+<head>
+<style>
+  body { font-size: 14px; margin: 0; }
+  .wrap { width: 420px; background-color: #eef2ff; margin-bottom: 12px; }
+  .fl { float: left; width: 110px; height: 80px; background-color: #cc3333; }
+  .fr { float: right; width: 90px; height: 50px; background-color: #33aa55; }
+  .stack { float: left; width: 60px; height: 40px; background-color: #3366cc; margin-right: 4px; }
+  .contained { overflow: hidden; width: 420px; background-color: #fff4e0; }
+  .cleared { clear: both; background-color: #ffd9d9; }
+</style>
+</head>
+<body>
+  <!-- Text flows around a left and a right float, then reclaims the width. -->
+  <div class="wrap"><div class="fl"></div><div class="fr"></div>
+    The quick brown fox jumps over the lazy dog. Pack my box with five dozen
+    liquor jugs. How vexingly quick daft zebras jump! The five boxing wizards
+    jump quickly at dawn and then rest.
+  </div>
+
+  <!-- Floats stack along the edge, dropping when the row runs out of room. -->
+  <div class="wrap">
+    <div class="stack"></div><div class="stack"></div><div class="stack"></div>
+    Short run of text beside the stacked floats to show the shortened band.
+  </div>
+
+  <!-- overflow:hidden establishes a BFC, so the float is contained. -->
+  <div class="contained"><div class="fl"></div>
+    This container establishes a block formatting context, so it grows to
+    contain its float instead of letting it hang out of the bottom.
+  </div>
+
+  <!-- NOT YET: a block-level sibling disables the float context, so these fall
+       back to normal flow (stacked) instead of floating. Making them float
+       needs each block's real flow position — margin collapsing included —
+       which only the position pass knows; estimating it in the size pass made
+       Wikipedia's paragraphs overlap. Kept so the golden shows the change when
+       single-pass block layout lands. -->
+  <div class="wrap"><div class="fl"></div><div class="fr"></div>
+    <div class="cleared">block sibling: floats fall back to normal flow</div>
+  </div>
+  <div class="wrap"><div class="fl"></div>
+    <p>Paragraph beside a float — not shortened yet (see above).</p>
+  </div>
+</body>
+</html>
