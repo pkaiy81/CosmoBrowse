@@ -411,8 +411,17 @@
 >   `delta`→`delt`/`a`、`1.`→`1`/`.`、MDN サイドバーの `positionin`/`g` はこれが原因だった。
 >   → **HANDOFF 既知の HN コスメ回帰(1024px で nav の submit が2行目に折返す)が解消**。
 >   reftest 13/13(再ベースライン不要)。
->   **残**: float 帯のブロックレベル接続(2.3 合流)、`pre`/ellipsis の IFC 化、flex/grid コンテナ、
->   計測と描画のズレ(インライン要素前の余白。本作業以前から存在)。
+>   ✅ **IFC が全インライン文脈をカバー (`72defa5`/`7f36fc1`/`955fb17`)** —
+>   **`pre`/`pre-wrap`/`pre-line`**: 改行を**必須改行**として UAX#14 の分割機会にマージ。改行文字自体は
+>   「改行そのもの」なので描画しない(旧実装は行末に□が出ていた)。保持ランの空白は
+>   `collapse_across_items` が素通し(両隣からも潰されない)。
+>   **`text-overflow: ellipsis`**: クリップ祖先の右端基準なのでフラグメント位置確定後=paint で truncate。
+>   **flex/grid item**: item は display に関わらず blockify されるので inline `<span>` item も IFC を持つ。
+>   ここで `inline_ancestors` が **Block まで**遡っていたため inline-kind の IFC ルート自身に
+>   `inline_offset` が付き、**位置パス(= flex 配置)を上書きしてチップが全部重なった** → ルートでも停止するよう修正。
+>   → **`collect_inline_items_from` のフォールバックは全て解消。旧インライン経路は未使用に。**
+>   **残**: grid item の幅(トラックサイズ未参照 = max-content。Phase 2.2 側の課題)、
+>   float 帯のブロックレベル接続(下記)、計測と描画のズレ(本作業以前から存在)。
 > - 🚧 **Phase 2.3 float 配置 (`4b6f4a6` 土台 + `7966dfd` 結線)** — `FloatContext`
 >   (`place`/`band`/`clearance`/`lowest_bottom`、10テスト)+ `establishes_block_formatting_context`
 >   (CSS2.2 §9.4.1)。IFC が各行の使用可能幅を context に問う形で書かれていたので、**float された子を
