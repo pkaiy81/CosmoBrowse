@@ -3429,17 +3429,13 @@ fn collect_inline_items_from(
     }
     if kind == LayoutObjectKind::Text {
         {
-            // Preserved white-space is still the legacy path's business (a
-            // `pre` run would lose its newlines here), as is ellipsis
-            // truncation, which paint applies against a clipping ancestor and
-            // cannot see once fragments are placed. `nowrap` on its own is
-            // handled: the run is simply unbreakable.
+            // Ellipsis truncation is still the legacy path's business: paint
+            // applies it against a clipping ancestor, which it cannot reach
+            // once fragments are placed. Preserved white-space is handled here
+            // — newlines become mandatory breaks and the run's own spaces
+            // survive collapsing — and `nowrap` makes the run unbreakable.
             let b = node.borrow();
-            if b.style.white_space_preserves_newlines()
-                || b.style.white_space_preserves_spaces()
-                || b.style.text_overflow_ellipsis()
-                || b.ellipsis_clip_width().is_some()
-            {
+            if b.style.text_overflow_ellipsis() || b.ellipsis_clip_width().is_some() {
                 return false;
             }
         }
@@ -3458,6 +3454,8 @@ fn collect_inline_items_from(
             bold: b.style.is_bold(),
             line_height: styled_line_height(&b.style),
             breakable: !b.style.white_space_nowrap(),
+            hard_breaks: b.style.white_space_preserves_newlines(),
+            preserves_spaces: b.style.white_space_preserves_spaces(),
         }));
         return true;
     }

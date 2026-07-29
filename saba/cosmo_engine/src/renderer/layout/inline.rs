@@ -36,6 +36,13 @@ pub struct TextRun {
     /// False for `white-space: nowrap`: the run is placed whole and allowed to
     /// overflow rather than wrapped. Spec: CSS Text §3.1.
     pub breakable: bool,
+    /// True for `pre`/`pre-wrap`/`pre-line`: a newline in the text ends the
+    /// line no matter how much room is left. Spec: CSS Text §4.1.1 — segment
+    /// break transformation. https://www.w3.org/TR/css-text-3/#line-breaking
+    pub hard_breaks: bool,
+    /// True for `pre`/`pre-wrap`: the run's white space is content, so it must
+    /// not be collapsed against a neighbouring run.
+    pub preserves_spaces: bool,
 }
 
 /// One inline-level thing to place on a line.
@@ -213,11 +220,26 @@ pub fn layout_inline_items_aligned(
                 // are a property of the text, not of the line it lands on, and
                 // recomputing per line would be quadratic on a long run.
                 // A nowrap run offers no break opportunity but its own end,
-                // so it is placed whole and overflows.
-                let breaks = if options.wrap && run.breakable {
-                    break_opportunities(&run.text)
+                // so it is placed whole and overflows. Newlines in a preserved
+                // run break regardless: they are content, not white space that
+                // may be collapsed away.
+                let forced = if run.hard_breaks {
+                    mandatory_breaks(&run.text)
                 } else {
-                    vec![run.text.len()]
+                    Vec::new()
+                };
+                let breaks = if options.wrap && run.breakable {
+                    let mut all = break_opportunities(&run.text);
+                    all.extend(forced.iter().copied());
+                    all.sort_unstable();
+                    all.dedup();
+                    all
+                } else {
+                    let mut all = forced.clone();
+                    all.push(run.text.len());
+                    all.sort_unstable();
+                    all.dedup();
+                    all
                 };
                 let mut rest = run.text.as_str();
                 loop {
@@ -237,6 +259,18 @@ pub fn layout_inline_items_aligned(
                     let base = run.text.len() - rest.len();
                     let (head, tail) =
                         break_text(rest, base, &breaks, run, available, current.is_empty());
+                    // A newline inside what fits still ends the line there.
+                    let (head, tail, forced_break) = match forced
+                        .iter()
+                        .copied()
+                        .find(|b| *b > base && *b - base <= head.len().max(1))
+                    {
+                        Some(at) if at - base <= head.len() => {
+                            let cut = at - base;
+                            (&rest[..cut], &rest[cut..], true)
+                        }
+                        _ => (head, tail, false),
+                    };
                     if head.is_empty() {
                         // Nothing fits on what's left of this line. If the line
                         // already holds something, move on.
@@ -278,13 +312,20 @@ pub fn layout_inline_items_aligned(
                         );
                         rest = remainder;
                     } else {
-                        let trimmed = head.trim_end_matches(is_break_space);
+                        // The newline that caused a mandatory break is the
+                        // break itself, not something to draw — strip it along
+                        // with any hanging spaces.
+                        let trimmed = head.trim_end_matches(is_break_space).trim_end_matches('\n');
                         let full = measure_text_width(head, run.font_size, run.bold);
                         let without = measure_text_width(trimmed, run.font_size, run.bold);
+                        // A run ending in a newline always ends its line, so its
+                        // hanging width must be recorded even when the trailing
+                        // characters measure the same.
+                        let hanging = (full - without).max(if head.ends_with('\n') { 1 } else { 0 });
                         current.push(
                             Fragment {
                                 item: index,
-                                trailing_space_width: full - without,
+                                trailing_space_width: hanging,
                                 text: Some(head.to_string()),
                                 x: current.x,
                                 y: current.y,
@@ -295,7 +336,16 @@ pub fn layout_inline_items_aligned(
                         );
                         rest = tail;
                     }
-                    if rest.is_empty() {
+                    if rest.is_empty() && !forced_break {
+                        break;
+                    }
+                    if forced_break && rest.is_empty() {
+                        // The run ended with a newline: close the line so the
+                        // next item starts below it.
+                        lines.push(current.close());
+                        let y = next_y(&lines);
+                        current =
+                            OpenLine::new(y, band_left(floats, content_width, y, run.line_height));
                         break;
                     }
                     // More text to place: it goes on a fresh line.
@@ -339,6 +389,12 @@ fn collapse_across_items(items: &[InlineItem]) -> Vec<InlineItem> {
     let mut previous_ended_with_space = true; // a line's leading space is dropped
     for item in items {
         match item {
+            InlineItem::Text(run) if run.preserves_spaces => {
+                // The run's white space is content; nothing may be collapsed
+                // against it, in either direction.
+                previous_ended_with_space = false;
+                out.push(item.clone());
+            }
             InlineItem::Text(run) => {
                 let mut text = run.text.as_str();
                 if previous_ended_with_space {
@@ -396,6 +452,15 @@ fn next_y(lines: &[LineBox]) -> i64 {
 fn break_opportunities(text: &str) -> Vec<usize> {
     unicode_linebreak::linebreaks(text)
         .map(|(offset, _)| offset)
+        .collect()
+}
+
+/// The offsets at which `text` *must* break — after each newline, which
+/// `white-space: pre`/`pre-wrap`/`pre-line` keep as content.
+fn mandatory_breaks(text: &str) -> Vec<usize> {
+    text.char_indices()
+        .filter(|(_, ch)| *ch == '\n')
+        .map(|(offset, ch)| offset + ch.len_utf8())
         .collect()
 }
 
@@ -524,7 +589,10 @@ impl OpenLine {
             if last.trailing_space_width > 0 {
                 last.width -= last.trailing_space_width;
                 if let Some(text) = &mut last.text {
-                    let trimmed = text.trim_end_matches(is_break_space).to_string();
+                    let trimmed = text
+                        .trim_end_matches(is_break_space)
+                        .trim_end_matches('\n')
+                        .to_string();
                     *text = trimmed;
                 }
             }
@@ -551,6 +619,8 @@ mod tests {
             bold: false,
             line_height: 20,
             breakable: true,
+            hard_breaks: false,
+            preserves_spaces: false,
         })
     }
 
@@ -705,6 +775,8 @@ mod tests {
             bold: false,
             line_height: 20,
             breakable: true,
+            hard_breaks: false,
+            preserves_spaces: false,
         })];
         // Room for roughly seven of the eight double-width characters.
         let narrow = measure_text_width("本日は晴天なり", FontSize::Medium, false);
@@ -780,6 +852,47 @@ mod tests {
         assert!(
             lines[0].end_x() > narrow,
             "the line overflows rather than wrapping"
+        );
+    }
+
+    fn pre_text(s: &str) -> InlineItem {
+        InlineItem::Text(TextRun {
+            text: s.to_string(),
+            font_size: FontSize::Medium,
+            bold: false,
+            line_height: 20,
+            breakable: true,
+            hard_breaks: true,
+            preserves_spaces: true,
+        })
+    }
+
+    #[test]
+    fn a_newline_in_preserved_text_ends_the_line() {
+        // `pre` keeps newlines as content: each one ends its line however much
+        // room is left.
+        let items = vec![pre_text("one\ntwo\nthree")];
+        let lines = layout_inline_items(&items, &FloatContext::default(), 10_000, 0, 0);
+        // The newline is the break itself, so it is not part of what is drawn.
+        assert_eq!(
+            lines_text(&lines),
+            vec![
+                vec!["one".to_string()],
+                vec!["two".to_string()],
+                vec!["three".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn preserved_runs_keep_their_spaces_across_items() {
+        // Collapsing must not reach into a `pre` run from either side.
+        let items = vec![text("a "), pre_text("   spaced   "), text(" b")];
+        let lines = layout_inline_items(&items, &FloatContext::default(), 10_000, 0, 0);
+        let joined: String = lines_text(&lines).into_iter().flatten().collect();
+        assert!(
+            joined.contains("   spaced   "),
+            "the preserved run keeps its own spaces, got {joined:?}"
         );
     }
 
