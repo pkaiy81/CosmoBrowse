@@ -3429,15 +3429,11 @@ fn collect_inline_items_from(
     }
     if kind == LayoutObjectKind::Text {
         {
-            // Ellipsis truncation is still the legacy path's business: paint
-            // applies it against a clipping ancestor, which it cannot reach
-            // once fragments are placed. Preserved white-space is handled here
-            // — newlines become mandatory breaks and the run's own spaces
-            // survive collapsing — and `nowrap` makes the run unbreakable.
-            let b = node.borrow();
-            if b.style.text_overflow_ellipsis() || b.ellipsis_clip_width().is_some() {
-                return false;
-            }
+            // Preserved white-space is handled here (newlines become
+            // mandatory breaks and the run's own spaces survive collapsing),
+            // `nowrap` makes the run unbreakable, and paint truncates for
+            // `text-overflow: ellipsis` once fragments have positions.
+            let _ = &node;
         }
         let text = match node.borrow().node_kind() {
             NodeKind::Text(t) => node.borrow().display_text(&t),

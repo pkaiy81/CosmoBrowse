@@ -259,7 +259,21 @@ impl LayoutObject {
                     if !self.inline_fragments.is_empty() {
                         let href = self.link_href();
                         let target = self.link_target();
+                        // `text-overflow: ellipsis` truncates against the
+                        // clipping ancestor's right edge, which is only known
+                        // once the fragment has a position — so it is applied
+                        // here rather than during line breaking.
+                        let ellipsis = self.ellipsis_clip_width();
                         for (text, dx, dy) in self.inline_fragments.clone() {
+                            let text = match ellipsis {
+                                Some(clip) => truncate_with_ellipsis(
+                                    &text,
+                                    fs,
+                                    bold,
+                                    (clip - dx).max(0),
+                                ),
+                                None => text,
+                            };
                             v.push(DisplayItem::Text {
                                 text,
                                 style: self.style(),
