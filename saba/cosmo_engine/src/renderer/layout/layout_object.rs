@@ -19,6 +19,7 @@ use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::EdgeSize;
 use crate::renderer::layout::computed_style::FlexDirection;
+use crate::renderer::layout::computed_style::Clear;
 use crate::renderer::layout::computed_style::Float;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
@@ -460,6 +461,11 @@ pub struct LayoutObject {
     /// inline formatting context. When set, `compute_position` uses it instead
     /// of anchoring against the previous sibling.
     pub(crate) inline_offset: Option<(i64, i64)>,
+    /// Floats placed in the block formatting context this box establishes, in
+    /// coordinates relative to its own content box. Populated between layout
+    /// iterations from the positions the previous one produced, and read by
+    /// descendants' inline layout to shorten their lines.
+    pub(crate) float_context: Option<FloatContext>,
     /// Flow-end cursor of a wrapped text run: width of the LAST line, the
     /// number of lines, and the line height used. A following inline sibling
     /// continues after the last line, not at the bounding box's top-right.
@@ -507,6 +513,7 @@ impl LayoutObject {
             text_line_max_width: 0,
             inline_fragments: Vec::new(),
             inline_offset: None,
+            float_context: None,
             text_last_line_width: 0,
             text_line_count: 0,
             text_line_height: 0,
@@ -2768,6 +2775,24 @@ impl LayoutObject {
             }
         }
 
+        // `clear` pushes an in-flow box below the floats on the cleared side.
+        // Spec: CSS 2.2 §9.5.2 — clearance.
+        // https://www.w3.org/TR/CSS22/visuren.html#flow-control
+        let clear = self.style.clear_or_default();
+        if clear != Clear::None && self.style.position() == PositionType::Static {
+            if let Some(parent) = self.parent.upgrade() {
+                let context = parent.borrow().float_context.clone();
+                if let Some(context) = context {
+                    let origin = parent.borrow().content_origin();
+                    let relative = point.y() - origin.y();
+                    let cleared = context.clearance(clear, relative);
+                    if cleared > relative {
+                        point.set_y(origin.y() + cleared);
+                    }
+                }
+            }
+        }
+
         self.point = point;
     }
 
@@ -3031,6 +3056,10 @@ impl LayoutObject {
         let Some((boxes, items)) = block.borrow().collect_inline_items() else {
             return false;
         };
+        // Floats from an enclosing block formatting context shorten this box's
+        // lines. They are stored on the BFC root in its own coordinates, so
+        // they are re-expressed against this box's content origin.
+        let inherited = inherited.cloned().or_else(|| ancestor_float_context(block));
         let options = LineOptions {
             align: match block.borrow().style.text_align() {
                 TextAlign::Center => LineAlign::Center,
@@ -3044,7 +3073,7 @@ impl LayoutObject {
         // usable span. Spec: CSS 2.2 §9.5. Floats declared by an ancestor in
         // the same formatting context are inherited (already re-expressed in
         // this box's coordinates).
-        let mut floats = inherited.cloned().unwrap_or_else(|| FloatContext::new(content_width));
+        let mut floats = inherited.unwrap_or_else(|| FloatContext::new(content_width));
         Self::place_floats_into(block, &mut floats);
         let Some(height) =
             Self::layout_inline_context_inner(block, boxes, items, content_width, options, &floats)
@@ -3420,6 +3449,30 @@ impl LayoutSize {
     }
 }
 
+
+/// The floats of the nearest ancestor block formatting context, translated
+/// into `block`'s own coordinates. `None` when no ancestor has any.
+fn ancestor_float_context(block: &Rc<RefCell<LayoutObject>>) -> Option<FloatContext> {
+    let own_origin = block.borrow().content_origin();
+    let mut ancestor = block.borrow().parent.upgrade();
+    while let Some(a) = ancestor {
+        let context = a.borrow().float_context.clone();
+        if let Some(context) = context {
+            let origin = a.borrow().content_origin();
+            // The context is in the BFC root's coordinates; this box starts
+            // `dy` below it.
+            return Some(context.translated(own_origin.y() - origin.y()));
+        }
+        if a.borrow().establishes_block_formatting_context() {
+            // A BFC root with no floats blocks the search: floats never cross
+            // a formatting context boundary.
+            return None;
+        }
+        let next = a.borrow().parent.upgrade();
+        ancestor = next;
+    }
+    None
+}
 
 /// Whether the Phase 2.5 inline formatting context replaces the legacy
 /// per-text-node wrapping. On by default; `COSMO_LEGACY_INLINE=1` (or
