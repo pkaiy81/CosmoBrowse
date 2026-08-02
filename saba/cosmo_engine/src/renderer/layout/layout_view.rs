@@ -372,9 +372,8 @@ impl LayoutView {
                 // the float has actually been placed, though — on the first
                 // iteration it is still in normal flow, which is what gives it
                 // the position the placement pass then reads.
-                let floated_and_placed = std::env::var("COSMO_FLOAT_ANCHOR").is_err()
-                    && b.style().float_or_default() != Float::None
-                    && b.inline_offset.is_some();
+                let floated_and_placed =
+                    b.style().float_or_default() != Float::None && b.inline_offset.is_some();
                 zero_sized || positioned || floated_and_placed
             };
             if out_of_flow {
@@ -952,9 +951,11 @@ impl LayoutView {
             )
         };
         // Where the float sits in the flow, relative to the containing block's
-        // content box. On the first iteration this is its normal-flow position;
-        // afterwards it is wherever the previous placement pinned it.
-        let top = (float.borrow().point().y() - origin.y()).max(0);
+        // content box — the position normal flow computed this pass, never the
+        // one the last placement assigned. Feeding the previous placement back
+        // in makes each pass start from its own output, so a float that was
+        // pushed down once can only be pushed down further.
+        let top = (float.borrow().flow_y - origin.y()).max(0);
         let clear = float.borrow().style().clear_or_default();
 
         let mut context = container

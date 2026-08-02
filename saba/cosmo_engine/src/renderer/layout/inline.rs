@@ -193,6 +193,12 @@ pub fn layout_inline_items_aligned(
     // Provisional line height so the float band query has a height to test
     // against before anything is on the line.
     let probe_height = items.first().map(InlineItem::height).unwrap_or(1);
+    // How many times a line may step down past a float looking for room, for
+    // this whole block. Per item it is not a bound at all: with many runs the
+    // steps accumulate, and content marched hundreds of thousands of pixels
+    // down a page whose floats never leave a usable band.
+    const MAX_PUSHES_BELOW: usize = 4;
+    let mut pushes_below = 0usize;
     // The first line begins after any float already occupying the left edge.
     let first_x = start_x.max(band_left(floats, content_width, start_y, probe_height));
     let mut current = OpenLine::new(start_y, first_x);
@@ -285,12 +291,21 @@ pub fn layout_inline_items_aligned(
                         // *down* past them rather than being squeezed to
                         // nothing (CSS 2.2 §9.5 — a line box that cannot fit
                         // next to floats is moved down until it fits).
-                        if let Some(below) = floats.next_edge_below(current.y) {
-                            current = OpenLine::new(
-                                below,
-                                band_left(floats, content_width, below, run.line_height),
-                            );
-                            continue;
+                        //
+                        // Bounded, because "until it fits" is unbounded when the
+                        // bands never fit: on a page with many floats the
+                        // content marched down past every one of them and the
+                        // box grew to twenty times its height. After a few
+                        // steps the line stays put and overflows instead.
+                        if pushes_below < MAX_PUSHES_BELOW {
+                            if let Some(below) = floats.next_edge_below(current.y) {
+                                pushes_below += 1;
+                                current = OpenLine::new(
+                                    below,
+                                    band_left(floats, content_width, below, run.line_height),
+                                );
+                                continue;
+                            }
                         }
                         // No floats left to clear: take one character so
                         // layout always progresses.
