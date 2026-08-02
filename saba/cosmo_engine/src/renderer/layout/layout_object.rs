@@ -2886,6 +2886,7 @@ impl LayoutObject {
     /// whitespace collapsing — which would panic against an outstanding mutable
     /// borrow.
     fn layout_inline_context_inner(
+        root: &Rc<RefCell<LayoutObject>>,
         boxes: Vec<Rc<RefCell<LayoutObject>>>,
         items: Vec<InlineItem>,
         content_width: i64,
@@ -2918,7 +2919,7 @@ impl LayoutObject {
                 continue;
             };
             union_into(&mut rects, boxed, rect);
-            for ancestor in inline_ancestors(boxed) {
+            for ancestor in inline_ancestors(boxed, root) {
                 union_into(&mut rects, &ancestor, rect);
             }
         }
@@ -2960,7 +2961,7 @@ impl LayoutObject {
             }
         }
         for boxed in boxes.iter() {
-            for ancestor in inline_ancestors(boxed) {
+            for ancestor in inline_ancestors(boxed, root) {
                 let Some(rect) = assign(&ancestor) else { continue };
                 let mut b = ancestor.borrow_mut();
                 b.size.set_width(rect.width());
@@ -2984,9 +2985,24 @@ impl LayoutObject {
         block: &Rc<RefCell<LayoutObject>>,
         inherited: Option<&FloatContext>,
     ) -> bool {
+        let is_flex_or_grid_item = block
+            .borrow()
+            .parent
+            .upgrade()
+            .map(|p| {
+                let p = p.borrow();
+                p.is_flex_container() || p.style.display() == DisplayType::Grid
+            })
+            .unwrap_or(false);
         {
             let b = block.borrow();
-            if b.kind() != LayoutObjectKind::Block {
+            // Flex and grid items are blockified whatever their own `display`
+            // says, so an inline item still establishes an inline formatting
+            // context for its contents. Without this a `<span>` flex item kept
+            // the legacy path, where its inline content overlaps.
+            // Spec: CSS Flexbox §4 / CSS Grid §6 — blockification.
+            // https://www.w3.org/TR/css-flexbox-1/#flex-items
+            if b.kind() != LayoutObjectKind::Block && !is_flex_or_grid_item {
                 return false;
             }
             // Contexts this pass does not own yet:
@@ -3031,7 +3047,7 @@ impl LayoutObject {
         let mut floats = inherited.cloned().unwrap_or_else(|| FloatContext::new(content_width));
         Self::place_floats_into(block, &mut floats);
         let Some(height) =
-            Self::layout_inline_context_inner(boxes, items, content_width, options, &floats)
+            Self::layout_inline_context_inner(block, boxes, items, content_width, options, &floats)
         else {
             return false;
         };
@@ -3429,19 +3445,11 @@ fn collect_inline_items_from(
     }
     if kind == LayoutObjectKind::Text {
         {
-            // Preserved white-space is still the legacy path's business (a
-            // `pre` run would lose its newlines here), as is ellipsis
-            // truncation, which paint applies against a clipping ancestor and
-            // cannot see once fragments are placed. `nowrap` on its own is
-            // handled: the run is simply unbreakable.
-            let b = node.borrow();
-            if b.style.white_space_preserves_newlines()
-                || b.style.white_space_preserves_spaces()
-                || b.style.text_overflow_ellipsis()
-                || b.ellipsis_clip_width().is_some()
-            {
-                return false;
-            }
+            // Preserved white-space is handled here (newlines become
+            // mandatory breaks and the run's own spaces survive collapsing),
+            // `nowrap` makes the run unbreakable, and paint truncates for
+            // `text-overflow: ellipsis` once fragments have positions.
+            let _ = &node;
         }
         let text = match node.borrow().node_kind() {
             NodeKind::Text(t) => node.borrow().display_text(&t),
@@ -3458,6 +3466,8 @@ fn collect_inline_items_from(
             bold: b.style.is_bold(),
             line_height: styled_line_height(&b.style),
             breakable: !b.style.white_space_nowrap(),
+            hard_breaks: b.style.white_space_preserves_newlines(),
+            preserves_spaces: b.style.white_space_preserves_spaces(),
         }));
         return true;
     }
@@ -3562,12 +3572,22 @@ fn union_into(
     }
 }
 
-/// The inline element boxes between `node` and its block container.
-fn inline_ancestors(node: &Rc<RefCell<LayoutObject>>) -> Vec<Rc<RefCell<LayoutObject>>> {
+/// The inline element boxes between `node` and the box establishing its inline
+/// formatting context.
+///
+/// Stopping at `root` matters as much as stopping at a block: an inline-kind
+/// root (a `<span>` flex item, which is blockified) would otherwise be handed
+/// an `inline_offset` of its own, and that overrides the position pass — which
+/// is where flex placement happens. Every chip then landed on the containing
+/// block's origin, stacked on top of each other.
+fn inline_ancestors(
+    node: &Rc<RefCell<LayoutObject>>,
+    root: &Rc<RefCell<LayoutObject>>,
+) -> Vec<Rc<RefCell<LayoutObject>>> {
     let mut chain = Vec::new();
     let mut ancestor = node.borrow().parent.upgrade();
     while let Some(a) = ancestor {
-        if a.borrow().kind() == LayoutObjectKind::Block {
+        if Rc::ptr_eq(&a, root) || a.borrow().kind() == LayoutObjectKind::Block {
             break;
         }
         chain.push(a.clone());

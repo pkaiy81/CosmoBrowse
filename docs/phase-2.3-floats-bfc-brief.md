@@ -2,13 +2,54 @@
 
 > 独立セッション用。着手前に `saba/HANDOFF.md` 全体と本書を読むこと。プランが **「古典レイアウト最難関」** と位置づける項目。**reftest 先行**で進める。
 
-> **⚠ 2.5 と結合(2026-07-25 知見)**: float の回り込みは size パスの float コンテキスト + 2.5 の行ボックスが前提で、**単独の部分実装は既存描画を悪化させうる**(今 float:right は通常フローで重なり無し)。**2.5 と一体で実施**すること。`float`/`clear` のパースは landing 済み(`b184e07`)。
+> **✅ 2.5 は完了、インライン文脈内の float も landing 済み(2026-07-29)**。残りはブロックレベルの回り込みだけで、**サイズ↔位置の不動点反復**が要る(下記)。一度推定ベースで実装して Wikipedia の段落が重なり revert した経緯も記載。
 
-## 背景 / 現在地
+## 状況(2026-07-29 更新)
+
+**インライン文脈内の float は landing 済み**(`4b6f4a6` 土台 / `7966dfd` 結線 / `16a9497`)。
+`FloatContext`(`place`/`band`/`clearance`/`lowest_bottom`/`translated`、11テスト)、
+`establishes_block_formatting_context`(CSS2.2 §9.4.1)、reftest `floats`(5ケース)。
+IFC が各行の使用可能幅を context に問うので、**含みブロックの中身が全てインラインなら回り込みが動く**
+(`<div><img style="float:left">text…</div>`)。CSS2.2 §9.5 の「脇に入らない行は下へ送る」も実装済み。
+
+**残るのはブロックレベルの回り込みのみ**: 非 float の兄弟に**ブロック**があると context が成立せず、
+float は通常フローに落ちる。reftest `floats` の該当ケースが「NOT YET」として固定している。
+
+### 一度試して revert した実装と、その理由(重要)
+
+「通常フローの積み上げなら各子の Y はサイズパスで計算できる(先行する子の outer height の総和)」
+として実装 → **margin collapsing 等 `compute_position` の仕事を推定しきれず**、さらにその結果を
+`inline_offset` で子に強制したため**位置パスを上書き**した。reftest は正しく見えたが
+**Wikipedia の段落同士が重なった**ため revert(`16a9497` のコミットメッセージに詳細)。
+**教訓: サイズパスの時点で「この子が最終的にどこに来るか」は原理的に分からない。**
+
+### 推奨する設計: サイズ↔位置の不動点反復
+
+float の位置は**実位置**からしか決まらず、実位置は行の短縮に依存する — この循環を反復で解く:
+
+```
+iteration 1: 従来どおり(float も通常フロー)→ 位置確定
+  ↓ 各 BFC ルートについて、iteration 1 の実位置で float を配置し
+    FloatContext を BFC ルートに保存(`LayoutObject::float_context`)
+iteration 2: サイズパスで各ボックスが「自分を含む BFC の context」を
+    **前回の自分の Y** で translate して参照し、行を短縮 → 位置再計算
+  ↓ float 集合が変わらなければ終了(通常 2 回で収束)
+```
+
+要点:
+- **float にだけ** `inline_offset`(位置固定)を与える。**在フローの兄弟には与えない** — これが前回の失敗要因。
+- `calculate_node_position` の out-of-flow 判定(現在 zero-size と absolute/fixed)に **float を追加**し、
+  float が次兄弟のフローアンカーにならないようにする(CSS2.2 §9.5: float は流れから外れる)。
+- 収束しない場合に備えて反復回数に上限を置く。
+
+### 撤退ライン
+
+反復が収束しない/回帰が大きい場合は、**float を含む BFC に限って**反復し、それ以外は現状維持。
+それも難しければ現状(インライン文脈のみ)で確定し、reftest の NOT YET ケースを維持する。
+
+## 旧・背景メモ
 
 - レイアウトは `cosmo_engine/src/renderer/layout/layout_view.rs`(`build_layout_tree` → `update_layout`)+ `layout_object.rs`(`compute_size` 上→下、`compute_position`)。
-- **float / clear は未実装**。`float` プロパティはカスケードで無視され、要素は通常フロー(block/inline)で配置される。
-- BFC(ブロック整形コンテキスト)の明示概念は無い。overflow/flex/grid item などの成立条件も未整理。
 - 影響例: Wikipedia のサムネイル(`float:right` + caption)、記事の回り込み。
 
 ## ゴール

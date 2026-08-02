@@ -993,32 +993,12 @@ mod tests {
 
     #[test]
     fn boa_fetch_renders_network_json() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        // Minimal one-shot HTTP server returning JSON.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            // Serve a couple of connections (favicon/other probes aside, the
-            // page makes one fetch); accept until the test's request is served.
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"items":["net-a","net-b"]}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                break; // one request is enough for this test
-            }
-        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = spawn_fixture_server(
+            r#"{"items":["net-a","net-b"]}"#,
+            "application/json",
+            stop.clone(),
+        );
 
         let base = format!("http://127.0.0.1:{port}/");
         let html = "<html><head><style>body{margin:0}</style></head><body>\
@@ -1036,8 +1016,50 @@ mod tests {
         // lifecycle settled the promise before layout).
         let has_a = result.render_tree_contains("net-a");
         let has_b = result.render_tree_contains("net-b");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = server.join();
         assert!(has_a && has_b, "fetched items not rendered; diagnostics={:?}", result.diagnostics);
+    }
+
+    /// Spawn a fixture HTTP server that answers `body` to **every** connection
+    /// until `stop` is set, and return its port plus the join handle.
+    ///
+    /// Serving exactly once is not enough: the shared `reqwest` client pools
+    /// connections and may open more than one, and a request that arrives after
+    /// the listener is gone waits out the 10s connect + 20s request timeouts —
+    /// which is what the 30s failures in this module were.
+    fn spawn_fixture_server(
+        body: &'static str,
+        content_type: &'static str,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, handle)
     }
 
     /// Serializes the tests that pump a `LivePage`. `COSMO_LAYOUT_ASSERT` is
@@ -1055,24 +1077,12 @@ mod tests {
     #[test]
     fn live_page_progressive_render_after_fetch() {
         let _env = lock_layout_assert_env();
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            if let Some(Ok(mut stream)) = listener.incoming().next() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"items":["late-x","late-y"]}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            }
-        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = spawn_fixture_server(
+            r#"{"items":["late-x","late-y"]}"#,
+            "application/json",
+            stop.clone(),
+        );
 
         let base = format!("http://127.0.0.1:{port}/");
         let html = "<html><head><style>body{margin:0}</style></head><body>\
@@ -1113,6 +1123,7 @@ mod tests {
                 relaid_out = true;
             }
         }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = server.join();
 
         assert!(relaid_out, "the fetch completion should have triggered a re-layout");
@@ -1128,27 +1139,15 @@ mod tests {
     #[test]
     fn incremental_matches_full_under_assert() {
         let _env = lock_layout_assert_env();
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
         // A fetch completes after load and its handler mutates the DOM; under
         // COSMO_LAYOUT_ASSERT the reused-CSSOM incremental pump must produce
         // scene items byte-identical to a full from-scratch layout.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            if let Some(Ok(mut stream)) = listener.incoming().next() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"items":["row0","row1","row2"]}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            }
-        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = spawn_fixture_server(
+            r#"{"items":["row0","row1","row2"]}"#,
+            "application/json",
+            stop.clone(),
+        );
 
         let base = format!("http://127.0.0.1:{port}/");
         let html = "<html><head><style>body{margin:0}li{color:#123456}</style></head><body>\
@@ -1174,6 +1173,7 @@ mod tests {
             }
         }
         std::env::remove_var("COSMO_LAYOUT_ASSERT");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = server.join();
 
         let scene = scene.expect("fetch mutation should trigger a re-layout (asserted == full)");
