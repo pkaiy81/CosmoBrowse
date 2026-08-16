@@ -2221,6 +2221,22 @@ impl LayoutObject {
                     } else {
                         available_width
                     }
+                } else if self.style.float_or_default() != Float::None {
+                    // A floated box with `width: auto` shrink-wraps its content
+                    // rather than filling the containing block — otherwise it
+                    // leaves no room beside itself and the whole point of
+                    // floating is lost. On Wikipedia, auto-width floats took the
+                    // full 912px column, so every band beside them was zero
+                    // wide and the article's text wrapped to nothing.
+                    //
+                    // Spec: CSS 2.2 §10.3.5 — shrink-to-fit is
+                    // min(max(preferred minimum, available), preferred).
+                    // https://www.w3.org/TR/CSS22/visudet.html#float-width
+                    let preferred = self.max_content_width();
+                    let preferred_minimum = self.min_content_width_hint();
+                    preferred.min(available_width).max(
+                        preferred_minimum.min(available_width),
+                    )
                 } else {
                     available_width
                 };
