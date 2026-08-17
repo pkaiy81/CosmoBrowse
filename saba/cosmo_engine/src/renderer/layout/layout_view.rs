@@ -272,6 +272,24 @@ impl LayoutView {
         tree
     }
 
+    /// Clear every box's laid-out geometry so a layout pass starts from the
+    /// same state each time. Style is untouched — it is an input.
+    ///
+    /// Content-derived caches (a table's per-column hints) are left alone: they
+    /// are computed from the DOM, not from a previous layout, so recomputing
+    /// them would give the same answer at a cost.
+    fn reset_layout_state(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(n) = node else { return };
+        {
+            let mut b = n.borrow_mut();
+            b.reset_geometry();
+        }
+        let first_child = n.borrow().first_child();
+        Self::reset_layout_state(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        Self::reset_layout_state(&next_sibling);
+    }
+
     // Spec: CSS2.2 visual formatting model computes used sizes before positions
     // for normal-flow block/inline boxes in a containing block.
     // https://www.w3.org/TR/CSS22/visuren.html
@@ -797,6 +815,13 @@ impl LayoutView {
 
     fn update_layout(&mut self) {
         let viewport_size = LayoutSize::new(self.viewport_width, 0);
+        // Geometry is this pass's *output*, never its input. Some sizing reads
+        // sibling boxes — a table cell's auto width consults the cells above it
+        // in the same column (`column_width_from_sibling_rows`) — so leaving the
+        // previous pass's sizes in place makes the result depend on how many
+        // times layout has run. Clearing them first makes a pass a pure function
+        // of the tree, the stylesheet and the viewport.
+        Self::reset_layout_state(&self.root);
         Self::calculate_node_size(&self.root, viewport_size);
         Self::adjust_rowspan_heights(&self.root);
         Self::equalize_cell_heights_in_rows(&self.root);
@@ -1560,6 +1585,178 @@ mod tests {
         let css_tokenizer = CssTokenizer::new(style);
         let cssom = CssParser::new(css_tokenizer).parse_stylesheet();
         LayoutView::new(dom, &cssom, viewport_width)
+    }
+
+    /// Lay `html` out, re-run the layout, and return the two paint results.
+    /// A second pass over an already-laid-out tree must be a no-op: nothing in
+    /// the pass may depend on the state the previous one left behind.
+    fn paint_twice(html: &str, viewport_width: i64) -> (Vec<DisplayItem>, Vec<DisplayItem>) {
+        let mut view = create_layout_view(html.to_string(), viewport_width);
+        let first = view.paint();
+        view.update_layout();
+        let second = view.paint();
+        (first, second)
+    }
+
+    /// Report the first place two paint results diverge, for a readable failure.
+    fn describe_divergence(first: &[DisplayItem], second: &[DisplayItem]) -> String {
+        if first.len() != second.len() {
+            return std::format!(
+                "item count {} -> {}",
+                first.len(),
+                second.len()
+            );
+        }
+        // Report geometry only: the whole ComputedStyle is unreadable in a
+        // failure message and is not what differs when a pass is not idempotent.
+        let geometry = |item: &DisplayItem| match item {
+            DisplayItem::Rect { layout_point, layout_size, .. }
+            | DisplayItem::Image { layout_point, layout_size, .. } => std::format!(
+                "rect/image at ({}, {}) {}x{}",
+                layout_point.x(),
+                layout_point.y(),
+                layout_size.width(),
+                layout_size.height()
+            ),
+            DisplayItem::Text { layout_point, text, .. } => std::format!(
+                "text at ({}, {}) {:?}",
+                layout_point.x(),
+                layout_point.y(),
+                text
+            ),
+        };
+        for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+            if a != b {
+                return std::format!(
+                    "item {i}: {} -> {}",
+                    geometry(a),
+                    geometry(b)
+                );
+            }
+        }
+        "identical".to_string()
+    }
+
+    /// The layout pass must be idempotent: re-running it over a tree it has
+    /// already laid out must produce exactly the same boxes.
+    ///
+    /// This is not academic. Block-level float flow-around needs to iterate
+    /// size and position to a fixed point — a float's position depends on the
+    /// flow, and the flow beside it depends on the float — and an iteration
+    /// whose steps are not idempotent cannot converge on anything.
+    #[test]
+    fn layout_pass_is_idempotent_for_blocks_and_inlines() {
+        let html = concat!(
+            "<html><head><style>",
+            "body{margin:0;font-size:14px}",
+            ".narrow{width:280px;padding:8px}",
+            "p{margin:4px 0}",
+            "</style></head><body>",
+            "<div class=\"narrow\">",
+            "  Text that must wrap inside a narrow container at word boundaries, ",
+            "  with <b>bold runs</b>, <a href=\"#\">an inline anchor</a> and more.",
+            "  <p>A nested paragraph with its own margins.</p>",
+            "</div>",
+            "<ul><li>list item one that wraps because it is fairly long</li>",
+            "<li>item two</li></ul>",
+            "</body></html>",
+        );
+        let (first, second) = paint_twice(html, 1024);
+        assert_eq!(
+            first,
+            second,
+            "second layout pass changed the result: {}",
+            describe_divergence(&first, &second)
+        );
+    }
+
+    /// Same, for a table — its sizing runs several corrective passes, so it is
+    /// the most likely place for state to accumulate across layouts.
+    #[test]
+    fn layout_pass_is_idempotent_for_tables() {
+        let html = concat!(
+            "<html><head><style>body{margin:0;font-size:13px}</style></head><body>",
+            "<table border=\"1\" cellspacing=\"2\">",
+            "<tr><th>Header A</th><th>Header B</th><th>Header C</th></tr>",
+            "<tr><td>alpha</td><td rowspan=\"2\">tall cell spanning two rows</td>",
+            "<td>gamma</td></tr>",
+            "<tr><td>delta</td><td>epsilon with longer content that widens it</td></tr>",
+            "<tr><td colspan=\"3\" align=\"center\">footer spanning all three</td></tr>",
+            "</table></body></html>",
+        );
+        let (first, second) = paint_twice(html, 1024);
+        assert_eq!(
+            first,
+            second,
+            "second layout pass changed the result: {}",
+            describe_divergence(&first, &second)
+        );
+    }
+
+    /// Flex/grid alignment and float placement are post-passes that *move*
+    /// boxes after they are positioned, so they are the other place a second
+    /// layout could double-apply.
+    #[test]
+    fn layout_pass_is_idempotent_for_flex_grid_and_floats() {
+        let html = concat!(
+            "<html><head><style>",
+            "body{margin:0;font-size:14px}",
+            ".row{display:flex;justify-content:center;background:#eee;padding:6px}",
+            ".chip{background:#36c;color:#fff;padding:6px;margin:4px}",
+            ".cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;width:640px}",
+            ".card{background:#fed;padding:10px}",
+            ".wrap{width:420px}",
+            ".fl{float:left;width:110px;height:80px;background:#c33}",
+            ".fr{float:right;width:90px;height:50px;background:#3a5}",
+            "</style></head><body>",
+            "<div class=\"row\"><span class=\"chip\">one</span>",
+            "<span class=\"chip\">two</span></div>",
+            "<div class=\"cards\"><div class=\"card\">Card one body text</div>",
+            "<div class=\"card\">Card two with more text inside it</div>",
+            "<div class=\"card\">Card three</div></div>",
+            "<div class=\"wrap\"><div class=\"fl\"></div><div class=\"fr\"></div>",
+            "Text that flows around both floats and reclaims the full width once ",
+            "it passes their bottom edges, wrapping several times on the way.",
+            "</div>",
+            "</body></html>",
+        );
+        let (first, second) = paint_twice(html, 1024);
+        assert_eq!(
+            first,
+            second,
+            "second layout pass changed the result: {}",
+            describe_divergence(&first, &second)
+        );
+    }
+
+    /// Transforms, sticky and positioned boxes are stamped onto the style
+    /// after positioning. A second pass must re-derive them, not compound them.
+    #[test]
+    fn layout_pass_is_idempotent_for_transforms_and_positioned() {
+        let html = concat!(
+            "<html><head><style>",
+            "body{margin:0;font-size:14px}",
+            ".rot{transform:rotate(8deg);background:#c44;width:120px;height:40px}",
+            ".sticky{position:sticky;top:10px;background:#4c4;height:30px}",
+            ".rel{position:relative;left:20px;top:5px;background:#44c;height:30px}",
+            ".abs{position:absolute;right:10px;top:40px;background:#cc4;width:80px;height:20px}",
+            ".scroll{overflow:auto;height:60px;background:#eee}",
+            "</style></head><body>",
+            "<div class=\"rot\">rotated</div>",
+            "<div class=\"sticky\">sticky</div>",
+            "<div class=\"rel\">relative</div>",
+            "<div class=\"abs\">absolute</div>",
+            "<div class=\"scroll\"><p>overflowing content that scrolls inside</p>",
+            "<p>a second paragraph to make it overflow</p></div>",
+            "</body></html>",
+        );
+        let (first, second) = paint_twice(html, 1024);
+        assert_eq!(
+            first,
+            second,
+            "second layout pass changed the result: {}",
+            describe_divergence(&first, &second)
+        );
     }
 
     #[test]
