@@ -1759,6 +1759,41 @@ mod tests {
         );
     }
 
+    /// The synthetic cases above are small. This runs the same check over the
+    /// frozen Wikipedia mirror — a 395KB real document — because that is where
+    /// the non-idempotence was found: a second layout used to move 80017px of
+    /// the page and a third moved it somewhere else again.
+    ///
+    /// Skipped when the fixture is absent, so a partial checkout still builds.
+    #[test]
+    fn layout_pass_is_idempotent_for_a_real_document() {
+        let path = std::path::Path::new("../testdata/sites/wikipedia/index.html");
+        let Ok(html) = std::fs::read_to_string(path) else {
+            return;
+        };
+        // Layout is recursive descent and real pages nest deeply, so this runs
+        // on a big stack for the same reason the renderer's main thread does.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let (first, second) = paint_twice(&html, 1024);
+                assert!(
+                    first.len() > 500,
+                    "fixture should produce a substantial layout, got {} items",
+                    first.len()
+                );
+                assert_eq!(
+                    first,
+                    second,
+                    "second layout pass changed the result: {}",
+                    describe_divergence(&first, &second)
+                );
+            })
+            .expect("spawn layout thread")
+            .join()
+            .expect("layout thread panicked");
+    }
+
     #[test]
     fn test_empty() {
         let layout_view = create_layout_view("".to_string(), 600);
