@@ -3523,9 +3523,14 @@ fn ancestor_float_context(block: &Rc<RefCell<LayoutObject>>) -> Option<FloatCont
         let context = a.borrow().float_context.clone();
         if let Some(context) = context {
             let origin = a.borrow().content_origin();
-            // The context is in the BFC root's coordinates; this box starts
-            // `dy` below it.
-            return Some(context.translated(own_origin.y() - origin.y()));
+            // The context is in the ancestor's coordinates; re-express it in
+            // this box's — offset *and* width, or a float lands in the wrong
+            // place or appears to narrow nothing.
+            return Some(context.translated(
+                own_origin.x() - origin.x(),
+                own_origin.y() - origin.y(),
+                block.borrow().content_size().width(),
+            ));
         }
         if a.borrow().establishes_block_formatting_context() {
             // A BFC root with no floats blocks the search: floats never cross
