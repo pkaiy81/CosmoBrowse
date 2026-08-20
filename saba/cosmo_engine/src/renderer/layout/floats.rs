@@ -197,6 +197,13 @@ impl FloatContext {
             .min()
     }
 
+    /// Add an already-placed float, as-is. Used to merge a box's own floats
+    /// into the context it inherited from an ancestor: both are expressed in
+    /// this box's coordinates by then.
+    pub fn adopt(&mut self, float: PlacedFloat) {
+        self.floats.push(float);
+    }
+
     /// A copy with every float shifted up by `dy`, i.e. re-expressed in the
     /// coordinates of a descendant box that starts `dy` below this context's
     /// origin. Floats belong to their block formatting context, not to the

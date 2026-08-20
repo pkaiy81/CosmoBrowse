@@ -19,6 +19,7 @@ use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::EdgeSize;
 use crate::renderer::layout::computed_style::FlexDirection;
+use crate::renderer::layout::computed_style::Clear;
 use crate::renderer::layout::computed_style::Float;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::GridTrack;
@@ -460,6 +461,16 @@ pub struct LayoutObject {
     /// inline formatting context. When set, `compute_position` uses it instead
     /// of anchoring against the previous sibling.
     pub(crate) inline_offset: Option<(i64, i64)>,
+    /// Floats placed in the block formatting context this box establishes, in
+    /// coordinates relative to its own content box. Populated between layout
+    /// iterations from the positions the previous one produced, and read by
+    /// descendants' inline layout to shorten their lines.
+    pub(crate) float_context: Option<FloatContext>,
+    /// Where normal flow would have put this box's top, recorded before any
+    /// float placement overrode it. Float placement must read *this*, not the
+    /// position it assigned last time, or each pass takes its own output as the
+    /// input and the float can only ever drift downwards.
+    pub(crate) flow_y: i64,
     /// Flow-end cursor of a wrapped text run: width of the LAST line, the
     /// number of lines, and the line height used. A following inline sibling
     /// continues after the last line, not at the bounding box's top-right.
@@ -507,6 +518,8 @@ impl LayoutObject {
             text_line_max_width: 0,
             inline_fragments: Vec::new(),
             inline_offset: None,
+            float_context: None,
+            flow_y: 0,
             text_last_line_width: 0,
             text_line_count: 0,
             text_line_height: 0,
@@ -2208,6 +2221,22 @@ impl LayoutObject {
                     } else {
                         available_width
                     }
+                } else if self.style.float_or_default() != Float::None {
+                    // A floated box with `width: auto` shrink-wraps its content
+                    // rather than filling the containing block — otherwise it
+                    // leaves no room beside itself and the whole point of
+                    // floating is lost. On Wikipedia, auto-width floats took the
+                    // full 912px column, so every band beside them was zero
+                    // wide and the article's text wrapped to nothing.
+                    //
+                    // Spec: CSS 2.2 §10.3.5 — shrink-to-fit is
+                    // min(max(preferred minimum, available), preferred).
+                    // https://www.w3.org/TR/CSS22/visudet.html#float-width
+                    let preferred = self.max_content_width();
+                    let preferred_minimum = self.min_content_width_hint();
+                    preferred.min(available_width).max(
+                        preferred_minimum.min(available_width),
+                    )
                 } else {
                     available_width
                 };
@@ -2494,10 +2523,20 @@ impl LayoutObject {
         // A box placed by the inline formatting context already knows where it
         // goes relative to its containing block; pairwise sibling anchoring
         // would undo that.
-        if let Some((dx, dy)) = self.inline_offset {
-            self.point.set_x(parent_point.x() + dx);
-            self.point.set_y(parent_point.y() + dy);
-            return;
+        // A float still runs the normal-flow computation below so its flow
+        // position stays available; everything else placed by inline layout
+        // takes its offset directly.
+        let float_placement = if self.style.float_or_default() != Float::None {
+            self.inline_offset
+        } else {
+            None
+        };
+        if float_placement.is_none() {
+            if let Some((dx, dy)) = self.inline_offset {
+                self.point.set_x(parent_point.x() + dx);
+                self.point.set_y(parent_point.y() + dy);
+                return;
+            }
         }
 
         let mut point = LayoutPoint::new(0, 0);
@@ -2768,6 +2807,29 @@ impl LayoutObject {
             }
         }
 
+        // `clear` pushes an in-flow box below the floats on the cleared side.
+        // Spec: CSS 2.2 §9.5.2 — clearance.
+        // https://www.w3.org/TR/CSS22/visuren.html#flow-control
+        let clear = self.style.clear_or_default();
+        if clear != Clear::None && self.style.position() == PositionType::Static {
+            if let Some(parent) = self.parent.upgrade() {
+                let context = parent.borrow().float_context.clone();
+                if let Some(context) = context {
+                    let origin = parent.borrow().content_origin();
+                    let relative = point.y() - origin.y();
+                    let cleared = context.clearance(clear, relative);
+                    if cleared > relative {
+                        point.set_y(origin.y() + cleared);
+                    }
+                }
+            }
+        }
+
+        self.flow_y = point.y();
+        if let Some((dx, dy)) = float_placement {
+            point.set_x(parent_point.x() + dx);
+            point.set_y(parent_point.y() + dy);
+        }
         self.point = point;
     }
 
@@ -2828,7 +2890,12 @@ impl LayoutObject {
         self.text_line_count = 0;
         self.text_line_height = 0;
         self.inline_fragments.clear();
-        self.inline_offset = None;
+        // A float's placement is the one thing the layout iteration carries
+        // between passes — it is what the fixed point solves for. Every other
+        // box's offset is re-derived by the pass about to run.
+        if self.style.float_or_default() == Float::None {
+            self.inline_offset = None;
+        }
     }
 
     /// The DOM node this box was generated from (identity is what the runtime's
@@ -3044,6 +3111,10 @@ impl LayoutObject {
         let Some((boxes, items)) = block.borrow().collect_inline_items() else {
             return false;
         };
+        // Floats from an enclosing block formatting context shorten this box's
+        // lines. They are stored on the BFC root in its own coordinates, so
+        // they are re-expressed against this box's content origin.
+        let inherited = inherited.cloned().or_else(|| ancestor_float_context(block));
         let options = LineOptions {
             align: match block.borrow().style.text_align() {
                 TextAlign::Center => LineAlign::Center,
@@ -3057,8 +3128,17 @@ impl LayoutObject {
         // usable span. Spec: CSS 2.2 §9.5. Floats declared by an ancestor in
         // the same formatting context are inherited (already re-expressed in
         // this box's coordinates).
-        let mut floats = inherited.cloned().unwrap_or_else(|| FloatContext::new(content_width));
-        Self::place_floats_into(block, &mut floats);
+        // This box's own floats, kept apart from the inherited ones: only the
+        // former decide how tall a block formatting context must be to contain
+        // them. Mixing them made a box stretch to reach an ancestor's float —
+        // which on a page with floats far down the document meant heights in
+        // the hundreds of thousands of pixels.
+        let mut own_floats = FloatContext::new(content_width);
+        Self::place_floats_into(block, &mut own_floats);
+        let mut floats = inherited.unwrap_or_else(|| FloatContext::new(content_width));
+        for placed in own_floats.placed() {
+            floats.adopt(*placed);
+        }
         let Some(height) =
             Self::layout_inline_context_inner(block, boxes, items, content_width, options, &floats)
         else {
@@ -3072,7 +3152,7 @@ impl LayoutObject {
         // A box that establishes a block formatting context contains its
         // floats; an ordinary block lets them overflow (CSS 2.2 §10.6.7).
         let height = if b.establishes_block_formatting_context() {
-            height.max(floats.lowest_bottom())
+            height.max(own_floats.lowest_bottom())
         } else {
             height
         };
@@ -3433,6 +3513,30 @@ impl LayoutSize {
     }
 }
 
+
+/// The floats of the nearest ancestor block formatting context, translated
+/// into `block`'s own coordinates. `None` when no ancestor has any.
+fn ancestor_float_context(block: &Rc<RefCell<LayoutObject>>) -> Option<FloatContext> {
+    let own_origin = block.borrow().content_origin();
+    let mut ancestor = block.borrow().parent.upgrade();
+    while let Some(a) = ancestor {
+        let context = a.borrow().float_context.clone();
+        if let Some(context) = context {
+            let origin = a.borrow().content_origin();
+            // The context is in the BFC root's coordinates; this box starts
+            // `dy` below it.
+            return Some(context.translated(own_origin.y() - origin.y()));
+        }
+        if a.borrow().establishes_block_formatting_context() {
+            // A BFC root with no floats blocks the search: floats never cross
+            // a formatting context boundary.
+            return None;
+        }
+        let next = a.borrow().parent.upgrade();
+        ancestor = next;
+    }
+    None
+}
 
 /// Whether the Phase 2.5 inline formatting context replaces the legacy
 /// per-text-node wrapping. On by default; `COSMO_LEGACY_INLINE=1` (or
