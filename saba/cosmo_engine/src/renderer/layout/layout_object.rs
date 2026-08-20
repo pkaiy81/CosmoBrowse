@@ -2818,6 +2818,19 @@ impl LayoutObject {
         self.node.borrow().kind().clone()
     }
 
+    /// Clear the geometry a layout pass produces, so the next one starts from
+    /// the same state. See `LayoutView::reset_layout_state`.
+    pub(crate) fn reset_geometry(&mut self) {
+        self.point = LayoutPoint::new(0, 0);
+        self.size = LayoutSize::new(0, 0);
+        self.text_line_max_width = 0;
+        self.text_last_line_width = 0;
+        self.text_line_count = 0;
+        self.text_line_height = 0;
+        self.inline_fragments.clear();
+        self.inline_offset = None;
+    }
+
     /// The DOM node this box was generated from (identity is what the runtime's
     /// transition driver keys its per-element animation state on).
     pub fn node_ref(&self) -> Rc<RefCell<Node>> {
