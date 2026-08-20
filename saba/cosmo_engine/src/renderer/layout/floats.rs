@@ -197,18 +197,38 @@ impl FloatContext {
             .min()
     }
 
-    /// A copy with every float shifted up by `dy`, i.e. re-expressed in the
-    /// coordinates of a descendant box that starts `dy` below this context's
-    /// origin. Floats belong to their block formatting context, not to the
-    /// block that happens to contain the text flowing around them, so a
-    /// descendant asks its questions in its own coordinates against this.
-    pub fn translated(&self, dy: i64) -> Self {
+    /// Add an already-placed float, as-is. Used to merge a box's own floats
+    /// into the context it inherited from an ancestor: both are expressed in
+    /// this box's coordinates by then.
+    pub fn adopt(&mut self, float: PlacedFloat) {
+        self.floats.push(float);
+    }
+
+    /// A copy re-expressed in the coordinates of a descendant box whose content
+    /// origin sits `(dx, dy)` from this context's, and whose content box is
+    /// `content_width` wide.
+    ///
+    /// Both parts matter. Shifting only `y` leaves each float's `x` in the
+    /// ancestor's frame, so an indented descendant compares its own
+    /// coordinates against someone else's; and keeping the ancestor's width
+    /// makes `band` clamp the right edge to a value the descendant never
+    /// reaches, so a float at the ancestor's right edge appears to narrow
+    /// nothing.
+    ///
+    /// Floats belong to their block formatting context, not to the block that
+    /// happens to contain the text flowing around them, which is why a
+    /// descendant has to ask its questions in its own frame.
+    pub fn translated(&self, dx: i64, dy: i64, content_width: i64) -> Self {
         Self {
-            content_width: self.content_width,
+            content_width: content_width.max(0),
             floats: self
                 .floats
                 .iter()
-                .map(|f| PlacedFloat { y: f.y - dy, ..*f })
+                .map(|f| PlacedFloat {
+                    x: f.x - dx,
+                    y: f.y - dy,
+                    ..*f
+                })
                 .collect(),
         }
     }
@@ -321,11 +341,28 @@ mod tests {
     fn translating_re_expresses_floats_for_a_descendant() {
         let mut c = ctx();
         c.place(FloatSide::Left, 30, 50, 0, Clear::None);
-        // A box starting 20 below sees the float's remaining 30.
-        let inner = c.translated(20);
+        // A box starting 20 below, same origin and width: sees the float's
+        // remaining 30.
+        let inner = c.translated(0, 20, 100);
         assert_eq!(inner.band(0, 10), Band { left: 30, right: 100 });
         assert_eq!(inner.band(29, 1), Band { left: 30, right: 100 });
         assert_eq!(inner.band(30, 10), Band { left: 0, right: 100 });
+    }
+
+    #[test]
+    fn translating_shifts_x_and_adopts_the_descendants_width() {
+        // A right float at the ancestor's right edge, and a descendant indented
+        // by 20 whose content box is 60 wide.
+        let mut c = ctx();
+        c.place(FloatSide::Right, 30, 50, 0, Clear::None);
+        assert_eq!(c.band(0, 10), Band { left: 0, right: 70 });
+
+        let inner = c.translated(20, 0, 60);
+        // In the descendant's frame the float starts at 70-20 = 50, so its
+        // 60-wide content box is narrowed to 0..50. Keeping the ancestor's
+        // width would have clamped to 70 and narrowed nothing.
+        assert_eq!(inner.band(0, 10), Band { left: 0, right: 50 });
+        assert!(inner.band(0, 10).width() < 60, "the descendant is narrowed");
     }
 
     #[test]

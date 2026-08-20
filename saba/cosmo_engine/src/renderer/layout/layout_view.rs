@@ -10,6 +10,8 @@ use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::layout_object::use_new_inline;
+use crate::renderer::layout::computed_style::Float;
+use crate::renderer::layout::floats::{FloatContext, FloatSide, PlacedFloat};
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::{
     AnimatedProperty, AnimatedValue, AnimationSpec, ComputedStyle, TransitionSpec,
@@ -272,6 +274,23 @@ impl LayoutView {
         tree
     }
 
+    /// Drop every float placement and context, so the fixed-point iteration
+    /// starts from the same state on each `update_layout`.
+    fn clear_float_state(node: &Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(n) = node else { return };
+        {
+            let mut b = n.borrow_mut();
+            b.float_context = None;
+            if b.style().float_or_default() != Float::None {
+                b.inline_offset = None;
+            }
+        }
+        let first_child = n.borrow().first_child();
+        Self::clear_float_state(&first_child);
+        let next_sibling = n.borrow().next_sibling();
+        Self::clear_float_state(&next_sibling);
+    }
+
     /// Clear every box's laid-out geometry so a layout pass starts from the
     /// same state each time. Style is untouched — it is an input.
     ///
@@ -382,7 +401,15 @@ impl LayoutView {
                     b.style().position(),
                     PositionType::Absolute | PositionType::Fixed
                 );
-                zero_sized || positioned
+                // A float is out of flow too: the next in-flow sibling stacks
+                // against the box *before* it and flows around the float
+                // instead of being pushed below it (CSS 2.2 §9.5). Only once
+                // the float has actually been placed, though — on the first
+                // iteration it is still in normal flow, which is what gives it
+                // the position the placement pass then reads.
+                let floated_and_placed =
+                    b.style().float_or_default() != Float::None && b.inline_offset.is_some();
+                zero_sized || positioned || floated_and_placed
             };
             if out_of_flow {
                 Self::calculate_node_position(
@@ -815,12 +842,186 @@ impl LayoutView {
 
     fn update_layout(&mut self) {
         let viewport_size = LayoutSize::new(self.viewport_width, 0);
-        // Geometry is this pass's *output*, never its input. Some sizing reads
-        // sibling boxes — a table cell's auto width consults the cells above it
-        // in the same column (`column_width_from_sibling_rows`) — so leaving the
-        // previous pass's sizes in place makes the result depend on how many
-        // times layout has run. Clearing them first makes a pass a pure function
-        // of the tree, the stylesheet and the viewport.
+
+        // A float's position depends on where it lands in the flow, and the
+        // lines beside it depend on the float — a cycle the size pass alone
+        // cannot break, because it does not know where a box will end up (that
+        // is what `compute_position`, margin collapsing included, decides).
+        //
+        // So the layout runs to a fixed point instead: lay out, place the
+        // floats from the *real* positions that produced, and lay out again
+        // with those floats known. Two iterations settle the common case (a
+        // float near the top of its container); the loop stops as soon as the
+        // placements repeat.
+        // Spec: CSS 2.2 §9.5. https://www.w3.org/TR/CSS22/visuren.html#floats
+        const MAX_ITERATIONS: usize = 4;
+        // The float placements are the iteration's *internal* state, so it
+        // starts from none of them every time. Without this a second
+        // `update_layout` would begin where the first left off and settle
+        // somewhere else — the whole call has to be a pure function of the
+        // tree, the stylesheet and the viewport, not just each pass.
+        Self::clear_float_state(&self.root);
+        let mut previous: Vec<PlacedFloat> = Vec::new();
+        let mut repeats = 0;
+        for iteration in 0..MAX_ITERATIONS {
+            self.run_layout_pass(viewport_size);
+            if !use_new_inline() {
+                break;
+            }
+            let placed = Self::place_floats_from_positions(&self.root);
+            if placed.is_empty() || iteration + 1 == MAX_ITERATIONS {
+                break;
+            }
+            // The placements repeating is not enough to stop. A float is pinned
+            // by its first placement, so it repeats from the second pass on
+            // while the boxes *beside* it are still moving — and each pass's
+            // sizing reads the positions the *previous* pass produced. Stopping
+            // at the first repeat means no pass ever sizes against the settled
+            // positions, so the lines beside a float never shorten. Wait for a
+            // second repeat, i.e. one full pass after everything has stopped
+            // moving.
+            if placed == previous {
+                repeats += 1;
+                if repeats >= 2 {
+                    break;
+                }
+            } else {
+                repeats = 0;
+            }
+            previous = placed;
+        }
+
+        Self::layout_flex_alignment(&self.root);
+        Self::align_inline_baselines(&self.root);
+        self.reposition_fixed_far_edges(&self.root.clone());
+        Self::apply_transforms(&self.root);
+        let mut next_scroll_id: u32 = 1;
+        Self::stamp_sticky_contexts(
+            &self.root,
+            None,
+            false,
+            (None, None),
+            true,
+            None,
+            None,
+            &mut next_scroll_id,
+        );
+    }
+
+    /// Place every float at the flow position the last pass gave it, storing
+    /// the result on its containing block for the next pass's inline layout to
+    /// consult. Returns every placement made, so the caller can tell when the
+    /// layout has settled.
+    ///
+    /// Placement uses real positions rather than an estimate: that is the whole
+    /// point of iterating, and estimating them in the size pass is what made an
+    /// earlier attempt overlap Wikipedia's paragraphs.
+    ///
+    /// A float is registered on its *containing block* rather than on the
+    /// enclosing BFC root. Strictly it belongs to the BFC — a float can overflow
+    /// a non-BFC parent — but its position is relative to the containing block
+    /// either way, and keeping the two frames the same avoids converting
+    /// between them on every read. Floats that overflow their parent are the
+    /// rarer case and stay unhandled.
+    fn place_floats_from_positions(
+        root: &Option<Rc<RefCell<LayoutObject>>>,
+    ) -> Vec<PlacedFloat> {
+        let mut all = Vec::new();
+        Self::collect_float_placements(root, &mut all);
+        all
+    }
+
+    fn collect_float_placements(
+        node: &Option<Rc<RefCell<LayoutObject>>>,
+        all: &mut Vec<PlacedFloat>,
+    ) {
+        let Some(n) = node else { return };
+
+        // Rebuild this box's context from scratch each iteration so a float
+        // that moved does not leave a stale band behind.
+        let has_floated_child = {
+            let mut child = n.borrow().first_child();
+            let mut found = false;
+            while let Some(c) = child {
+                if c.borrow().style().float_or_default() != Float::None {
+                    found = true;
+                    break;
+                }
+                let next = c.borrow().next_sibling();
+                child = next;
+            }
+            found
+        };
+        if has_floated_child {
+            let content_width = n.borrow().content_size().width();
+            n.borrow_mut().float_context = Some(FloatContext::new(content_width));
+            let mut child = n.borrow().first_child();
+            while let Some(c) = child {
+                if c.borrow().style().float_or_default() != Float::None {
+                    Self::place_float_into(n, &c, all);
+                }
+                let next = c.borrow().next_sibling();
+                child = next;
+            }
+        } else {
+            n.borrow_mut().float_context = None;
+        }
+
+        let first_child = n.borrow().first_child();
+        Self::collect_float_placements(&first_child, all);
+        let next_sibling = n.borrow().next_sibling();
+        Self::collect_float_placements(&next_sibling, all);
+    }
+
+    /// Add one float to `container`'s context at its current flow position.
+    fn place_float_into(
+        container: &Rc<RefCell<LayoutObject>>,
+        float: &Rc<RefCell<LayoutObject>>,
+        all: &mut Vec<PlacedFloat>,
+    ) {
+        let Some(side) = FloatSide::from_float(float.borrow().style().float_or_default()) else {
+            return;
+        };
+        let origin = container.borrow().content_origin();
+        let metrics = compute_box_model_metrics(&float.borrow().style());
+        let (width, height) = {
+            let f = float.borrow();
+            (
+                f.size().width() + metrics.margin.left + metrics.margin.right,
+                f.size().height() + metrics.margin.top + metrics.margin.bottom,
+            )
+        };
+        // Where the float sits in the flow, relative to the containing block's
+        // content box — the position normal flow computed this pass, never the
+        // one the last placement assigned. Feeding the previous placement back
+        // in makes each pass start from its own output, so a float that was
+        // pushed down once can only be pushed down further.
+        let top = (float.borrow().flow_y - origin.y()).max(0);
+        let clear = float.borrow().style().clear_or_default();
+
+        let mut context = container
+            .borrow_mut()
+            .float_context
+            .take()
+            .expect("context was just created");
+        let placed = context.place(side, width, height, top, clear);
+        container.borrow_mut().float_context = Some(context);
+
+        // Pin the float where the context put it; the position pass honours
+        // `inline_offset` instead of anchoring it against a sibling.
+        float.borrow_mut().inline_offset =
+            Some((placed.x + metrics.margin.left, placed.y + metrics.margin.top));
+        all.push(placed);
+    }
+
+    /// One size-then-position pass over the whole tree.
+    fn run_layout_pass(&mut self, viewport_size: LayoutSize) {
+        // Geometry is this pass's *output*, never its input (a table cell's
+        // auto width reads the cells above it in the same column), so every
+        // iteration starts from the same state. The float placements are the
+        // one thing carried across — they are what the iteration solves for,
+        // which makes a pass a pure function of
+        // (tree, stylesheet, viewport, floats).
         Self::reset_layout_state(&self.root);
         Self::calculate_node_size(&self.root, viewport_size);
         Self::adjust_rowspan_heights(&self.root);
@@ -842,21 +1043,6 @@ impl LayoutView {
             LayoutObjectKind::Block,
             None,
             None,
-        );
-        Self::layout_flex_alignment(&self.root);
-        Self::align_inline_baselines(&self.root);
-        self.reposition_fixed_far_edges(&self.root.clone());
-        Self::apply_transforms(&self.root);
-        let mut next_scroll_id: u32 = 1;
-        Self::stamp_sticky_contexts(
-            &self.root,
-            None,
-            false,
-            (None, None),
-            true,
-            None,
-            None,
-            &mut next_scroll_id,
         );
     }
 
