@@ -264,10 +264,11 @@ impl CssParser {
                     // this engine — applying their declarations to the element
                     // itself would leak decoration styles. Legacy single-colon
                     // spellings of before/after count as pseudo-elements too.
-                    let interactive = matches!(
-                        name.as_str(),
-                        "active" | "focus" | "focus-within" | "focus-visible"
-                    );
+                    // `:focus-visible` stays inert: it means "focused *and*
+                    // the UA would show a focus ring", which for a mouse click
+                    // is false — treating it as `:focus` would paint rings real
+                    // browsers do not. `:active` has no state behind it yet.
+                    let interactive = matches!(name.as_str(), "active" | "focus-visible");
                     // ::before / ::after generate content boxes; capture the
                     // kind (the rule is realized by the layout-tree builder).
                     // Legacy single-colon `:before`/`:after` count too.
@@ -290,6 +291,12 @@ impl CssParser {
                         match name.as_str() {
                             "hover" => {
                                 parts.push(Selector::PseudoClass(PseudoClassKind::Hover))
+                            }
+                            "focus" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Focus))
+                            }
+                            "focus-within" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::FocusWithin))
                             }
                             "root" => {
                                 parts.push(Selector::PseudoClass(PseudoClassKind::Root))
@@ -967,6 +974,11 @@ impl StyleSheet {
         self.rules.iter().any(|rule| rule.selector.uses_hover())
     }
 
+    /// As `uses_hover`, for `:focus` / `:focus-within`.
+    pub fn uses_focus(&self) -> bool {
+        self.rules.iter().any(|rule| rule.selector.uses_focus())
+    }
+
     pub fn set_rules(&mut self, rules: Vec<QualifiedRule>) {
         self.rules = rules;
     }
@@ -1091,6 +1103,11 @@ pub enum PseudoClassKind {
     /// Matched against the hover chain the renderer publishes before each
     /// style pass. https://www.w3.org/TR/selectors-4/#the-hover-pseudo
     Hover,
+    /// `:focus` — the element with keyboard focus.
+    /// https://www.w3.org/TR/selectors-4/#the-focus-pseudo
+    Focus,
+    /// `:focus-within` — the focused element or an ancestor of it.
+    FocusWithin,
     /// `:root` — the document's root element (`<html>`).
     Root,
     FirstChild,
@@ -1172,23 +1189,36 @@ fn finish_keyframes(name: String, mut frames: Vec<Keyframe>) -> Option<Keyframes
 }
 
 impl Selector {
+    /// Whether this selector (or any part of it) tests `:focus`-family state.
+    pub fn uses_focus(&self) -> bool {
+        self.tests_pseudo(&|kind| {
+            matches!(kind, PseudoClassKind::Focus | PseudoClassKind::FocusWithin)
+        })
+    }
+
     /// Whether this selector (or any part of it) tests `:hover`.
     pub fn uses_hover(&self) -> bool {
+        self.tests_pseudo(&|kind| matches!(kind, PseudoClassKind::Hover))
+    }
+
+    /// Whether any pseudo-class in this selector satisfies `want`.
+    fn tests_pseudo(&self, want: &dyn Fn(&PseudoClassKind) -> bool) -> bool {
         match self {
-            Self::PseudoClass(PseudoClassKind::Hover) => true,
+            Self::PseudoClass(kind) => want(kind),
             Self::Compound(parts) | Self::List(parts) => {
-                parts.iter().any(|part| part.uses_hover())
+                parts.iter().any(|part| part.tests_pseudo(want))
             }
             Self::Descendant(a, b)
             | Self::Child(a, b)
             | Self::NextSibling(a, b)
-            | Self::SubsequentSibling(a, b) => a.uses_hover() || b.uses_hover(),
+            | Self::SubsequentSibling(a, b) => a.tests_pseudo(want) || b.tests_pseudo(want),
             Self::Not(inner) | Self::Is(inner) | Self::PseudoElement(inner, _) => {
-                inner.uses_hover()
+                inner.tests_pseudo(want)
             }
             _ => false,
         }
     }
+
 
     /// Cascade specificity packed as a single sortable integer:
     /// id count (high byte-pair), then class count, then type count, each
