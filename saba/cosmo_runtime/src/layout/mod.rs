@@ -378,9 +378,11 @@ impl LivePage {
         rect: &FrameRect,
         waker: Option<crate::loader::FetchWaker>,
     ) -> (Self, LayoutScene) {
-        // The hover chain keys on node addresses, which a freed document can
-        // hand back to a new one — drop it before the new DOM exists.
+        // The hover and focus chains key on node addresses, which a freed
+        // document can hand back to a new one — drop them before the new DOM
+        // exists.
         cosmo_engine::renderer::style::values::set_hover_chain(&[]);
+        cosmo_engine::renderer::style::values::set_focus_chain(&[]);
         let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
         let dom = window.borrow().document();
 
@@ -553,7 +555,21 @@ impl LivePage {
                 .and_then(nearest_element)
         };
         self.focused_field = hit.filter(is_text_input);
+        self.publish_focus_chain();
         self.focused_field.is_some()
+    }
+
+    /// Tell the style engine which element is focused, so `:focus` and
+    /// `:focus-within` resolve. Returns whether it changed — the caller
+    /// re-lays-out when it did, since focus styling moves boxes.
+    fn publish_focus_chain(&self) -> bool {
+        let chain = ancestor_chain(self.focused_field.clone());
+        cosmo_engine::renderer::style::values::set_focus_chain(&chain)
+    }
+
+    /// Re-lay-out if the focus change altered any `:focus` styling.
+    pub fn relayout_for_focus(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
+        Some(self.layout_and_drive(rect))
     }
 
     pub fn has_focused_field(&self) -> bool {
@@ -562,6 +578,13 @@ impl LivePage {
 
     pub fn blur_field(&mut self) {
         self.focused_field = None;
+        self.publish_focus_chain();
+    }
+
+    /// Whether this document styles anything on `:focus` / `:focus-within`.
+    /// Pages that don't need no re-layout when the focus moves.
+    pub fn uses_focus(&self) -> bool {
+        self.cssom.uses_focus()
     }
 
     /// Append `text` to the focused field's value.
@@ -1759,6 +1782,45 @@ mod tests {
         let scene = page.backspace(&rect).expect("backspace re-lays-out");
         assert!(scene_contains_text(&scene, "hi"), "backspace removes a character");
         assert!(!scene_contains_text(&scene, "hi!"));
+    }
+
+    #[test]
+    fn focus_pseudo_classes_style_the_focused_field() {
+        // `:focus` matches only the field; `:focus-within` also matches the
+        // form around it. Both used to be poisoned to "never matches".
+        let html = "<html><head><style>body{margin:0}\
+            input{width:120px;height:20px;background:#ffffff}\
+            input:focus{background:#ffff00}\
+            form{background:#eeeeee}\
+            form:focus-within{background:#00ff00}</style></head><body>\
+            <form><input id=\"q\" value=\"\"></form></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert!(page.uses_focus(), "the sheet styles on :focus");
+        let backgrounds = |scene: &LayoutScene| -> Vec<String> {
+            scene
+                .scene_items
+                .iter()
+                .filter_map(|item| match item {
+                    SceneItem::Rect { background_color, .. } => Some(background_color.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(!backgrounds(&first).contains(&"#ffff00".to_string()));
+        assert!(!backgrounds(&first).contains(&"#00ff00".to_string()));
+
+        assert!(page.focus_field_at((10, 10), &rect));
+        let focused = page.relayout_for_focus(&rect).expect("focus re-lays-out");
+        let colors = backgrounds(&focused);
+        assert!(colors.contains(&"#ffff00".to_string()), ":focus applies to the field");
+        assert!(colors.contains(&"#00ff00".to_string()), ":focus-within applies to the form");
+
+        page.blur_field();
+        let blurred = page.relayout_for_focus(&rect).expect("blur re-lays-out");
+        let colors = backgrounds(&blurred);
+        assert!(!colors.contains(&"#ffff00".to_string()), "focus styling is dropped");
+        assert!(!colors.contains(&"#00ff00".to_string()));
     }
 
     #[test]

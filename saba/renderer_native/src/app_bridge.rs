@@ -221,6 +221,22 @@ impl AppBridge {
             let rect = frame.rect.clone();
             focused = frame.page.focus_field_at(point, &rect);
         }
+        // `:focus` styling changes the boxes, so a page that uses it has to be
+        // laid out again once the focus has moved.
+        let restyles: Vec<(String, Vec<SceneItem>)> = self
+            .live_frames
+            .iter_mut()
+            .filter(|f| f.page.uses_focus())
+            .filter_map(|f| {
+                let rect = f.rect.clone();
+                f.page
+                    .relayout_for_focus(&rect)
+                    .map(|scene| (f.frame_id.clone(), scene.scene_items))
+            })
+            .collect();
+        for (frame_id, items) in restyles {
+            self.splice_frame_scene(&frame_id, &items);
+        }
         focused
     }
 
