@@ -273,33 +273,105 @@ pub struct ClickOutcome {
     pub messages: Vec<String>,
 }
 
-/// Whether `node` is a text-entry `<input>`. Buttons, checkboxes and the rest
-/// take clicks, not keystrokes.
+/// Where a field keeps its text. `<input>` uses the `value` attribute, which is
+/// also what layout paints; `<textarea>` uses its child text, per HTML LS
+/// §4.10.11 (its value is its text content, not an attribute).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldStorage {
+    ValueAttribute,
+    ChildText,
+}
+
+/// How `node` stores its text, or `None` if it is not a text-entry field.
+/// Buttons, checkboxes and the rest take clicks, not keystrokes.
 /// Spec: HTML LS §4.10.5.1 — input type keywords.
-fn is_text_input(node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>) -> bool {
+fn field_storage(
+    node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+) -> Option<FieldStorage> {
     let borrowed = node.borrow();
     let NodeKind::Element(element) = borrowed.kind() else {
-        return false;
+        return None;
     };
-    if element.tag_name() != "input" {
-        return false;
+    match element.tag_name() {
+        "textarea" => Some(FieldStorage::ChildText),
+        "input" => {
+            // A missing or unknown `type` is text (the missing value default).
+            let kind = element
+                .get_attribute("type")
+                .unwrap_or_else(|| "text".to_string())
+                .to_ascii_lowercase();
+            matches!(
+                kind.as_str(),
+                "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+            )
+            .then_some(FieldStorage::ValueAttribute)
+        }
+        _ => None,
     }
-    // A missing or unknown `type` is text (HTML LS: the missing value default).
-    let kind = element
-        .get_attribute("type")
-        .unwrap_or_else(|| "text".to_string())
-        .to_ascii_lowercase();
-    matches!(
-        kind.as_str(),
-        "text" | "search" | "email" | "url" | "tel" | "password" | "number"
-    )
+}
+
+fn is_text_input(node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>) -> bool {
+    field_storage(node).is_some()
 }
 
 /// The field's current value.
 fn current_value(node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>) -> String {
-    match node.borrow().kind() {
-        NodeKind::Element(element) => element.get_attribute("value").unwrap_or_default(),
-        _ => String::new(),
+    match field_storage(node) {
+        Some(FieldStorage::ValueAttribute) => match node.borrow().kind() {
+            NodeKind::Element(element) => element.get_attribute("value").unwrap_or_default(),
+            _ => String::new(),
+        },
+        Some(FieldStorage::ChildText) => {
+            // From the *children*: `collect_text` also walks the node's
+            // following siblings, so passing the element itself swept up
+            // whatever came after it in the document — the newline text node
+            // after `</textarea>` ended up in the value, and every keystroke
+            // landed on its own line.
+            let mut text = String::new();
+            cosmo_engine::renderer::dom::api::collect_text(
+                node.borrow().first_child(),
+                &mut text,
+            );
+            text
+        }
+        None => String::new(),
+    }
+}
+
+/// Write `value` back to the field, wherever it keeps it.
+fn set_field_value(
+    node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    value: &str,
+) {
+    match field_storage(node) {
+        Some(FieldStorage::ValueAttribute) => {
+            let mut borrowed = node.borrow_mut();
+            if let NodeKind::Element(element) = borrowed.kind_mut() {
+                element.set_attribute("value", value);
+            }
+        }
+        Some(FieldStorage::ChildText) => {
+            // Reuse the existing text node when there is one so the tree keeps
+            // its shape; otherwise give the element a single text child.
+            let existing = node.borrow().first_child();
+            match existing {
+                Some(child)
+                    if matches!(child.borrow().kind(), NodeKind::Text(_)) =>
+                {
+                    *child.borrow_mut().kind_mut() = NodeKind::Text(value.to_string());
+                }
+                _ => {
+                    let text = Rc::new(RefCell::new(
+                        cosmo_engine::renderer::dom::node::Node::new(NodeKind::Text(
+                            value.to_string(),
+                        )),
+                    ));
+                    text.borrow_mut().set_parent(Rc::downgrade(node));
+                    node.borrow_mut().set_first_child(Some(text));
+                }
+            }
+        }
+        None => {}
     }
 }
 
@@ -601,10 +673,12 @@ impl LivePage {
 
     /// Apply `edit` to the focused field's value, fire `input`, and re-lay-out.
     ///
-    /// The value lives on the `value` attribute, which is what layout already
-    /// paints for an `<input>`, so writing it there is all the rendering needs.
-    /// Spec: HTML LS §4.10.5 — the value sanitization/edit steps fire `input`
-    /// at the element. https://html.spec.whatwg.org/multipage/input.html
+    /// Where the value lives depends on the element: `<input>` keeps it in the
+    /// `value` attribute, `<textarea>` in its child text (HTML LS §4.10.11).
+    /// Both are what layout already paints, so writing there is all the
+    /// rendering needs.
+    /// Spec: HTML LS §4.10.5 — the value edit steps fire `input` at the
+    /// element. https://html.spec.whatwg.org/multipage/input.html
     fn edit_focused_value(
         &mut self,
         rect: &FrameRect,
@@ -613,12 +687,7 @@ impl LivePage {
         let field = self.focused_field.clone()?;
         let mut value = current_value(&field);
         edit(&mut value);
-        {
-            let mut borrowed = field.borrow_mut();
-            if let NodeKind::Element(element) = borrowed.kind_mut() {
-                element.set_attribute("value", &value);
-            }
-        }
+        set_field_value(&field, &value);
         // Let the page see the edit. A handler may mutate the DOM further, so
         // the generation is re-read after dispatching.
         self.host.dispatch_event(field, "input");
@@ -1835,6 +1904,74 @@ mod tests {
         assert!(!page.has_focused_field());
         // With nothing focused, keystrokes must not change the page.
         assert!(page.insert_text("z", &rect).is_none());
+    }
+
+    #[test]
+    fn typing_into_a_textarea_edits_its_text_content() {
+        // A `<textarea>` keeps its value in child text rather than an
+        // attribute (HTML LS §4.10.11), so editing has to go there — and its
+        // existing text is the starting value, not something to discard.
+        let html = "<html><head><style>body{margin:0}\
+            textarea{width:200px;height:60px}</style></head><body>\
+            <textarea id=\"n\">seed</textarea></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
+        let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
+        assert!(scene_contains_text(&first, "seed"), "starts with its text content");
+
+        assert!(page.focus_field_at((20, 10), &rect), "a textarea takes focus");
+        let scene = page.insert_text("ed", &rect).expect("typing re-lays-out");
+        assert!(
+            scene_contains_text(&scene, "seeded"),
+            "typing appends to the existing text"
+        );
+
+        let scene = page.backspace(&rect).expect("backspace re-lays-out");
+        assert!(scene_contains_text(&scene, "seede"));
+    }
+
+    #[test]
+    fn typing_a_character_at_a_time_into_a_textarea_does_not_insert_spaces() {
+        // The GUI delivers one keystroke per call, so each edit re-reads the
+        // value it just wrote. Anything that mangles the round-trip shows up
+        // here and not in a single multi-character insert.
+        let html = "<html><head><style>body{margin:0}\
+            textarea{width:200px;height:60px}</style></head><body>\
+            <p>label</p><textarea id=\"n\">seed text</textarea>\n\
+            <p>after</p></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        assert!(page.focus_field_at((20, 40), &rect), "textarea takes focus");
+        let mut scene = None;
+        // Two things this pins, both of which bit in the GUI but not in a
+        // tidier fixture: a leading space (what the GUI sends for the space
+        // key), and content *after* the textarea — reading the value used to
+        // sweep up the following siblings' text, so the newline after
+        // `</textarea>` joined the value and every keystroke landed on its
+        // own line.
+        for ch in " + typed".chars() {
+            scene = page.insert_text(&ch.to_string(), &rect);
+        }
+        let scene = scene.expect("typing re-lays-out");
+        assert!(
+            scene_contains_text(&scene, "seed text + typed"),
+            "characters land next to each other, not spaced apart"
+        );
+        assert!(
+            scene_contains_text(&scene, "after"),
+            "the following sibling is untouched"
+        );
+    }
+
+    #[test]
+    fn typing_into_an_empty_textarea_creates_its_text() {
+        let html = "<html><head><style>body{margin:0}\
+            textarea{width:200px;height:60px}</style></head><body>\
+            <textarea id=\"n\"></textarea></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        assert!(page.focus_field_at((20, 10), &rect));
+        let scene = page.insert_text("new", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "new"), "a text child is created");
     }
 
     #[test]
