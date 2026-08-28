@@ -273,6 +273,36 @@ pub struct ClickOutcome {
     pub messages: Vec<String>,
 }
 
+/// Whether `node` is a text-entry `<input>`. Buttons, checkboxes and the rest
+/// take clicks, not keystrokes.
+/// Spec: HTML LS §4.10.5.1 — input type keywords.
+fn is_text_input(node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>) -> bool {
+    let borrowed = node.borrow();
+    let NodeKind::Element(element) = borrowed.kind() else {
+        return false;
+    };
+    if element.tag_name() != "input" {
+        return false;
+    }
+    // A missing or unknown `type` is text (HTML LS: the missing value default).
+    let kind = element
+        .get_attribute("type")
+        .unwrap_or_else(|| "text".to_string())
+        .to_ascii_lowercase();
+    matches!(
+        kind.as_str(),
+        "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+    )
+}
+
+/// The field's current value.
+fn current_value(node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>) -> String {
+    match node.borrow().kind() {
+        NodeKind::Element(element) => element.get_attribute("value").unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Node identities of `node` and every element ancestor, nearest first — the
 /// set `:hover` matches for a pointer over `node`.
 fn ancestor_chain(
@@ -332,6 +362,9 @@ pub struct LivePage {
     transitions: TransitionDriver,
     /// `@keyframes` playback state (Phase 4.4): plays declared timelines.
     keyframes: KeyframeDriver,
+    /// The text field the user is typing into, if any. Keystrokes are routed
+    /// here instead of to the browser chrome.
+    focused_field: Option<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
 }
 
 impl LivePage {
@@ -386,6 +419,7 @@ impl LivePage {
             last_generation,
             transitions: TransitionDriver::default(),
             keyframes: KeyframeDriver::default(),
+            focused_field: None,
         };
         // The first layout only records the transition baselines: an element's
         // initial style never animates (CSS Transitions §2).
@@ -504,6 +538,68 @@ impl LivePage {
         if !cosmo_engine::renderer::style::values::set_hover_chain(&chain) {
             return None;
         }
+        Some(self.layout_and_drive(rect))
+    }
+
+    /// Focus the text field at `point` (frame-local document coordinates), or
+    /// clear the focus when there is no field there. Returns whether a field is
+    /// now focused, which is how the caller knows to route keystrokes here
+    /// rather than to the URL bar.
+    pub fn focus_field_at(&mut self, point: (i64, i64), rect: &FrameRect) -> bool {
+        let hit = {
+            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            view.find_node_by_position(point)
+                .map(|object| object.borrow().node_ref())
+                .and_then(nearest_element)
+        };
+        self.focused_field = hit.filter(is_text_input);
+        self.focused_field.is_some()
+    }
+
+    pub fn has_focused_field(&self) -> bool {
+        self.focused_field.is_some()
+    }
+
+    pub fn blur_field(&mut self) {
+        self.focused_field = None;
+    }
+
+    /// Append `text` to the focused field's value.
+    pub fn insert_text(&mut self, text: &str, rect: &FrameRect) -> Option<LayoutScene> {
+        self.edit_focused_value(rect, |value| value.push_str(text))
+    }
+
+    /// Delete the last character of the focused field's value.
+    pub fn backspace(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
+        self.edit_focused_value(rect, |value| {
+            value.pop();
+        })
+    }
+
+    /// Apply `edit` to the focused field's value, fire `input`, and re-lay-out.
+    ///
+    /// The value lives on the `value` attribute, which is what layout already
+    /// paints for an `<input>`, so writing it there is all the rendering needs.
+    /// Spec: HTML LS §4.10.5 — the value sanitization/edit steps fire `input`
+    /// at the element. https://html.spec.whatwg.org/multipage/input.html
+    fn edit_focused_value(
+        &mut self,
+        rect: &FrameRect,
+        edit: impl FnOnce(&mut String),
+    ) -> Option<LayoutScene> {
+        let field = self.focused_field.clone()?;
+        let mut value = current_value(&field);
+        edit(&mut value);
+        {
+            let mut borrowed = field.borrow_mut();
+            if let NodeKind::Element(element) = borrowed.kind_mut() {
+                element.set_attribute("value", &value);
+            }
+        }
+        // Let the page see the edit. A handler may mutate the DOM further, so
+        // the generation is re-read after dispatching.
+        self.host.dispatch_event(field, "input");
+        self.last_generation = self.host.dom_generation();
         Some(self.layout_and_drive(rect))
     }
 
@@ -1628,6 +1724,63 @@ mod tests {
         let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
         let (page, _) = LivePage::load("about:blank", html, &rect, None);
         assert!(!page.uses_hover(), "no :hover rule — the GUI can skip tracking");
+    }
+
+    #[test]
+    fn typing_into_a_focused_field_updates_it_and_fires_input() {
+        // Clicking a text field focuses it, keystrokes change its value, the
+        // page sees an `input` event, and the new value is what gets painted.
+        let html = "<html><head><style>body{margin:0}\
+            input{width:200px;height:24px}</style></head><body>\
+            <input id=\"q\" value=\"\"><p id=\"echo\"></p>\
+            <script>document.getElementById('q').addEventListener('input',function(e){\
+              document.getElementById('echo').textContent='saw:'+e.target.getAttribute('value');});\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+
+        assert!(page.focus_field_at((20, 10), &rect), "the click should focus the field");
+        assert!(page.has_focused_field());
+
+        let mut scene = None;
+        for ch in ["h", "i", "!"] {
+            scene = page.insert_text(ch, &rect);
+        }
+        let scene = scene.expect("typing should re-lay-out");
+        assert!(
+            scene_contains_text(&scene, "hi!"),
+            "the field paints its new value"
+        );
+        assert!(
+            scene_contains_text(&scene, "saw:hi!"),
+            "the page's input handler ran and saw the value"
+        );
+
+        let scene = page.backspace(&rect).expect("backspace re-lays-out");
+        assert!(scene_contains_text(&scene, "hi"), "backspace removes a character");
+        assert!(!scene_contains_text(&scene, "hi!"));
+    }
+
+    #[test]
+    fn clicking_outside_a_field_clears_the_focus() {
+        let html = "<html><head><style>body{margin:0}\
+            input{width:100px;height:20px}#pad{height:80px}</style></head><body>\
+            <input value=\"x\"><div id=\"pad\">not a field</div></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        assert!(page.focus_field_at((10, 10), &rect));
+        assert!(!page.focus_field_at((10, 60), &rect), "the div is not a field");
+        assert!(!page.has_focused_field());
+        // With nothing focused, keystrokes must not change the page.
+        assert!(page.insert_text("z", &rect).is_none());
+    }
+
+    #[test]
+    fn a_button_input_does_not_take_keystrokes() {
+        let html = "<html><body><input type=\"submit\" value=\"Go\"></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        assert!(!page.focus_field_at((10, 10), &rect), "submit is not a text field");
     }
 
     #[test]
