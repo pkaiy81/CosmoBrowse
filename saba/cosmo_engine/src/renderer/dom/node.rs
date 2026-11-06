@@ -213,7 +213,7 @@ impl Element {
             self.tag.as_str(),
             "body" | "div" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header"
                 | "li" | "main" | "p" | "section" | "ul" | "ol" | "center" | "table" | "tr"
-                | "hr" | "pre" | "blockquote" | "br" | "td" | "th" | "dl" | "dt" | "dd"
+                | "hr" | "pre" | "blockquote" | "td" | "th" | "dl" | "dt" | "dd"
                 | "caption" | "tbody" | "thead" | "tfoot" | "nav" | "article" | "aside"
                 | "footer" | "figure" | "figcaption" | "address" | "details" | "summary"
                 | "fieldset"

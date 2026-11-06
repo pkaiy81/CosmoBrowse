@@ -2125,7 +2125,7 @@ mod tests {
             <p>after</p></body></html>";
         let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
         let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
-        assert!(page.focus_field_at((190, 40), &rect), "textarea takes focus");
+        assert!(page.focus_field_at((190, 70), &rect), "textarea takes focus");
         let mut scene = None;
         // Two things this pins, both of which bit in the GUI but not in a
         // tidier fixture: a leading space (what the GUI sends for the space

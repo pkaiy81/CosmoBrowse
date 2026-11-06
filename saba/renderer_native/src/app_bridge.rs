@@ -414,7 +414,9 @@ impl AppBridge {
         }
         let page = self
             .adapter
-            .set_viewport(width as i64, height as i64)
+            // The page gets the window minus the browser chrome above it, which
+            // is what `100vh`, media queries and `position: fixed` measure against.
+            .set_viewport(width as i64, (height as i64 - crate::ui_chrome::CHROME_HEIGHT).max(0))
             .map_err(|e| e.message)?;
         self.current_page = Some(page);
         // The static DTO from the adapter replaced our scripted scenes; reflow

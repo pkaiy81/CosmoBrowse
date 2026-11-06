@@ -15,17 +15,11 @@ use std::fmt::Debug;
 use std::sync::OnceLock;
 
 pub trait FontMetricsProvider: Debug + Send + Sync {
-    /// Advance width in px of `c` at the given font size/weight, rounded UP —
-    /// layout must never reserve less than the renderer draws, or a box wraps
-    /// its own content.
-    fn char_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64;
-
-    /// How far the renderer's pen actually moves for `c`, which can be less than
-    /// [`Self::char_advance`] reserves. A caret has to be placed with this one
-    /// to land between the glyphs.
-    fn painted_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
-        self.char_advance(c, font_size, bold)
-    }
+    /// Advance width in px of `c` at the given font size/weight, unrounded.
+    /// Runs add these up and round once at the end: rounding per character
+    /// makes layout reserve more than the painter draws, a pixel or so per
+    /// glyph, which shows up as a gap wherever an inline element follows text.
+    fn advance(&self, c: char, font_size: FontSize, bold: bool) -> f64;
 
     /// Default line box height (glyph height + leading) for the font size.
     fn line_height(&self, font_size: FontSize) -> i64 {
@@ -38,11 +32,11 @@ pub trait FontMetricsProvider: Debug + Send + Sync {
 pub struct FixedMetricsProvider;
 
 impl FontMetricsProvider for FixedMetricsProvider {
-    fn char_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
+    fn advance(&self, c: char, font_size: FontSize, bold: bool) -> f64 {
         scale_advance(
             char_advance_16(c),
             bold_width_adjust(char_width_px(font_size), bold),
-        )
+        ) as f64
     }
 }
 

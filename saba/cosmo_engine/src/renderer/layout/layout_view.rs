@@ -199,6 +199,7 @@ fn build_layout_tree(
 
         obj.borrow_mut().set_first_child(first_child);
         obj.borrow_mut().set_next_sibling(next_sibling);
+        LayoutObject::normalize_children(obj);
     }
 
     layout_object
@@ -325,11 +326,13 @@ impl LayoutView {
                 n.borrow_mut().set_column_max_hints(max_hints);
             }
 
-            if n.borrow().kind() == LayoutObjectKind::Block {
+            let contains_children =
+                n.borrow().kind() == LayoutObjectKind::Block || n.borrow().is_inline_block();
+            if contains_children {
                 n.borrow_mut().compute_size(parent_size);
             }
 
-            let child_parent_size = if n.borrow().kind() == LayoutObjectKind::Block {
+            let child_parent_size = if contains_children {
                 n.borrow().content_size()
             } else {
                 parent_size
@@ -372,6 +375,7 @@ impl LayoutView {
                 previous_sibling_point,
                 previous_sibling_size,
             );
+            LayoutObject::assign_flow_offsets(n);
 
             let first_child = n.borrow().first_child();
             Self::calculate_node_position(
@@ -1497,8 +1501,9 @@ impl LayoutView {
             };
             for c in &children {
                 let kind = c.borrow().kind();
-                let is_inline =
-                    matches!(kind, LayoutObjectKind::Inline | LayoutObjectKind::Text);
+                // The inline formatting context already aligned what it placed.
+                let is_inline = matches!(kind, LayoutObjectKind::Inline | LayoutObjectKind::Text)
+                    && c.borrow().inline_offset.is_none();
                 let zero = {
                     let b = c.borrow();
                     b.size().width() == 0 && b.size().height() == 0
@@ -5234,5 +5239,258 @@ mod tests {
         // page is in wix_page.html for manual verification.
         let html = include_str!("../../../testdata/wix_page_small.html").to_string();
         let _view = create_layout_view(html, 1024);
+    }
+
+    /// `(background, x, y, width, height)` of each box painted with a background,
+    /// by the color it was given, in paint order.
+    fn colored_boxes(html: &str, viewport_width: i64) -> Vec<(String, i64, i64, i64, i64)> {
+        create_layout_view(html.to_string(), viewport_width)
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    layout_size,
+                    ..
+                } => {
+                    let background = style.background_color();
+                    let color = background.code();
+                    (color != "#000000" && color != "transparent" && color != "#ffffff").then(
+                        || {
+                            (
+                                color.to_string(),
+                                layout_point.x(),
+                                layout_point.y(),
+                                layout_size.width(),
+                                layout_size.height(),
+                            )
+                        },
+                    )
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn box_with(boxes: &[(String, i64, i64, i64, i64)], color: &str) -> (i64, i64, i64, i64) {
+        let found = boxes
+            .iter()
+            .find(|b| b.0 == color)
+            .unwrap_or_else(|| panic!("no {color} box in {boxes:?}"));
+        (found.1, found.2, found.3, found.4)
+    }
+
+    #[test]
+    fn sibling_margins_collapse_to_the_larger() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{height:10px}</style></head><body>
+            <div style="background:#ff0000;margin-bottom:20px"></div>
+            <div style="background:#00ff00;margin-top:30px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").1, 0);
+        assert_eq!(box_with(&boxes, "#00ff00").1, 40, "10 tall + max(20, 30)");
+    }
+
+    #[test]
+    fn negative_margins_subtract_when_collapsing() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{height:10px}</style></head><body>
+            <div style="background:#ff0000;margin-bottom:20px"></div>
+            <div style="background:#00ff00;margin-top:-5px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").1, 25, "10 tall + 20 - 5");
+    }
+
+    #[test]
+    fn a_first_childs_margin_escapes_its_parent() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="height:10px"></div>
+            <div style="background:#ff0000"><div style="background:#00ff00;margin:20px 0;height:10px"></div></div>
+            <div style="background:#0000ff;height:10px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(
+            box_with(&boxes, "#ff0000"),
+            (0, 30, 400, 10),
+            "the parent starts at its child: the margin is outside both"
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").1, 30);
+        assert_eq!(box_with(&boxes, "#0000ff").1, 60, "bottom margin escapes too");
+    }
+
+    #[test]
+    fn padding_keeps_a_childs_margin_inside() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="background:#ff0000;padding:1px 0"><div style="background:#00ff00;margin:20px 0;height:10px"></div></div>
+            </body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (0, 0, 400, 52));
+        assert_eq!(box_with(&boxes, "#00ff00").1, 21);
+    }
+
+    #[test]
+    fn margins_collapse_through_an_empty_block() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="background:#ff0000;height:10px;margin-bottom:5px"></div>
+            <div style="margin:15px 0"></div>
+            <div style="background:#00ff00;height:10px;margin-top:8px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").1, 25, "10 tall + max(5, 15, 15, 8)");
+    }
+
+    #[test]
+    fn positioned_and_floated_children_do_not_grow_their_parent() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="background:#ff0000">
+              <div style="position:absolute;width:10px;height:100px"></div>
+              <div style="float:left;width:10px;height:100px"></div>
+              <div style="height:5px"></div>
+            </div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").3, 5);
+    }
+
+    #[test]
+    fn text_beside_a_block_gets_an_anonymous_block_of_its_own() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>before <b>bold</b><div id=x style="height:30px"></div>after</div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let y_of = |wanted: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text {
+                        text, layout_point, ..
+                    } if text.trim() == wanted => Some(layout_point.y()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?}"))
+        };
+        let line = y_of("before");
+        assert_eq!(y_of("bold"), line, "the run stays on one line");
+        assert!(
+            y_of("after") >= line + 30,
+            "text after the block goes below it"
+        );
+    }
+
+    #[test]
+    fn br_breaks_a_line_inside_flowing_text() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <p style="margin:0">one <i>two</i><br>three<br><br>four</p></body></html>"#
+                .to_string(),
+            400,
+        );
+        let ys: Vec<(String, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.trim().to_string(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+        let y = |w: &str| ys.iter().find(|(t, _)| t == w).unwrap_or_else(|| panic!("{ys:?}")).1;
+        assert_eq!(y("one"), y("two"));
+        let line = y("three") - y("one");
+        assert!(line > 0);
+        assert_eq!(y("four") - y("three"), 2 * line, "<br><br> leaves a blank line");
+    }
+
+    #[test]
+    fn inline_block_lays_out_blocks_inside_and_sits_on_the_line() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>x<span style="display:inline-block;background:#ff0000;padding:2px;margin-left:4px"><div style="background:#00ff00;width:50px;height:10px"></div><div style="background:#0000ff;width:30px;height:20px"></div></span>y</div></body></html>"#,
+            400,
+        );
+        let outer = box_with(&boxes, "#ff0000");
+        assert_eq!((outer.2, outer.3), (54, 34), "shrink-wrapped to the widest child");
+        let first = box_with(&boxes, "#00ff00");
+        assert_eq!((first.0, first.1), (outer.0 + 2, outer.1 + 2));
+        assert_eq!(box_with(&boxes, "#0000ff").1, first.1 + 10, "stacked inside");
+        assert!(outer.0 >= 4, "its margin takes up room on the line");
+    }
+
+    #[test]
+    fn inline_padding_takes_room_on_the_line_and_outlines_the_text() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>a<span style="background:#ff0000;padding:0 10px">b</span>c</div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let x_of = |wanted: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text {
+                        text, layout_point, ..
+                    } if text == wanted => Some(layout_point.x()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?}"))
+        };
+        let (a, b, c) = (x_of("a"), x_of("b"), x_of("c"));
+        let span = items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    layout_size,
+                    ..
+                } if style.background_color().code() == "#ff0000" => {
+                    Some((layout_point.x(), layout_size.width()))
+                }
+                _ => None,
+            })
+            .expect("span box");
+        assert_eq!(b - span.0, 10, "the text starts inside the padding");
+        assert!(b - a > 10, "padding pushes the run along");
+        assert_eq!(c - (span.0 + span.1), 0, "the next run follows the padding");
+    }
+
+    #[test]
+    fn a_background_on_wrapped_inline_text_follows_each_line() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div style="width:120px">aaaaaa <span style="background:#ff0000">bbbbbb cccccc</span></div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let rects: Vec<(i64, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    ..
+                } if style.background_color().code() == "#ff0000" => {
+                    Some((layout_point.x(), layout_point.y()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rects.len(), 2, "one box per line: {rects:?}");
+        assert!(rects[0].1 < rects[1].1);
     }
 }

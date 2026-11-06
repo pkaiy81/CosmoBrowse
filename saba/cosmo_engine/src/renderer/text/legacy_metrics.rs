@@ -57,14 +57,9 @@ pub(crate) fn styled_line_height(style: &ComputedStyle) -> i64 {
     }
 }
 
-/// Advance width of one character from the installed metrics provider.
-pub(crate) fn char_advance(c: char, font_size: FontSize, bold: bool) -> i64 {
-    super::provider::metrics().char_advance(c, font_size, bold)
-}
-
-/// How far the renderer's pen moves for one character.
-pub(crate) fn painted_advance(c: char, font_size: FontSize, bold: bool) -> i64 {
-    super::provider::metrics().painted_advance(c, font_size, bold)
+/// Unrounded advance of one character from the installed metrics provider.
+pub(crate) fn char_advance(c: char, font_size: FontSize, bold: bool) -> f64 {
+    super::provider::metrics().advance(c, font_size, bold)
 }
 
 pub(crate) fn is_wide_char(c: char) -> bool {
@@ -121,8 +116,8 @@ pub(crate) fn truncate_with_ellipsis(
         return text.to_string();
     }
     let ellipsis_w = char_advance('…', font_size, bold);
-    let budget = (max_width - ellipsis_w).max(0);
-    let mut acc = 0i64;
+    let budget = (max_width as f64 - ellipsis_w).max(0.0);
+    let mut acc = 0f64;
     let mut out = String::new();
     for c in text.chars() {
         let w = char_advance(c, font_size, bold);
@@ -146,14 +141,14 @@ pub(crate) fn bold_width_adjust(width: i64, bold: bool) -> i64 {
     }
 }
 
-/// Width of `text`, accumulating PER-CHARACTER rounded advances — the exact
-/// accounting `split_text` uses, so a box sized from this never wraps its own
-/// content (a one-shot total scale rounds lower and "login" wrapped as
-/// "logi/n").
+/// Width of `text`: the exact advances summed, rounded up once. Line breaking
+/// sums the same advances and compares against whole pixels, so a box sized
+/// from this never wraps its own content.
 pub(crate) fn measure_text_width(text: &str, font_size: FontSize, bold: bool) -> i64 {
     text.chars()
         .map(|c| char_advance(c, font_size, bold))
-        .sum()
+        .sum::<f64>()
+        .ceil() as i64
 }
 pub(crate) fn is_break_space(c: char) -> bool {
     c == ' ' || c == '\u{3000}'
@@ -183,17 +178,17 @@ pub(crate) fn split_text(
         .max(1);
     // Line capacity in pixels; per-character advances come from the same
     // provider as measurement so wrapping and sizing agree.
-    let max_units = safe_width;
+    let max_units = safe_width as f64;
 
     let mut result: Vec<String> = vec![];
     let mut line_start = 0usize; // byte offset where the current visual line starts
-    let mut cur_units = 0i64; // width units accumulated on the current line
+    let mut cur_units = 0f64; // width units accumulated on the current line
     let mut started = false; // whether the current line has consumed any char
     // Last space seen on the current line: (its byte offset, byte offset just
     // after it, units accumulated since it). Used to break at word boundaries.
     let mut last_space: Option<usize> = None;
     let mut byte_after_space = 0usize;
-    let mut units_after_space = 0i64;
+    let mut units_after_space = 0f64;
 
     for (idx, c) in line.char_indices() {
         let w = char_advance(c, font_size, bold);
@@ -212,7 +207,7 @@ pub(crate) fn split_text(
                 None => {
                     result.push(line[line_start..idx].to_string());
                     line_start = idx;
-                    cur_units = 0;
+                    cur_units = 0.0;
                 }
             }
         }
@@ -222,7 +217,7 @@ pub(crate) fn split_text(
         if is_break_space(c) {
             last_space = Some(idx);
             byte_after_space = idx + c.len_utf8();
-            units_after_space = 0;
+            units_after_space = 0.0;
         } else {
             units_after_space += w;
         }
