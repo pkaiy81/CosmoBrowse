@@ -89,10 +89,16 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             use crate::renderer::css::cssom::PseudoClassKind;
             // `:hover` consults the pointer state the renderer published for
             // this style pass (the hovered element and its ancestors).
+            let key = Rc::as_ptr(node) as *const () as usize;
             if matches!(kind, PseudoClassKind::Hover) {
-                return crate::renderer::style::values::is_hovered(
-                    Rc::as_ptr(node) as *const () as usize
-                );
+                return crate::renderer::style::values::is_hovered(key);
+            }
+            // Focus state, published by the renderer the same way hover is.
+            if matches!(kind, PseudoClassKind::Focus) {
+                return crate::renderer::style::values::is_focused(key);
+            }
+            if matches!(kind, PseudoClassKind::FocusWithin) {
+                return crate::renderer::style::values::is_focus_within(key);
             }
             // `:root` is the <html> element (it has no element parent).
             if matches!(kind, PseudoClassKind::Root) {
@@ -148,9 +154,10 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
                 }
             };
             return match kind {
-                PseudoClassKind::Hover | PseudoClassKind::Root => {
-                    unreachable!("handled above")
-                }
+                PseudoClassKind::Hover
+                | PseudoClassKind::Focus
+                | PseudoClassKind::FocusWithin
+                | PseudoClassKind::Root => unreachable!("handled above"),
                 PseudoClassKind::FirstChild => index == 1,
                 PseudoClassKind::LastChild => index == total,
                 PseudoClassKind::OnlyChild => total == 1,

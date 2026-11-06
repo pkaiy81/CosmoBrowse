@@ -203,6 +203,82 @@ impl AppBridge {
         result
     }
 
+    /// Focus the text field at `(doc_x, doc_y)`, clearing any other frame's
+    /// focus. Returns whether a field took it — the caller routes keystrokes to
+    /// the page when it did, and to the URL bar when it did not.
+    pub fn focus_field_at(&mut self, doc_x: i64, doc_y: i64) -> bool {
+        let mut focused = false;
+        for frame in &mut self.live_frames {
+            let inside = doc_x >= frame.rect.x
+                && doc_x < frame.rect.x + frame.rect.width
+                && doc_y >= frame.rect.y
+                && doc_y < frame.rect.y + frame.rect.height;
+            if focused || !inside {
+                frame.page.blur_field();
+                continue;
+            }
+            let point = (doc_x - frame.rect.x, doc_y - frame.rect.y);
+            let rect = frame.rect.clone();
+            focused = frame.page.focus_field_at(point, &rect);
+        }
+        // `:focus` styling changes the boxes, so a page that uses it has to be
+        // laid out again once the focus has moved.
+        let restyles: Vec<(String, Vec<SceneItem>)> = self
+            .live_frames
+            .iter_mut()
+            .filter(|f| f.page.uses_focus())
+            .filter_map(|f| {
+                let rect = f.rect.clone();
+                f.page
+                    .relayout_for_focus(&rect)
+                    .map(|scene| (f.frame_id.clone(), scene.scene_items))
+            })
+            .collect();
+        for (frame_id, items) in restyles {
+            self.splice_frame_scene(&frame_id, &items);
+        }
+        focused
+    }
+
+    pub fn has_focused_field(&self) -> bool {
+        self.live_frames.iter().any(|f| f.page.has_focused_field())
+    }
+
+    /// Type `text` into whichever frame holds the focused field. Returns true
+    /// if the page changed (the caller repaints).
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        self.edit_focused(|page, rect| page.insert_text(text, rect))
+    }
+
+    /// Delete the character before the caret in the focused field.
+    pub fn backspace(&mut self) -> bool {
+        self.edit_focused(|page, rect| page.backspace(rect))
+    }
+
+    fn edit_focused(
+        &mut self,
+        edit: impl Fn(&mut LivePage, &FrameRect) -> Option<cosmo_runtime::LayoutScene>,
+    ) -> bool {
+        let mut update: Option<(String, Vec<SceneItem>)> = None;
+        for frame in &mut self.live_frames {
+            if !frame.page.has_focused_field() {
+                continue;
+            }
+            let rect = frame.rect.clone();
+            if let Some(scene) = edit(&mut frame.page, &rect) {
+                update = Some((frame.frame_id.clone(), scene.scene_items));
+            }
+            break;
+        }
+        match update {
+            Some((frame_id, items)) => {
+                self.splice_frame_scene(&frame_id, &items);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether any live frame styles anything on `:hover`. When nothing does,
     /// the caller skips pointer tracking altogether (it costs a hit-test plus a
     /// re-style per move that changes the hovered element).

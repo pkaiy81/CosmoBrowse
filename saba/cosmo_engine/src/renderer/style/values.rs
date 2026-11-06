@@ -25,6 +25,11 @@ thread_local! {
     /// Spec: Selectors 4 §9.1 — `:hover` matches an element *and* its
     /// ancestors. https://www.w3.org/TR/selectors-4/#the-hover-pseudo
     static HOVER_CHAIN: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+
+    /// The focused element and its ancestors, same pattern as `HOVER_CHAIN`.
+    /// The head is the focused element itself: `:focus` matches only that,
+    /// `:focus-within` matches the whole chain.
+    static FOCUS_CHAIN: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn set_styling_viewport(width: i64, height: i64) {
@@ -50,6 +55,31 @@ pub fn set_hover_chain(chain: &[usize]) -> bool {
 /// Whether `node_key` (an `Rc::as_ptr` identity) is in the hover chain.
 pub(crate) fn is_hovered(node_key: usize) -> bool {
     HOVER_CHAIN.with(|c| c.borrow().contains(&node_key))
+}
+
+/// Publish the focus chain: the focused element first, then its ancestors.
+/// Empty when nothing is focused. Returns whether it changed.
+pub fn set_focus_chain(chain: &[usize]) -> bool {
+    FOCUS_CHAIN.with(|c| {
+        let mut current = c.borrow_mut();
+        if *current == chain {
+            return false;
+        }
+        current.clear();
+        current.extend_from_slice(chain);
+        true
+    })
+}
+
+/// Whether `node_key` is *the* focused element — `:focus` matches only it.
+pub(crate) fn is_focused(node_key: usize) -> bool {
+    FOCUS_CHAIN.with(|c| c.borrow().first() == Some(&node_key))
+}
+
+/// Whether `node_key` is the focused element or an ancestor of it —
+/// `:focus-within`. Spec: Selectors 4 §9.4.
+pub(crate) fn is_focus_within(node_key: usize) -> bool {
+    FOCUS_CHAIN.with(|c| c.borrow().contains(&node_key))
 }
 
 pub(crate) fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> Option<f64> {

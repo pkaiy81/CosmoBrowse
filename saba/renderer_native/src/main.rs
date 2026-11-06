@@ -290,6 +290,33 @@ impl App {
             return;
         }
 
+        // A focused page field takes text and backspace; everything else
+        // (Enter, Tab, shortcuts) falls through to the chrome handling below.
+        if self.bridge.has_focused_field() && !self.chrome.is_focused {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Backspace) => {
+                    if self.bridge.backspace() {
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Space) => {
+                    if self.bridge.insert_text(" ") {
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                Key::Character(ch) if !is_ctrl_pressed(&event) => {
+                    let typed: String = ch.chars().filter(|c| !c.is_control()).collect();
+                    if !typed.is_empty() && self.bridge.insert_text(&typed) {
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => {
                 if self.chrome.is_focused {
@@ -407,6 +434,12 @@ impl App {
         // into `cosmobrowse:navigate` messages, which is how link activation
         // arrives here when scripts handle the click.
         let doc_y = y - CHROME_HEIGHT + self.scroll_y;
+        // A click moves the typing focus: into a text field if there is one
+        // under the pointer, out of any field otherwise. Clicking the page also
+        // takes focus away from the URL bar.
+        if self.bridge.focus_field_at(x, doc_y) {
+            self.chrome.is_focused = false;
+        }
         let page_click = self.bridge.dispatch_click(x, doc_y);
         if page_click.repainted {
             self.needs_redraw = true;
@@ -862,6 +895,9 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
         bridge.set_hover(hx, hy);
         bridge.settle_async(300);
     }
+    // `COSMO_HEADLESS_TYPE=text` types into the field focused by
+    // COSMO_HEADLESS_CLICK, so form input is screenshot-testable too.
+    // (Applied after the click below; declared here so the order reads.)
     // `COSMO_HEADLESS_CLICK=x,y` clicks the page once (document coordinates)
     // before capturing, so scripted interactions — click handlers, and the
     // transitions they trigger — can be screenshot-tested without a window.
@@ -869,6 +905,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
         .ok()
         .and_then(|v| parse_point(&v))
     {
+        bridge.focus_field_at(cx, cy);
         let click = bridge.dispatch_click(cx, cy);
         for request in &click.navigations {
             if let Err(e) =
@@ -876,6 +913,12 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
             {
                 eprintln!("[SCREENSHOT] link activation error: {}", e);
             }
+        }
+        bridge.settle_async(300);
+    }
+    if let Ok(text) = std::env::var("COSMO_HEADLESS_TYPE") {
+        for ch in text.chars() {
+            bridge.insert_text(&ch.to_string());
         }
         bridge.settle_async(300);
     }
