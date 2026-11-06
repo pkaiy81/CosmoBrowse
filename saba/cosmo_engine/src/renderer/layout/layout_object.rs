@@ -43,6 +43,7 @@ use crate::renderer::style::values::{
     resolve_grid_tracks,
 };
 use crate::renderer::text::legacy_metrics::{
+    painted_advance,
     bold_width_adjust, char_width_px,
     is_wide_char, measure_text_width, split_text,
     styled_line_height,
@@ -404,6 +405,73 @@ impl BoxModelMetrics {
     pub fn inner_vertical(&self) -> i64 {
         self.padding.vertical() + self.border.vertical()
     }
+}
+
+/// A position a text caret can occupy, in document coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaretStop {
+    pub x: i64,
+    pub y: i64,
+    pub height: i64,
+}
+
+/// One [`CaretStop`] per position in `value` (so `chars + 1` of them), found by
+/// walking the painted `fragments` alongside it.
+///
+/// The two do not line up one-to-one: a line break consumes a newline, and a
+/// space where a line wraps is not painted at its source position. Characters
+/// of `value` that a fragment does not show stay on the current line, and a
+/// newline moves to the next one even when no fragment is there to say so
+/// (blank lines, a trailing newline). Positions follow what the painter does
+/// rather than what layout reserves, or the caret drifts away from the glyphs.
+fn caret_stops(
+    value: &str,
+    fragments: &[(String, i64, i64)],
+    origin: (i64, i64),
+    style: &ComputedStyle,
+) -> Vec<CaretStop> {
+    let font_size = style.font_size();
+    let bold = style.is_bold();
+    let height = styled_line_height(style);
+    let chars: Vec<char> = value.chars().collect();
+    let mut stops = Vec::with_capacity(chars.len() + 1);
+    let mut at = origin;
+    let mut index = 0;
+
+    let skip_unpainted = |index: &mut usize, at: &mut (i64, i64), stops: &mut Vec<CaretStop>| {
+        stops.push(CaretStop { x: at.0, y: at.1, height });
+        if chars[*index] == '\n' {
+            *at = (origin.0, at.1 + height);
+        }
+        *index += 1;
+    };
+
+    for (text, x, y) in fragments {
+        let mut pen = *x;
+        let mut line_started = false;
+        for painted in text.chars() {
+            // A painted character the value does not have (`text-transform`,
+            // say) only moves the pen; it must not consume the rest of the value.
+            if chars[index..].contains(&painted) {
+                while chars[index] != painted {
+                    skip_unpainted(&mut index, &mut at, &mut stops);
+                }
+                if !line_started {
+                    line_started = true;
+                    at = (pen, *y);
+                }
+                stops.push(CaretStop { x: pen, y: *y, height });
+                index += 1;
+                at.0 = pen + painted_advance(painted, font_size, bold);
+            }
+            pen += painted_advance(painted, font_size, bold);
+        }
+    }
+    while index < chars.len() {
+        skip_unpainted(&mut index, &mut at, &mut stops);
+    }
+    stops.push(CaretStop { x: at.0, y: at.1, height });
+    stops
 }
 
 pub fn compute_box_model_metrics(style: &ComputedStyle) -> BoxModelMetrics {
@@ -1992,6 +2060,59 @@ impl LayoutObject {
         offset + n_rowspan_cols * cs
     }
 
+    /// Whether this is an inline-level `<textarea>`: one box to the line around
+    /// it, and its own inline formatting context inside.
+    fn is_atomic_field(&self) -> bool {
+        self.kind() == LayoutObjectKind::Inline
+            && self.node_ref().borrow().element_tag_name().as_deref() == Some("textarea")
+    }
+
+    /// Where a caret can sit in this field, given the value it holds. An
+    /// `<input>` paints its value at a fixed inset; a `<textarea>` paints its
+    /// value as the text box inside it, which the inline layout has already
+    /// broken into lines.
+    pub(crate) fn field_caret_stops(&self, value: &str) -> Vec<CaretStop> {
+        if self.element_kind() == Some(ElementKind::Input) {
+            let (x, y) = (self.point().x() + 10, self.point().y() + 10);
+            let right = self.point().x() + self.size().width() - 1;
+            let mut stops = caret_stops(
+                value,
+                &[(value.to_string(), x, y)],
+                (x, y),
+                &self.style,
+            );
+            // The value is not scrolled yet, so past the box edge it is clipped
+            // and the caret stays at the edge rather than leaving the field.
+            for stop in &mut stops {
+                stop.x = stop.x.min(right);
+            }
+            return stops;
+        }
+        let origin = self.content_origin();
+        let origin = (origin.x(), origin.y());
+        let text_box = self
+            .first_child()
+            .filter(|child| child.borrow().kind() == LayoutObjectKind::Text);
+        let fragments = match &text_box {
+            Some(text_box) => {
+                let text_box = text_box.borrow();
+                text_box
+                    .inline_fragments
+                    .iter()
+                    .map(|(text, dx, dy)| {
+                        (
+                            text.clone(),
+                            text_box.point().x() + dx,
+                            text_box.point().y() + dy,
+                        )
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        caret_stops(value, &fragments, origin, &self.style)
+    }
+
     pub(crate) fn placeholder_text(&self) -> Option<String> {
         match self.element_kind()? {
             ElementKind::Img => Some(
@@ -3082,7 +3203,10 @@ impl LayoutObject {
             // the legacy path, where its inline content overlaps.
             // Spec: CSS Flexbox §4 / CSS Grid §6 — blockification.
             // https://www.w3.org/TR/css-flexbox-1/#flex-items
-            if b.kind() != LayoutObjectKind::Block && !is_flex_or_grid_item {
+            if b.kind() != LayoutObjectKind::Block
+                && !is_flex_or_grid_item
+                && !b.is_atomic_field()
+            {
                 return false;
             }
             // Contexts this pass does not own yet:
@@ -3564,6 +3688,19 @@ fn collect_inline_items_from(
     let kind = node.borrow().kind();
     if kind.normal_flow_spec().stacks_vertically {
         return false;
+    }
+    // A textarea sits in the line as one box, with its text inside it: that text
+    // wraps at the textarea's edge, not the surrounding block's.
+    if node.borrow().is_atomic_field() {
+        let b = node.borrow();
+        let size = b.size();
+        boxes.push(node.clone());
+        items.push(InlineItem::Atomic {
+            width: size.width(),
+            height: size.height(),
+            baseline: size.height(),
+        });
+        return true;
     }
     if kind == LayoutObjectKind::Text {
         {

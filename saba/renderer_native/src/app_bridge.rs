@@ -255,6 +255,41 @@ impl AppBridge {
         self.edit_focused(|page, rect| page.backspace(rect))
     }
 
+    /// Delete the character after the caret in the focused field.
+    pub fn delete_forward(&mut self) -> bool {
+        self.edit_focused(|page, rect| page.delete_forward(rect))
+    }
+
+    pub fn focused_field_is_multiline(&self) -> bool {
+        self.live_frames
+            .iter()
+            .any(|f| f.page.focused_field_is_multiline())
+    }
+
+    /// Move the caret in the focused field. Returns whether it moved.
+    pub fn move_caret(&mut self, movement: cosmo_runtime::CaretMove) -> bool {
+        self.live_frames
+            .iter_mut()
+            .find(|f| f.page.has_focused_field())
+            .is_some_and(|frame| {
+                let rect = frame.rect.clone();
+                frame.page.move_caret(movement, &rect)
+            })
+    }
+
+    /// The caret to draw, in document coordinates.
+    pub fn caret_rect(&mut self) -> Option<cosmo_runtime::CaretRect> {
+        let frame = self
+            .live_frames
+            .iter_mut()
+            .find(|f| f.page.has_focused_field())?;
+        let rect = frame.rect.clone();
+        let mut caret = frame.page.caret_rect(&rect)?;
+        caret.x += rect.x;
+        caret.y += rect.y;
+        Some(caret)
+    }
+
     fn edit_focused(
         &mut self,
         edit: impl Fn(&mut LivePage, &FrameRect) -> Option<cosmo_runtime::LayoutScene>,

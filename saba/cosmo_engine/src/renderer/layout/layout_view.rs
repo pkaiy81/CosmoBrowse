@@ -7,6 +7,7 @@ use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
 use crate::renderer::layout::layout_object::compute_box_model_metrics;
 use crate::renderer::layout::layout_object::create_layout_object;
+use crate::renderer::layout::layout_object::CaretStop;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::layout_object::use_new_inline;
@@ -1708,6 +1709,40 @@ impl LayoutView {
             let next_sibling = n.borrow().next_sibling();
             Self::collect_animation_targets_node(&next_sibling, cssom, out);
         }
+    }
+
+    /// Every position a caret can occupy in `field` holding `value` (one more
+    /// than it has characters), and the color to draw it in. `None` when the
+    /// field has no box, e.g. under `display: none`.
+    pub fn field_caret_stops(
+        &self,
+        field: &Rc<RefCell<Node>>,
+        value: &str,
+    ) -> Option<(Vec<CaretStop>, String)> {
+        let object = Self::find_object_for_node(self.root(), field)?;
+        let object = object.borrow();
+        Some((
+            object.field_caret_stops(value),
+            object.style().color().code().to_string(),
+        ))
+    }
+
+    fn find_object_for_node(
+        first: Option<Rc<RefCell<LayoutObject>>>,
+        target: &Rc<RefCell<Node>>,
+    ) -> Option<Rc<RefCell<LayoutObject>>> {
+        let mut current = first;
+        while let Some(object) = current {
+            if Rc::ptr_eq(&object.borrow().node_ref(), target) {
+                return Some(object);
+            }
+            let child = object.borrow().first_child();
+            if let Some(found) = Self::find_object_for_node(child, target) {
+                return Some(found);
+            }
+            current = object.borrow().next_sibling();
+        }
+        None
     }
 
     pub fn find_node_by_position(&self, position: (i64, i64)) -> Option<Rc<RefCell<LayoutObject>>> {

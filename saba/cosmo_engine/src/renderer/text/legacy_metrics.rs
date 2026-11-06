@@ -62,6 +62,11 @@ pub(crate) fn char_advance(c: char, font_size: FontSize, bold: bool) -> i64 {
     super::provider::metrics().char_advance(c, font_size, bold)
 }
 
+/// How far the renderer's pen moves for one character.
+pub(crate) fn painted_advance(c: char, font_size: FontSize, bold: bool) -> i64 {
+    super::provider::metrics().painted_advance(c, font_size, bold)
+}
+
 pub(crate) fn is_wide_char(c: char) -> bool {
     let cp = c as u32;
     // CJK Unified Ideographs, Hiragana, Katakana, Fullwidth forms, CJK symbols

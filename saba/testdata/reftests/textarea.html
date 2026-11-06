@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head>
+<style>
+  body { margin: 8px; }
+  #sized { width: 300px; height: 80px; }
+</style>
+</head>
+<body>
+<!-- A textarea is a box in the line with its own wrapping and newlines. -->
+<form>label <textarea cols="30" rows="3">a long sentence that has to wrap at the edge of its box to fit</textarea> tail</form>
+<form><textarea id="sized">first line
+
+third line after a blank one</textarea></form>
+<form><textarea></textarea></form>
+</body>
+</html>
