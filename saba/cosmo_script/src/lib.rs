@@ -20,6 +20,9 @@ use cosmo_engine::renderer::html::parser::HtmlParser;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+mod platform;
+pub use platform::LayoutProvider;
+
 /// Host data attached to an `Element` JsObject: a handle to the live DOM
 /// node, kept outside Boa's GC. The Rc/RefCell contain no GC-managed
 /// values, so ignoring them for tracing is sound.
@@ -38,6 +41,8 @@ struct EventFlags {
     default_prevented: std::cell::Cell<bool>,
     #[unsafe_ignore_trace]
     stop_propagation: std::cell::Cell<bool>,
+    #[unsafe_ignore_trace]
+    cancelable: std::cell::Cell<bool>,
 }
 
 /// A registered event listener: the event type and its JS callback. The
@@ -49,6 +54,14 @@ struct Listener {
     /// True if registered for the capture phase (addEventListener's 3rd arg
     /// `true` or `{capture: true}`).
     capture: bool,
+    /// `{once: true}`: removed when it first fires.
+    once: bool,
+}
+
+fn parse_once(arg: Option<&JsValue>, ctx: &mut Context) -> bool {
+    arg.and_then(|v| v.as_object())
+        .and_then(|o| o.get(js_string!("once"), ctx).ok())
+        .is_some_and(|v| v.to_boolean())
 }
 
 /// Parse addEventListener's optional 3rd argument (a boolean `useCapture` or an
@@ -74,6 +87,9 @@ pub struct FetchRequest {
     /// Request headers (name, value) from fetch `options.headers` or
     /// `XMLHttpRequest.setRequestHeader`.
     pub headers: Vec<(String, String)>,
+    /// Load without CORS, as `<script src>` does. Only the script loader sets it;
+    /// `fetch` and XHR always go through CORS.
+    pub no_cors: bool,
 }
 
 /// The result of a network request delivered back from the host's worker.
@@ -95,6 +111,14 @@ pub struct FetchResponse {
 /// must return immediately with a receiver that yields exactly one response.
 pub trait FetchEngine: 'static {
     fn start(&self, req: FetchRequest) -> std::sync::mpsc::Receiver<FetchResponse>;
+
+    /// What `document.cookie` reads: cookies for this document script may see.
+    fn document_cookie(&self) -> String {
+        String::new()
+    }
+
+    /// A write to `document.cookie`.
+    fn set_document_cookie(&self, _cookie: &str) {}
 }
 
 /// A `fetch` awaiting its worker response: the channel plus the promise's
@@ -171,6 +195,26 @@ struct PageState {
     pending_fetches: RefCell<Vec<PendingFetch>>,
     /// In-flight `XMLHttpRequest.send()` requests awaiting their response.
     pending_xhr: RefCell<Vec<PendingXhr>>,
+    /// Prototypes for wrappers, by tag or node kind, set up by `bootstrap.js`.
+    protos: RefCell<std::collections::HashMap<String, JsObject>>,
+    /// `bootstrap.js`'s function that delivers an event to the window.
+    window_dispatcher: RefCell<Option<JsObject>>,
+    /// `bootstrap.js`'s function for load and resize.
+    lifecycle: RefCell<Option<JsObject>>,
+    layout_provider: RefCell<Option<Box<dyn LayoutProvider>>>,
+    /// The script element being run, for `document.currentScript`.
+    current_script: RefCell<Option<Rc<RefCell<Node>>>>,
+    /// Script elements that have been run, or that must never be.
+    started_scripts: RefCell<std::collections::HashSet<usize>>,
+    /// Scripts added by script, waiting on their fetch.
+    pending_scripts: RefCell<Vec<PendingScript>>,
+}
+
+struct PendingScript {
+    node: Rc<RefCell<Node>>,
+    kind_is_module: bool,
+    url: String,
+    rx: std::sync::mpsc::Receiver<FetchResponse>,
 }
 
 impl Default for PageState {
@@ -190,6 +234,13 @@ impl Default for PageState {
             fetch_engine: RefCell::new(None),
             pending_fetches: RefCell::new(Vec::new()),
             pending_xhr: RefCell::new(Vec::new()),
+            protos: RefCell::new(std::collections::HashMap::new()),
+            window_dispatcher: RefCell::new(None),
+            lifecycle: RefCell::new(None),
+            layout_provider: RefCell::new(None),
+            current_script: RefCell::new(None),
+            started_scripts: RefCell::new(std::collections::HashSet::new()),
+            pending_scripts: RefCell::new(Vec::new()),
         }
     }
 }
@@ -241,6 +292,13 @@ page_field!(POSTED_MESSAGES, posted_messages, RefCell<Vec<String>>);
 page_field!(FETCH_ENGINE, fetch_engine, RefCell<Option<Box<dyn FetchEngine>>>);
 page_field!(PENDING_FETCHES, pending_fetches, RefCell<Vec<PendingFetch>>);
 page_field!(PENDING_XHR, pending_xhr, RefCell<Vec<PendingXhr>>);
+page_field!(PROTOS, protos, RefCell<std::collections::HashMap<String, JsObject>>);
+page_field!(WINDOW_DISPATCHER, window_dispatcher, RefCell<Option<JsObject>>);
+page_field!(LIFECYCLE, lifecycle, RefCell<Option<JsObject>>);
+page_field!(LAYOUT_PROVIDER, layout_provider, RefCell<Option<Box<dyn LayoutProvider>>>);
+page_field!(CURRENT_SCRIPT, current_script, RefCell<Option<Rc<RefCell<Node>>>>);
+page_field!(STARTED_SCRIPTS, started_scripts, RefCell<std::collections::HashSet<usize>>);
+page_field!(PENDING_SCRIPTS, pending_scripts, RefCell<Vec<PendingScript>>);
 
 fn ls_get(key: &str) -> Option<String> {
     LOCAL_STORAGE.with(|s| s.borrow().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
@@ -313,8 +371,13 @@ fn make_element(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
     obj
 }
 
-fn build_element_wrapper(node: Rc<RefCell<Node>>, context: &mut Context) -> JsObject {
-    let obj = JsObject::from_proto_and_data(None, NodeHandle { node });
+fn build_element_wrapper(node: Rc<RefCell<Node>>, _context: &mut Context) -> JsObject {
+    JsObject::from_proto_and_data(platform::proto_for(&node), NodeHandle { node })
+}
+
+/// The object every node wrapper inherits from: `Node.prototype`.
+fn build_node_base(context: &mut Context) -> JsObject {
+    let obj = ObjectInitializer::new(context).build();
     let realm = context.realm().clone();
 
     let accessor = |get: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
@@ -353,8 +416,10 @@ fn build_element_wrapper(node: Rc<RefCell<Node>>, context: &mut Context) -> JsOb
     obj.insert_property(js_string!("parentNode"), accessor(element_get_parent_node, None));
     obj.insert_property(
         js_string!("parentElement"),
-        accessor(element_get_parent_node, None),
+        accessor(platform::node_get_parent_element, None),
     );
+    obj.insert_property(js_string!("nodeType"), accessor(platform::node_get_type, None));
+    obj.insert_property(js_string!("nodeName"), accessor(platform::node_get_name, None));
     obj.insert_property(
         js_string!("firstChild"),
         accessor(element_get_first_child, None),
@@ -393,6 +458,8 @@ fn build_element_wrapper(node: Rc<RefCell<Node>>, context: &mut Context) -> JsOb
     method(element_get_attribute, js_string!("getAttribute"), 1);
     method(element_set_attribute, js_string!("setAttribute"), 2);
     method(element_has_attribute, js_string!("hasAttribute"), 1);
+    method(platform::element_remove_attribute, js_string!("removeAttribute"), 1);
+    method(platform::node_clone, js_string!("cloneNode"), 1);
     method(element_append_child, js_string!("appendChild"), 1);
     method(element_remove_child, js_string!("removeChild"), 1);
     method(element_insert_before, js_string!("insertBefore"), 2);
@@ -526,8 +593,25 @@ fn element_append_child(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsR
     let (Some(parent), Some(child)) = (handle_node(this), a.first().and_then(handle_node)) else {
         return Ok(JsValue::null());
     };
-    append_child_node(&parent, &child);
+    for node in nodes_to_insert(&child) {
+        append_child_node(&parent, &node);
+        platform::run_inserted_scripts(&node, ctx);
+    }
     Ok(JsValue::from(make_element(child, ctx)))
+}
+
+/// What inserting `node` inserts: its children, if it's a document fragment.
+fn nodes_to_insert(node: &Rc<RefCell<Node>>) -> Vec<Rc<RefCell<Node>>> {
+    if node.borrow().element_tag_name().as_deref() != Some("cosmo-fragment") {
+        return vec![node.clone()];
+    }
+    let mut children = Vec::new();
+    let mut child = node.borrow().first_child();
+    while let Some(c) = child {
+        child = c.borrow().next_sibling();
+        children.push(c);
+    }
+    children
 }
 
 fn element_remove_child(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -546,7 +630,10 @@ fn element_insert_before(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> Js
         return Ok(JsValue::null());
     };
     let reference = a.get(1).and_then(handle_node);
-    insert_before_node(&parent, &new_node, reference.as_ref());
+    for node in nodes_to_insert(&new_node) {
+        insert_before_node(&parent, &node, reference.as_ref());
+        platform::run_inserted_scripts(&node, ctx);
+    }
     Ok(JsValue::from(make_element(new_node, ctx)))
 }
 
@@ -571,11 +658,12 @@ fn element_add_event_listener(
         return Ok(JsValue::undefined());
     };
     let capture = parse_capture(a.get(2), c);
+    let once = parse_once(a.get(2), c);
     LISTENERS.with(|m| {
         m.borrow_mut()
             .entry(node_key(&node))
             .or_default()
-            .push(Listener { event_type, callback: cb, capture });
+            .push(Listener { event_type, callback: cb, capture, once });
     });
     Ok(JsValue::undefined())
 }
@@ -604,8 +692,28 @@ fn element_dispatch_event(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
     let Some(node) = handle_node(this) else {
         return Ok(JsValue::from(true));
     };
-    // Accept either an Event-like object with a `type` property or a bare
-    // string naming the event type.
+    dispatch_from_script(node, a, c)
+}
+
+/// `target.dispatchEvent(event)`: the page's own event object goes through, with
+/// whatever it was given; anything else stands for an event of that type.
+fn dispatch_from_script(node: Rc<RefCell<Node>>, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    if let Some(event) = a.first().and_then(|v| v.as_object()) {
+        if event.downcast_ref::<EventFlags>().is_some() {
+            let event_type = event
+                .get(js_string!("type"), c)?
+                .to_string(c)?
+                .to_std_string_escaped();
+            let bubbles = event.get(js_string!("bubbles"), c)?.to_boolean();
+            return Ok(JsValue::from(dispatch_event_object(
+                node,
+                &event_type,
+                event.clone(),
+                bubbles,
+                c,
+            )));
+        }
+    }
     let event_type = match a.first() {
         Some(v) if v.is_object() => v
             .as_object()
@@ -616,8 +724,7 @@ fn element_dispatch_event(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
         Some(v) => v.clone().to_string(c)?.to_std_string_escaped(),
         None => String::new(),
     };
-    let not_prevented = run_dispatch(node, &event_type, None, c);
-    Ok(JsValue::from(not_prevented))
+    Ok(JsValue::from(run_dispatch(node, &event_type, None, c)))
 }
 
 /// Build an `Event` JsObject carrying `type`, `target`, propagation flags, and
@@ -634,28 +741,67 @@ fn make_event(
     mouse: Option<(f64, f64)>,
     ctx: &mut Context,
 ) -> JsObject {
+    let obj = build_event(event_type, true, true, None, ctx);
+    let target_val = JsValue::from(make_element(target.clone(), ctx));
+    set_event_field(&obj, js_string!("target"), target_val);
+    if let Some((x, y)) = mouse {
+        // Primary (left) button, no modifiers — the only kind of click the GUI
+        // synthesizes today.
+        set_event_field(&obj, js_string!("button"), JsValue::from(0));
+        set_event_field(&obj, js_string!("buttons"), JsValue::from(1));
+        for key in ["altKey", "ctrlKey", "metaKey", "shiftKey"] {
+            set_event_field(&obj, js_string!(key), JsValue::from(false));
+        }
+        for key in ["clientX", "pageX", "x", "offsetX"] {
+            set_event_field(&obj, js_string!(key), JsValue::from(x));
+        }
+        for key in ["clientY", "pageY", "y", "offsetY"] {
+            set_event_field(&obj, js_string!(key), JsValue::from(y));
+        }
+    }
+    obj
+}
+
+fn set_event_field(event: &JsObject, name: boa_engine::JsString, value: JsValue) {
+    event.insert_property(
+        name,
+        PropertyDescriptor::builder()
+            .value(value)
+            .writable(true)
+            .enumerable(true)
+            .configurable(true)
+            .build(),
+    );
+}
+
+/// An event object with its flags and the fields every event has.
+fn build_event(
+    event_type: &str,
+    bubbles: bool,
+    cancelable: bool,
+    proto: Option<JsObject>,
+    ctx: &mut Context,
+) -> JsObject {
+    let proto = proto.or_else(|| PROTOS.with(|p| p.borrow().get("Event").cloned()));
     let obj = JsObject::from_proto_and_data(
-        None,
+        proto,
         EventFlags {
             default_prevented: std::cell::Cell::new(false),
             stop_propagation: std::cell::Cell::new(false),
+            cancelable: std::cell::Cell::new(cancelable),
         },
     );
+    set_event_field(&obj, js_string!("target"), JsValue::null());
+    set_event_field(&obj, js_string!("currentTarget"), JsValue::null());
+    set_event_field(&obj, js_string!("srcElement"), JsValue::null());
+    set_event_field(&obj, js_string!("eventPhase"), JsValue::from(0));
+    set_event_field(&obj, js_string!("isTrusted"), JsValue::from(false));
+    set_event_field(&obj, js_string!("timeStamp"), JsValue::from(VIRTUAL_CLOCK.with(|c| c.get()) as f64));
     let realm = ctx.realm().clone();
     obj.insert_property(
         js_string!("type"),
         PropertyDescriptor::builder()
             .value(js_string!(event_type))
-            .writable(false)
-            .enumerable(true)
-            .configurable(true)
-            .build(),
-    );
-    let target_val = JsValue::from(make_element(target.clone(), ctx));
-    obj.insert_property(
-        js_string!("target"),
-        PropertyDescriptor::builder()
-            .value(target_val)
             .writable(false)
             .enumerable(true)
             .configurable(true)
@@ -675,34 +821,8 @@ fn make_event(
     method(event_prevent_default, js_string!("preventDefault"));
     method(event_stop_propagation, js_string!("stopPropagation"));
 
-    let constant = |name, value: JsValue| {
-        obj.insert_property(
-            name,
-            PropertyDescriptor::builder()
-                .value(value)
-                .writable(false)
-                .enumerable(true)
-                .configurable(true)
-                .build(),
-        );
-    };
-    constant(js_string!("bubbles"), JsValue::from(true));
-    constant(js_string!("cancelable"), JsValue::from(true));
-    if let Some((x, y)) = mouse {
-        // Primary (left) button, no modifiers — the only kind of click the GUI
-        // synthesizes today.
-        constant(js_string!("button"), JsValue::from(0));
-        constant(js_string!("buttons"), JsValue::from(1));
-        for key in ["altKey", "ctrlKey", "metaKey", "shiftKey"] {
-            constant(js_string!(key), JsValue::from(false));
-        }
-        for key in ["clientX", "pageX", "x", "offsetX"] {
-            constant(js_string!(key), JsValue::from(x));
-        }
-        for key in ["clientY", "pageY", "y", "offsetY"] {
-            constant(js_string!(key), JsValue::from(y));
-        }
-    }
+    set_event_field(&obj, js_string!("bubbles"), JsValue::from(bubbles));
+    set_event_field(&obj, js_string!("cancelable"), JsValue::from(cancelable));
     // `defaultPrevented` reflects the flag preventDefault() sets.
     obj.insert_property(
         js_string!("defaultPrevented"),
@@ -729,7 +849,9 @@ fn event_default_prevented(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> 
 fn event_prevent_default(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     if let Some(obj) = this.as_object() {
         if let Some(f) = obj.downcast_ref::<EventFlags>() {
-            f.default_prevented.set(true);
+            if f.cancelable.get() {
+                f.default_prevented.set(true);
+            }
         }
     }
     Ok(JsValue::undefined())
@@ -755,6 +877,22 @@ fn run_dispatch(
     ctx: &mut Context,
 ) -> bool {
     let event = make_event(&target, event_type, mouse, ctx);
+    set_event_field(&event, js_string!("isTrusted"), JsValue::from(true));
+    dispatch_event_object(target, event_type, event, true, ctx)
+}
+
+/// Send `event` through capture, target and bubble. Returns whether its default
+/// action should run. Reaches the window too, except when it doesn't bubble.
+fn dispatch_event_object(
+    target: Rc<RefCell<Node>>,
+    event_type: &str,
+    event: JsObject,
+    bubbles: bool,
+    ctx: &mut Context,
+) -> bool {
+    let target_value = JsValue::from(make_element(target.clone(), ctx));
+    set_event_field(&event, js_string!("target"), target_value.clone());
+    set_event_field(&event, js_string!("srcElement"), target_value);
 
     // Propagation path: [target, parent, ..., root].
     let mut path = vec![target.clone()];
@@ -782,7 +920,7 @@ fn run_dispatch(
         stopped: &dyn Fn(&JsObject) -> bool,
         ctx: &mut Context,
     ) -> bool {
-        let callbacks: Vec<JsObject> = LISTENERS.with(|m| {
+        let callbacks: Vec<(JsObject, bool)> = LISTENERS.with(|m| {
             m.borrow()
                 .get(&node_key(node))
                 .map(|v| {
@@ -791,14 +929,50 @@ fn run_dispatch(
                             l.event_type == event_type
                                 && want.map(|w| l.capture == w).unwrap_or(true)
                         })
-                        .map(|l| l.callback.clone())
+                        .map(|l| (l.callback.clone(), l.once))
                         .collect()
                 })
                 .unwrap_or_default()
         });
-        for cb in callbacks {
-            let this = JsValue::from(make_element(node.clone(), ctx));
-            let _ = cb.call(&this, &[JsValue::from(event.clone())], ctx);
+        let this = JsValue::from(make_element(node.clone(), ctx));
+        set_event_field(event, js_string!("currentTarget"), this.clone());
+        set_event_field(
+            event,
+            js_string!("eventPhase"),
+            JsValue::from(match want {
+                Some(true) => 1,
+                None => 2,
+                Some(false) => 3,
+            }),
+        );
+        for (callback, once) in callbacks {
+            if once {
+                LISTENERS.with(|m| {
+                    if let Some(list) = m.borrow_mut().get_mut(&node_key(node)) {
+                        list.retain(|l| {
+                            !(l.event_type == event_type && JsObject::equals(&l.callback, &callback))
+                        });
+                    }
+                });
+            }
+            // An object listener has a `handleEvent` method instead.
+            let result = if callback.is_callable() {
+                callback.call(&this, &[JsValue::from(event.clone())], ctx)
+            } else {
+                callback
+                    .get(js_string!("handleEvent"), ctx)
+                    .and_then(|method| match method.as_object() {
+                        Some(method) if method.is_callable() => method.call(
+                            &JsValue::from(callback.clone()),
+                            &[JsValue::from(event.clone())],
+                            ctx,
+                        ),
+                        _ => Ok(JsValue::undefined()),
+                    })
+            };
+            if let Err(error) = result {
+                CONSOLE_LOG.with(|log| log.borrow_mut().push(format!("[error] listener: {error}")));
+            }
             if stopped(event) {
                 return false;
             }
@@ -806,7 +980,7 @@ fn run_dispatch(
         // An inline `on<type>="..."` attribute acts as a listener registered on
         // the element itself, in the bubble phase.
         // Spec: HTML LS §8.1.7 — event handler content attributes.
-        // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes
+        // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attribut
         if want != Some(true) && !fire_inline_handler(node, event_type, event, ctx) {
             return false;
         }
@@ -823,10 +997,21 @@ fn run_dispatch(
     if !fire(&target, event_type, None, &event, &stopped, ctx) {
         return default_allowed(&event);
     }
+    if !bubbles {
+        return default_allowed(&event);
+    }
     // Bubble phase: parent up to root.
     for node in path[1..].iter() {
         if !fire(node, event_type, Some(false), &event, &stopped, ctx) {
             return default_allowed(&event);
+        }
+    }
+    // Then the window, if this reached the document.
+    let reached_document = path.last().is_some_and(|root| matches!(root.borrow().kind, NodeKind::Document));
+    if reached_document {
+        let dispatcher = WINDOW_DISPATCHER.with(|d| d.borrow().clone());
+        if let Some(dispatcher) = dispatcher {
+            let _ = dispatcher.call(&JsValue::undefined(), &[JsValue::from(event.clone())], ctx);
         }
     }
 
@@ -1613,8 +1798,12 @@ impl Default for ScriptHost {
 
 impl ScriptHost {
     pub fn new() -> Self {
+        let context = Context::builder()
+            .module_loader(Rc::new(platform::PageModuleLoader::new()))
+            .build()
+            .expect("the default realm builds");
         let mut host = Self {
-            context: Context::default(),
+            context,
             state: Rc::new(PageState::default()),
         };
         host.activate();
@@ -1628,7 +1817,27 @@ impl ScriptHost {
             limits.set_recursion_limit(2_000);
         }
         host.install_dom_globals();
+        host.install_platform();
         host
+    }
+
+    /// Build the rest of the platform, in JS over a small native object. It sits
+    /// behind everything a page sees, so a failure here is a bug in the browser.
+    fn install_platform(&mut self) {
+        let node_base = build_node_base(&mut self.context);
+        PROTOS.with(|p| p.borrow_mut().insert("Node".to_string(), node_base.clone()));
+        let native = platform::make_native_object(node_base, &mut self.context);
+        self.context
+            .register_global_property(js_string!("__cosmo"), native, Attribute::all())
+            .expect("register __cosmo");
+        if let Err(error) = self
+            .context
+            .eval(Source::from_bytes(include_str!("bootstrap.js")))
+        {
+            panic!("bootstrap.js failed: {error}");
+        }
+        let empty = Rc::new(RefCell::new(Node::new(NodeKind::Document)));
+        self.set_document(empty);
     }
 
     /// Point the `ACTIVE_PAGE` thread-local at this host's state so native
@@ -1660,7 +1869,13 @@ impl ScriptHost {
         PENDING_XHR.with(|p| p.borrow_mut().clear());
         VIRTUAL_CLOCK.with(|c| c.set(0));
         DOM_GENERATION.with(|g| g.set(0));
-        SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root));
+        STARTED_SCRIPTS.with(|s| s.borrow_mut().clear());
+        PENDING_SCRIPTS.with(|s| s.borrow_mut().clear());
+        CURRENT_SCRIPT.with(|s| *s.borrow_mut() = None);
+        SCRIPT_DOM.with(|d| *d.borrow_mut() = Some(root.clone()));
+        let document = make_element(root, &mut self.context);
+        let global = self.context.global_object();
+        let _ = global.set(js_string!("document"), document, false, &mut self.context);
     }
 
     /// Fire an event of `event_type` at `target`, bubbling up its ancestor
@@ -1687,65 +1902,6 @@ impl ScriptHost {
     }
 
     fn install_dom_globals(&mut self) {
-        // document.getElementById(id) — for now returns the element's
-        // textContent string (or null). A real Element wrapper with
-        // mutable textContent / DOM methods is the next step (plan 3.2).
-        let document = ObjectInitializer::new(&mut self.context)
-            .function(
-                NativeFunction::from_fn_ptr(dom_get_element_by_id),
-                js_string!("getElementById"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(dom_query_selector),
-                js_string!("querySelector"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(dom_query_selector_all),
-                js_string!("querySelectorAll"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(dom_create_element),
-                js_string!("createElement"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(dom_create_text_node),
-                js_string!("createTextNode"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(dom_get_elements_by_tag_name),
-                js_string!("getElementsByTagName"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(dom_get_elements_by_class_name),
-                js_string!("getElementsByClassName"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(doc_add_event_listener),
-                js_string!("addEventListener"),
-                2,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(doc_remove_event_listener),
-                js_string!("removeEventListener"),
-                2,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(doc_dispatch_event),
-                js_string!("dispatchEvent"),
-                1,
-            )
-            .build();
-        self.context
-            .register_global_property(js_string!("document"), document, Attribute::all())
-            .expect("register document");
-
         // console.{log,info,warn,error,debug}
         let console = ObjectInitializer::new(&mut self.context)
             .function(NativeFunction::from_fn_ptr(console_log), js_string!("log"), 1)
@@ -1948,6 +2104,7 @@ impl ScriptHost {
     /// it. Spec: HTML LS §13.2.7 "the end".
     /// https://html.spec.whatwg.org/multipage/parsing.html#the-end
     pub fn fire_dom_content_loaded(&mut self) {
+        self.run_lifecycle("interactive");
         self.activate();
         let Some(document) = SCRIPT_DOM.with(|d| d.borrow().clone()) else {
             return;
@@ -1974,6 +2131,8 @@ impl ScriptHost {
         self.activate();
         self.context.run_jobs();
         self.pump_fetches();
+        platform::pump_inserted_scripts(&mut self.context);
+        self.context.run_jobs();
         let target = VIRTUAL_CLOCK.with(|c| c.get()) + frame_ms.max(1);
         let mut fired = 0;
         while fired < max_fires {
@@ -2036,6 +2195,9 @@ impl ScriptHost {
     /// runtime uses this to decide whether another layout pass is warranted.
     pub fn has_pending_fetches(&self) -> bool {
         self.activate();
+        if PENDING_SCRIPTS.with(|p| !p.borrow().is_empty()) {
+            return true;
+        }
         PENDING_FETCHES.with(|p| !p.borrow().is_empty())
             || PENDING_XHR.with(|p| !p.borrow().is_empty())
     }
@@ -2260,9 +2422,24 @@ fn location_href() -> String {
 fn location_get_href(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::from(js_string!(location_href().as_str())))
 }
+/// Assigning `location.href` loads that page, unless only the fragment differs.
 fn location_set_href(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let href = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
-    LOCATION_HREF.with(|h| *h.borrow_mut() = href);
+    let current = location_href();
+    let resolved = url::Url::parse(&current)
+        .ok()
+        .and_then(|base| base.join(&href).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| href.clone());
+    let without_fragment = |u: &str| u.split('#').next().unwrap_or("").to_string();
+    if without_fragment(&resolved) != without_fragment(&current) {
+        let message = format!(
+            "{{\"type\":\"cosmobrowse:navigate\",\"href\":{}}}",
+            platform::json_string(&resolved)
+        );
+        POSTED_MESSAGES.with(|m| m.borrow_mut().push(message));
+    }
+    LOCATION_HREF.with(|h| *h.borrow_mut() = resolved);
     Ok(JsValue::undefined())
 }
 fn location_get_protocol(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
@@ -2417,6 +2594,7 @@ fn js_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
                 method: method.clone(),
                 body: body.clone(),
                 headers: headers.clone(),
+                no_cors: false,
             })
         })
     });
@@ -2585,7 +2763,7 @@ fn xhr_send(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     let started = FETCH_ENGINE.with(|e| {
         e.borrow()
             .as_ref()
-            .map(|eng| eng.start(FetchRequest { url, method, body, headers }))
+            .map(|eng| eng.start(FetchRequest { url, method, body, headers, no_cors: false }))
     });
     match started {
         Some(rx) => PENDING_XHR.with(|p| p.borrow_mut().push(PendingXhr { rx, obj })),
@@ -2638,11 +2816,12 @@ fn doc_add_event_listener(_this: &JsValue, a: &[JsValue], c: &mut Context) -> Js
         return Ok(JsValue::undefined());
     };
     let capture = parse_capture(a.get(2), c);
+    let once = parse_once(a.get(2), c);
     LISTENERS.with(|m| {
         m.borrow_mut()
             .entry(node_key(&root))
             .or_default()
-            .push(Listener { event_type, callback: cb, capture });
+            .push(Listener { event_type, callback: cb, capture, once });
     });
     Ok(JsValue::undefined())
 }
@@ -2667,17 +2846,7 @@ fn doc_dispatch_event(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResu
     let Some(root) = script_dom_root() else {
         return Ok(JsValue::from(true));
     };
-    let event_type = match a.first() {
-        Some(v) if v.is_object() => v
-            .as_object()
-            .unwrap()
-            .get(js_string!("type"), c)?
-            .to_string(c)?
-            .to_std_string_escaped(),
-        Some(v) => v.clone().to_string(c)?.to_std_string_escaped(),
-        None => String::new(),
-    };
-    Ok(JsValue::from(run_dispatch(root, &event_type, None, c)))
+    dispatch_from_script(root, a, c)
 }
 
 /// `window.parent.postMessage(message, targetOrigin)` — capture the message

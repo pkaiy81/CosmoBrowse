@@ -719,7 +719,8 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
     // via Access-Control-Allow-Origin. Only enforced when the document has a
     // real http(s) origin (opaque bases like about:blank are permissive).
     // Spec: Fetch CORS protocol. https://fetch.spec.whatwg.org/#http-cors-protocol
-    let enforce_cors = (base.starts_with("http://") || base.starts_with("https://"))
+    let enforce_cors = !req.no_cors
+        && (base.starts_with("http://") || base.starts_with("https://"))
         && !crate::security::is_same_origin(base, &url);
 
     let mut diagnostics = Vec::new();
@@ -1284,6 +1285,7 @@ mod tests {
         do_fetch(
             base,
             cosmo_script::FetchRequest {
+                no_cors: false,
                 url: url.to_string(),
                 method: "GET".to_string(),
                 body: None,
@@ -1361,6 +1363,7 @@ mod tests {
         do_fetch(
             base,
             cosmo_script::FetchRequest {
+                no_cors: false,
                 url: url.to_string(),
                 method: "GET".to_string(),
                 body: None,

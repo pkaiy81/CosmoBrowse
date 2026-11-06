@@ -7,3 +7,4 @@ edition = "2021"
 boa_engine = "0.20"
 boa_gc = "0.20"
 cosmo_engine = { path = "../cosmo_engine" }
+url = "2"
