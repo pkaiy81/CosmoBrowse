@@ -15,11 +15,13 @@ use crate::renderer::dom::node::Element;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
+use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::EdgeSize;
 use crate::renderer::layout::computed_style::FlexDirection;
 use crate::renderer::layout::computed_style::FlexWrap;
+use crate::renderer::layout::computed_style::VerticalAlign;
 use crate::renderer::layout::computed_style::Clear;
 use crate::renderer::layout::computed_style::Float;
 use crate::renderer::layout::computed_style::FontSize;
@@ -27,7 +29,7 @@ use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::floats::{FloatContext, FloatSide};
 use crate::renderer::layout::inline::{
-    layout_inline_items_aligned, InlineItem, LineAlign, LineOptions, TextRun,
+    layout_inline_items_aligned, InlineItem, LineAlign, LineEdge, LineOptions, TextRun,
 };
 use std::collections::HashMap;
 use std::format;
@@ -45,7 +47,7 @@ use crate::renderer::style::values::{
 use crate::renderer::text::legacy_metrics::{
     bold_width_adjust, char_advance, char_width_px,
     is_wide_char, measure_text_width, split_text,
-    styled_line_height,
+    styled_line_height, text_baseline,
 };
 
 fn edge_to_i64(value: f64) -> i64 {
@@ -59,6 +61,40 @@ fn edge_to_i64(value: f64) -> i64 {
 
 
 
+thread_local! {
+    /// The computed style of `<html>`, which has no box of its own (the layout
+    /// tree starts at `<body>`) but which `<body>` inherits from.
+    static ROOT_STYLE: RefCell<Option<ComputedStyle>> = const { RefCell::new(None) };
+}
+
+/// Work out `<html>`'s style before building the tree, and with it what `rem`
+/// means. `html { font-size: 62.5% }` is common, with everything sized in `rem`.
+pub(crate) fn root_background() -> Option<Color> {
+    ROOT_STYLE.with(|root| {
+        root.borrow()
+            .as_ref()
+            .map(|style| style.background_color())
+            .filter(|color| color.code() != "#00000000" && color.code() != "transparent")
+    })
+}
+
+pub(crate) fn prepare_root_style(body: &Rc<RefCell<Node>>, cssom: &StyleSheet) {
+    crate::renderer::style::values::set_root_font_px(16.0);
+    ROOT_STYLE.with(|root| *root.borrow_mut() = None);
+    let Some(html) = body.borrow().parent().upgrade() else {
+        return;
+    };
+    if !matches!(html.borrow().kind(), NodeKind::Element(_)) {
+        return;
+    }
+    let Some(object) = create_layout_object(&Some(html), &None, cssom) else {
+        return;
+    };
+    let style = object.borrow().style();
+    crate::renderer::style::values::set_root_font_px(style.font_size().px() as f64);
+    ROOT_STYLE.with(|root| *root.borrow_mut() = Some(style));
+}
+
 pub fn create_layout_object(
     node: &Option<Rc<RefCell<Node>>>,
     parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
@@ -68,9 +104,13 @@ pub fn create_layout_object(
         let layout_object = Rc::new(RefCell::new(LayoutObject::new(n.clone(), parent_obj)));
 
         // Parent font size: the base for resolving font-size em/% values.
-        let parent_font_size = parent_obj
+        let inherited = parent_obj
             .as_ref()
-            .map(|p| p.borrow().style().font_size())
+            .map(|p| p.borrow().style())
+            .or_else(|| ROOT_STYLE.with(|root| root.borrow().clone()));
+        let parent_font_size = inherited
+            .as_ref()
+            .map(|style| style.font_size())
             .unwrap_or(FontSize::Medium);
 
         // Cascade order: matching rules sorted by specificity (ascending) so a
@@ -83,7 +123,7 @@ pub fn create_layout_object(
             .iter()
             .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
             .collect();
-        matched.sort_by_key(|rule| rule.selector.specificity());
+        matched.sort_by_key(|rule| (!rule.user_agent, !rule.layered, rule.selector.specificity()));
 
         // Inline `style="..."` attribute declarations (parsed once, applied in
         // the importance tiers below).
@@ -192,8 +232,7 @@ pub fn create_layout_object(
             }
         }
 
-        let parent_style = parent_obj.as_ref().map(|parent| parent.borrow().style());
-        layout_object.borrow_mut().defaulting_style(n, parent_style);
+        layout_object.borrow_mut().defaulting_style(n, inherited);
 
         if layout_object.borrow().style().display() == DisplayType::DisplayNone {
             return None;
@@ -230,7 +269,7 @@ pub fn build_pseudo_element(
             _ => false,
         })
         .collect();
-    matched.sort_by_key(|rule| rule.selector.specificity());
+    matched.sort_by_key(|rule| (!rule.user_agent, !rule.layered, rule.selector.specificity()));
 
     // Resolve the `content` string (last declaration wins). `none`/`normal`
     // suppress the box.
@@ -471,7 +510,7 @@ fn caret_stops(
     style: &ComputedStyle,
 ) -> Vec<CaretStop> {
     let font_size = style.font_size();
-    let bold = style.is_bold();
+    let face = style.text_face();
     let height = styled_line_height(style);
     let chars: Vec<char> = value.chars().collect();
     let mut stops = Vec::with_capacity(chars.len() + 1);
@@ -502,9 +541,9 @@ fn caret_stops(
                 }
                 stops.push(CaretStop { x: pen.round() as i64, y: *y, height });
                 index += 1;
-                at.0 = (pen + char_advance(painted, font_size, bold)).round() as i64;
+                at.0 = (pen + char_advance(painted, font_size, face)).round() as i64;
             }
-            pen += char_advance(painted, font_size, bold);
+            pen += char_advance(painted, font_size, face);
         }
     }
     while index < chars.len() {
@@ -580,6 +619,13 @@ pub struct LayoutObject {
     /// position it assigned last time, or each pass takes its own output as the
     /// input and the float can only ever drift downwards.
     pub(crate) flow_y: i64,
+    /// On the root box: `<html>`'s background, which has no box of its own to
+    /// paint it.
+    pub(crate) html_background: Option<Color>,
+    /// Where the previous layout pass put this box. Lines in a block look floats
+    /// up in the coordinates of whatever holds them, and a pass doesn't know a
+    /// box's position until after sizing it, so sizing has to use the last one.
+    pub(crate) previous_point: LayoutPoint,
     /// Offset of this box's top from its parent's content box in block flow,
     /// margins collapsed. Worked out by the parent, because how a child's
     /// margins collapse depends on the siblings around it.
@@ -653,6 +699,8 @@ impl LayoutObject {
             inline_offset: None,
             float_context: None,
             flow_y: 0,
+            html_background: None,
+            previous_point: LayoutPoint::new(0, 0),
             flow_offset_y: None,
             assigned_width: None,
             stretched_height: None,
@@ -734,6 +782,8 @@ impl LayoutObject {
     /// child becomes a block itself, which is what splitting it around that
     /// child comes to when, as is usual, it holds nothing else.
     pub(crate) fn normalize_children(object: &Rc<RefCell<LayoutObject>>) {
+        Self::hide_closed_details_content(object);
+        Self::add_disclosure_marker(object);
         let mut children = Vec::new();
         let mut child = object.borrow().first_child();
         while let Some(c) = child {
@@ -804,6 +854,69 @@ impl LayoutObject {
             next = Some(c);
         }
         object.borrow_mut().first_child = next;
+    }
+
+    /// A closed `<details>` shows only its `<summary>`. The stylesheet can hide
+    /// elements but not the text beside them, so this drops the boxes here.
+    fn hide_closed_details_content(object: &Rc<RefCell<LayoutObject>>) {
+        {
+            let b = object.borrow();
+            let node = b.node.borrow();
+            let closed = node.element_tag_name().as_deref() == Some("details")
+                && matches!(node.kind(), NodeKind::Element(ref e) if e.get_attribute("open").is_none());
+            if !closed {
+                return;
+            }
+        }
+        let mut kept = None;
+        let mut child = object.borrow().first_child();
+        while let Some(c) = child {
+            child = c.borrow().next_sibling();
+            let is_summary =
+                c.borrow().node.borrow().element_tag_name().as_deref() == Some("summary");
+            if is_summary && kept.is_none() {
+                c.borrow_mut().next_sibling = None;
+                kept = Some(c);
+            }
+        }
+        object.borrow_mut().first_child = kept;
+    }
+
+    /// A `<summary>` shows whether its `<details>` is open. It's the box's list
+    /// marker, so a page that changes the `display` or removes the marker with
+    /// `list-style` loses it too, as it should.
+    /// https://html.spec.whatwg.org/multipage/rendering.html#the-details-and-summary-elements
+    fn add_disclosure_marker(object: &Rc<RefCell<LayoutObject>>) {
+        use crate::renderer::layout::computed_style::ListStyleType;
+        let (node, open) = {
+            let b = object.borrow();
+            if b.node.borrow().element_tag_name().as_deref() != Some("summary")
+                || b.style.display() != DisplayType::Block
+                || b.style.list_style_type() == ListStyleType::None
+            {
+                return;
+            }
+            let open = b.node.borrow().parent().upgrade().is_some_and(|parent| {
+                let parent = parent.borrow();
+                parent.element_tag_name().as_deref() == Some("details")
+                    && matches!(parent.kind(), NodeKind::Element(ref e) if e.get_attribute("open").is_some())
+            });
+            (b.node.clone(), open)
+        };
+        let text = Rc::new(RefCell::new(Node::new(NodeKind::Text(
+            if open { "\u{25BC}\u{00A0}" } else { "\u{25B6}\u{00A0}" }.to_string(),
+        ))));
+        text.borrow_mut().set_parent(Rc::downgrade(&node));
+        let marker = Rc::new(RefCell::new(LayoutObject::new(
+            text.clone(),
+            &Some(object.clone()),
+        )));
+        let style = Some(object.borrow().style());
+        marker.borrow_mut().defaulting_style(&text, style);
+        marker.borrow_mut().update_kind();
+        let first = object.borrow_mut().first_child.take();
+        marker.borrow_mut().next_sibling = first;
+        object.borrow_mut().first_child = Some(marker);
     }
 
     /// Each run of text directly inside a flex or grid container becomes one item.
@@ -886,6 +999,44 @@ impl LayoutObject {
                 self.element_kind(),
                 Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
             )
+    }
+
+    /// How far `vertical-align` lifts this box's baseline above its parent's.
+    /// `atomic` gives an inline-level box's own (height, baseline).
+    /// https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align
+    fn vertical_align_raise(&self, atomic: Option<(i64, i64)>) -> i64 {
+        let parent = self.parent.upgrade();
+        let parent_px = parent
+            .as_ref()
+            .map(|p| p.borrow().style.font_size().px())
+            .unwrap_or(self.style.font_size().px());
+        let (parent_ascent, parent_descent) = parent
+            .as_ref()
+            .map(|p| font_extent(&p.borrow().style))
+            .unwrap_or((parent_px, 0));
+        match self.style.vertical_align() {
+            VerticalAlign::Baseline | VerticalAlign::Top | VerticalAlign::Bottom => 0,
+            VerticalAlign::Raise(px) => px as i64,
+            VerticalAlign::RaiseRatio(ratio) => {
+                (ratio * styled_line_height(&self.style) as f64) as i64
+            }
+            VerticalAlign::Super => parent_px / 3,
+            VerticalAlign::Sub => -(parent_px / 5),
+            // The box's middle on the parent's baseline plus half its x-height,
+            // taking an x-height as half an em.
+            VerticalAlign::Middle => match atomic {
+                Some((height, baseline)) => parent_px / 4 + height / 2 - baseline,
+                None => 0,
+            },
+            VerticalAlign::TextTop => match atomic {
+                Some((_, baseline)) => parent_ascent - baseline,
+                None => 0,
+            },
+            VerticalAlign::TextBottom => match atomic {
+                Some((height, baseline)) => -parent_descent + (height - baseline),
+                None => 0,
+            },
+        }
     }
 
     /// Stack this box's block-level children, collapsing margins. `None` when it
@@ -1342,7 +1493,7 @@ impl LayoutObject {
             match b.node_kind() {
                 NodeKind::Text(ref t) => {
                     let fs = b.style.font_size();
-                    let bold = b.style.is_bold();
+                    let bold = b.style.text_face();
                     if b.style.white_space_preserves_newlines() {
                         // Each hard line within the text starts a new line box.
                         let mut lines = t.split('\n');
@@ -1441,7 +1592,7 @@ impl LayoutObject {
             // unbreakable and may be wider — take the max of the two.
             if let NodeKind::Text(ref t) = borrowed.node_kind() {
                 let font_size = borrowed.style.font_size();
-                let bold = borrowed.style.is_bold();
+                let bold = borrowed.style.text_face();
                 let longest = t.split(|c: char| c == ' ' || c == '\u{3000}' || c == '\n' || c == '\t')
                     .map(|word| {
                         // Longest ASCII run between wide chars within this word.
@@ -2095,7 +2246,7 @@ impl LayoutObject {
         &self,
         plain_text: &str,
         fs: FontSize,
-        bold: bool,
+        bold: crate::renderer::text::face::TextFace,
         max_width: i64,
     ) -> Vec<String> {
         use crate::renderer::layout::computed_style::WhiteSpace;
@@ -2186,14 +2337,24 @@ impl LayoutObject {
         let mut prev_inline = false;
         let mut next_inline = false;
         if let Some(parent) = self.parent.upgrade() {
+            // Inside an inline element, what comes before or after may lie outside
+            // it. The line layout collapses spaces across such boundaries, so
+            // keep the space for it to decide.
+            let inside_inline = parent.borrow().kind() == LayoutObjectKind::Inline
+                && !parent.borrow().is_inline_block();
+            prev_inline = inside_inline;
+            next_inline = inside_inline;
             let mut prev_kind: Option<LayoutObjectKind> = None;
             let mut child = parent.borrow().first_child();
             while let Some(c) = child {
                 if std::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
-                    prev_inline = matches!(
-                        prev_kind,
-                        Some(LayoutObjectKind::Inline) | Some(LayoutObjectKind::Text)
-                    );
+                    prev_inline = match prev_kind {
+                        Some(kind) => matches!(
+                            kind,
+                            LayoutObjectKind::Inline | LayoutObjectKind::Text
+                        ),
+                        None => inside_inline,
+                    };
                     next_inline = self
                         .next_sibling()
                         .map(|n| {
@@ -2202,7 +2363,7 @@ impl LayoutObject {
                                 LayoutObjectKind::Inline | LayoutObjectKind::Text
                             )
                         })
-                        .unwrap_or(false);
+                        .unwrap_or(inside_inline);
                     break;
                 }
                 let b = c.borrow();
@@ -2418,7 +2579,7 @@ impl LayoutObject {
                     .unwrap_or_else(|| "Button".to_string());
                 Some(LayoutSize::new(
                     explicit_width
-                        .max(measure_text_width(&child_text, self.style.font_size(), self.style.is_bold()) + 28),
+                        .max(measure_text_width(&child_text, self.style.font_size(), self.style.text_face()) + 28),
                     explicit_height.max(36),
                 ))
             }
@@ -2427,7 +2588,9 @@ impl LayoutObject {
     }
 
     fn resolved_width(&self, parent_size: LayoutSize) -> i64 {
-        let w = if let Some(ratio) = self.style.width_ratio() {
+        let w = if let Some(expr) = self.style.width_expr() {
+            edge_to_i64(expr.eval(parent_size.width() as f64))
+        } else if let Some(ratio) = self.style.width_ratio() {
             edge_to_i64(parent_size.width() as f64 * ratio)
         } else {
             edge_to_i64(self.style.width())
@@ -2443,7 +2606,9 @@ impl LayoutObject {
     }
 
     fn resolved_height(&self, parent_size: LayoutSize) -> i64 {
-        let h = if let Some(ratio) = self.style.height_ratio() {
+        let h = if let Some(expr) = self.style.height_expr() {
+            edge_to_i64(expr.eval(parent_size.height() as f64))
+        } else if let Some(ratio) = self.style.height_ratio() {
             edge_to_i64(parent_size.height() as f64 * ratio)
         } else {
             edge_to_i64(self.style.height())
@@ -2473,6 +2638,7 @@ impl LayoutObject {
 
     pub fn compute_size(&mut self, parent_size: LayoutSize) {
         let mut size = LayoutSize::new(0, 0);
+        self.style.resolve_percent_edges(parent_size.width());
         let metrics = compute_box_model_metrics(&self.style);
         // An inline-block is a block on the inside; only how its parent places
         // it differs.
@@ -2589,6 +2755,7 @@ impl LayoutObject {
                     }
                 } else if self.style.float_or_default() != Float::None
                     || self.is_inline_block()
+                    || self.style.width_is_fit()
                 {
                     // A floated box with `width: auto` shrink-wraps its content
                     // rather than filling the containing block — otherwise it
@@ -2669,6 +2836,10 @@ impl LayoutObject {
                     if explicit_height > 0 || self.style.explicit_zero_height() {
                         self.collapses_through = false;
                         explicit_height
+                    } else if let Some(ratio) = self.style.aspect_ratio() {
+                        // Spec: CSS Sizing 4 §4.1. The content can still make it taller.
+                        self.collapses_through = false;
+                        ((content_width as f64 / ratio).round() as i64).max(content_height)
                     } else {
                         content_height.max(0)
                     }
@@ -2765,8 +2936,8 @@ impl LayoutObject {
             LayoutObjectKind::Text => {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let fs = self.style.font_size();
-                    let bold = self.style.is_bold();
-                    let cw = bold_width_adjust(char_width_px(fs), bold);
+                    let bold = self.style.text_face();
+                    let cw = bold_width_adjust(char_width_px(fs), bold.bold);
                     let lh = styled_line_height(&self.style);
                     let plain_text = self.display_text(&t);
                     // max_width is the available horizontal space for this text
@@ -3106,6 +3277,7 @@ impl LayoutObject {
     /// Clear the geometry a layout pass produces, so the next one starts from
     /// the same state. See `LayoutView::reset_layout_state`.
     pub(crate) fn reset_geometry(&mut self) {
+        self.previous_point = self.point;
         self.point = LayoutPoint::new(0, 0);
         self.size = LayoutSize::new(0, 0);
         self.text_line_max_width = 0;
@@ -3161,7 +3333,7 @@ impl LayoutObject {
                 if c.borrow().kind().normal_flow_spec().stacks_vertically {
                     return None;
                 }
-                if !collect_inline_items_from(&c, &mut boxes, &mut items) {
+                if !collect_inline_items_from(&c, &mut boxes, &mut items, 0) {
                     return None;
                 }
             }
@@ -3221,7 +3393,13 @@ impl LayoutObject {
                 }
                 let boxed = &boxes[fragment.item];
                 let mut x = fragment.x;
-                let mut y = fragment.y + (line.baseline - items[fragment.item].baseline_offset());
+                let mut y = match &items[fragment.item] {
+                    InlineItem::Atomic { line_edge: Some(LineEdge::Top), .. } => fragment.y,
+                    InlineItem::Atomic { line_edge: Some(LineEdge::Bottom), height, .. } => {
+                        fragment.y + line.height - height
+                    }
+                    item => fragment.y + (line.baseline - item.baseline_offset()),
+                };
                 // A fragment is an atomic box's margin box; the box itself sits
                 // inside that.
                 if matches!(items[fragment.item], InlineItem::Atomic { .. }) {
@@ -3415,6 +3593,12 @@ impl LayoutObject {
                 _ => LineAlign::Start,
             },
             wrap: !block.borrow().style.white_space_nowrap(),
+            strut: {
+                let b = block.borrow();
+                let baseline = text_baseline(&b.style);
+                (baseline, styled_line_height(&b.style) - baseline)
+            },
+            indent: block.borrow().style.text_indent() as i64,
         };
         // Place this context's floats first: the lines below then flow around
         // them, because line breaking asks the same context for each line's
@@ -3722,6 +3906,20 @@ impl LayoutObject {
         )
     }
 
+    /// As [`Self::content_origin`], from where the previous pass put this box.
+    fn previous_content_origin(&self) -> LayoutPoint {
+        let metrics = compute_box_model_metrics(&self.style);
+        let cp = if self.is_table_cell() {
+            self.ancestor_table_cellpadding()
+        } else {
+            0
+        };
+        LayoutPoint::new(
+            self.previous_point.x() + metrics.padding.left + metrics.border.left + cp,
+            self.previous_point.y() + metrics.padding.top + metrics.border.top + cp,
+        )
+    }
+
     pub fn content_size(&self) -> LayoutSize {
         let metrics = compute_box_model_metrics(&self.style);
         let cp = if self.is_table_cell() {
@@ -3820,12 +4018,12 @@ impl LayoutSize {
 /// The floats of the nearest ancestor block formatting context, translated
 /// into `block`'s own coordinates. `None` when no ancestor has any.
 fn ancestor_float_context(block: &Rc<RefCell<LayoutObject>>) -> Option<FloatContext> {
-    let own_origin = block.borrow().content_origin();
+    let own_origin = block.borrow().previous_content_origin();
     let mut ancestor = block.borrow().parent.upgrade();
     while let Some(a) = ancestor {
         let context = a.borrow().float_context.clone();
         if let Some(context) = context {
-            let origin = a.borrow().content_origin();
+            let origin = a.borrow().previous_content_origin();
             // The context is in the ancestor's coordinates; re-express it in
             // this box's — offset *and* width, or a float lands in the wrong
             // place or appears to narrow nothing.
@@ -3863,6 +4061,7 @@ fn collect_inline_items_from(
     node: &Rc<RefCell<LayoutObject>>,
     boxes: &mut Vec<Rc<RefCell<LayoutObject>>>,
     items: &mut Vec<InlineItem>,
+    raise: i64,
 ) -> bool {
     let kind = node.borrow().kind();
     if kind.normal_flow_spec().stacks_vertically {
@@ -3874,7 +4073,7 @@ fn collect_inline_items_from(
         let b = node.borrow();
         let baseline = b.inline_block_baseline();
         boxes.push(node.clone());
-        items.push(atomic_item(&b, baseline));
+        items.push(atomic_item(&b, baseline, raise));
         return true;
     }
     if kind == LayoutObjectKind::Text {
@@ -3897,7 +4096,9 @@ fn collect_inline_items_from(
         items.push(InlineItem::Text(TextRun {
             text,
             font_size: b.style.font_size(),
-            bold: b.style.is_bold(),
+            face: b.style.text_face(),
+            baseline: text_baseline(&b.style),
+            raise,
             line_height: styled_line_height(&b.style),
             breakable: !b.style.white_space_nowrap(),
             hard_breaks: b.style.white_space_preserves_newlines(),
@@ -3918,9 +4119,11 @@ fn collect_inline_items_from(
         let b = node.borrow();
         let bottom = b.size().height();
         boxes.push(node.clone());
-        items.push(atomic_item(&b, bottom));
+        items.push(atomic_item(&b, bottom, raise));
         return true;
     }
+    // The parent's baseline moves for everything inside a raised element.
+    let raise = raise + node.borrow().vertical_align_raise(None);
     let metrics = compute_box_model_metrics(&node.borrow().style);
     let leading = metrics.margin.left + metrics.border.left + metrics.padding.left;
     let trailing = metrics.margin.right + metrics.border.right + metrics.padding.right;
@@ -3932,7 +4135,7 @@ fn collect_inline_items_from(
     while let Some(c) = child {
         // A float or positioned box inside an inline element is placed apart
         // from the line; it must not stop the rest being laid out as text.
-        if !c.borrow().is_out_of_flow() && !collect_inline_items_from(&c, boxes, items) {
+        if !c.borrow().is_out_of_flow() && !collect_inline_items_from(&c, boxes, items, raise) {
             return false;
         }
         let next = c.borrow().next_sibling();
@@ -3947,14 +4150,30 @@ fn collect_inline_items_from(
 
 /// The item for a box placed whole on a line: its margin box, with `baseline`
 /// measured from its border box's top.
-fn atomic_item(b: &LayoutObject, baseline: i64) -> InlineItem {
+fn atomic_item(b: &LayoutObject, baseline: i64, raise: i64) -> InlineItem {
     let metrics = compute_box_model_metrics(&b.style);
     let size = b.size();
+    let height = size.height() + metrics.margin.top + metrics.margin.bottom;
+    let baseline = baseline + metrics.margin.top;
+    let line_edge = match b.style.vertical_align() {
+        VerticalAlign::Top => Some(LineEdge::Top),
+        VerticalAlign::Bottom => Some(LineEdge::Bottom),
+        _ => None,
+    };
     InlineItem::Atomic {
         width: size.width() + metrics.margin.left + metrics.margin.right,
-        height: size.height() + metrics.margin.top + metrics.margin.bottom,
-        baseline: baseline + metrics.margin.top,
+        height,
+        baseline,
+        raise: raise + b.vertical_align_raise(Some((height, baseline))),
+        line_edge,
     }
+}
+
+/// A font's extent above and below the baseline, in whole pixels.
+fn font_extent(style: &ComputedStyle) -> (i64, i64) {
+    let (ascent, descent) = crate::renderer::text::provider::metrics()
+        .ascent_descent(style.font_size(), style.text_face());
+    (ascent.round() as i64, descent.round() as i64)
 }
 
 /// A rect in the inline formatting context's (block-relative) coordinates.
@@ -3990,7 +4209,7 @@ fn fragment_rect(node: &Rc<RefCell<LayoutObject>>, placed: &[(String, i64, i64)]
     let first = placed.first()?;
     let b = node.borrow();
     let is_text = b.kind() == LayoutObjectKind::Text;
-    let (font_size, bold) = (b.style.font_size(), b.style.is_bold());
+    let (font_size, bold) = (b.style.font_size(), b.style.text_face());
     let line_height = styled_line_height(&b.style);
     let (own_width, own_height) = (b.size().width(), b.size().height());
     drop(b);

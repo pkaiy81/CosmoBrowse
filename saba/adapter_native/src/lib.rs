@@ -1430,6 +1430,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 target: text.target.clone(),
                 z_index: text.z_index,
                 clip_rect: text.clip_rect,
+                detail: text.detail.clone(),
             }),
             PaintCommand::DrawImage(image) => items.push(SceneItem::Image {
                 fixed: image.fixed,

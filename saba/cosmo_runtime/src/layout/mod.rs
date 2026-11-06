@@ -1152,6 +1152,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
+                    detail: cosmo_engine::paint_commands::TextDetail::from_style(&style),
                 });
             }
             DisplayItem::Image {

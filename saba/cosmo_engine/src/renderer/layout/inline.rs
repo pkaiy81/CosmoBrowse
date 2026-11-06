@@ -23,6 +23,7 @@
 
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::floats::FloatContext;
+use crate::renderer::text::face::TextFace;
 use crate::renderer::text::legacy_metrics::{char_advance, is_break_space, measure_text_width};
 
 /// A run of text with the font it is measured in.
@@ -30,7 +31,11 @@ use crate::renderer::text::legacy_metrics::{char_advance, is_break_space, measur
 pub struct TextRun {
     pub text: String,
     pub font_size: FontSize,
-    pub bold: bool,
+    pub face: TextFace,
+    /// Where the baseline sits below the top of this run's line-height box.
+    pub baseline: i64,
+    /// How far `vertical-align` raises the run.
+    pub raise: i64,
     /// Used line-height: the height this run contributes to a line box.
     pub line_height: i64,
     /// False for `white-space: nowrap`: the run is placed whole and allowed to
@@ -57,12 +62,24 @@ pub enum InlineItem {
         height: i64,
         /// Distance from the box's top to its baseline.
         baseline: i64,
+        /// How far `vertical-align` raises the box.
+        raise: i64,
+        /// `vertical-align: top` or `bottom` place it against the line itself,
+        /// once the line's height is known.
+        line_edge: Option<LineEdge>,
     },
     /// A `<br>`: ends the line, and gives an otherwise empty one its height.
     ForcedBreak { line_height: i64 },
     /// The margin, border and padding at the edge of an inline element. It
     /// takes up room on the line but adds nothing to the line's height.
     Spacer { width: i64 },
+}
+
+/// The edge of the line box a `vertical-align: top` or `bottom` box sticks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEdge {
+    Top,
+    Bottom,
 }
 
 impl InlineItem {
@@ -89,8 +106,8 @@ impl InlineItem {
     /// up a pixel apart from where the rest of the engine expects them.
     fn baseline(&self) -> i64 {
         match self {
-            Self::Text(run) => run.font_size.px(),
-            Self::Atomic { baseline, .. } => *baseline,
+            Self::Text(run) => run.baseline + run.raise,
+            Self::Atomic { baseline, raise, .. } => *baseline + *raise,
             Self::ForcedBreak { .. } | Self::Spacer { .. } => 0,
         }
     }
@@ -152,6 +169,10 @@ pub struct LineOptions {
     /// suppress breaks *between* items too, not just inside a run.
     /// Spec: CSS Text §3.1. https://www.w3.org/TR/css-text-3/#white-space-property
     pub wrap: bool,
+    /// The block's own font's extent above and below the baseline.
+    pub strut: (i64, i64),
+    /// `text-indent`: how far in the first line starts.
+    pub indent: i64,
 }
 
 impl Default for LineOptions {
@@ -159,6 +180,8 @@ impl Default for LineOptions {
         Self {
             align: LineAlign::Start,
             wrap: true,
+            strut: (0, 0),
+            indent: 0,
         }
     }
 }
@@ -208,14 +231,15 @@ pub fn layout_inline_items_aligned(
     const MAX_PUSHES_BELOW: usize = 4;
     let mut pushes_below = 0usize;
     // The first line begins after any float already occupying the left edge.
-    let first_x = start_x.max(band_left(floats, content_width, start_y, probe_height));
+    let first_x = start_x.max(band_left(floats, content_width, start_y, probe_height))
+        + options.indent;
     let mut current = OpenLine::new(start_y, first_x);
 
     for (index, item) in items.iter().enumerate() {
         match item {
             InlineItem::ForcedBreak { line_height } => {
                 current.height = current.height.max(*line_height);
-                lines.push(current.close());
+                lines.push(current.close(options.strut));
                 let y = next_y(&lines);
                 current = OpenLine::new(y, band_left(floats, content_width, y, *line_height));
             }
@@ -237,7 +261,7 @@ pub fn layout_inline_items_aligned(
             InlineItem::Atomic { width, height, .. } => {
                 let band = band_for(floats, content_width, current.y, (*height).max(probe_height));
                 if options.wrap && current.needs_break(*width, band.right) {
-                    lines.push(current.close());
+                    lines.push(current.close(options.strut));
                     current = OpenLine::new(next_y(&lines), band_left(floats, content_width, next_y(&lines), *height));
                 }
                 current.push(Fragment {
@@ -310,7 +334,7 @@ pub fn layout_inline_items_aligned(
                         // Nothing fits on what's left of this line. If the line
                         // already holds something, move on.
                         if !current.is_empty() {
-                            lines.push(current.close());
+                            lines.push(current.close(options.strut));
                             let y = next_y(&lines);
                             current = OpenLine::new(y, band_left(floats, content_width, y, run.line_height));
                             continue;
@@ -349,7 +373,7 @@ pub fn layout_inline_items_aligned(
                                 text: Some(forced.to_string()),
                                 x: current.x,
                                 y: current.y,
-                                width: measure_text_width(forced, run.font_size, run.bold),
+                                width: measure_text_width(forced, run.font_size, run.face),
                                 height: run.line_height,
                             },
                             item,
@@ -360,8 +384,8 @@ pub fn layout_inline_items_aligned(
                         // break itself, not something to draw — strip it along
                         // with any hanging spaces.
                         let trimmed = head.trim_end_matches(is_break_space).trim_end_matches('\n');
-                        let full = measure_text_width(head, run.font_size, run.bold);
-                        let without = measure_text_width(trimmed, run.font_size, run.bold);
+                        let full = measure_text_width(head, run.font_size, run.face);
+                        let without = measure_text_width(trimmed, run.font_size, run.face);
                         // A run ending in a newline always ends its line, so its
                         // hanging width must be recorded even when the trailing
                         // characters measure the same.
@@ -386,14 +410,14 @@ pub fn layout_inline_items_aligned(
                     if forced_break && rest.is_empty() {
                         // The run ended with a newline: close the line so the
                         // next item starts below it.
-                        lines.push(current.close());
+                        lines.push(current.close(options.strut));
                         let y = next_y(&lines);
                         current =
                             OpenLine::new(y, band_left(floats, content_width, y, run.line_height));
                         break;
                     }
                     // More text to place: it goes on a fresh line.
-                    lines.push(current.close());
+                    lines.push(current.close(options.strut));
                     let y = next_y(&lines);
                     current = OpenLine::new(y, band_left(floats, content_width, y, run.line_height));
                 }
@@ -401,7 +425,7 @@ pub fn layout_inline_items_aligned(
         }
     }
     if !current.is_empty() {
-        lines.push(current.close());
+        lines.push(current.close(options.strut));
     }
     if align != LineAlign::Start {
         for line in &mut lines {
@@ -552,7 +576,7 @@ fn break_text<'a>(
             // Nothing further can fit; stop rather than scanning the rest.
             break;
         }
-        width += char_advance(ch, run.font_size, run.bold);
+        width += char_advance(ch, run.font_size, run.face);
         if !is_break_space(ch) {
             width_without_trailing_space = width;
         }
@@ -594,6 +618,10 @@ struct OpenLine {
     start_x: i64,
     height: i64,
     baseline: i64,
+    /// Extent below the baseline.
+    below: i64,
+    /// The tallest box stuck to the line's top or bottom edge.
+    edge_height: i64,
     fragments: Vec<Fragment>,
 }
 
@@ -605,6 +633,8 @@ impl OpenLine {
             start_x,
             height: 0,
             baseline: 0,
+            below: 0,
+            edge_height: 0,
             fragments: Vec::new(),
         }
     }
@@ -622,16 +652,29 @@ impl OpenLine {
         self.x = fragment.x + fragment.width;
         // The line grows to fit the tallest item, aligned on the deepest
         // baseline (CSS 2.2 §10.8).
+        // A box stuck to the line's edge doesn't take part in baseline alignment:
+        // it only needs the line to be at least as tall as it is.
+        if matches!(item, InlineItem::Atomic { line_edge: Some(_), .. }) {
+            self.edge_height = self.edge_height.max(item.height());
+            self.fragments.push(fragment);
+            return;
+        }
         self.baseline = self.baseline.max(item.baseline());
-        let below = item.height() - item.baseline();
-        self.height = self.height.max(self.baseline + below);
+        self.below = self.below.max(item.height() - item.baseline());
         self.fragments.push(fragment);
     }
 
     /// Finish the line: place every fragment on the shared baseline and let the
     /// last one's trailing white space hang past the edge (CSS Text §4.1) so it
     /// neither widens the line nor shifts an alignment.
-    fn close(mut self) -> LineBox {
+    fn close(mut self, strut: (i64, i64)) -> LineBox {
+        // Every line is at least as tall as the block's own font and line-height
+        // would make it, whatever is on it. Spec: CSS 2.2 §10.8.1 ("strut").
+        if !self.fragments.is_empty() {
+            self.baseline = self.baseline.max(strut.0);
+            self.below = self.below.max(strut.1);
+        }
+        self.height = self.height.max(self.baseline + self.below).max(self.edge_height);
         let baseline = self.baseline;
         for fragment in &mut self.fragments {
             fragment.y = self.y;
@@ -667,7 +710,9 @@ mod tests {
         InlineItem::Text(TextRun {
             text: s.to_string(),
             font_size: FontSize::Medium,
-            bold: false,
+            face: TextFace::plain(false),
+            baseline: FontSize::Medium.px(),
+            raise: 0,
             line_height: 20,
             breakable: true,
             hard_breaks: false,
@@ -676,7 +721,7 @@ mod tests {
     }
 
     fn width_of(s: &str) -> i64 {
-        measure_text_width(s, FontSize::Medium, false)
+        measure_text_width(s, FontSize::Medium, TextFace::plain(false))
     }
 
     fn lines_text(lines: &[LineBox]) -> Vec<Vec<String>> {
@@ -773,6 +818,8 @@ mod tests {
                 width: content,
                 height: 30,
                 baseline: 30,
+                raise: 0,
+                line_edge: None,
             },
         ];
         let lines = layout_inline_items(&items, &FloatContext::default(), content, 0, 0);
@@ -806,6 +853,8 @@ mod tests {
                 width: 10,
                 height: 40,
                 baseline: 40,
+                raise: 0,
+                line_edge: None,
             },
         ];
         let lines = layout_inline_items(&items, &FloatContext::default(), 10_000, 0, 0);
@@ -823,14 +872,16 @@ mod tests {
         let items = vec![InlineItem::Text(TextRun {
             text: "本日は晴天なり。".to_string(),
             font_size: FontSize::Medium,
-            bold: false,
+            face: TextFace::plain(false),
+            baseline: FontSize::Medium.px(),
+            raise: 0,
             line_height: 20,
             breakable: true,
             hard_breaks: false,
             preserves_spaces: false,
         })];
         // Room for roughly seven of the eight double-width characters.
-        let narrow = measure_text_width("本日は晴天なり", FontSize::Medium, false);
+        let narrow = measure_text_width("本日は晴天なり", FontSize::Medium, TextFace::plain(false));
         let lines = layout_inline_items(&items, &FloatContext::default(), narrow, 0, 0);
         let first: String = lines[0]
             .fragments
@@ -892,7 +943,7 @@ mod tests {
             narrow,
             0,
             0,
-            LineOptions { align: LineAlign::Start, wrap: false },
+            LineOptions { align: LineAlign::Start, wrap: false, ..LineOptions::default() },
         );
         assert_eq!(lines.len(), 1, "nowrap must produce a single line");
         assert_eq!(
@@ -910,7 +961,9 @@ mod tests {
         InlineItem::Text(TextRun {
             text: s.to_string(),
             font_size: FontSize::Medium,
-            bold: false,
+            face: TextFace::plain(false),
+            baseline: FontSize::Medium.px(),
+            raise: 0,
             line_height: 20,
             breakable: true,
             hard_breaks: true,

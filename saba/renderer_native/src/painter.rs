@@ -4,6 +4,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use cosmo_engine::renderer::text::face::{FontClass, TextFace};
 use cosmo_engine::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
 use tiny_skia::{
     Color, GradientStop, LinearGradient, Paint, Pixmap, Point, Rect, Shader, SpreadMode, Transform,
@@ -942,10 +943,35 @@ fn draw_text(
     // Approximate baseline = top + font_size (ascent ≈ font_size for most fonts).
     let ty = text.y + chrome_height + font_px as i64 - inner_y;
     let tx = text.x - inner_x;
+    let face = TextFace {
+        class: FontClass::from_name(&text.font_family),
+        bold: text.bold,
+        italic: text.detail.italic,
+        ..TextFace::default()
+    }
+    .with_spacing(text.detail.letter_spacing, text.detail.word_spacing);
 
     let screen_clip = text
         .clip_rect
         .map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
+    if let Some((dx, dy, color)) = &text.detail.shadow {
+        let (sr, sg, sb, sa) = parse_css_color(color);
+        let shadow_alpha = (text.opacity * sa as f64).round().clamp(0.0, 255.0) as u8;
+        text_renderer.draw_text_clipped(
+            pixmap,
+            &text.text,
+            tx + dx,
+            ty + dy,
+            font_px,
+            sr,
+            sg,
+            sb,
+            shadow_alpha,
+            scroll_y,
+            face,
+            screen_clip,
+        );
+    }
     let end_x = text_renderer.draw_text_clipped(
         pixmap,
         &text.text,
@@ -957,27 +983,33 @@ fn draw_text(
         b,
         alpha,
         scroll_y,
-        text.bold,
+        face,
         screen_clip,
     );
 
-    // `text-decoration` alone decides this: a link with `none` has no underline.
-    if text.underline {
-        let uy = ty - scroll_y + 2;
+    let mut decorate = |uy: i64| {
         let (clip_top, clip_bottom, clip_left, clip_right) = match screen_clip {
             Some((cx, cy, cw, ch)) => (cy, cy + ch, cx, cx + cw),
             None => (i64::MIN, i64::MAX, i64::MIN, i64::MAX),
         };
-        if uy >= 0
-            && uy < pixmap.height() as i64
-            && (clip_top..clip_bottom).contains(&uy)
-        {
+        if uy >= 0 && uy < pixmap.height() as i64 && (clip_top..clip_bottom).contains(&uy) {
             let start = tx.max(0).max(clip_left);
             let end = end_x.min(pixmap.width() as i64).min(clip_right);
             for col in start..end {
                 crate::text_render::blend_pixel(pixmap, col as u32, uy as u32, r, g, b, alpha);
             }
         }
+    };
+    let baseline = ty - scroll_y;
+    // `text-decoration` alone decides this: a link with `none` has no underline.
+    if text.underline {
+        decorate(baseline + 2);
+    }
+    if text.detail.line_through {
+        decorate(baseline - font_px as i64 * 3 / 10);
+    }
+    if text.detail.overline {
+        decorate(baseline - font_px as i64 * 4 / 5);
     }
 
     end_x

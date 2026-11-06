@@ -1,3 +1,4 @@
+use cosmo_engine::paint_commands::TextDetail;
 use serde::{Deserialize, Serialize};
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -339,6 +340,8 @@ pub enum SceneItem {
         target: Option<String>,
         z_index: i32,
         clip_rect: Option<(i64, i64, i64, i64)>,
+        #[serde(default, skip_serializing_if = "TextDetail::is_plain")]
+        detail: TextDetail,
     },
     Image {
         /// position:fixed — exempt from scrolling.

@@ -8,6 +8,7 @@
 //! tables exactly, so existing layout expectations are unchanged.
 
 use crate::renderer::layout::computed_style::FontSize;
+use crate::renderer::text::face::TextFace;
 use crate::renderer::text::legacy_metrics::{
     bold_width_adjust, char_advance_16, char_width_px, line_height_px, scale_advance,
 };
@@ -19,10 +20,18 @@ pub trait FontMetricsProvider: Debug + Send + Sync {
     /// Runs add these up and round once at the end: rounding per character
     /// makes layout reserve more than the painter draws, a pixel or so per
     /// glyph, which shows up as a gap wherever an inline element follows text.
-    fn advance(&self, c: char, font_size: FontSize, bold: bool) -> f64;
+    fn advance(&self, c: char, font_size: FontSize, face: TextFace) -> f64;
+
+    /// Distance from the baseline up to the top of the font's glyph area, and
+    /// down to its bottom. Half the difference between their sum and the
+    /// line-height goes above the text, half below (CSS 2.2 §10.8.1).
+    fn ascent_descent(&self, font_size: FontSize, _face: TextFace) -> (f64, f64) {
+        let px = font_size.px() as f64;
+        (px, (line_height_px(font_size) as f64 - px).max(0.0))
+    }
 
     /// Default line box height (glyph height + leading) for the font size.
-    fn line_height(&self, font_size: FontSize) -> i64 {
+    fn line_height(&self, font_size: FontSize, _face: TextFace) -> i64 {
         line_height_px(font_size)
     }
 }
@@ -32,10 +41,10 @@ pub trait FontMetricsProvider: Debug + Send + Sync {
 pub struct FixedMetricsProvider;
 
 impl FontMetricsProvider for FixedMetricsProvider {
-    fn advance(&self, c: char, font_size: FontSize, bold: bool) -> f64 {
+    fn advance(&self, c: char, font_size: FontSize, face: TextFace) -> f64 {
         scale_advance(
             char_advance_16(c),
-            bold_width_adjust(char_width_px(font_size), bold),
+            bold_width_adjust(char_width_px(font_size), face.bold),
         ) as f64
     }
 }

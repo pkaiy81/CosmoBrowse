@@ -7,6 +7,7 @@ use crate::constants::CHAR_WIDTH;
 use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::LineHeight;
+use crate::renderer::text::face::TextFace;
 
 pub(crate) fn font_ratio(font_size: FontSize) -> i64 {
     match font_size {
@@ -53,13 +54,23 @@ pub(crate) fn styled_line_height(style: &ComputedStyle) -> i64 {
         Some(LineHeight::Factor(f)) => {
             ((style.font_size_or_default().px() as f64 * f) as i64).max(1)
         }
-        None => super::provider::metrics().line_height(style.font_size_or_default()),
+        None | Some(LineHeight::Normal) => super::provider::metrics()
+            .line_height(style.font_size_or_default(), style.text_face()),
     }
 }
 
+/// How far below the top of its line-height box a run's baseline sits: half the
+/// leading, then the font's ascent. Spec: CSS 2.2 §10.8.1.
+pub(crate) fn text_baseline(style: &ComputedStyle) -> i64 {
+    let (ascent, descent) = super::provider::metrics()
+        .ascent_descent(style.font_size_or_default(), style.text_face());
+    let leading = styled_line_height(style) as f64 - (ascent + descent);
+    (leading / 2.0 + ascent).round() as i64
+}
+
 /// Unrounded advance of one character from the installed metrics provider.
-pub(crate) fn char_advance(c: char, font_size: FontSize, bold: bool) -> f64 {
-    super::provider::metrics().advance(c, font_size, bold)
+pub(crate) fn char_advance(c: char, font_size: FontSize, face: TextFace) -> f64 {
+    super::provider::metrics().advance(c, font_size, face) + face.extra_advance(c)
 }
 
 pub(crate) fn is_wide_char(c: char) -> bool {
@@ -109,18 +120,18 @@ pub(crate) fn scale_advance(advance_16: i64, cw: i64) -> i64 {
 pub(crate) fn truncate_with_ellipsis(
     text: &str,
     font_size: FontSize,
-    bold: bool,
+    face: TextFace,
     max_width: i64,
 ) -> String {
-    if measure_text_width(text, font_size, bold) <= max_width {
+    if measure_text_width(text, font_size, face) <= max_width {
         return text.to_string();
     }
-    let ellipsis_w = char_advance('…', font_size, bold);
+    let ellipsis_w = char_advance('…', font_size, face);
     let budget = (max_width as f64 - ellipsis_w).max(0.0);
     let mut acc = 0f64;
     let mut out = String::new();
     for c in text.chars() {
-        let w = char_advance(c, font_size, bold);
+        let w = char_advance(c, font_size, face);
         if acc + w > budget {
             break;
         }
@@ -144,9 +155,9 @@ pub(crate) fn bold_width_adjust(width: i64, bold: bool) -> i64 {
 /// Width of `text`: the exact advances summed, rounded up once. Line breaking
 /// sums the same advances and compares against whole pixels, so a box sized
 /// from this never wraps its own content.
-pub(crate) fn measure_text_width(text: &str, font_size: FontSize, bold: bool) -> i64 {
+pub(crate) fn measure_text_width(text: &str, font_size: FontSize, face: TextFace) -> i64 {
     text.chars()
-        .map(|c| char_advance(c, font_size, bold))
+        .map(|c| char_advance(c, font_size, face))
         .sum::<f64>()
         .ceil() as i64
 }
@@ -170,11 +181,11 @@ pub(crate) fn is_break_space(c: char) -> bool {
 pub(crate) fn split_text(
     line: String,
     font_size: FontSize,
-    bold: bool,
+    face: TextFace,
     max_width: i64,
 ) -> Vec<String> {
     let safe_width = max_width
-        .max(bold_width_adjust(char_width_px(font_size), bold))
+        .max(bold_width_adjust(char_width_px(font_size), face.bold))
         .max(1);
     // Line capacity in pixels; per-character advances come from the same
     // provider as measurement so wrapping and sizing agree.
@@ -191,7 +202,7 @@ pub(crate) fn split_text(
     let mut units_after_space = 0f64;
 
     for (idx, c) in line.char_indices() {
-        let w = char_advance(c, font_size, bold);
+        let w = char_advance(c, font_size, face);
 
         if started && cur_units + w > max_units {
             match last_space {

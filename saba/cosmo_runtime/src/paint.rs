@@ -79,6 +79,7 @@ pub fn scene_items_to_paint_commands(
                 target,
                 z_index,
                 clip_rect,
+                detail,
             } => {
                 let family = if font_family.trim().is_empty() {
                     diagnostics
@@ -107,6 +108,7 @@ pub fn scene_items_to_paint_commands(
                     target: target.clone(),
                     z_index: *z_index,
                     clip_rect: *clip_rect,
+                    detail: detail.clone(),
                 }));
             }
             SceneItem::Image {

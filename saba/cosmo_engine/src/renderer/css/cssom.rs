@@ -7,10 +7,15 @@ use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 use std::iter::Peekable;
+use std::rc::Rc;
+use std::vec;
 
 #[derive(Debug, Clone)]
 pub struct CssParser {
-    t: Peekable<CssTokenizer>,
+    t: Peekable<vec::IntoIter<CssToken>>,
+    /// What `&` means where this parser is reading: the enclosing rule's
+    /// selector inside a nested rule, the subject inside `:has()`.
+    nesting: Option<Selector>,
     /// Conditions collected from `@media` preludes; `QualifiedRule::media`
     /// indexes into this.
     media_conditions: Vec<MediaQueryList>,
@@ -20,11 +25,188 @@ pub struct CssParser {
 
 impl CssParser {
     pub fn new(t: CssTokenizer) -> Self {
+        Self::from_tokens(t.collect())
+    }
+
+    fn from_tokens(tokens: Vec<CssToken>) -> Self {
         Self {
-            t: t.peekable(),
+            t: tokens.into_iter().peekable(),
+            nesting: None,
             media_conditions: Vec::new(),
             keyframes: Vec::new(),
         }
+    }
+
+    /// Everything up to the `}` closing a block whose `{` was just consumed.
+    fn take_block(&mut self) -> Vec<CssToken> {
+        let mut depth = 1;
+        let mut tokens = Vec::new();
+        while let Some(token) = self.t.next() {
+            match token {
+                CssToken::OpenCurly => depth += 1,
+                CssToken::CloseCurly => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return tokens;
+                    }
+                }
+                _ => {}
+            }
+            tokens.push(token);
+        }
+        tokens
+    }
+
+    /// The tokens of a parenthesized argument whose `(` is next.
+    fn take_parenthesized(&mut self) -> Vec<CssToken> {
+        let mut tokens = Vec::new();
+        if self.t.peek() != Some(&CssToken::OpenParenthesis) {
+            return tokens;
+        }
+        self.t.next();
+        let mut depth = 1;
+        while let Some(token) = self.t.next() {
+            match token {
+                CssToken::OpenParenthesis => depth += 1,
+                CssToken::CloseParenthesis => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return tokens;
+                    }
+                }
+                _ => {}
+            }
+            tokens.push(token);
+        }
+        tokens
+    }
+
+    /// The contents of a style rule's block: its declarations, then any rules
+    /// nested in it, with `&` standing for `selector`.
+    /// https://www.w3.org/TR/css-nesting-1/
+    fn parse_style_block(
+        &mut self,
+        selector: &Selector,
+        media: &[usize],
+        tokens: Vec<CssToken>,
+    ) -> Vec<QualifiedRule> {
+        let mut declaration_tokens: Vec<CssToken> = Vec::new();
+        let mut nested: Vec<(Vec<CssToken>, Vec<CssToken>)> = Vec::new();
+        let mut pending: Vec<CssToken> = Vec::new();
+        let mut depth = 0;
+        let mut parens = 0;
+        let mut block: Vec<CssToken> = Vec::new();
+        let mut prelude: Vec<CssToken> = Vec::new();
+        for token in tokens {
+            if depth > 0 {
+                match token {
+                    CssToken::OpenCurly => depth += 1,
+                    CssToken::CloseCurly => {
+                        depth -= 1;
+                        if depth == 0 {
+                            nested.push((
+                                core::mem::take(&mut prelude),
+                                core::mem::take(&mut block),
+                            ));
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                block.push(token);
+                continue;
+            }
+            match token {
+                CssToken::OpenParenthesis => {
+                    parens += 1;
+                    pending.push(token);
+                }
+                CssToken::CloseParenthesis => {
+                    parens -= 1;
+                    pending.push(token);
+                }
+                CssToken::OpenCurly if parens == 0 => {
+                    depth = 1;
+                    prelude = core::mem::take(&mut pending);
+                }
+                CssToken::SemiColon if parens == 0 => {
+                    declaration_tokens.append(&mut pending);
+                    declaration_tokens.push(CssToken::SemiColon);
+                }
+                other => pending.push(other),
+            }
+        }
+        declaration_tokens.append(&mut pending);
+
+        let mut rule = QualifiedRule::new();
+        rule.set_selector(selector.clone());
+        rule.media = media.to_vec();
+        rule.set_declarations(Self::from_tokens(declaration_tokens).consume_list_of_declarations());
+        let mut rules = vec![rule];
+        for (prelude, block) in nested {
+            rules.extend(self.parse_nested(selector, media, prelude, block));
+        }
+        rules
+    }
+
+    fn parse_nested(
+        &mut self,
+        selector: &Selector,
+        media: &[usize],
+        prelude: Vec<CssToken>,
+        block: Vec<CssToken>,
+    ) -> Vec<QualifiedRule> {
+        let first = prelude.iter().find(|t| **t != CssToken::Whitespace);
+        if let Some(CssToken::AtKeyword(keyword)) = first {
+            let conditions: Vec<CssToken> = prelude
+                .iter()
+                .skip_while(|t| !matches!(t, CssToken::AtKeyword(_)))
+                .skip(1)
+                .cloned()
+                .collect();
+            let mut media = media.to_vec();
+            match keyword.as_str() {
+                "media" => {
+                    media.push(self.media_conditions.len());
+                    self.media_conditions.push(parse_media_query_list(&conditions));
+                }
+                "container" => {
+                    media.push(self.media_conditions.len());
+                    self.media_conditions
+                        .push(parse_media_query_list(&container_condition(&conditions)));
+                }
+                "supports" => {
+                    if !supports_condition(&conditions) {
+                        return Vec::new();
+                    }
+                }
+                "layer" => {}
+                _ => return Vec::new(),
+            }
+            return self.parse_style_block(selector, &media, block);
+        }
+
+        // Each alternative is relative to `&` unless it says where `&` goes.
+        let mut tokens = Vec::new();
+        for (index, part) in split_on_commas(&prelude).into_iter().enumerate() {
+            if index > 0 {
+                tokens.push(CssToken::Delim(','));
+            }
+            let mut part: Vec<CssToken> = part
+                .iter()
+                .skip_while(|t| **t == CssToken::Whitespace)
+                .cloned()
+                .collect();
+            if !part.contains(&CssToken::Delim('&')) {
+                tokens.push(CssToken::Delim('&'));
+                tokens.push(CssToken::Whitespace);
+            }
+            tokens.append(&mut part);
+        }
+        let mut parser = Self::from_tokens(tokens);
+        parser.nesting = Some(selector.clone());
+        let nested_selector = parser.consume_selector_list();
+        self.parse_style_block(&nested_selector, media, block)
     }
 
     /// Skip any whitespace tokens. Whitespace is only meaningful inside
@@ -181,6 +363,13 @@ impl CssParser {
                     self.t.next();
                     saw_universal = true;
                 }
+                Some(CssToken::Delim('&')) => {
+                    self.t.next();
+                    match self.nesting.clone() {
+                        Some(parent) => parts.push(Selector::Is(Box::new(parent))),
+                        None => never = true,
+                    }
+                }
                 Some(CssToken::Delim('[')) => {
                     self.t.next();
                     match self.consume_attribute_selector() {
@@ -201,37 +390,49 @@ impl CssParser {
                     // `:not(...)` takes a real selector argument: parse it
                     // inline with the selector machinery, then expect `)`.
                     if name == "not" && self.t.peek() == Some(&CssToken::OpenParenthesis) {
-                        self.t.next();
-                        self.skip_whitespace();
-                        let inner = self.consume_selector_list();
-                        self.skip_whitespace();
-                        // Error recovery: skip to the closing paren.
-                        loop {
-                            match self.t.next() {
-                                None | Some(CssToken::CloseParenthesis) => break,
-                                _ => {}
-                            }
-                        }
-                        parts.push(Selector::Not(Box::new(inner)));
+                        let mut inner = Self::from_tokens(self.take_parenthesized());
+                        inner.nesting = self.nesting.clone();
+                        parts.push(Selector::Not(Box::new(inner.consume_selector_list())));
                         continue;
                     }
                     // `:is(list)` / `:where(list)`: matches when ANY of the
-                    // alternatives matches. (:where's zero specificity is
-                    // approximated by the argument list's own specificity.)
-                    if (name == "is" || name == "where" || name == "matches")
-                        && self.t.peek() == Some(&CssToken::OpenParenthesis)
+                    // alternatives matches. `:where` adds no specificity.
+                    if matches!(
+                        name.as_str(),
+                        "is" | "where" | "matches" | "any" | "-webkit-any" | "-moz-any"
+                    ) && self.t.peek() == Some(&CssToken::OpenParenthesis)
                     {
-                        self.t.next();
-                        self.skip_whitespace();
-                        let inner = self.consume_selector_list();
-                        self.skip_whitespace();
-                        loop {
-                            match self.t.next() {
-                                None | Some(CssToken::CloseParenthesis) => break,
-                                _ => {}
+                        let mut inner = Self::from_tokens(self.take_parenthesized());
+                        inner.nesting = self.nesting.clone();
+                        let inner = Box::new(inner.consume_selector_list());
+                        parts.push(if name == "where" {
+                            Selector::Where(inner)
+                        } else {
+                            Selector::Is(inner)
+                        });
+                        continue;
+                    }
+                    // `:has(relative list)`: the arguments are relative to the
+                    // subject, which `&` stands for here too.
+                    // https://www.w3.org/TR/selectors-4/#relational
+                    if name == "has" && self.t.peek() == Some(&CssToken::OpenParenthesis) {
+                        let mut tokens = Vec::new();
+                        for (index, part) in split_on_commas(&self.take_parenthesized())
+                            .into_iter()
+                            .enumerate()
+                        {
+                            if index > 0 {
+                                tokens.push(CssToken::Delim(','));
                             }
+                            tokens.push(CssToken::Delim('&'));
+                            tokens.push(CssToken::Whitespace);
+                            tokens.extend(
+                                part.iter().skip_while(|t| **t == CssToken::Whitespace).cloned(),
+                            );
                         }
-                        parts.push(Selector::Is(Box::new(inner)));
+                        let mut inner = Self::from_tokens(tokens);
+                        inner.nesting = Some(Selector::HasSubject);
+                        parts.push(Selector::Has(Rc::new(inner.consume_selector_list())));
                         continue;
                     }
                     // Other functional pseudos (`:nth-child(2n+1)`): capture
@@ -334,10 +535,42 @@ impl CssParser {
                                 // over-match.
                                 None => never = true,
                             },
-                            // All other pseudo-classes (:link, :visited,
-                            // :root, :not(...) …) are approximated as
-                            // matching.
-                            _ => {}
+                            "link" | "any-link" | "-webkit-any-link" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Link))
+                            }
+                            "checked" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Checked))
+                            }
+                            "disabled" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Disabled))
+                            }
+                            "enabled" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Enabled))
+                            }
+                            "empty" => parts.push(Selector::PseudoClass(PseudoClassKind::Empty)),
+                            "required" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Required))
+                            }
+                            "optional" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::Optional))
+                            }
+                            "read-only" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::ReadOnly))
+                            }
+                            "read-write" => {
+                                parts.push(Selector::PseudoClass(PseudoClassKind::ReadWrite))
+                            }
+                            "placeholder-shown" => parts
+                                .push(Selector::PseudoClass(PseudoClassKind::PlaceholderShown)),
+                            "scope" => parts.push(Selector::PseudoClass(PseudoClassKind::Root)),
+                            // True of every element this engine produces, and
+                            // of every language a page tends to ask about.
+                            "defined" | "lang" => {}
+                            // `:visited` must not match, for privacy and so
+                            // links keep their unvisited color; `:target` and
+                            // the rest have no state behind them yet. An
+                            // unknown pseudo-class makes the selector invalid.
+                            _ => never = true,
                         }
                     }
                 }
@@ -466,6 +699,7 @@ impl CssParser {
                 | Some(CssToken::Delim('.'))
                 | Some(CssToken::Delim('*'))
                 | Some(CssToken::Delim('['))
+                | Some(CssToken::Delim('&'))
                 | Some(CssToken::Colon)
                     if saw_ws =>
                 {
@@ -499,12 +733,10 @@ impl CssParser {
         }
     }
 
-    fn consume_qualified_rule(&mut self) -> Option<QualifiedRule> {
-        let mut rule = QualifiedRule::new();
-
+    fn consume_qualified_rule(&mut self) -> Option<Vec<QualifiedRule>> {
         self.skip_whitespace();
         self.t.peek()?;
-        rule.set_selector(self.consume_selector_list());
+        let mut selector = self.consume_selector_list();
 
         // Error recovery: skip anything unparseable (attribute selectors,
         // stray delimiters) up to the rule block, poisoning the selector so
@@ -513,12 +745,12 @@ impl CssParser {
             match self.t.peek() {
                 None => return None,
                 Some(CssToken::OpenCurly) => {
-                    assert_eq!(self.t.next(), Some(CssToken::OpenCurly));
-                    rule.set_declarations(self.consume_list_of_declarations());
-                    return Some(rule);
+                    self.t.next();
+                    let block = self.take_block();
+                    return Some(self.parse_style_block(&selector, &[], block));
                 }
                 Some(_) => {
-                    rule.set_selector(Selector::UnknownSelector);
+                    selector = Selector::UnknownSelector;
                     self.t.next();
                 }
             }
@@ -550,30 +782,50 @@ impl CssParser {
                 CssToken::Whitespace => {
                     self.t.next();
                 }
-                CssToken::AtKeyword(ref keyword) if keyword == "media" && !in_block => {
-                    // Parse the prelude into a media condition and keep the
-                    // block's rules, tagged with the condition index. Rules
-                    // become active/inactive per layout via
-                    // `StyleSheet::filter_for_media`. (Nested @media inside a
-                    // media block still falls to consume_at_rule below.)
-                    self.t.next(); // @media
+                CssToken::AtKeyword(ref keyword)
+                    if matches!(keyword.as_str(), "media" | "container" | "supports" | "layer") =>
+                {
+                    // Conditional groups keep their rules, tagged with whatever
+                    // has to hold for them to apply. Rules become active per
+                    // layout via `StyleSheet::filter_for_media`.
+                    let keyword = keyword.clone();
+                    self.t.next();
                     let mut prelude = Vec::new();
+                    let mut has_block = false;
                     loop {
                         match self.t.next() {
                             None => return rules,
-                            Some(CssToken::OpenCurly) => break,
-                            Some(CssToken::SemiColon) => {
-                                prelude.clear();
+                            Some(CssToken::OpenCurly) => {
+                                has_block = true;
                                 break;
                             }
+                            Some(CssToken::SemiColon) => break,
                             Some(t) => prelude.push(t),
                         }
                     }
-                    let idx = self.media_conditions.len();
-                    self.media_conditions.push(parse_media_query_list(&prelude));
-                    for mut rule in self.consume_rules(true) {
-                        if rule.media.is_none() {
-                            rule.media = Some(idx);
+                    // `@layer a, b;` only declares an order.
+                    if !has_block {
+                        continue;
+                    }
+                    let condition = match keyword.as_str() {
+                        "media" => Some(parse_media_query_list(&prelude)),
+                        "container" => {
+                            Some(parse_media_query_list(&container_condition(&prelude)))
+                        }
+                        _ => None,
+                    };
+                    let index = condition.map(|condition| {
+                        self.media_conditions.push(condition);
+                        self.media_conditions.len() - 1
+                    });
+                    let inner = self.consume_rules(true);
+                    if keyword == "supports" && !supports_condition(&prelude) {
+                        continue;
+                    }
+                    for mut rule in inner {
+                        rule.media.extend(index);
+                        if keyword == "layer" {
+                            rule.layered = true;
                         }
                         rules.push(rule);
                     }
@@ -600,9 +852,8 @@ impl CssParser {
                     self.consume_at_rule();
                 }
                 _ => {
-                    let rule = self.consume_qualified_rule();
-                    match rule {
-                        Some(r) => rules.push(r),
+                    match self.consume_qualified_rule() {
+                        Some(mut parsed) => rules.append(&mut parsed),
                         None => return rules,
                     }
                 }
@@ -712,7 +963,8 @@ impl CssParser {
                         let mut r = QualifiedRule::new();
                         r.set_selector(alt);
                         r.set_declarations(rule.declarations.clone());
-                        r.media = rule.media;
+                        r.media = rule.media.clone();
+                        r.layered = rule.layered;
                         rules.push(r);
                     }
                 }
@@ -723,6 +975,160 @@ impl CssParser {
         sheet.media_conditions = core::mem::take(&mut self.media_conditions);
         sheet.keyframes = core::mem::take(&mut self.keyframes);
         sheet
+    }
+}
+
+/// Split a token run at its top-level commas.
+fn split_on_commas(tokens: &[CssToken]) -> Vec<&[CssToken]> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            CssToken::OpenParenthesis => depth += 1,
+            CssToken::CloseParenthesis => depth -= 1,
+            CssToken::Delim(',') if depth == 0 => {
+                parts.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&tokens[start..]);
+    parts
+}
+
+/// An `@container` prelude as a media condition. Containers have no sizes while
+/// the stylesheet is being filtered, so this measures against the viewport,
+/// which is right for the common case of a container spanning the page. The
+/// optional container name is dropped.
+fn container_condition(prelude: &[CssToken]) -> Vec<CssToken> {
+    prelude
+        .iter()
+        .skip_while(|t| matches!(t, CssToken::Whitespace | CssToken::Ident(_)))
+        .cloned()
+        .collect()
+}
+
+/// Whether this engine does something with `property`, for `@supports`.
+fn is_known_property(property: &str) -> bool {
+    matches!(
+        property,
+        "align-content" | "align-items" | "align-self" | "animation" | "animation-name"
+            | "aspect-ratio" | "background" | "background-color" | "background-image"
+            | "background-position" | "background-repeat" | "background-size" | "border"
+            | "border-bottom" | "border-color" | "border-left" | "border-radius" | "border-right"
+            | "border-style" | "border-top" | "border-width" | "bottom" | "box-shadow"
+            | "box-sizing" | "clear" | "color" | "column-gap" | "display" | "flex" | "flex-basis"
+            | "flex-direction" | "flex-flow" | "flex-grow" | "flex-shrink" | "flex-wrap" | "float"
+            | "font" | "font-family" | "font-size" | "font-style" | "font-weight" | "gap" | "grid"
+            | "grid-area" | "grid-auto-columns" | "grid-auto-flow" | "grid-auto-rows"
+            | "grid-column" | "grid-row" | "grid-template" | "grid-template-areas"
+            | "grid-template-columns" | "grid-template-rows" | "height" | "inset"
+            | "justify-content" | "justify-items" | "justify-self" | "left" | "letter-spacing"
+            | "line-height" | "list-style" | "list-style-type" | "margin" | "margin-bottom"
+            | "margin-left" | "margin-right" | "margin-top" | "max-height" | "max-width"
+            | "min-height" | "min-width" | "opacity" | "order" | "outline" | "overflow"
+            | "overflow-x" | "overflow-y" | "padding" | "padding-bottom" | "padding-left"
+            | "padding-right" | "padding-top" | "place-content" | "place-items" | "place-self"
+            | "position" | "right" | "row-gap" | "text-align" | "text-decoration" | "text-indent"
+            | "text-overflow" | "text-shadow" | "text-transform" | "top" | "transform"
+            | "transition" | "vertical-align" | "visibility" | "white-space" | "width"
+            | "word-spacing" | "z-index"
+    )
+}
+
+/// Evaluate an `@supports` condition. A declaration holds when the property is
+/// known; `display` also looks at its value, the one case pages commonly test
+/// that this engine would otherwise answer wrongly.
+/// https://www.w3.org/TR/css-conditional-3/#at-supports
+fn supports_condition(tokens: &[CssToken]) -> bool {
+    let tokens: Vec<&CssToken> = tokens.iter().filter(|t| **t != CssToken::Whitespace).collect();
+    let mut position = 0;
+    supports_or(&tokens, &mut position)
+}
+
+fn supports_or(tokens: &[&CssToken], position: &mut usize) -> bool {
+    let mut result = supports_and(tokens, position);
+    while matches!(tokens.get(*position), Some(CssToken::Ident(i)) if i.eq_ignore_ascii_case("or")) {
+        *position += 1;
+        let next = supports_and(tokens, position);
+        result = result || next;
+    }
+    result
+}
+
+fn supports_and(tokens: &[&CssToken], position: &mut usize) -> bool {
+    let mut result = supports_term(tokens, position);
+    while matches!(tokens.get(*position), Some(CssToken::Ident(i)) if i.eq_ignore_ascii_case("and")) {
+        *position += 1;
+        let next = supports_term(tokens, position);
+        result = result && next;
+    }
+    result
+}
+
+fn supports_term(tokens: &[&CssToken], position: &mut usize) -> bool {
+    match tokens.get(*position) {
+        Some(CssToken::Ident(i)) if i.eq_ignore_ascii_case("not") => {
+            *position += 1;
+            !supports_term(tokens, position)
+        }
+        // `selector(...)` and other functions: the selector forms pages test
+        // are the ones this engine has.
+        Some(CssToken::Ident(_)) => {
+            *position += 1;
+            skip_parens(tokens, position);
+            true
+        }
+        Some(CssToken::OpenParenthesis) => {
+            let declaration = matches!(tokens.get(*position + 2), Some(CssToken::Colon));
+            if declaration {
+                let property = match tokens.get(*position + 1) {
+                    Some(CssToken::Ident(name)) => name.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let value = match tokens.get(*position + 3) {
+                    Some(CssToken::Ident(value)) => value.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                skip_parens(tokens, position);
+                is_known_property(&property)
+                    && !(property == "display"
+                        && matches!(value.as_str(), "ruby" | "subgrid" | "masonry"))
+            } else {
+                *position += 1;
+                let result = supports_or(tokens, position);
+                if matches!(tokens.get(*position), Some(CssToken::CloseParenthesis)) {
+                    *position += 1;
+                }
+                result
+            }
+        }
+        _ => {
+            *position += 1;
+            false
+        }
+    }
+}
+
+fn skip_parens(tokens: &[&CssToken], position: &mut usize) {
+    if !matches!(tokens.get(*position), Some(CssToken::OpenParenthesis)) {
+        return;
+    }
+    let mut depth = 0;
+    while let Some(token) = tokens.get(*position) {
+        *position += 1;
+        match token {
+            CssToken::OpenParenthesis => depth += 1,
+            CssToken::CloseParenthesis => {
+                depth -= 1;
+                if depth == 0 {
+                    return;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -983,6 +1389,25 @@ impl StyleSheet {
         self.rules = rules;
     }
 
+    /// This sheet with the browser's own rules in front of it.
+    pub fn with_user_agent_rules(&self) -> StyleSheet {
+        thread_local! {
+            static USER_AGENT_RULES: Vec<QualifiedRule> = {
+                let css = include_str!("../style/ua.css").to_string();
+                let mut rules = CssParser::new(CssTokenizer::new(css)).parse_stylesheet().rules;
+                for rule in &mut rules {
+                    rule.user_agent = true;
+                }
+                rules
+            };
+        }
+        let mut sheet = self.clone();
+        USER_AGENT_RULES.with(|rules| {
+            sheet.rules.splice(0..0, rules.iter().cloned());
+        });
+        sheet
+    }
+
     /// The rules that apply in `ctx`: unconditional rules plus the rules of
     /// matching `@media` blocks, in document order, with conditions
     /// resolved away.
@@ -996,10 +1421,14 @@ impl StyleSheet {
             rules: self
                 .rules
                 .iter()
-                .filter(|r| r.media.map_or(true, |i| active.get(i).copied().unwrap_or(false)))
+                .filter(|r| {
+                    r.media
+                        .iter()
+                        .all(|i| active.get(*i).copied().unwrap_or(false))
+                })
                 .map(|r| {
                     let mut r = r.clone();
-                    r.media = None;
+                    r.media.clear();
                     r
                 })
                 .collect(),
@@ -1015,9 +1444,13 @@ impl StyleSheet {
 pub struct QualifiedRule {
     pub selector: Selector,
     pub declarations: Vec<Declaration>,
-    /// `Some(i)` = this rule lives inside the `@media` block whose condition
-    /// is `StyleSheet::media_conditions[i]`.
-    pub media: Option<usize>,
+    /// Indexes into `StyleSheet::media_conditions` of the `@media` blocks this
+    /// rule lives inside. All of them have to match.
+    pub media: Vec<usize>,
+    /// Declared inside `@layer`: loses to unlayered rules of the same origin.
+    pub layered: bool,
+    /// From the browser's own stylesheet: loses to every page rule.
+    pub user_agent: bool,
 }
 
 impl QualifiedRule {
@@ -1025,7 +1458,9 @@ impl QualifiedRule {
         Self {
             selector: Selector::TypeSelector("".to_string()),
             declarations: Vec::new(),
-            media: None,
+            media: Vec::new(),
+            layered: false,
+            user_agent: false,
         }
     }
 
@@ -1083,6 +1518,15 @@ pub enum Selector {
     /// ANY alternative in the list matches.
     /// https://www.w3.org/TR/selectors-4/#matches
     Is(Box<Selector>),
+    /// `:where(...)`: `:is` with no specificity.
+    Where(Box<Selector>),
+    /// `:has(...)`: some element related to the subject matches. The argument is
+    /// a selector over those elements, with [`Selector::HasSubject`] marking
+    /// where the subject has to be.
+    /// https://www.w3.org/TR/selectors-4/#relational
+    Has(Rc<Selector>),
+    /// The element `:has()` is being tested against.
+    HasSubject,
     /// `host::before` / `host::after` — never matches a real element (so its
     /// declarations don't leak onto the host); the layout tree builder uses
     /// `pseudo_element_target` to find these and synthesize a generated box.
@@ -1110,6 +1554,17 @@ pub enum PseudoClassKind {
     FocusWithin,
     /// `:root` — the document's root element (`<html>`).
     Root,
+    /// `:link` — a hyperlink. Nothing here counts as visited, so also `:any-link`.
+    Link,
+    Checked,
+    Disabled,
+    Enabled,
+    Empty,
+    Required,
+    Optional,
+    ReadOnly,
+    ReadWrite,
+    PlaceholderShown,
     FirstChild,
     LastChild,
     OnlyChild,
@@ -1212,9 +1667,11 @@ impl Selector {
             | Self::Child(a, b)
             | Self::NextSibling(a, b)
             | Self::SubsequentSibling(a, b) => a.tests_pseudo(want) || b.tests_pseudo(want),
-            Self::Not(inner) | Self::Is(inner) | Self::PseudoElement(inner, _) => {
-                inner.tests_pseudo(want)
-            }
+            Self::Not(inner)
+            | Self::Is(inner)
+            | Self::Where(inner)
+            | Self::PseudoElement(inner, _) => inner.tests_pseudo(want),
+            Self::Has(inner) => inner.tests_pseudo(want),
             _ => false,
         }
     }
@@ -1240,7 +1697,12 @@ impl Selector {
             | Selector::Attribute { .. }
             | Selector::PseudoClass(_) => (0, 1, 0),
             Selector::TypeSelector(_) => (0, 0, 1),
-            Selector::Universal | Selector::UnknownSelector | Selector::Never => (0, 0, 0),
+            Selector::Universal
+            | Selector::UnknownSelector
+            | Selector::Never
+            | Selector::Where(_)
+            | Selector::HasSubject => (0, 0, 0),
+            Selector::Has(inner) => inner.specificity_abc(),
             Selector::Compound(parts) => parts.iter().fold((0, 0, 0), |acc, p| {
                 let (a, b, c) = p.specificity_abc();
                 (acc.0 + a, acc.1 + b, acc.2 + c)
@@ -1487,14 +1949,14 @@ mod tests {
         let tagged: std::vec::Vec<_> = cssom
             .rules
             .iter()
-            .map(|r| (r.selector.clone(), r.media))
+            .map(|r| (r.selector.clone(), r.media.clone()))
             .collect();
         assert_eq!(
             tagged,
             std::vec![
-                (Selector::TypeSelector("td".to_string()), None),
-                (Selector::TypeSelector("td".to_string()), Some(0)),
-                (Selector::TypeSelector("p".to_string()), None),
+                (Selector::TypeSelector("td".to_string()), std::vec![]),
+                (Selector::TypeSelector("td".to_string()), std::vec![0]),
+                (Selector::TypeSelector("p".to_string()), std::vec![]),
             ],
             "got rules: {:?}",
             cssom.rules
@@ -1514,7 +1976,7 @@ mod tests {
         assert_eq!(cssom.filter_for_media(&desktop).rules.len(), 2);
         let phone_rules = cssom.filter_for_media(&phone).rules;
         assert_eq!(phone_rules.len(), 3);
-        assert!(phone_rules.iter().all(|r| r.media.is_none()));
+        assert!(phone_rules.iter().all(|r| r.media.is_empty()));
     }
 
     #[test]
@@ -1552,7 +2014,14 @@ mod tests {
         let style = "@import url(x.css); @font-face { font-family: X; src: url(x.woff); } td { color: blue; } @supports (display: grid) { p { color: red; } }".to_string();
         let cssom = CssParser::new(CssTokenizer::new(style)).parse_stylesheet();
         let selectors: std::vec::Vec<_> = cssom.rules.iter().map(|r| r.selector.clone()).collect();
-        assert_eq!(selectors, std::vec![Selector::TypeSelector("td".to_string())]);
+        assert_eq!(
+            selectors,
+            std::vec![
+                Selector::TypeSelector("td".to_string()),
+                Selector::TypeSelector("p".to_string()),
+            ],
+            "@supports keeps its rules when the condition holds; the others are skipped"
+        );
     }
 
     #[test]

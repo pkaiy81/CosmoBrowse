@@ -7,6 +7,102 @@ use crate::renderer::dom::node::{Node, NodeKind};
 use std::rc::Rc;
 use std::cell::RefCell;
 
+thread_local! {
+    /// The elements whose `:has()` is being tested, innermost last. `HasSubject`
+    /// matches only the last, so a `:has()` nested in another still works.
+    static HAS_SUBJECT: RefCell<Vec<Rc<RefCell<Node>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `:has(...)`: test `node`'s descendants, plus its later siblings and theirs,
+/// which is everything a relative selector can reach.
+fn matches_has(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
+    if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+        return false;
+    }
+    fn any_within(start: Option<Rc<RefCell<Node>>>, selector: &Selector) -> bool {
+        let mut current = start;
+        while let Some(n) = current {
+            if dom_node_selected(&n, selector) {
+                return true;
+            }
+            if any_within(n.borrow().first_child(), selector) {
+                return true;
+            }
+            current = n.borrow().next_sibling();
+        }
+        false
+    }
+    HAS_SUBJECT.with(|subject| subject.borrow_mut().push(node.clone()));
+    let found = any_within(node.borrow().first_child(), selector)
+        || any_within(node.borrow().next_sibling(), selector);
+    HAS_SUBJECT.with(|subject| subject.borrow_mut().pop());
+    found
+}
+
+/// The pseudo-classes read off the element's own tag and attributes.
+fn form_or_link_state(
+    node: &Rc<RefCell<Node>>,
+    kind: &crate::renderer::css::cssom::PseudoClassKind,
+) -> Option<bool> {
+    use crate::renderer::css::cssom::PseudoClassKind as K;
+    let borrowed = node.borrow();
+    let NodeKind::Element(ref element) = borrowed.kind() else {
+        return Some(false);
+    };
+    let tag = element.tag_name();
+    let has = |name: &str| element.get_attribute(name).is_some();
+    let is_control = matches!(
+        tag,
+        "input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+    );
+    let is_field = matches!(tag, "input" | "select" | "textarea");
+    let text_entry = match tag {
+        "textarea" => true,
+        "input" => !matches!(
+            element.get_attribute("type").unwrap_or_default().to_ascii_lowercase().as_str(),
+            "checkbox" | "radio" | "range" | "color" | "file" | "submit" | "reset" | "button"
+                | "image" | "hidden"
+        ),
+        _ => false,
+    };
+    Some(match kind {
+        K::Link => matches!(tag, "a" | "area") && has("href"),
+        K::Checked => {
+            (tag == "input"
+                && matches!(
+                    element.get_attribute("type").unwrap_or_default().to_ascii_lowercase().as_str(),
+                    "checkbox" | "radio"
+                )
+                && has("checked"))
+                || (tag == "option" && has("selected"))
+        }
+        K::Disabled => is_control && has("disabled"),
+        K::Enabled => is_control && !has("disabled"),
+        K::Empty => {
+            let mut child = borrowed.first_child();
+            let mut empty = true;
+            while let Some(c) = child {
+                match c.borrow().kind() {
+                    NodeKind::Text(ref t) if t.is_empty() => {}
+                    _ => empty = false,
+                }
+                child = c.borrow().next_sibling();
+            }
+            empty
+        }
+        K::Required => is_field && has("required"),
+        K::Optional => is_field && !has("required"),
+        K::ReadWrite => text_entry && !has("readonly") && !has("disabled"),
+        K::ReadOnly => !(text_entry && !has("readonly") && !has("disabled")),
+        K::PlaceholderShown => {
+            text_entry
+                && has("placeholder")
+                && element.get_attribute("value").unwrap_or_default().is_empty()
+        }
+        _ => return None,
+    })
+}
+
 /// Selector matching against a DOM node. Combinators walk DOM relationships
 /// (parent / preceding siblings); simple selectors test the element itself.
 pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
@@ -78,10 +174,19 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             return matches!(node.borrow().kind(), NodeKind::Element(_))
                 && !dom_node_selected(node, inner);
         }
-        Selector::Is(inner) => {
+        Selector::Is(inner) | Selector::Where(inner) => {
             return matches!(node.borrow().kind(), NodeKind::Element(_))
                 && dom_node_selected(node, inner);
         }
+        Selector::HasSubject => {
+            return HAS_SUBJECT.with(|subject| {
+                subject
+                    .borrow()
+                    .last()
+                    .is_some_and(|candidate| Rc::ptr_eq(candidate, node))
+            });
+        }
+        Selector::Has(inner) => return matches_has(node, inner),
         Selector::PseudoClass(kind) => {
             if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
                 return false;
@@ -99,6 +204,9 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             }
             if matches!(kind, PseudoClassKind::FocusWithin) {
                 return crate::renderer::style::values::is_focus_within(key);
+            }
+            if let Some(result) = form_or_link_state(node, kind) {
+                return result;
             }
             // `:root` is the <html> element (it has no element parent).
             if matches!(kind, PseudoClassKind::Root) {
@@ -157,7 +265,17 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
                 PseudoClassKind::Hover
                 | PseudoClassKind::Focus
                 | PseudoClassKind::FocusWithin
-                | PseudoClassKind::Root => unreachable!("handled above"),
+                | PseudoClassKind::Root
+                | PseudoClassKind::Link
+                | PseudoClassKind::Checked
+                | PseudoClassKind::Disabled
+                | PseudoClassKind::Enabled
+                | PseudoClassKind::Empty
+                | PseudoClassKind::Required
+                | PseudoClassKind::Optional
+                | PseudoClassKind::ReadOnly
+                | PseudoClassKind::ReadWrite
+                | PseudoClassKind::PlaceholderShown => unreachable!("handled above"),
                 PseudoClassKind::FirstChild => index == 1,
                 PseudoClassKind::LastChild => index == total,
                 PseudoClassKind::OnlyChild => total == 1,

@@ -1,6 +1,6 @@
 use std::string::ToString;
 use std::vec::Vec;
-use crate::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList};
+use crate::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand, PaintCommandList, TextDetail};
 
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextDecoration;
@@ -186,6 +186,7 @@ pub fn map_display_items_to_paint_commands(
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    detail: TextDetail::from_style(style),
                 }));
             }
             DisplayItem::Image {

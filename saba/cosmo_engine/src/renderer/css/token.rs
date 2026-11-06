@@ -50,23 +50,64 @@ impl CssTokenizer {
     }
 
     // https://www.w3.org/TR/css-syntax-3/#consume-string-token
+    /// `self.pos` is on the opening quote. The string ends at the same kind of
+    /// quote, so `"it's"` is one string.
+    /// https://www.w3.org/TR/css-syntax-3/#consume-string-token
     fn consume_string_token(&mut self) -> String {
         let mut s = String::new();
+        let quote = self.input[self.pos];
 
         loop {
+            self.pos += 1;
             if self.pos >= self.input.len() {
                 return s;
             }
-
-            self.pos += 1;
             let c = self.input[self.pos];
             match c {
-                '"' | '\'' => break,
+                c if c == quote => break,
+                '\\' => {
+                    // An escaped newline continues the string on the next line.
+                    if self.input.get(self.pos + 1) == Some(&'\n') {
+                        self.pos += 1;
+                    } else if self.pos + 1 < self.input.len() {
+                        self.pos += 1;
+                        s.push(self.consume_escape());
+                        self.pos -= 1;
+                    }
+                }
                 _ => s.push(c),
             }
         }
 
         s
+    }
+
+    /// Decode an escape whose first character (after the backslash) is at
+    /// `self.pos`, leaving `self.pos` just past it.
+    /// https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point
+    fn consume_escape(&mut self) -> char {
+        let first = self.input[self.pos];
+        if !first.is_ascii_hexdigit() {
+            self.pos += 1;
+            return first;
+        }
+        let mut value = 0u32;
+        let mut digits = 0;
+        while digits < 6
+            && self.pos < self.input.len()
+            && self.input[self.pos].is_ascii_hexdigit()
+        {
+            value = value * 16 + self.input[self.pos].to_digit(16).unwrap_or(0);
+            self.pos += 1;
+            digits += 1;
+        }
+        // One white space character after a hex escape belongs to the escape.
+        if self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+        char::from_u32(value)
+            .filter(|c| *c != '\0')
+            .unwrap_or('\u{fffd}')
     }
 
     /// https://www.w3.org/TR/css-syntax-3/#consume-number
@@ -123,7 +164,15 @@ impl CssTokenizer {
     // https://www.w3.org/TR/css-syntax-3/#consume-name
     fn consume_ident_token(&mut self) -> String {
         let mut s = String::new();
-        s.push(self.input[self.pos]);
+        if self.input[self.pos] == '\\' {
+            self.pos += 1;
+            if self.pos < self.input.len() {
+                s.push(self.consume_escape());
+            }
+            self.pos -= 1;
+        } else {
+            s.push(self.input[self.pos]);
+        }
 
         loop {
             self.pos += 1;
@@ -134,6 +183,12 @@ impl CssTokenizer {
             match c {
                 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => {
                     s.push(c);
+                }
+                c if !c.is_ascii() => s.push(c),
+                '\\' if self.pos + 1 < self.input.len() => {
+                    self.pos += 1;
+                    s.push(self.consume_escape());
+                    self.pos -= 1;
                 }
                 _ => break,
             }
@@ -269,6 +324,11 @@ impl Iterator for CssTokenizer {
                     }
                 }
                 'a'..='z' | 'A'..='Z' | '_' => {
+                    let t = CssToken::Ident(self.consume_ident_token());
+                    self.pos -= 1;
+                    t
+                }
+                c if !c.is_ascii() || c == '\\' => {
                     let t = CssToken::Ident(self.consume_ident_token());
                     self.pos -= 1;
                     t

@@ -63,10 +63,49 @@ impl LayoutObject {
                         // fragment identifier within a document.
                         // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid
                         let anchor_id = self.element_attribute("id");
+                        // The root's background covers the whole canvas, past
+                        // `<body>`'s margins, unless `<html>` has its own, which
+                        // then takes the canvas and leaves `<body>` to its box.
+                        // Spec: CSS Backgrounds §2.11.2.
+                        // https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds
+                        let is_root = self.parent.upgrade().is_none();
+                        let margin = compute_box_model_metrics(&self.style).margin;
+                        let (canvas_point, canvas_size) = (
+                            LayoutPoint::new(self.point().x() - margin.left, rect_y - margin.top),
+                            LayoutSize::new(
+                                self.size().width() + margin.left + margin.right,
+                                rect_h + margin.top + margin.bottom,
+                            ),
+                        );
+                        let mut canvas_item = None;
+                        if let Some(color) = self.html_background.clone() {
+                            let mut canvas_style = self.style();
+                            canvas_style.set_background_color(color);
+                            canvas_item = Some(DisplayItem::Rect {
+                                style: canvas_style,
+                                layout_point: canvas_point,
+                                layout_size: canvas_size,
+                                paint_order: PaintOrder {
+                                    stacking_context: self.stacking_context_level(),
+                                    z_index: self.style.z_index_or_default(),
+                                },
+                                clip_rect: None,
+                                anchor_id: None,
+                            });
+                        }
+                        let fill_canvas = is_root && canvas_item.is_none();
                         let mut items = vec![DisplayItem::Rect {
                             style: self.style(),
-                            layout_point: LayoutPoint::new(self.point().x(), rect_y),
-                            layout_size: LayoutSize::new(self.size().width(), rect_h),
+                            layout_point: if fill_canvas {
+                                canvas_point
+                            } else {
+                                LayoutPoint::new(self.point().x(), rect_y)
+                            },
+                            layout_size: if fill_canvas {
+                                canvas_size
+                            } else {
+                                LayoutSize::new(self.size().width(), rect_h)
+                            },
                             paint_order: PaintOrder {
                                 stacking_context: self.stacking_context_level(),
                                 z_index: self.style.z_index_or_default(),
@@ -79,10 +118,13 @@ impl LayoutObject {
                             }),
                             anchor_id,
                         }];
+                        if let Some(canvas) = canvas_item {
+                            items.insert(0, canvas);
+                        }
                         if let Some(marker) = self.list_marker_text() {
                             let fs = self.style.font_size();
+                            let w = measure_text_width(&marker, fs, self.style.text_face());
                             let bold = self.style.is_bold();
-                            let w = measure_text_width(&marker, fs, bold);
                             items.push(DisplayItem::Text {
                                 text: marker,
                                 style: self.style(),
@@ -216,8 +258,8 @@ impl LayoutObject {
                 if let NodeKind::Text(t) = self.node_kind() {
                     let mut v = vec![];
                     let fs = self.style.font_size();
-                    let bold = self.style.is_bold();
-                    let cw = bold_width_adjust(char_width_px(fs), bold);
+                    let bold = self.style.text_face();
+                    let cw = bold_width_adjust(char_width_px(fs), bold.bold);
                     let lh = styled_line_height(&self.style);
                     let plain_text = self.display_text(&t);
                     // Use the max_width that was established during compute_size so
@@ -262,7 +304,11 @@ impl LayoutObject {
                     let href = self.link_href();
                     let target = self.link_target();
 
+                    let face = bold;
                     let bold = self.style.is_bold();
+                    // The painter draws from a baseline one font-size below the
+                    // point it is given; this puts the real baseline there.
+                    let paint_dy = text_baseline(&self.style) - fs.px();
                     // Phase 2.5: when the inline formatting context placed this
                     // run, paint its fragments where they were placed — a run
                     // that starts mid-line and continues at the left edge below
@@ -280,7 +326,7 @@ impl LayoutObject {
                                 Some(clip) => truncate_with_ellipsis(
                                     &text,
                                     fs,
-                                    bold,
+                                    face,
                                     (clip - dx).max(0),
                                 ),
                                 None => text,
@@ -290,7 +336,7 @@ impl LayoutObject {
                                 style: self.style(),
                                 layout_point: LayoutPoint::new(
                                     self.point().x() + dx,
-                                    self.point().y() + dy,
+                                    self.point().y() + dy + paint_dy,
                                 ),
                                 href: href.clone(),
                                 target: target.clone(),
@@ -315,7 +361,7 @@ impl LayoutObject {
                             style: self.style(),
                             layout_point: LayoutPoint::new(
                                 self.point().x(),
-                                self.point().y() + lh * i as i64,
+                                self.point().y() + lh * i as i64 + paint_dy,
                             ),
                             href: href.clone(),
                             target: target.clone(),
