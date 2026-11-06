@@ -250,7 +250,7 @@ impl TextRenderer {
     }
 }
 
-fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
+pub(crate) fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
     if a == 0 {
         return;
     }

@@ -97,7 +97,6 @@ pub struct ComputedStyle {
     grid_template_areas: Option<Rc<Vec<Vec<String>>>>,
     /// Named grid lines of grid-template-columns: entry i = names before
     /// track i (last entry = names after the final track).
-    grid_column_line_names: Option<Rc<Vec<Vec<String>>>>,
     /// `grid-area: <name>` on a grid item.
     grid_area_name: Option<String>,
     flex_grow: Option<f64>,
@@ -141,6 +140,25 @@ pub struct ComputedStyle {
     height_author: bool,
     margin_left_auto: bool,
     margin_right_auto: bool,
+    margin_top_auto: bool,
+    margin_bottom_auto: bool,
+    /// `inline-flex`/`inline-grid`: `display` holds the inner layout, and this
+    /// says the box itself sits on a line.
+    inline_outer: bool,
+    flex_wrap: Option<FlexWrap>,
+    flex_reverse: bool,
+    flex_basis_ratio: Option<f64>,
+    order: Option<i32>,
+    align_content: Option<AlignContent>,
+    justify_items: Option<AlignItems>,
+    justify_self: Option<AlignItems>,
+    grid_columns_template: Option<Rc<GridTemplate>>,
+    grid_rows_template: Option<Rc<GridTemplate>>,
+    grid_auto_columns: Option<Rc<Vec<GridTrack>>>,
+    grid_auto_rows: Option<Rc<Vec<GridTrack>>>,
+    grid_auto_flow_column: bool,
+    grid_column: Option<Rc<GridPlacement>>,
+    grid_row: Option<Rc<GridPlacement>>,
     margin: Option<EdgeSize>,
     padding: Option<EdgeSize>,
     border: Option<EdgeSize>,
@@ -244,7 +262,6 @@ pub struct ComputedStyle {
     scroll_container_def: Option<(u32, f64, f64)>,
     /// Column tracks from `grid-template-columns`. Only meaningful when
     /// `display` is `Grid`.
-    grid_template_columns: Option<Vec<GridTrack>>,
     /// `column-gap` / `row-gap` (or the `gap` shorthand) in pixels.
     column_gap: Option<f64>,
     row_gap: Option<f64>,
@@ -263,16 +280,87 @@ pub enum LineHeight {
     Factor(f64),
 }
 
-/// One column track of a grid template.
+/// One track of a grid template.
 /// https://www.w3.org/TR/css-grid-1/#track-sizing
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GridTrack {
     /// Fixed size in pixels (from px/pt/… lengths).
     Px(f64),
+    /// A share of the container, as a ratio (`50%` is 0.5).
+    Percent(f64),
     /// Flexible fraction of the remaining space (`1fr`).
     Fr(f64),
-    /// `auto` / unsupported sizes — treated as `1fr`.
     Auto,
+    MinContent,
+    MaxContent,
+    /// `fit-content(<length>)`.
+    FitContent(f64),
+    /// `minmax(min, max)`.
+    MinMax(Box<GridTrack>, Box<GridTrack>),
+}
+
+/// `repeat(auto-fill | auto-fit, ...)`: how many copies depends on the room the
+/// container has, so it can only be expanded during layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridAutoRepeat {
+    /// Index in the template's tracks before which the copies go.
+    pub at: usize,
+    pub tracks: Vec<GridTrack>,
+    /// `auto-fit`: tracks left empty collapse away.
+    pub fit: bool,
+}
+
+/// A parsed `grid-template-columns` or `grid-template-rows`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridTemplate {
+    pub tracks: Vec<GridTrack>,
+    /// `line_names[i]` holds the names declared before track `i`, with a final
+    /// entry after the last track.
+    pub line_names: Vec<Vec<String>>,
+    pub auto_repeat: Option<GridAutoRepeat>,
+}
+
+/// One end of a grid item's placement along an axis.
+/// https://www.w3.org/TR/css-grid-1/#line-placement
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum GridLine {
+    #[default]
+    Auto,
+    /// A line number: 1 is the first line, -1 the last line of the explicit grid.
+    Number(i32),
+    /// `span n`.
+    Span(i32),
+    /// A named line (or the `-start`/`-end` lines of a named area), the
+    /// `n`th of that name.
+    Name(String, i32),
+}
+
+/// A grid item's placement along one axis.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridPlacement {
+    pub start: GridLine,
+    pub end: GridLine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlexWrap {
+    #[default]
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+/// `align-content`: how lines (or grid rows) share the room left over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlignContent {
+    #[default]
+    Stretch,
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
 }
 
 impl ComputedStyle {
@@ -295,7 +383,6 @@ impl ComputedStyle {
             box_sizing_border_box: None,
             list_style_type: None,
             grid_template_areas: None,
-            grid_column_line_names: None,
             grid_area_name: None,
             flex_grow: None,
             flex_shrink: None,
@@ -321,6 +408,23 @@ impl ComputedStyle {
             height_author: false,
             margin_left_auto: false,
             margin_right_auto: false,
+            margin_top_auto: false,
+            margin_bottom_auto: false,
+            inline_outer: false,
+            flex_wrap: None,
+            flex_reverse: false,
+            flex_basis_ratio: None,
+            order: None,
+            align_content: None,
+            justify_items: None,
+            justify_self: None,
+            grid_columns_template: None,
+            grid_rows_template: None,
+            grid_auto_columns: None,
+            grid_auto_rows: None,
+            grid_auto_flow_column: false,
+            grid_column: None,
+            grid_row: None,
             margin: None,
             padding: None,
             border: None,
@@ -360,7 +464,6 @@ impl ComputedStyle {
             final_clip: None,
             scroll_container: None,
             scroll_container_def: None,
-            grid_template_columns: None,
             column_gap: None,
             row_gap: None,
             custom_properties: None,
@@ -1180,30 +1283,6 @@ impl ComputedStyle {
         self.flex_direction.unwrap_or(FlexDirection::Row)
     }
 
-    pub fn set_grid_template_columns(&mut self, tracks: Vec<GridTrack>) {
-        if !tracks.is_empty() {
-            self.grid_template_columns = Some(tracks);
-        }
-    }
-
-    /// Column tracks of a grid container; a grid without
-    /// `grid-template-columns` is a single auto column per CSS Grid §7.1.
-    pub fn grid_template_columns(&self) -> Vec<GridTrack> {
-        self.grid_template_columns.clone().unwrap_or_else(|| {
-            let mut v = Vec::with_capacity(1);
-            v.push(GridTrack::Auto);
-            v
-        })
-    }
-
-    /// Column track count of a grid container.
-    pub fn grid_columns(&self) -> usize {
-        self.grid_template_columns
-            .as_ref()
-            .map(|t| t.len().max(1))
-            .unwrap_or(1)
-    }
-
     pub fn set_column_gap(&mut self, px: f64) {
         self.column_gap = Some(px.max(0.0));
     }
@@ -1272,13 +1351,130 @@ impl ComputedStyle {
     pub fn set_grid_template_areas(&mut self, rows: Vec<Vec<String>>) {
         self.grid_template_areas = Some(Rc::new(rows));
     }
-    pub fn grid_column_line_names(&self) -> Option<Rc<Vec<Vec<String>>>> {
-        self.grid_column_line_names.clone()
+    pub fn grid_columns_template(&self) -> Option<Rc<GridTemplate>> {
+        self.grid_columns_template.clone()
     }
-    pub fn set_grid_column_line_names(&mut self, v: Vec<Vec<String>>) {
-        if v.iter().any(|names| !names.is_empty()) {
-            self.grid_column_line_names = Some(Rc::new(v));
-        }
+    pub fn set_grid_columns_template(&mut self, template: GridTemplate) {
+        self.grid_columns_template = Some(Rc::new(template));
+    }
+    pub fn grid_rows_template(&self) -> Option<Rc<GridTemplate>> {
+        self.grid_rows_template.clone()
+    }
+    pub fn set_grid_rows_template(&mut self, template: GridTemplate) {
+        self.grid_rows_template = Some(Rc::new(template));
+    }
+    /// Sizes of tracks the explicit grid does not cover; cycles through them.
+    pub fn grid_auto_columns(&self) -> Option<Rc<Vec<GridTrack>>> {
+        self.grid_auto_columns.clone()
+    }
+    pub fn set_grid_auto_columns(&mut self, tracks: Vec<GridTrack>) {
+        self.grid_auto_columns = Some(Rc::new(tracks));
+    }
+    pub fn grid_auto_rows(&self) -> Option<Rc<Vec<GridTrack>>> {
+        self.grid_auto_rows.clone()
+    }
+    pub fn set_grid_auto_rows(&mut self, tracks: Vec<GridTrack>) {
+        self.grid_auto_rows = Some(Rc::new(tracks));
+    }
+    pub fn grid_auto_flow_column(&self) -> bool {
+        self.grid_auto_flow_column
+    }
+    pub fn set_grid_auto_flow_column(&mut self, column: bool) {
+        self.grid_auto_flow_column = column;
+    }
+    pub fn grid_column(&self) -> Option<Rc<GridPlacement>> {
+        self.grid_column.clone()
+    }
+    pub fn set_grid_column(&mut self, placement: GridPlacement) {
+        self.grid_column = Some(Rc::new(placement));
+    }
+    pub fn set_grid_column_start(&mut self, line: GridLine) {
+        let mut placement = self.grid_column.as_deref().cloned().unwrap_or_default();
+        placement.start = line;
+        self.grid_column = Some(Rc::new(placement));
+    }
+    pub fn set_grid_column_end(&mut self, line: GridLine) {
+        let mut placement = self.grid_column.as_deref().cloned().unwrap_or_default();
+        placement.end = line;
+        self.grid_column = Some(Rc::new(placement));
+    }
+    pub fn grid_row(&self) -> Option<Rc<GridPlacement>> {
+        self.grid_row.clone()
+    }
+    pub fn set_grid_row(&mut self, placement: GridPlacement) {
+        self.grid_row = Some(Rc::new(placement));
+    }
+    pub fn set_grid_row_start(&mut self, line: GridLine) {
+        let mut placement = self.grid_row.as_deref().cloned().unwrap_or_default();
+        placement.start = line;
+        self.grid_row = Some(Rc::new(placement));
+    }
+    pub fn set_grid_row_end(&mut self, line: GridLine) {
+        let mut placement = self.grid_row.as_deref().cloned().unwrap_or_default();
+        placement.end = line;
+        self.grid_row = Some(Rc::new(placement));
+    }
+
+    pub fn is_inline_outer(&self) -> bool {
+        self.inline_outer
+    }
+    pub fn set_inline_outer(&mut self, inline: bool) {
+        self.inline_outer = inline;
+    }
+    pub fn flex_wrap(&self) -> FlexWrap {
+        self.flex_wrap.unwrap_or_default()
+    }
+    pub fn set_flex_wrap(&mut self, wrap: FlexWrap) {
+        self.flex_wrap = Some(wrap);
+    }
+    pub fn flex_reverse(&self) -> bool {
+        self.flex_reverse
+    }
+    pub fn set_flex_reverse(&mut self, reverse: bool) {
+        self.flex_reverse = reverse;
+    }
+    pub fn flex_basis_ratio(&self) -> Option<f64> {
+        self.flex_basis_ratio
+    }
+    pub fn set_flex_basis_ratio(&mut self, ratio: Option<f64>) {
+        self.flex_basis_ratio = ratio;
+    }
+    pub fn order(&self) -> i32 {
+        self.order.unwrap_or(0)
+    }
+    pub fn set_order(&mut self, order: i32) {
+        self.order = Some(order);
+    }
+    pub fn align_content(&self) -> AlignContent {
+        self.align_content.unwrap_or_default()
+    }
+    pub fn set_align_content(&mut self, value: AlignContent) {
+        self.align_content = Some(value);
+    }
+    /// `justify-items`: `None` is `normal`, which behaves as stretch.
+    pub fn justify_items(&self) -> Option<AlignItems> {
+        self.justify_items
+    }
+    pub fn set_justify_items(&mut self, value: AlignItems) {
+        self.justify_items = Some(value);
+    }
+    pub fn justify_self_or(&self, container: AlignItems) -> AlignItems {
+        self.justify_self.unwrap_or(container)
+    }
+    pub fn set_justify_self(&mut self, value: AlignItems) {
+        self.justify_self = Some(value);
+    }
+    pub fn margin_top_auto(&self) -> bool {
+        self.margin_top_auto
+    }
+    pub fn set_margin_top_auto(&mut self, enabled: bool) {
+        self.margin_top_auto = enabled;
+    }
+    pub fn margin_bottom_auto(&self) -> bool {
+        self.margin_bottom_auto
+    }
+    pub fn set_margin_bottom_auto(&mut self, enabled: bool) {
+        self.margin_bottom_auto = enabled;
     }
 
     pub fn grid_area_name(&self) -> Option<&str> {
@@ -1307,7 +1503,7 @@ impl ComputedStyle {
         self.flex_basis = v;
     }
     pub fn justify_content(&self) -> JustifyContent {
-        self.justify_content.unwrap_or(JustifyContent::FlexStart)
+        self.justify_content.unwrap_or(JustifyContent::Normal)
     }
     pub fn set_justify_content(&mut self, v: JustifyContent) {
         self.justify_content = Some(v);
@@ -1374,6 +1570,10 @@ impl ComputedStyle {
             h = h.max(px);
         }
         h
+    }
+
+    pub fn has_max_width(&self) -> bool {
+        self.max_width.is_some()
     }
 
     pub fn has_size_limits(&self) -> bool {
@@ -1747,6 +1947,8 @@ pub enum JustifyContent {
     SpaceBetween,
     SpaceAround,
     SpaceEvenly,
+    /// `normal`, the default: start in flex, stretch auto tracks in grid.
+    Normal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2368,13 +2570,12 @@ impl DisplayType {
         // and hiding those blanks the entire page.
         match s.trim() {
             "none" => Ok(Self::DisplayNone),
-            // Flex containers get real (if basic) flex layout. inline-flex is
-            // treated as a block-level flex container for simplicity.
+            // The inline-level forms lay out their contents the same way; the
+            // cascade records that the box itself sits on a line.
             "flex" | "inline-flex" => Ok(Self::Flex),
-            // Grid containers get basic row-major track placement.
-            "grid" => Ok(Self::Grid),
-            "inline-block" => Ok(Self::InlineBlock),
-            "inline" | "inline-grid" | "inline-table" => Ok(Self::Inline),
+            "grid" | "inline-grid" => Ok(Self::Grid),
+            "inline-block" | "inline-table" => Ok(Self::InlineBlock),
+            "inline" => Ok(Self::Inline),
             "contents" => Ok(Self::Contents),
             _ => Ok(Self::Block),
         }

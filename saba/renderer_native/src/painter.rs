@@ -961,23 +961,21 @@ fn draw_text(
         screen_clip,
     );
 
-    // Draw underline for links.
-    if text.underline || text.href.is_some() {
+    // `text-decoration` alone decides this: a link with `none` has no underline.
+    if text.underline {
         let uy = ty - scroll_y + 2;
-        let width = end_x - text.x;
-        let pw = pixmap.width() as i64;
-        let ph = pixmap.height() as i64;
-        if uy >= 0 && uy < ph && width > 0 {
-            let uy = uy as u32;
-            let data = pixmap.data_mut();
-            for col in text.x.max(0)..end_x.min(pw) {
-                let idx = (uy * pw as u32 + col as u32) as usize * 4;
-                if idx + 3 < data.len() {
-                    data[idx] = r;
-                    data[idx + 1] = g;
-                    data[idx + 2] = b;
-                    data[idx + 3] = alpha;
-                }
+        let (clip_top, clip_bottom, clip_left, clip_right) = match screen_clip {
+            Some((cx, cy, cw, ch)) => (cy, cy + ch, cx, cx + cw),
+            None => (i64::MIN, i64::MAX, i64::MIN, i64::MAX),
+        };
+        if uy >= 0
+            && uy < pixmap.height() as i64
+            && (clip_top..clip_bottom).contains(&uy)
+        {
+            let start = tx.max(0).max(clip_left);
+            let end = end_x.min(pixmap.width() as i64).min(clip_right);
+            for col in start..end {
+                crate::text_render::blend_pixel(pixmap, col as u32, uy as u32, r, g, b, alpha);
             }
         }
     }
