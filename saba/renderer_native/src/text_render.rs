@@ -47,6 +47,19 @@ impl FontMetricsProvider for FontdueMetricsProvider {
         if let Some(v) = self.cache.lock().unwrap().get(&key) {
             return *v;
         }
+        let v = (self.exact_advance(c, px, bold).ceil() as i64).max(1);
+        self.cache.lock().unwrap().insert(key, v);
+        v
+    }
+
+    /// `TextRenderer` moves its pen by the truncated advance.
+    fn painted_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
+        self.exact_advance(c, font_size.px(), bold) as i64
+    }
+}
+
+impl FontdueMetricsProvider {
+    fn exact_advance(&self, c: char, px: i64, bold: bool) -> f32 {
         let primary: &[Font] = if bold && !self.bold_fonts.is_empty() {
             &self.bold_fonts
         } else {
@@ -68,15 +81,12 @@ impl FontMetricsProvider for FontdueMetricsProvider {
                 break;
             }
         }
-        let advance = advance.unwrap_or_else(|| {
+        advance.unwrap_or_else(|| {
             primary
                 .first()
                 .map(|f| f.metrics(c, px as f32).advance_width)
                 .unwrap_or(px as f32 / 2.0)
-        });
-        let v = (advance.ceil() as i64).max(1);
-        self.cache.lock().unwrap().insert(key, v);
-        v
+        })
     }
 }
 

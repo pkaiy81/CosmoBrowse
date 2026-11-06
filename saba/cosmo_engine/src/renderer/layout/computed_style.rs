@@ -531,8 +531,15 @@ impl ComputedStyle {
                 self.color = Some(Color::black());
             }
         }
+        let is_textarea = node.borrow().element_tag_name().as_deref() == Some("textarea");
         if self.display.is_none() {
-            self.display = Some(DisplayType::default(node));
+            // UA stylesheet: a textarea is a box in the line, not a run of text,
+            // or only its characters could be clicked (HTML LS §15.5.15).
+            self.display = Some(if is_textarea {
+                DisplayType::InlineBlock
+            } else {
+                DisplayType::default(node)
+            });
         }
         if self.font_family.is_none() {
             self.font_family = Some("serif".to_string());
@@ -566,10 +573,14 @@ impl ComputedStyle {
                 _ => None,
             };
         }
-        if self.white_space.is_none()
-            && node.borrow().element_tag_name().as_deref() == Some("pre")
-        {
-            self.white_space = Some(WhiteSpace::Pre);
+        if self.white_space.is_none() {
+            // UA stylesheet: a textarea shows its value as typed, newlines and
+            // all, and still wraps at the box edge (HTML LS §15.5.15).
+            match node.borrow().element_tag_name().as_deref() {
+                Some("pre") => self.white_space = Some(WhiteSpace::Pre),
+                Some("textarea") => self.white_space = Some(WhiteSpace::PreWrap),
+                _ => {}
+            }
         }
         // UA stylesheet: lists indent their items so outside markers have
         // room (browsers use padding-inline-start: 40px).
@@ -580,6 +591,23 @@ impl ComputedStyle {
             )
         {
             self.padding = Some(EdgeSize::from_values(0.0, 0.0, 0.0, 40.0));
+        }
+        if is_textarea {
+            // `rows` and `cols` size it unless the author did, with their
+            // defaults when absent (HTML LS §4.10.11). Approximated in px from a
+            // typical character cell: `ch` and `lh` are not resolved here.
+            let attribute = |name: &str, default: f64| {
+                get_element_attribute(node, name)
+                    .and_then(|value| value.trim().parse::<f64>().ok())
+                    .filter(|value| *value > 0.0)
+                    .unwrap_or(default)
+            };
+            if self.height.is_none() {
+                self.height = Some(attribute("rows", 2.0) * 20.0);
+            }
+            if self.width.is_none() {
+                self.width = Some(attribute("cols", 20.0) * 8.0);
+            }
         }
         if self.height.is_none() {
             self.height = Some(0.0);
@@ -691,6 +719,12 @@ impl ComputedStyle {
                         self.border_color = Some(Color::from_code("#808080").unwrap());
                     }
                 }
+            }
+        }
+        if self.border.is_none() && is_textarea {
+            self.border = Some(EdgeSize::all(1.0));
+            if self.border_color.is_none() {
+                self.border_color = Some(Color::from_code("#767676").unwrap());
             }
         }
         if self.border.is_none() {

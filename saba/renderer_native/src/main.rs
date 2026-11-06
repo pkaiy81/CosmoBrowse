@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 
 use app_bridge::AppBridge;
+use cosmo_runtime::CaretMove;
 use hit_test::hit_test;
 use painter::{render_commands, ImageCache};
 use text_render::TextRenderer;
@@ -24,6 +25,7 @@ use winit::{
 
 const DEFAULT_WIDTH: u32 = 1024;
 const DEFAULT_HEIGHT: u32 = 768;
+const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 
 /// Custom event delivered to the winit event loop from background threads.
 /// `Redraw` is sent by the image cache when an asynchronously-fetched image
@@ -57,6 +59,9 @@ struct App {
     save_screenshot: bool,
     /// Next time an animation frame should be driven (throttles to ~60fps).
     next_anim_frame: std::time::Instant,
+    /// Whether the blinking caret is in its visible half, and when it flips.
+    caret_visible: bool,
+    next_caret_blink: std::time::Instant,
     /// Per-scroll-container inner offsets (x, y).
     inner_scroll_offsets: std::collections::HashMap<u32, (i64, i64)>,
     /// Scroll containers visible in the last paint: (id, x, y, w, h,
@@ -82,9 +87,18 @@ impl App {
             pending_url: None,
             save_screenshot: false,
             next_anim_frame: std::time::Instant::now(),
+            caret_visible: true,
+            next_caret_blink: std::time::Instant::now(),
             inner_scroll_offsets: std::collections::HashMap::new(),
             scroll_containers: Vec::new(),
         }
+    }
+
+    /// Restart the blink with the caret showing, so it never goes dark while
+    /// the user is typing or moving it.
+    fn show_caret(&mut self) {
+        self.caret_visible = true;
+        self.next_caret_blink = std::time::Instant::now() + CARET_BLINK;
     }
 
     fn request_redraw(&self) {
@@ -236,6 +250,12 @@ impl App {
         let content_height = self.bridge.content_height();
         ui_chrome::draw_scrollbar(&mut pixmap, self.scroll_y, content_height, width, height);
 
+        if self.caret_visible && !self.chrome.is_focused {
+            if let Some(caret) = self.bridge.caret_rect() {
+                draw_caret(&mut pixmap, &caret, self.scroll_y);
+            }
+        }
+
         // Draw status message.
         if !self.status_message.is_empty() {
             let status_y = height as i64 - 4;
@@ -290,30 +310,34 @@ impl App {
             return;
         }
 
-        // A focused page field takes text and backspace; everything else
-        // (Enter, Tab, shortcuts) falls through to the chrome handling below.
+        // A focused page field takes text and caret keys; everything else (Tab,
+        // shortcuts) falls through to the chrome handling below.
         if self.bridge.has_focused_field() && !self.chrome.is_focused {
-            match event.logical_key.as_ref() {
-                Key::Named(NamedKey::Backspace) => {
-                    if self.bridge.backspace() {
-                        self.needs_redraw = true;
-                    }
-                    return;
+            let handled = match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Backspace) => Some(self.bridge.backspace()),
+                Key::Named(NamedKey::Delete) => Some(self.bridge.delete_forward()),
+                Key::Named(NamedKey::Space) => Some(self.bridge.insert_text(" ")),
+                Key::Named(NamedKey::Enter) if self.bridge.focused_field_is_multiline() => {
+                    Some(self.bridge.insert_text("\n"))
                 }
-                Key::Named(NamedKey::Space) => {
-                    if self.bridge.insert_text(" ") {
-                        self.needs_redraw = true;
-                    }
-                    return;
-                }
+                Key::Named(NamedKey::ArrowLeft) => Some(self.bridge.move_caret(CaretMove::Left)),
+                Key::Named(NamedKey::ArrowRight) => Some(self.bridge.move_caret(CaretMove::Right)),
+                Key::Named(NamedKey::ArrowUp) => Some(self.bridge.move_caret(CaretMove::Up)),
+                Key::Named(NamedKey::ArrowDown) => Some(self.bridge.move_caret(CaretMove::Down)),
+                Key::Named(NamedKey::Home) => Some(self.bridge.move_caret(CaretMove::LineStart)),
+                Key::Named(NamedKey::End) => Some(self.bridge.move_caret(CaretMove::LineEnd)),
                 Key::Character(ch) if !is_ctrl_pressed(&event) => {
                     let typed: String = ch.chars().filter(|c| !c.is_control()).collect();
-                    if !typed.is_empty() && self.bridge.insert_text(&typed) {
-                        self.needs_redraw = true;
-                    }
-                    return;
+                    Some(!typed.is_empty() && self.bridge.insert_text(&typed))
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(changed) = handled {
+                self.show_caret();
+                if changed {
+                    self.needs_redraw = true;
+                }
+                return;
             }
         }
 
@@ -439,6 +463,8 @@ impl App {
         // takes focus away from the URL bar.
         if self.bridge.focus_field_at(x, doc_y) {
             self.chrome.is_focused = false;
+            self.show_caret();
+            self.needs_redraw = true;
         }
         let page_click = self.bridge.dispatch_click(x, doc_y);
         if page_click.repainted {
@@ -592,11 +618,22 @@ impl ApplicationHandler<UserEvent> for App {
     /// Drive JS animations (rAF loops / setInterval) at ~60fps while any are
     /// pending; otherwise wait idle for the next event.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = std::time::Instant::now();
+        let caret_blinks = self.bridge.has_focused_field() && !self.chrome.is_focused;
+        if caret_blinks && now >= self.next_caret_blink {
+            self.caret_visible = !self.caret_visible;
+            self.next_caret_blink = now + CARET_BLINK;
+            self.needs_redraw = true;
+            self.request_redraw();
+        }
         if !self.bridge.has_pending_animation() {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop.set_control_flow(if caret_blinks {
+                ControlFlow::WaitUntil(self.next_caret_blink)
+            } else {
+                ControlFlow::Wait
+            });
             return;
         }
-        let now = std::time::Instant::now();
         if now >= self.next_anim_frame {
             if self.bridge.animation_frame() {
                 self.scroll_y = self.scroll_y.min(self.bridge.content_height());
@@ -605,7 +642,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             self.next_anim_frame = now + std::time::Duration::from_millis(16);
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_anim_frame));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(if caret_blinks {
+            self.next_anim_frame.min(self.next_caret_blink)
+        } else {
+            self.next_anim_frame
+        }));
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -697,6 +738,27 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// Draw the text caret over the page, in the field's text color. It is painted
+/// here rather than added to the scene so that blinking costs a repaint, not a
+/// layout. Scrolled past the top, it stops at the chrome instead of over it.
+fn draw_caret(pixmap: &mut tiny_skia::Pixmap, caret: &cosmo_runtime::CaretRect, scroll_y: i64) {
+    let top = caret.y - scroll_y + CHROME_HEIGHT;
+    let bottom = top + caret.height;
+    let top = top.max(CHROME_HEIGHT);
+    let Some(rect) = tiny_skia::Rect::from_xywh(
+        caret.x as f32,
+        top as f32,
+        1.0,
+        (bottom - top) as f32,
+    ) else {
+        return;
+    };
+    let mut paint = tiny_skia::Paint::default();
+    let (r, g, b, a) = color::parse_css_color(&caret.color);
+    paint.set_color(tiny_skia::Color::from_rgba8(r, g, b, a));
+    pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
 }
 
 fn is_ctrl_pressed(event: &KeyEvent) -> bool {
@@ -916,6 +978,21 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
         }
         bridge.settle_async(300);
     }
+    // `COSMO_HEADLESS_KEYS=left,left,home` moves the caret before typing, and
+    // `COSMO_HEADLESS_TYPE` goes in at wherever it ends up.
+    if let Ok(keys) = std::env::var("COSMO_HEADLESS_KEYS") {
+        for key in keys.split(',') {
+            match key {
+                "left" => bridge.move_caret(CaretMove::Left),
+                "right" => bridge.move_caret(CaretMove::Right),
+                "up" => bridge.move_caret(CaretMove::Up),
+                "down" => bridge.move_caret(CaretMove::Down),
+                "home" => bridge.move_caret(CaretMove::LineStart),
+                "end" => bridge.move_caret(CaretMove::LineEnd),
+                _ => false,
+            };
+        }
+    }
     if let Ok(text) = std::env::var("COSMO_HEADLESS_TYPE") {
         for ch in text.chars() {
             bridge.insert_text(&ch.to_string());
@@ -955,6 +1032,9 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     }
     let content_height = bridge.content_height();
     ui_chrome::draw_scrollbar(&mut pixmap, 0, content_height, width, height);
+    if let Some(caret) = bridge.caret_rect() {
+        draw_caret(&mut pixmap, &caret, headless_scroll());
+    }
     match pixmap.save_png(out_path) {
         Ok(()) => eprintln!("[SCREENSHOT] Saved to {}", out_path),
         Err(e) => eprintln!("[SCREENSHOT] Failed: {}", e),
