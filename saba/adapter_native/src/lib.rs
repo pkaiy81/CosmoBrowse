@@ -1155,7 +1155,7 @@ fn log_recovery_event(event: &str, pid: Option<u32>, detail: &str) {
 mod tests {
     use super::*;
     use cosmo_runtime::ScrollPosition;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, MutexGuard, OnceLock};
 
     fn unix_timestamp_ms() -> u64 {
         SystemTime::now()
@@ -1220,13 +1220,20 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    /// Serializes every test that builds an adapter: startup and `Drop` read and
+    /// write the snapshot paths named by process-wide env vars, even in a test
+    /// that sets none of them. A failed test must not fail the others too, so a
+    /// poisoned lock is still taken.
+    fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
     fn forced_renderer_exit_triggers_restart_and_allows_retry_success() {
+        let _env_guard = env_lock();
         let state = Arc::new(Mutex::new(FakeProcessState::default()));
         let adapter = NativeAdapter::with_process_host(
             Box::new(FakeProcessHost::new(state.clone())),
@@ -1266,7 +1273,7 @@ mod tests {
 
     #[test]
     fn adapter_restores_saved_session_snapshot_on_startup() {
-        let _env_guard = env_lock().lock().expect("env lock");
+        let _env_guard = env_lock();
         let snapshot_dir =
             std::env::temp_dir().join(format!("cosmobrowse-session-test-{}", unix_timestamp_ms()));
         let session_path = snapshot_dir.join("session.json");
@@ -1320,7 +1327,7 @@ mod tests {
 
     #[test]
     fn get_latest_crash_report_reads_newest_entry_from_repository() {
-        let _env_guard = env_lock().lock().expect("env lock");
+        let _env_guard = env_lock();
         let repo_dir =
             std::env::temp_dir().join(format!("cosmobrowse-crash-test-{}", unix_timestamp_ms()));
         std::env::set_var("COSMO_CRASH_REPOSITORY_DIR", &repo_dir);

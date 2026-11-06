@@ -901,8 +901,17 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
-    use std::sync::Once;
+    use std::sync::{MutexGuard, Once};
     use std::thread::JoinHandle;
+
+    /// Serializes the tests that point `COSMO_DOWNLOAD_DIR` somewhere: it is
+    /// process-wide, and each test's manager numbers its downloads from the same
+    /// start, so two at once share a `.part` file. A failed test must not fail
+    /// the others too, so a poisoned lock is still taken.
+    fn download_dir_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn configure_loopback_proxy_bypass() {
         static CONFIGURE_PROXY_BYPASS: Once = Once::new();
@@ -1125,6 +1134,7 @@ mod tests {
 
     #[test]
     fn pause_and_resume_uses_range_when_server_supports_it() {
+        let _dir_guard = download_dir_lock();
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
@@ -1148,6 +1158,7 @@ mod tests {
 
     #[test]
     fn resume_falls_back_to_restart_when_server_does_not_support_range() {
+        let _dir_guard = download_dir_lock();
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
@@ -1191,6 +1202,7 @@ mod tests {
 
     #[test]
     fn resume_falls_back_when_content_range_offset_is_invalid() {
+        let _dir_guard = download_dir_lock();
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
@@ -1238,6 +1250,7 @@ mod tests {
 
     #[test]
     fn resume_falls_back_when_etag_does_not_match_previous_partial() {
+        let _dir_guard = download_dir_lock();
         let temp_dir =
             std::env::temp_dir().join(format!("cosmobrowse-download-test-{}", unix_timestamp_ms()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
