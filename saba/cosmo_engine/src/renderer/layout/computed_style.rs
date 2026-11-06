@@ -2838,6 +2838,7 @@ impl DisplayType {
     fn default(node: &Rc<RefCell<Node>>) -> Self {
         match &node.borrow().kind() {
             NodeKind::Document => DisplayType::Block,
+            NodeKind::Comment(_) | NodeKind::Doctype { .. } => DisplayType::DisplayNone,
             NodeKind::Element(e) => {
                 if e.is_non_rendered_element() {
                     DisplayType::DisplayNone

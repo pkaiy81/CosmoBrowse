@@ -101,6 +101,23 @@ pub fn create_layout_object(
     cssom: &StyleSheet,
 ) -> Option<Rc<RefCell<LayoutObject>>> {
     if let Some(n) = node {
+        if matches!(n.borrow().kind, NodeKind::Comment(_) | NodeKind::Doctype { .. }) {
+            return None;
+        }
+        // White space between table parts makes no box. Column and row indexing
+        // count their siblings, so it mustn't be there to count.
+        if let NodeKind::Text(ref text) = n.borrow().kind {
+            let in_table_part = parent_obj.as_ref().is_some_and(|p| {
+                let p = p.borrow();
+                p.is_table()
+                    || p.is_table_row()
+                    || p.is_row_group()
+                    || p.element_kind() == Some(ElementKind::Colgroup)
+            });
+            if in_table_part && text.trim().is_empty() {
+                return None;
+            }
+        }
         let layout_object = Rc::new(RefCell::new(LayoutObject::new(n.clone(), parent_obj)));
 
         // Parent font size: the base for resolving font-size em/% values.
@@ -3263,6 +3280,9 @@ impl LayoutObject {
                 }
             },
             NodeKind::Text(_) => self.kind = LayoutObjectKind::Text,
+            NodeKind::Comment(_) | NodeKind::Doctype { .. } => {
+                panic!("should not create a layout object for a comment or doctype")
+            }
         }
     }
 

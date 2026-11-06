@@ -1240,6 +1240,8 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
         NodeKind::Document => ("#document".to_string(), None),
         NodeKind::Element(element) => (element.kind().to_string(), None),
         NodeKind::Text(value) => ("#text".to_string(), Some(value)),
+        NodeKind::Comment(value) => ("#comment".to_string(), Some(value)),
+        NodeKind::Doctype { name, .. } => ("#doctype".to_string(), Some(name)),
     };
 
     let mut children = Vec::new();

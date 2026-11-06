@@ -322,3 +322,25 @@ pub fn element_closest(node: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<Ref
     }
     None
 }
+
+/// Take a node out of its parent, closing the gap between its siblings.
+pub fn detach_node(node: &Rc<RefCell<Node>>) {
+    let Some(parent) = node.borrow().parent().upgrade() else {
+        return;
+    };
+    let previous = node.borrow().previous_sibling().upgrade();
+    let next = node.borrow().next_sibling();
+    match &previous {
+        Some(previous) => previous.borrow_mut().set_next_sibling(next.clone()),
+        None => parent.borrow_mut().set_first_child(next.clone()),
+    }
+    let back = previous.as_ref().map(Rc::downgrade).unwrap_or_default();
+    match &next {
+        Some(next) => next.borrow_mut().set_previous_sibling(back),
+        None => parent.borrow_mut().set_last_child(back),
+    }
+    let mut n = node.borrow_mut();
+    n.set_parent(Default::default());
+    n.set_previous_sibling(Default::default());
+    n.set_next_sibling(None);
+}

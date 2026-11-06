@@ -12,11 +12,11 @@ use boa_engine::gc::{Finalize, Trace};
 use boa_engine::object::builtins::{JsArray, JsPromise, JsProxy};
 use boa_engine::builtins::promise::ResolvingFunctions;
 use cosmo_engine::renderer::dom::api::{
-    collect_text, element_closest, element_matches, get_element_by_id, get_target_element_node,
-    query_selector, query_selector_all,
+    collect_text, element_closest, element_matches, get_element_by_id, query_selector,
+    query_selector_all,
 };
-use cosmo_engine::renderer::dom::node::{Element, ElementKind, Node, NodeKind};
-use cosmo_engine::renderer::html::{parser::HtmlParser, token::HtmlTokenizer};
+use cosmo_engine::renderer::dom::node::{Element, Node, NodeKind};
+use cosmo_engine::renderer::html::parser::HtmlParser;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
@@ -1469,6 +1469,11 @@ fn escape_html_attr(s: &str) -> String {
 fn serialize_node(node: &Rc<RefCell<Node>>, out: &mut String) {
     match node.borrow().kind() {
         NodeKind::Text(t) => out.push_str(&escape_html_text(&t)),
+        NodeKind::Comment(text) => {
+            out.push_str("<!--");
+            out.push_str(&text);
+            out.push_str("-->");
+        }
         NodeKind::Element(e) => {
             let tag = e.tag_name().to_string();
             out.push('<');
@@ -1524,19 +1529,12 @@ fn element_set_inner_html(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
         target.borrow_mut().set_last_child(Weak::new());
     }
 
-    // Parse the fragment and re-parent the body's children under the target.
-    let window = HtmlParser::new(HtmlTokenizer::new(html)).construct_tree();
-    let doc = window.borrow().document();
-    if let Some(body) = get_target_element_node(Some(doc), ElementKind::Body) {
-        let mut new_children = Vec::new();
-        let mut cur = body.borrow().first_child();
-        while let Some(child) = cur {
-            new_children.push(child.clone());
-            cur = child.borrow().next_sibling();
-        }
-        for child in new_children {
-            append_child_node(&target, &child);
-        }
+    // Parse the fragment in the target's context, so `<tr>` works in a `<tbody>`
+    // and text in a `<textarea>` stays text.
+    let context = target.borrow().element_tag_name().unwrap_or_else(|| "div".to_string());
+    for child in HtmlParser::parse_fragment(&context, html) {
+        cosmo_engine::renderer::dom::api::detach_node(&child);
+        append_child_node(&target, &child);
     }
     // Covers the case of clearing to empty (no appends above).
     bump_dom_generation();

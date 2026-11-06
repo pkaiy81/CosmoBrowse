@@ -1866,7 +1866,8 @@ mod tests {
     #[test]
     fn test_empty() {
         let layout_view = create_layout_view("".to_string(), 600);
-        assert_eq!(None, layout_view.root());
+        // Even an empty document has a `<body>`.
+        assert!(layout_view.root().is_some());
     }
 
     #[test]
