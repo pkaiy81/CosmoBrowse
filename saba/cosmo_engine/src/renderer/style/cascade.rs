@@ -948,7 +948,32 @@ impl LayoutObject {
                         self.style.set_border_color(c);
                     }
                 }
+                "object-fit" => {
+                    use crate::paint_commands::ImageFit;
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style.set_object_fit(match value.as_str() {
+                            "contain" => ImageFit::Contain,
+                            "cover" => ImageFit::Cover,
+                            "none" => ImageFit::None,
+                            "scale-down" => ImageFit::ScaleDown,
+                            _ => ImageFit::Fill,
+                        });
+                    }
+                }
+                "fill" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style.set_svg_fill(value.clone());
+                    } else if let Some(ComponentValue::HashToken(value)) = first_value {
+                        self.style.set_svg_fill(value.clone());
+                    }
+                }
                 "border-radius" => {
+                    if let Some(ComponentValue::Dimension(v, unit)) = first_value {
+                        if unit == "%" {
+                            self.style.set_border_radius_ratio(*v / 100.0);
+                            continue;
+                        }
+                    }
                     if let Some(px) = first_value
                         .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
                     {

@@ -53,6 +53,7 @@ struct App {
     mouse_pos: (i64, i64),
     viewport_width: u32,
     viewport_height: u32,
+    image_sizes_seen: u64,
     needs_redraw: bool,
     status_message: String,
     pending_url: Option<String>,
@@ -82,6 +83,7 @@ impl App {
             mouse_pos: (0, 0),
             viewport_width: DEFAULT_WIDTH,
             viewport_height: DEFAULT_HEIGHT,
+            image_sizes_seen: 0,
             needs_redraw: true,
             status_message: String::new(),
             pending_url: None,
@@ -173,6 +175,12 @@ impl App {
         // Pull in any images that finished fetching on background threads
         // since the last paint.
         self.image_cache.integrate_results();
+        // An image's size can change the layout it's drawn into.
+        let image_sizes = cosmo_engine::renderer::layout::replaced::image_sizes_generation();
+        if image_sizes != self.image_sizes_seen {
+            self.image_sizes_seen = image_sizes;
+            self.bridge.relayout_live_frames();
+        }
 
         // Draw page content.
         let mut all_hit_regions = Vec::new();
@@ -319,6 +327,12 @@ impl App {
                 Key::Named(NamedKey::Space) => Some(self.bridge.insert_text(" ")),
                 Key::Named(NamedKey::Enter) if self.bridge.focused_field_is_multiline() => {
                     Some(self.bridge.insert_text("\n"))
+                }
+                Key::Named(NamedKey::Enter) => {
+                    for request in self.bridge.submit_focused_field() {
+                        self.follow_navigation(&request);
+                    }
+                    Some(true)
                 }
                 Key::Named(NamedKey::ArrowLeft) => Some(self.bridge.move_caret(CaretMove::Left)),
                 Key::Named(NamedKey::ArrowRight) => Some(self.bridge.move_caret(CaretMove::Right)),
@@ -471,7 +485,7 @@ impl App {
             self.needs_redraw = true;
         }
         for request in &page_click.navigations {
-            self.follow_link(&request.frame_id, &request.href, request.target.as_deref());
+            self.follow_navigation(request);
         }
         if !page_click.navigations.is_empty() || page_click.default_prevented {
             // The page handled it (or asked us not to follow the link).
@@ -492,6 +506,13 @@ impl App {
                 self.needs_redraw = true;
             }
         }
+    }
+
+    fn follow_navigation(&mut self, request: &cosmo_runtime::NavigateRequest) {
+        if let Some(body) = &request.post_body {
+            cosmo_runtime::queue_form_post(&request.href, body);
+        }
+        self.follow_link(&request.frame_id, &request.href, request.target.as_deref());
     }
 
     /// Navigate `frame_id` to `href`, updating the chrome and scroll position.
@@ -838,6 +859,7 @@ fn headless_screenshot(url: &str, out_path: &str) {
     // reflects the fully-loaded page (progressive updates can't be observed
     // across frames here).
     bridge.settle_async(300);
+    settle_images(&mut bridge, &mut text_renderer, &mut image_cache, width, height);
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
@@ -889,6 +911,7 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
     }
     // One-shot capture: settle in-flight fetch/XHR before painting.
     bridge.settle_async(300);
+    settle_images(&mut bridge, &mut text_renderer, &mut image_cache, width, height);
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
     let chrome = ChromeState::new();
@@ -928,6 +951,29 @@ fn headless_screenshot_w(url: &str, out_path: &str, width: u32) {
     }
 }
 
+/// One-shot capture: fetch the page's images and lay it out with their sizes,
+/// until no new ones turn up.
+fn settle_images(
+    bridge: &mut AppBridge,
+    text_renderer: &mut text_render::TextRenderer,
+    image_cache: &mut ImageCache,
+    width: u32,
+    height: u32,
+) {
+    let mut scratch = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
+    for _ in 0..4 {
+        let before = cosmo_engine::renderer::layout::replaced::image_sizes_generation();
+        for (frame_id, frame_url, commands) in &bridge.collect_paint_commands() {
+            render_commands(&mut scratch, commands, text_renderer, image_cache, frame_url, 0,
+                CHROME_HEIGHT, frame_id, &headless_inner_offsets());
+        }
+        if cosmo_engine::renderer::layout::replaced::image_sizes_generation() == before {
+            return;
+        }
+        bridge.relayout_live_frames();
+    }
+}
+
 fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     let url = if url.contains("://") {
         url.to_string()
@@ -947,6 +993,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     }
     // One-shot capture: settle in-flight fetch/XHR before painting.
     bridge.settle_async(300);
+    settle_images(&mut bridge, &mut text_renderer, &mut image_cache, width, height);
     // `COSMO_HEADLESS_HOVER=x,y` parks the pointer over the page (document
     // coordinates) so `:hover` styling — and the transitions it triggers — can
     // be screenshot-tested.
@@ -956,6 +1003,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
     {
         bridge.set_hover(hx, hy);
         bridge.settle_async(300);
+    settle_images(&mut bridge, &mut text_renderer, &mut image_cache, width, height);
     }
     // `COSMO_HEADLESS_TYPE=text` types into the field focused by
     // COSMO_HEADLESS_CLICK, so form input is screenshot-testable too.
@@ -977,6 +1025,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
             }
         }
         bridge.settle_async(300);
+    settle_images(&mut bridge, &mut text_renderer, &mut image_cache, width, height);
     }
     // `COSMO_HEADLESS_KEYS=left,left,home` moves the caret before typing, and
     // `COSMO_HEADLESS_TYPE` goes in at wherever it ends up.
@@ -998,6 +1047,7 @@ fn headless_screenshot_wh(url: &str, out_path: &str, width: u32, height: u32) {
             bridge.insert_text(&ch.to_string());
         }
         bridge.settle_async(300);
+    settle_images(&mut bridge, &mut text_renderer, &mut image_cache, width, height);
     }
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);

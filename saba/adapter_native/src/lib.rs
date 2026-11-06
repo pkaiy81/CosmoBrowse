@@ -1448,6 +1448,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 target: image.target.clone(),
                 z_index: image.z_index,
                 clip_rect: image.clip_rect,
+                fit: image.fit,
             }),
         }
     }

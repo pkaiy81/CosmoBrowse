@@ -1,4 +1,5 @@
 mod download;
+mod forms;
 mod layout;
 mod loader;
 mod model;
@@ -18,7 +19,7 @@ pub use model::{
     SESSION_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use layout::{CaretMove, CaretRect, ClickOutcome, LayoutScene, LivePage};
-pub use loader::{parse_navigate_message, FetchWaker, NavigateRequest};
+pub use loader::{parse_navigate_message, queue_form_post, FetchWaker, NavigateRequest};
 pub use paint::scene_items_to_paint_commands;
 pub use session::BrowserApp;
 

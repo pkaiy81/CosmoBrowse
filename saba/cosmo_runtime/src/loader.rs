@@ -34,6 +34,8 @@ struct CachedEntry {
 #[derive(Debug, Clone)]
 struct FetchRequest {
     url: String,
+    /// A urlencoded form body: the first request is a POST with it.
+    post_body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,24 @@ pub enum TrackSpec {
     Raw(f64),
 }
 
+/// Form bodies waiting for the navigation to their URL to fetch them.
+fn queued_posts() -> &'static Mutex<HashMap<String, String>> {
+    static QUEUED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    QUEUED.get_or_init(Default::default)
+}
+
+/// Make the next document fetch of `url` a form POST of `body`. Navigation runs
+/// through several layers that only carry a URL, so the body waits here.
+pub fn queue_form_post(url: &str, body: &str) {
+    if let Ok(mut queued) = queued_posts().lock() {
+        queued.insert(url.to_string(), body.to_string());
+    }
+}
+
+fn take_queued_post(url: &str) -> Option<String> {
+    queued_posts().lock().ok()?.remove(url)
+}
+
 pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     if let Some(document) = load_fixture_document(url) {
         return Ok(document);
@@ -89,7 +109,9 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     // https://datatracker.ietf.org/doc/html/rfc8446
     let request = FetchRequest {
         url: url.to_string(),
+        post_body: take_queued_post(url),
     };
+    let posting = request.post_body.is_some();
     let mut diagnostics = Vec::new();
 
     // Spec: RFC 9110 request and redirect semantics.
@@ -113,7 +135,10 @@ pub fn fetch_document(url: &str) -> AppResult<LoadedDocument> {
     }
 
     let decoded = decode_html_bytes(&response.body, response.content_type.as_deref());
-    store_cache_entry(url, &response, &decoded.html);
+    // The answer to a POST isn't what a GET of that URL would return.
+    if !posting {
+        store_cache_entry(url, &response, &decoded.html);
+    }
     diagnostics.extend(response.diagnostics);
     diagnostics.extend(decoded.diagnostics.clone());
 
@@ -186,11 +211,25 @@ fn fetch_with_pipeline(
 ) -> AppResult<FetchResponse> {
     let mut current_url = request.url.clone();
     let mut redirect_count = 0usize;
+    // Following a redirect drops the body: browsers turn a POST that redirects
+    // into a GET, the post/redirect/get pattern pages rely on.
+    let mut post_body = request.post_body.clone();
 
     loop {
-        let cached = lookup_cache_entry(&current_url);
+        let body = post_body.take();
+        let cached = if body.is_some() {
+            None
+        } else {
+            lookup_cache_entry(&current_url)
+        };
         let client = select_http_client(&current_url, diagnostics);
-        let mut builder = client.get(&current_url);
+        let mut builder = match &body {
+            Some(body) => client
+                .post(&current_url)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body.clone()),
+            None => client.get(&current_url),
+        };
         let mut request_headers = HeaderMap::new();
         if attach_cookie_header(&mut request_headers, &current_url, &current_url) {
             diagnostics.push(format!("attached Cookie header for {}", current_url));
@@ -798,6 +837,8 @@ pub struct NavigateRequest {
     pub href: String,
     /// `target` attribute, if the anchor had a non-empty one.
     pub target: Option<String>,
+    /// The urlencoded body, when this is a form POST.
+    pub post_body: Option<String>,
 }
 
 /// Parse one `postMessage` payload drained from a page. Returns `None` for
@@ -823,6 +864,10 @@ pub fn parse_navigate_message(message: &str) -> Option<NavigateRequest> {
             .get("target")
             .and_then(|v| v.as_str())
             .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        post_body: value
+            .get("postBody")
+            .and_then(|v| v.as_str())
             .map(str::to_string),
     })
 }

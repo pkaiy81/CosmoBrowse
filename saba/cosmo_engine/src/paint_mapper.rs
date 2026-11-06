@@ -92,9 +92,16 @@ pub fn map_display_items_to_paint_commands(
                     .max(border.bottom())
                     .max(border.left())
                     + 0.5) as i64;
-                let border_color = style.border_color()
-                    .map(|c| c.code().to_string())
-                    .unwrap_or_default();
+                let border_color = if border_width > 0 {
+                    // With no color of its own, a border takes the text's.
+                    style
+                        .border_color()
+                        .unwrap_or_else(|| style.color_or_black())
+                        .code()
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 let ctx = style.scale_context();
                 let (lx, ly) = scaled_point(ctx, layout_point.x(), layout_point.y());
                 commands.push(PaintCommand::DrawRect(DrawRect {
@@ -125,7 +132,10 @@ pub fn map_display_items_to_paint_commands(
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
-                    border_radius: scaled_len(ctx, style.border_radius() as i64),
+                    border_radius: scaled_len(
+                        ctx,
+                        style.border_radius_for(layout_size.width(), layout_size.height()),
+                    ),
                     box_shadow: style.box_shadow().map(|(dx, dy, b, c)| (dx as i64, dy as i64, b as i64, c.code().to_string())),
                     rotate: style.rotate_context().map(|(cx, cy, deg)| {
                         (origin_x + cx as i64, origin_y + cy as i64, deg)
@@ -220,6 +230,7 @@ pub fn map_display_items_to_paint_commands(
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x, c.y, c.width, c.height)),
+                    fit: style.object_fit(),
                 }));
             }
         }

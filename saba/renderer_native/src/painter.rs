@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use cosmo_engine::renderer::text::face::{FontClass, TextFace};
-use cosmo_engine::paint_commands::{DrawImage, DrawRect, DrawText, PaintCommand};
+use cosmo_engine::paint_commands::{ImageFit, DrawImage, DrawRect, DrawText, PaintCommand};
 use tiny_skia::{
     Color, GradientStop, LinearGradient, Paint, Pixmap, Point, Rect, Shader, SpreadMode, Transform,
 };
@@ -20,6 +20,9 @@ use crate::UserEvent;
 struct DecodedImage {
     width: u32,
     height: u32,
+    /// The size the image says it is, which layout uses. An SVG is rasterized
+    /// larger than this, to stay sharp when it's drawn big.
+    natural: (u32, u32),
     rgba: Vec<u8>,
 }
 
@@ -75,8 +78,15 @@ impl ImageCache {
     /// start of each paint so freshly-arrived images become visible.
     pub fn integrate_results(&mut self) {
         while let Ok(FetchResult { key, decoded }) = self.result_rx.try_recv() {
+            publish_natural_size(&key, decoded.as_ref());
             self.cache.insert(key, ImageState::Done(decoded));
         }
+    }
+
+    /// What's known about an image, starting its fetch if nothing is.
+    fn state_of(&mut self, src: &str, base_url: &str) -> Option<&ImageState> {
+        self.get_or_fetch(src, base_url);
+        self.cache.get(src)
     }
 
     fn get_or_fetch(&mut self, src: &str, base_url: &str) -> Option<&DecodedImage> {
@@ -100,6 +110,7 @@ impl ImageCache {
                 // Sync (headless): fetch inline so this paint sees the image.
                 None => {
                     let decoded = fetch_and_decode(&resolved);
+                    publish_natural_size(src, decoded.as_ref());
                     self.cache
                         .insert(src.to_string(), ImageState::Done(decoded));
                 }
@@ -109,6 +120,15 @@ impl ImageCache {
             Some(ImageState::Done(Some(img))) => Some(img),
             _ => None,
         }
+    }
+}
+
+/// Layout sizes an image from its natural size, which is only known here.
+fn publish_natural_size(src: &str, decoded: Option<&DecodedImage>) {
+    use cosmo_engine::renderer::layout::replaced::{register_image_failed, register_image_size};
+    match decoded {
+        Some(image) => register_image_size(src, image.natural.0, image.natural.1),
+        None => register_image_failed(src),
     }
 }
 
@@ -144,13 +164,80 @@ fn image_http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// The bytes in a `data:` URL.
+/// https://fetch.spec.whatwg.org/#data-url-processor
+fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if meta.to_ascii_lowercase().ends_with(";base64") {
+        return decode_base64(&percent_decode(data));
+    }
+    Some(percent_decode(data))
+}
+
+fn percent_decode(data: &str) -> Vec<u8> {
+    let bytes = data.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let mut bits = 0u32;
+    let mut count = 0;
+    for &byte in data {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        };
+        bits = (bits << 6) | value as u32;
+        count += 1;
+        if count == 4 {
+            out.extend_from_slice(&[(bits >> 16) as u8, (bits >> 8) as u8, bits as u8]);
+            bits = 0;
+            count = 0;
+        }
+    }
+    match count {
+        2 => out.push((bits >> 4) as u8),
+        3 => out.extend_from_slice(&[(bits >> 10) as u8, (bits >> 2) as u8]),
+        _ => {}
+    }
+    Some(out)
+}
+
 fn fetch_and_decode(url: &str) -> Option<DecodedImage> {
-    let bytes = image_http_client()
-        .get(url)
-        .send()
-        .ok()?
-        .bytes()
-        .ok()?;
+    let bytes: Vec<u8> = if url.starts_with("data:") {
+        decode_data_url(url)?
+    } else {
+        let response = image_http_client().get(url).send().ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.bytes().ok()?.to_vec()
+    };
 
     // SVG (e.g. Hacker News' votearrow triangle.svg) — rasterize at the
     // document's intrinsic size via resvg; the raster decoders below can't
@@ -158,6 +245,7 @@ fn fetch_and_decode(url: &str) -> Option<DecodedImage> {
     let head = &bytes[..bytes.len().min(512)];
     let looks_like_svg = url.split('?').next().is_some_and(|p| p.ends_with(".svg"))
         || head.starts_with(b"<svg")
+        || url.starts_with("data:image/svg")
         || (head.starts_with(b"<?xml") && bytes.windows(4).take(512).any(|w| w == b"<svg"));
     if looks_like_svg {
         return decode_svg(&bytes);
@@ -168,6 +256,7 @@ fn fetch_and_decode(url: &str) -> Option<DecodedImage> {
     Some(DecodedImage {
         width: rgba.width(),
         height: rgba.height(),
+        natural: (rgba.width(), rgba.height()),
         rgba: rgba.into_raw(),
     })
 }
@@ -175,12 +264,18 @@ fn fetch_and_decode(url: &str) -> Option<DecodedImage> {
 fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
     let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
     let size = tree.size();
-    let (w, h) = (size.width().ceil() as u32, size.height().ceil() as u32);
-    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+    let (natural_w, natural_h) = (size.width().ceil() as u32, size.height().ceil() as u32);
+    if natural_w == 0 || natural_h == 0 || natural_w > 4096 || natural_h > 4096 {
         return None;
     }
+    // An icon with a small declared size is often drawn much bigger.
+    let scale = (1024.0 / natural_w.max(natural_h) as f32).clamp(1.0, 8.0);
+    let (w, h) = (
+        (natural_w as f32 * scale).ceil() as u32,
+        (natural_h as f32 * scale).ceil() as u32,
+    );
     let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
-    resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     // tiny-skia stores PREMULTIPLIED rgba; the blit/blend paths in this file
     // expect straight alpha (like the `image` crate produces) — unpremultiply.
     let mut rgba = pixmap.take();
@@ -195,6 +290,7 @@ fn decode_svg(bytes: &[u8]) -> Option<DecodedImage> {
     Some(DecodedImage {
         width: w,
         height: h,
+        natural: (natural_w, natural_h),
         rgba,
     })
 }
@@ -1028,115 +1124,122 @@ fn draw_image(
 ) {
     let iy = img.y + chrome_height - scroll_y - inner_y;
     let ix_pos = img.x - inner_x;
-
-    // Try to fetch and render the actual image.
-    if !img.src.is_empty() {
-        if let Some(decoded) = image_cache.get_or_fetch(&img.src, base_url) {
+    if img.width <= 0 || img.height <= 0 || img.src.is_empty() {
+        if !img.src.is_empty() {
+            // Still fetched: its size is what decides this box's size.
+            image_cache.state_of(&img.src, base_url);
+        }
+        return;
+    }
+    let clip = img
+        .clip_rect
+        .map(|(cx, cy, cw, ch)| (cx, cy + chrome_height - scroll_y, cw, ch));
+    let visible = |px: i64, py: i64| match clip {
+        Some((cx, cy, cw, ch)) => px >= cx && px < cx + cw && py >= cy && py < cy + ch,
+        None => true,
+    };
+    match image_cache.state_of(&img.src, base_url) {
+        Some(ImageState::Done(Some(decoded))) => {
+            let (src_w, src_h) = (decoded.width as f64, decoded.height as f64);
+            let (box_w, box_h) = (img.width as f64, img.height as f64);
+            // Where the image's picture lands inside the box.
+            let (scale_x, scale_y) = match img.fit {
+                ImageFit::Fill => (box_w / src_w, box_h / src_h),
+                ImageFit::Contain => {
+                    let s = (box_w / src_w).min(box_h / src_h);
+                    (s, s)
+                }
+                ImageFit::Cover => {
+                    let s = (box_w / src_w).max(box_h / src_h);
+                    (s, s)
+                }
+                ImageFit::None => (1.0, 1.0),
+                ImageFit::ScaleDown => {
+                    let s = (box_w / src_w).min(box_h / src_h).min(1.0);
+                    (s, s)
+                }
+            };
+            let (drawn_w, drawn_h) = (src_w * scale_x, src_h * scale_y);
+            let (offset_x, offset_y) = ((box_w - drawn_w) / 2.0, (box_h - drawn_h) / 2.0);
             let pw = pixmap.width() as i64;
             let ph = pixmap.height() as i64;
-            let src_w = decoded.width as i64;
-            let src_h = decoded.height as i64;
-            let dst_w = img.width;
-            let dst_h = img.height;
+            let opacity = img.opacity.clamp(0.0, 1.0);
             let data = pixmap.data_mut();
-
-            for dy in 0..dst_h {
+            // Shrinking averages the source pixels a target pixel covers, up to a
+            // limit; enlarging samples the nearest.
+            let (step_x, step_y) = (1.0 / scale_x, 1.0 / scale_y);
+            let samples_x = (step_x.ceil() as i64).clamp(1, 8);
+            let samples_y = (step_y.ceil() as i64).clamp(1, 8);
+            for dy in 0..img.height {
                 let py = iy + dy;
                 if py < 0 || py >= ph {
                     continue;
                 }
-                for dx in 0..dst_w {
+                for dx in 0..img.width {
                     let px = ix_pos + dx;
-                    if px < 0 || px >= pw {
+                    if px < 0 || px >= pw || !visible(px, py) {
                         continue;
                     }
-                    // Nearest-neighbor sampling from source.
-                    let sx = (dx * src_w / dst_w).min(src_w - 1);
-                    let sy = (dy * src_h / dst_h).min(src_h - 1);
-                    let si = (sy * src_w + sx) as usize * 4;
-                    let sr = decoded.rgba[si];
-                    let sg = decoded.rgba[si + 1];
-                    let sb = decoded.rgba[si + 2];
-                    let sa = decoded.rgba[si + 3];
-
+                    let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+                    let mut count = 0u32;
+                    for ky in 0..samples_y {
+                        for kx in 0..samples_x {
+                            let u = (dx as f64 - offset_x
+                                + (kx as f64 + 0.5) / samples_x as f64)
+                                * step_x;
+                            let v = (dy as f64 - offset_y
+                                + (ky as f64 + 0.5) / samples_y as f64)
+                                * step_y;
+                            if u < 0.0 || v < 0.0 || u >= src_w || v >= src_h {
+                                continue;
+                            }
+                            let si = (v as usize * decoded.width as usize + u as usize) * 4;
+                            let alpha = decoded.rgba[si + 3] as u32;
+                            r += decoded.rgba[si] as u32 * alpha;
+                            g += decoded.rgba[si + 1] as u32 * alpha;
+                            b += decoded.rgba[si + 2] as u32 * alpha;
+                            a += alpha;
+                            count += 1;
+                        }
+                    }
+                    if count == 0 || a == 0 {
+                        continue;
+                    }
+                    let (sr, sg, sb) = (r / a, g / a, b / a);
+                    let sa = ((a / count) as f64 * opacity) as u32;
                     let di = (py * pw + px) as usize * 4;
-                    if di + 3 >= data.len() {
+                    if di + 3 >= data.len() || sa == 0 {
                         continue;
                     }
-                    // Alpha compositing.
-                    if sa == 255 {
-                        data[di] = sr;
-                        data[di + 1] = sg;
-                        data[di + 2] = sb;
-                        data[di + 3] = 255;
-                    } else if sa > 0 {
-                        let a = sa as u32;
-                        let inv_a = 255 - a;
-                        data[di] = ((sr as u32 * a + data[di] as u32 * inv_a) / 255) as u8;
-                        data[di + 1] = ((sg as u32 * a + data[di + 1] as u32 * inv_a) / 255) as u8;
-                        data[di + 2] = ((sb as u32 * a + data[di + 2] as u32 * inv_a) / 255) as u8;
-                        data[di + 3] = 255;
-                    }
+                    let inv = 255 - sa;
+                    data[di] = ((sr * sa + data[di] as u32 * inv) / 255) as u8;
+                    data[di + 1] = ((sg * sa + data[di + 1] as u32 * inv) / 255) as u8;
+                    data[di + 2] = ((sb * sa + data[di + 2] as u32 * inv) / 255) as u8;
+                    data[di + 3] = 255;
                 }
             }
-            return;
         }
+        // It can't be shown: its alt text stands in, as far as it fits.
+        Some(ImageState::Done(None)) => {
+            if !img.alt.is_empty() {
+                let screen_clip = Some((ix_pos, iy, img.width, img.height));
+                text_renderer.draw_text_clipped(
+                    pixmap,
+                    &img.alt,
+                    img.x - inner_x,
+                    img.y + 13 + chrome_height - inner_y,
+                    13,
+                    0x44,
+                    0x44,
+                    0x44,
+                    255,
+                    scroll_y,
+                    TextFace::plain(false),
+                    screen_clip,
+                );
+            }
+        }
+        // Still loading.
+        _ => {}
     }
-
-    // Fallback: gray placeholder with alt text.
-    let placeholder = DrawRect {
-        x: img.x,
-        y: img.y,
-        width: img.width,
-        height: img.height,
-        background_color: "#d0d0d0".to_string(),
-        background_image: None,
-        background_gradient: None,
-        opacity: img.opacity,
-        z_index: img.z_index,
-        clip_rect: img.clip_rect,
-        anchor_id: None,
-        border_width: 0,
-        border_widths: None,
-        border_color: String::new(),
-        background_position: None,
-        background_no_repeat: false,
-        background_size: None,
-        border_radius: 0,
-        box_shadow: None,
-        rotate: None,
-        fixed: img.fixed,
-        sticky: img.sticky,
-        scroll_container: img.scroll_container,
-        scroll_container_def: None,
-    };
-    draw_rect(
-        pixmap,
-        &placeholder,
-        scroll_y,
-        chrome_height,
-        image_cache,
-        base_url,
-        inner_x,
-        inner_y,
-    );
-
-    let label = if img.alt.is_empty() {
-        "[image]"
-    } else {
-        &img.alt
-    };
-    text_renderer.draw_text(
-        pixmap,
-        label,
-        img.x + 4 - inner_x,
-        img.y + 14 + chrome_height - inner_y,
-        12,
-        0x44,
-        0x44,
-        0x44,
-        255,
-        scroll_y,
-        false,
-    );
 }
