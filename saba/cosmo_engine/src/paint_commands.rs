@@ -196,6 +196,24 @@ impl TextDetail {
     }
 }
 
+/// `object-fit`: how an image fills its box.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageFit {
+    #[default]
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
+impl ImageFit {
+    pub fn is_fill(&self) -> bool {
+        *self == Self::Fill
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DrawImage {
     /// position:fixed — exempt from scrolling.
@@ -218,4 +236,6 @@ pub struct DrawImage {
     pub target: Option<String>,
     pub z_index: i32,
     pub clip_rect: Option<(i64, i64, i64, i64)>,
+    #[serde(default, skip_serializing_if = "ImageFit::is_fill")]
+    pub fit: ImageFit,
 }

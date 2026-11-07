@@ -799,6 +799,11 @@ impl LayoutObject {
     /// child becomes a block itself, which is what splitting it around that
     /// child comes to when, as is usual, it holds nothing else.
     pub(crate) fn normalize_children(object: &Rc<RefCell<LayoutObject>>) {
+        // What's inside a replaced element isn't rendered as boxes.
+        if object.borrow().is_replaced_box() {
+            object.borrow_mut().first_child = None;
+            return;
+        }
         Self::hide_closed_details_content(object);
         Self::add_disclosure_marker(object);
         let mut children = Vec::new();
@@ -1012,10 +1017,7 @@ impl LayoutObject {
     pub(crate) fn is_inline_block(&self) -> bool {
         self.kind() == LayoutObjectKind::Inline
             && (self.style.display() == DisplayType::InlineBlock || self.style.is_inline_outer())
-            && !matches!(
-                self.element_kind(),
-                Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
-            )
+            && !self.is_replaced_box()
     }
 
     /// How far `vertical-align` lifts this box's baseline above its parent's.
@@ -1355,14 +1357,6 @@ impl LayoutObject {
         self.is_out_of_flow()
     }
 
-    /// Replaced elements and form controls size themselves.
-    pub(crate) fn is_replaced_box(&self) -> bool {
-        matches!(
-            self.element_kind(),
-            Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
-        )
-    }
-
     pub(crate) fn resolved_width_for(&self, parent: LayoutSize) -> i64 {
         self.resolved_width(parent)
     }
@@ -1569,12 +1563,11 @@ impl LayoutObject {
         let metrics = compute_box_model_metrics(&self.style);
         let content = if self.style.width_ratio().is_none() && self.style.width() > 0.0 {
             edge_to_i64(self.style.width())
-        } else if matches!(
-            self.element_kind(),
-            Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
-        ) {
-            // Sizes itself; the box already includes its padding and border.
-            return self.size().width() + metrics.margin.left + metrics.margin.right;
+        } else if self.is_replaced_box() {
+            // Sizes itself. A percentage has nothing to resolve against here.
+            self.intrinsic_inline_size(LayoutSize::new(0, 0))
+                .map(|size| size.width())
+                .unwrap_or(0)
         } else {
             self.max_content_width_depth(depth)
         };
@@ -2511,11 +2504,17 @@ impl LayoutObject {
     /// broken into lines.
     pub(crate) fn field_caret_stops(&self, value: &str) -> Vec<CaretStop> {
         if self.element_kind() == Some(ElementKind::Input) {
-            let (x, y) = (self.point().x() + 10, self.point().y() + 10);
+            let (x, y) = self.control_text_origin();
             let right = self.point().x() + self.size().width() - 1;
+            // A password paints bullets, which is what the caret has to follow.
+            let shown = if self.input_kind() == crate::renderer::layout::replaced::InputKind::Password {
+                "\u{2022}".repeat(value.chars().count())
+            } else {
+                value.to_string()
+            };
             let mut stops = caret_stops(
-                value,
-                &[(value.to_string(), x, y)],
+                &shown,
+                &[(shown.clone(), x, y)],
                 (x, y),
                 &self.style,
             );
@@ -2551,57 +2550,8 @@ impl LayoutObject {
         caret_stops(value, &fragments, origin, &self.style)
     }
 
-    pub(crate) fn placeholder_text(&self) -> Option<String> {
-        match self.element_kind()? {
-            ElementKind::Img => Some(
-                self.element_attribute("alt")
-                    .filter(|alt| !alt.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        self.element_attribute("src")
-                            .map(|src| format!("Image: {src}"))
-                            .unwrap_or_else(|| "Image".to_string())
-                    }),
-            ),
-            ElementKind::Input => Some(
-                self.element_attribute("value")
-                    .or_else(|| self.element_attribute("placeholder"))
-                    .unwrap_or_else(|| "Input".to_string()),
-            ),
-            _ => None,
-        }
-    }
-
-    fn intrinsic_inline_size(&self, parent_size: LayoutSize) -> Option<LayoutSize> {
-        let explicit_width = self.resolved_width(parent_size);
-        let explicit_height = self.resolved_height(parent_size);
-        let width_attr = parse_dimension_attr(self.element_attribute("width"));
-        let height_attr = parse_dimension_attr(self.element_attribute("height"));
-
-        match self.element_kind()? {
-            ElementKind::Img => Some(LayoutSize::new(
-                explicit_width.max(width_attr.unwrap_or(220)),
-                explicit_height.max(height_attr.unwrap_or(140)),
-            )),
-            ElementKind::Input => Some(LayoutSize::new(
-                explicit_width.max(width_attr.unwrap_or(220)),
-                explicit_height.max(height_attr.unwrap_or(36)),
-            )),
-            ElementKind::Button => {
-                let child_text = self
-                    .first_child()
-                    .and_then(|child| match child.borrow().node_kind() {
-                        NodeKind::Text(ref text) => Some(text.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "Button".to_string());
-                Some(LayoutSize::new(
-                    explicit_width
-                        .max(measure_text_width(&child_text, self.style.font_size(), self.style.text_face()) + 28),
-                    explicit_height.max(36),
-                ))
-            }
-            _ => None,
-        }
+    pub(crate) fn resolved_height_for(&self, parent: LayoutSize) -> i64 {
+        self.resolved_height(parent)
     }
 
     fn resolved_width(&self, parent_size: LayoutSize) -> i64 {
@@ -2661,6 +2611,10 @@ impl LayoutObject {
         // it differs.
         let sizing_kind = if self.is_inline_block() {
             LayoutObjectKind::Block
+        } else if self.is_replaced_box() {
+            // And a replaced box sizes itself even when its `display` makes it
+            // block-level.
+            LayoutObjectKind::Inline
         } else {
             self.kind()
         };
@@ -3654,6 +3608,20 @@ impl LayoutObject {
         b.last_line_baseline = last_baseline.map(|baseline| inset + baseline);
         // An explicit height wins over the content's own.
         if b.style.has_author_height() {
+            // A button keeps its content in the middle of whatever height it has.
+            if b.node.borrow().element_tag_name().as_deref() == Some("button") {
+                let spare = (b.content_size().height() - height) / 2;
+                if spare > 0 {
+                    let mut child = b.first_child();
+                    while let Some(c) = child {
+                        let mut c_mut = c.borrow_mut();
+                        if let Some((x, y)) = c_mut.inline_offset {
+                            c_mut.inline_offset = Some((x, y + spare));
+                        }
+                        child = c_mut.next_sibling();
+                    }
+                }
+            }
             return true;
         }
         // A box that establishes a block formatting context contains its

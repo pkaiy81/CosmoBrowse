@@ -203,6 +203,34 @@ impl AppBridge {
         result
     }
 
+    /// Enter in a single-line field: the form submissions it caused.
+    pub fn submit_focused_field(&mut self) -> Vec<NavigateRequest> {
+        self.live_frames
+            .iter_mut()
+            .filter(|frame| frame.page.has_focused_field())
+            .flat_map(|frame| frame.page.submit_focused_field())
+            .filter_map(|message| parse_navigate_message(&message))
+            .collect()
+    }
+
+    /// Lay every live frame out again, for image sizes that have come in.
+    pub fn relayout_live_frames(&mut self) {
+        let updates: Vec<(String, Vec<SceneItem>)> = self
+            .live_frames
+            .iter_mut()
+            .filter_map(|frame| {
+                let rect = frame.rect.clone();
+                frame
+                    .page
+                    .relayout_for_focus(&rect)
+                    .map(|scene| (frame.frame_id.clone(), scene.scene_items))
+            })
+            .collect();
+        for (frame_id, items) in updates {
+            self.splice_frame_scene(&frame_id, &items);
+        }
+    }
+
     /// Focus the text field at `(doc_x, doc_y)`, clearing any other frame's
     /// focus. Returns whether a field took it — the caller routes keystrokes to
     /// the page when it did, and to the URL bar when it did not.

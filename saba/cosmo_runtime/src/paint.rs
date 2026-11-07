@@ -127,6 +127,7 @@ pub fn scene_items_to_paint_commands(
                 target,
                 z_index,
                 clip_rect,
+                fit,
             } => {
                 // Spec note: HTML images should expose fallback text when image data is unavailable.
                 // We preserve accessibility intent by painting a neutral placeholder and `alt` text.
@@ -191,6 +192,7 @@ pub fn scene_items_to_paint_commands(
                         target: target.clone(),
                         z_index: *z_index,
                         clip_rect: *clip_rect,
+                    fit: *fit,
                     }));
                 }
             }

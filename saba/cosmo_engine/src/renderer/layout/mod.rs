@@ -5,6 +5,7 @@ pub mod grid;
 pub mod inline;
 pub mod layout_object;
 pub mod layout_view;
+pub mod replaced;
 
 /// CSS layout support contract for the current engine iteration.
 ///

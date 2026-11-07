@@ -62,3 +62,27 @@ details:not([open]) > :not(summary) { display: none; }
 /* Forms. */
 fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px solid #c0c0c0; }
 legend { padding: 0 2px; }
+input, select, textarea, button {
+  font: 13.33px sans-serif; color: black; line-height: normal; text-align: start;
+  letter-spacing: normal; word-spacing: normal; text-indent: 0; text-transform: none;
+}
+input, select, textarea {
+  background-color: white; border: 1px solid #767676; border-radius: 2px; padding: 1px 2px;
+}
+textarea { font-family: monospace; padding: 2px; white-space: pre-wrap; }
+button, input[type=submit i], input[type=button i], input[type=reset i], input[type=file i] {
+  display: inline-block; background-color: #efefef; border: 1px solid #767676;
+  border-radius: 3px; padding: 1px 6px; text-align: center;
+}
+input[type=checkbox i], input[type=radio i] {
+  margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; background-color: white;
+}
+input[type=radio i] { border-radius: 50%; }
+input[type=range i] { margin: 2px; padding: 0; border: 0; background-color: transparent; }
+input[type=color i] { padding: 1px 2px; background-color: #efefef; }
+select { padding-right: 2px; }
+progress, meter { border-radius: 3px; }
+
+/* Embedded content. */
+iframe { border: 2px inset #767676; }
+video { background-color: black; }

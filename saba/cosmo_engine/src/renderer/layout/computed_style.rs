@@ -261,6 +261,11 @@ pub struct ComputedStyle {
     rotate_context: Option<(f64, f64, f64)>,
     /// `border-radius` in pixels (single radius, all corners).
     border_radius: Option<f64>,
+    /// `border-radius` as a percentage of the box, as a ratio.
+    border_radius_ratio: Option<f64>,
+    /// `fill` on an inline `<svg>`.
+    svg_fill: Option<String>,
+    object_fit: Option<crate::paint_commands::ImageFit>,
     /// `box-shadow`: (dx, dy, blur, color).
     box_shadow: Option<(f64, f64, f64, Color)>,
     /// `white-space: nowrap` — suppress line wrapping. Inherited.
@@ -585,6 +590,9 @@ impl ComputedStyle {
             scale_context: None,
             rotate_context: None,
             border_radius: None,
+            border_radius_ratio: None,
+            svg_fill: None,
+            object_fit: None,
             box_shadow: None,
             white_space: None,
             text_transform: None,
@@ -761,13 +769,7 @@ impl ComputedStyle {
             self.background_color = Some(Color::gray());
         }
         if self.background_color.is_none() {
-            self.background_color = Some(match node.borrow().element_kind() {
-                Some(ElementKind::Button) | Some(ElementKind::Img) | Some(ElementKind::Input) => {
-                    Color::lightgray()
-                }
-                // Use transparent default so parent backgrounds (e.g. body bgcolor) show through.
-                _ => Color::transparent(),
-            });
+            self.background_color = Some(Color::transparent());
         }
         if self.color.is_none() {
             self.color = Some(Color::black());
@@ -1126,7 +1128,37 @@ impl ComputedStyle {
         self.scale_context
     }
 
+    pub fn set_border_radius_ratio(&mut self, ratio: f64) {
+        self.border_radius_ratio = Some(ratio.max(0.0));
+        self.border_radius = None;
+    }
+
+    /// The radius for a box this size.
+    pub fn border_radius_for(&self, width: i64, height: i64) -> i64 {
+        match self.border_radius_ratio {
+            Some(ratio) => (width.min(height) as f64 * ratio) as i64,
+            None => self.border_radius() as i64,
+        }
+    }
+
+    pub fn object_fit(&self) -> crate::paint_commands::ImageFit {
+        self.object_fit.unwrap_or_default()
+    }
+
+    pub fn set_object_fit(&mut self, fit: crate::paint_commands::ImageFit) {
+        self.object_fit = Some(fit);
+    }
+
+    pub fn set_svg_fill(&mut self, fill: String) {
+        self.svg_fill = Some(fill);
+    }
+
+    pub fn svg_fill(&self) -> Option<&str> {
+        self.svg_fill.as_deref()
+    }
+
     pub fn set_border_radius(&mut self, r: f64) {
+        self.border_radius_ratio = None;
         self.border_radius = Some(r.max(0.0));
     }
 

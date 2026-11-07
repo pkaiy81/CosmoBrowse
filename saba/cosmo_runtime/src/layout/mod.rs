@@ -6,6 +6,7 @@ use crate::security::{local_storage_snapshot, replace_local_storage};
 use cosmo_engine::renderer::layout::layout_object::CaretStop;
 use cosmo_engine::renderer::css::cssom::CssParser;
 use cosmo_engine::renderer::css::token::CssTokenizer;
+use crate::forms;
 use crate::loader::fetch_external_stylesheets;
 use cosmo_engine::renderer::dom::api::{
     get_js_content, get_style_content, get_stylesheet_links,
@@ -274,6 +275,24 @@ pub struct ClickOutcome {
     pub messages: Vec<String>,
 }
 
+/// Marks a `<select>` as showing its list, for the painter.
+const OPEN_SELECT_ATTRIBUTE: &str = "data-cosmo-open";
+
+fn collect_options(
+    node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    out: &mut Vec<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
+) {
+    let mut child = node.borrow().first_child();
+    while let Some(c) = child {
+        if c.borrow().element_tag_name().as_deref() == Some("option") {
+            out.push(c.clone());
+        }
+        collect_options(&c, out);
+        let next = c.borrow().next_sibling();
+        child = next;
+    }
+}
+
 /// A caret movement requested from the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaretMove {
@@ -516,6 +535,8 @@ pub struct LivePage {
     host: cosmo_script::ScriptHost,
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
     document_url: String,
+    /// The `<select>` whose list is showing.
+    open_select: Option<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
     /// The parsed stylesheets, resolved once at load and reused across
     /// pumps/reflows (script DOM mutations rarely change the stylesheets, so
     /// the expensive CSS re-parse is skipped — the first incremental win).
@@ -594,6 +615,7 @@ impl LivePage {
             transitions: TransitionDriver::default(),
             keyframes: KeyframeDriver::default(),
             focused_field: None,
+            open_select: None,
             caret: 0,
             caret_stops: None,
         };
@@ -651,6 +673,9 @@ impl LivePage {
     /// Spec: UI Events §3.5 — the click sequence.
     /// https://w3c.github.io/uievents/#event-type-click
     pub fn dispatch_click(&mut self, point: (i64, i64), rect: &FrameRect) -> ClickOutcome {
+        if let Some(select) = self.open_select.clone() {
+            return self.click_open_select(select, point, rect);
+        }
         let mut outcome = ClickOutcome::default();
         let target = {
             let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
@@ -667,16 +692,136 @@ impl LivePage {
             self.host
                 .dispatch_mouse_event(target.clone(), event_type, x, y);
         }
-        outcome.default_prevented = !self.host.dispatch_mouse_event(target, "click", x, y);
+        outcome.default_prevented =
+            !self.host.dispatch_mouse_event(target.clone(), "click", x, y);
+        let mut changed = false;
+        if !outcome.default_prevented {
+            changed = self.run_activation(forms::activate(&target), &mut outcome);
+        }
         replace_local_storage(&self.document_url, &self.host.local_storage_entries());
-        outcome.messages = self.host.take_posted_messages();
+        outcome.messages.extend(self.host.take_posted_messages());
 
         let generation = self.host.dom_generation();
-        if generation != self.last_generation {
+        if generation != self.last_generation || changed {
             self.last_generation = generation;
             outcome.scene = Some(self.layout_and_drive(rect));
         }
         outcome
+    }
+
+    /// Carry out what a click on a control does once the page has had its say.
+    /// Returns whether the document changed.
+    fn run_activation(
+        &mut self,
+        activation: forms::Activation,
+        outcome: &mut ClickOutcome,
+    ) -> bool {
+        match activation {
+            forms::Activation::None | forms::Activation::FocusField(_) => false,
+            forms::Activation::Toggled(control) => {
+                self.host.dispatch_event(control.clone(), "input");
+                self.host.dispatch_event(control, "change");
+                true
+            }
+            forms::Activation::ToggleDetails(details) => {
+                let open = matches!(
+                    details.borrow().kind,
+                    NodeKind::Element(ref e) if e.get_attribute("open").is_some()
+                );
+                if open {
+                    forms::remove_attribute(&details, "open");
+                } else {
+                    forms::set_attribute(&details, "open", "");
+                }
+                self.host.dispatch_event(details, "toggle");
+                true
+            }
+            forms::Activation::ToggleSelect(select) => {
+                self.open_select = Some(select.clone());
+                forms::set_attribute(&select, OPEN_SELECT_ATTRIBUTE, "");
+                true
+            }
+            forms::Activation::Submit { form, submitter } => {
+                self.submit_form(&form, submitter.as_ref(), outcome);
+                false
+            }
+        }
+    }
+
+    /// Fire `submit`, and unless the page cancels it, ask to navigate.
+    fn submit_form(
+        &mut self,
+        form: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+        submitter: Option<&Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
+        outcome: &mut ClickOutcome,
+    ) {
+        if !self.host.dispatch_event(form.clone(), "submit") {
+            return;
+        }
+        let Some(submission) = forms::build_submission(form, submitter, &self.document_url)
+        else {
+            return;
+        };
+        outcome.messages.push(
+            serde_json::json!({
+                "type": "cosmobrowse:navigate",
+                "href": submission.url,
+                "target": submission.target,
+                "postBody": submission.post_body,
+            })
+            .to_string(),
+        );
+    }
+
+    /// Enter in a single-line field. Returns the navigation messages it caused.
+    pub fn submit_focused_field(&mut self) -> Vec<String> {
+        let mut outcome = ClickOutcome::default();
+        let field = self.focused_field.clone();
+        if let Some(forms::Activation::Submit { form, submitter }) =
+            field.as_ref().and_then(forms::implicit_submission)
+        {
+            self.submit_form(&form, submitter.as_ref(), &mut outcome);
+        }
+        outcome.messages.extend(self.host.take_posted_messages());
+        outcome.messages
+    }
+
+    /// A click while a `<select>`'s list is open goes to the list: an option
+    /// picks it, and anywhere else just closes it.
+    fn click_open_select(
+        &mut self,
+        select: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+        point: (i64, i64),
+        rect: &FrameRect,
+    ) -> ClickOutcome {
+        let picked = {
+            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            view.find_object_of_node(&select).and_then(|object| {
+                let object = object.borrow();
+                let row = object.select_popup_rows().iter().position(|(x, y, w, h)| {
+                    point.0 >= *x && point.0 < x + w && point.1 >= *y && point.1 < y + h
+                })?;
+                object.select_options().get(row).map(|(_, node)| node.clone())
+            })
+        };
+        forms::remove_attribute(&select, OPEN_SELECT_ATTRIBUTE);
+        self.open_select = None;
+        if let Some(option) = picked {
+            let mut options = Vec::new();
+            collect_options(&select, &mut options);
+            for other in options {
+                forms::remove_attribute(&other, "selected");
+            }
+            forms::set_attribute(&option, "selected", "");
+            self.host.dispatch_event(select.clone(), "input");
+            self.host.dispatch_event(select, "change");
+        }
+        ClickOutcome {
+            hit: true,
+            default_prevented: true,
+            scene: Some(self.layout_and_drive(rect)),
+            messages: self.host.take_posted_messages(),
+        }
     }
 
     /// Whether this document has any `:hover` rule. Pointer motion over a page
@@ -1070,9 +1215,16 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     border.bottom().round() as i64,
                     border.left().round() as i64,
                 ));
-                let border_color = style.border_color()
-                    .map(|c| c.code().to_string())
-                    .unwrap_or_default();
+                let border_color = if border_width > 0 {
+                    // With no color of its own, a border takes the text's.
+                    style
+                        .border_color()
+                        .unwrap_or_else(|| style.color_or_black())
+                        .code()
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 scene_items.push(SceneItem::Rect {
                     x,
                     y,
@@ -1101,7 +1253,10 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     background_position: style.background_position(),
                     background_no_repeat: style.background_no_repeat(),
                     background_size: style.background_size(),
-                    border_radius: scaled_len(ctx, style.border_radius() as i64),
+                    border_radius: scaled_len(
+                        ctx,
+                        style.border_radius_for(layout_size.width(), layout_size.height()),
+                    ),
                     box_shadow: style.box_shadow().map(|(dx, dy, b, c)| (dx as i64, dy as i64, b as i64, c.code().to_string())),
                     rotate: style.rotate_context().map(|(cx, cy, deg)| {
                         (rect.x + cx as i64, rect.y + cy as i64, deg)
@@ -1195,6 +1350,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
+                    fit: style.object_fit(),
                 });
             }
         }
@@ -2313,6 +2469,195 @@ mod tests {
         assert!(!outcome.hit);
         assert!(!outcome.default_prevented);
         assert!(outcome.scene.is_none());
+    }
+
+    fn page_with(html: &str) -> (LivePage, FrameRect) {
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (page, _) = LivePage::load("http://x.test/dir/page", html, &rect, None);
+        (page, rect)
+    }
+
+    fn element(page: &LivePage, id: &str) -> Rc<RefCell<cosmo_engine::renderer::dom::node::Node>> {
+        cosmo_engine::renderer::dom::api::get_element_by_id(
+            Some(page.dom.clone()),
+            &id.to_string(),
+        )
+        .expect("element")
+    }
+
+    fn has_attribute(page: &LivePage, id: &str, name: &str) -> bool {
+        matches!(
+            element(page, id).borrow().kind,
+            NodeKind::Element(ref e) if e.get_attribute(name).is_some()
+        )
+    }
+
+    const CONTROLS: &str = "<!doctype html><style>body{margin:0}input,button,select,summary{display:block;width:200px;height:20px;margin:0;padding:0;border:0}</style>";
+
+    #[test]
+    fn clicking_a_checkbox_toggles_it_and_repaints() {
+        let html = format!("{CONTROLS}<input type=checkbox id=c>");
+        let (mut page, rect) = page_with(&html);
+        let outcome = page.dispatch_click((5, 5), &rect);
+        assert!(has_attribute(&page, "c", "checked"));
+        assert!(outcome.scene.is_some());
+        page.dispatch_click((5, 5), &rect);
+        assert!(!has_attribute(&page, "c", "checked"));
+    }
+
+    #[test]
+    fn prevent_default_stops_the_activation() {
+        let html = format!(
+            "{CONTROLS}<input type=checkbox id=c><script>document.getElementById('c').addEventListener('click',function(e){{e.preventDefault()}})</script>"
+        );
+        let (mut page, rect) = page_with(&html);
+        page.dispatch_click((5, 5), &rect);
+        assert!(!has_attribute(&page, "c", "checked"));
+    }
+
+    #[test]
+    fn a_change_event_follows_the_toggle() {
+        let html = format!(
+            "{CONTROLS}<input type=checkbox id=c><p id=o></p><script>document.getElementById('c').addEventListener('change',function(){{document.getElementById('o').textContent='changed'}})</script>"
+        );
+        let (mut page, rect) = page_with(&html);
+        let outcome = page.dispatch_click((5, 5), &rect);
+        assert!(scene_contains_text(&outcome.scene.expect("repaint"), "changed"));
+    }
+
+    #[test]
+    fn a_select_opens_and_a_click_picks_an_option() {
+        let html = format!("{CONTROLS}<select id=s><option id=a>first<option id=b>second</select>");
+        let (mut page, rect) = page_with(&html);
+        page.dispatch_click((5, 5), &rect);
+        assert!(has_attribute(&page, "s", "data-cosmo-open"), "the list opens");
+        // Rows start below the 20px box, and the second comes after one row.
+        let row = 20 + styled_row_height(&page, &rect, "s") + 2;
+        page.dispatch_click((5, row), &rect);
+        assert!(!has_attribute(&page, "s", "data-cosmo-open"));
+        assert!(has_attribute(&page, "b", "selected"));
+        assert!(!has_attribute(&page, "a", "selected"));
+    }
+
+    fn styled_row_height(page: &LivePage, rect: &FrameRect, id: &str) -> i64 {
+        let view = build_layout_view(page.dom.clone(), &page.cssom, rect);
+        let object = view.find_object_of_node(&element(page, id)).expect("box");
+        let rows = object.borrow().select_popup_rows();
+        rows[0].3
+    }
+
+    #[test]
+    fn a_click_outside_an_open_select_only_closes_it() {
+        let html = format!("{CONTROLS}<select id=s><option>first</select><input type=checkbox id=c>");
+        let (mut page, rect) = page_with(&html);
+        page.dispatch_click((5, 5), &rect);
+        page.dispatch_click((300, 290), &rect);
+        assert!(!has_attribute(&page, "s", "data-cosmo-open"));
+        assert!(!has_attribute(&page, "c", "checked"));
+    }
+
+    #[test]
+    fn clicking_a_summary_toggles_its_details() {
+        let html = format!("{CONTROLS}<details id=d><summary>head</summary><p>body</p></details>");
+        let (mut page, rect) = page_with(&html);
+        let outcome = page.dispatch_click((5, 5), &rect);
+        assert!(has_attribute(&page, "d", "open"));
+        assert!(scene_contains_text(&outcome.scene.expect("repaint"), "body"));
+    }
+
+    #[test]
+    fn a_submit_button_asks_to_navigate_with_the_form_data() {
+        let html = format!(
+            "{CONTROLS}<form action=results><input type=submit name=go value=Go></form>"
+        );
+        let (mut page, rect) = page_with(&html);
+        let outcome = page.dispatch_click((5, 5), &rect);
+        let request = outcome
+            .messages
+            .iter()
+            .find_map(|m| crate::loader::parse_navigate_message(m))
+            .expect("a navigation");
+        assert_eq!(request.href, "http://x.test/dir/results?go=Go");
+        assert_eq!(request.post_body, None);
+    }
+
+    #[test]
+    fn a_post_form_keeps_its_data_out_of_the_url() {
+        let html = format!(
+            "{CONTROLS}<form action=login method=post><input type=submit name=go value=Go></form>"
+        );
+        let (mut page, rect) = page_with(&html);
+        let outcome = page.dispatch_click((5, 5), &rect);
+        let request = outcome
+            .messages
+            .iter()
+            .find_map(|m| crate::loader::parse_navigate_message(m))
+            .expect("a navigation");
+        assert_eq!(request.href, "http://x.test/dir/login");
+        assert_eq!(request.post_body.as_deref(), Some("go=Go"));
+    }
+
+    #[test]
+    fn a_page_can_cancel_a_submission() {
+        let html = format!(
+            "{CONTROLS}<form id=f action=x><input type=submit value=Go></form><script>document.getElementById('f').addEventListener('submit',function(e){{e.preventDefault()}})</script>"
+        );
+        let (mut page, rect) = page_with(&html);
+        let outcome = page.dispatch_click((5, 5), &rect);
+        assert!(outcome
+            .messages
+            .iter()
+            .all(|m| crate::loader::parse_navigate_message(m).is_none()));
+    }
+
+    #[test]
+    fn enter_in_a_field_submits_its_form() {
+        let html = format!("{CONTROLS}<form action=s><input name=q value=hi></form>");
+        let (mut page, rect) = page_with(&html);
+        assert!(page.focus_field_at((5, 5), &rect));
+        let messages = page.submit_focused_field();
+        let request = messages
+            .iter()
+            .find_map(|m| crate::loader::parse_navigate_message(m))
+            .expect("a navigation");
+        assert_eq!(request.href, "http://x.test/dir/s?q=hi");
+    }
+
+    #[test]
+    fn a_password_never_paints_what_was_typed() {
+        let html = format!("{CONTROLS}<input type=password id=p value=secret>");
+        let (_, rect) = page_with(&html);
+        let (page, scene) = LivePage::load("http://x.test/", &html, &rect, None);
+        let _ = page;
+        assert!(!scene_contains_text(&scene, "secret"));
+        assert!(scene_contains_text(&scene, "\u{2022}\u{2022}\u{2022}"));
+    }
+
+    #[test]
+    fn typing_into_a_password_field_keeps_it_masked() {
+        let html = format!("{CONTROLS}<input type=password id=p>");
+        let (mut page, rect) = page_with(&html);
+        assert!(page.focus_field_at((5, 5), &rect));
+        let scene = page.insert_text("abc", &rect).expect("repaint");
+        assert!(!scene_contains_text(&scene, "abc"));
+        assert!(scene_contains_text(&scene, "\u{2022}\u{2022}\u{2022}"));
+    }
+
+    #[test]
+    fn a_field_with_nothing_in_it_shows_its_placeholder_again() {
+        let html = format!("{CONTROLS}<input id=i placeholder=hint value=a>");
+        let (mut page, rect) = page_with(&html);
+        assert!(page.focus_field_at((5, 5), &rect));
+        let scene = page.backspace(&rect).expect("repaint");
+        assert!(scene_contains_text(&scene, "hint"));
+    }
+
+    #[test]
+    fn an_empty_field_paints_no_stand_in_text() {
+        let html = format!("{CONTROLS}<input id=i>");
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 300 };
+        let (_, scene) = LivePage::load("http://x.test/", &html, &rect, None);
+        assert!(!scene_contains_text(&scene, "Input"));
     }
 
     fn scene_contains_text(scene: &LayoutScene, needle: &str) -> bool {
