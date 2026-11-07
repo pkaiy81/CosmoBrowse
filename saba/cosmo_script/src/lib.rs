@@ -1833,6 +1833,10 @@ fn element_set_text_content(
 }
 
 
+/// What this browser calls itself, on the network and in `navigator.userAgent`.
+pub const USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) CosmoBrowse/0.1 Safari/537.36";
+
 /// Default per-loop iteration cap. Above realistic page-load loops but bounds
 /// a runaway `while(true)` to a few seconds (Boa is an interpreter; a
 /// thread-based timeout isn't possible because its Context is !Send).

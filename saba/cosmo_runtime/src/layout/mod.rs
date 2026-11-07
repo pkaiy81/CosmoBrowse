@@ -1922,6 +1922,52 @@ mod tests {
     }
 
     #[test]
+    fn interface_objects_answer_instanceof() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><i></i>t<!--c--></div><svg id=s class=k></svg><script>\
+             var d=document.getElementById('d'),s=document.getElementById('s');\
+             var w=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT),seen=[];\
+             while(w.nextNode())seen.push(w.currentNode.nodeType);\
+             var c=document.createTreeWalker(d,NodeFilter.SHOW_TEXT,function(){return NodeFilter.FILTER_REJECT;});\
+             var r=[d.childNodes instanceof NodeList,d.classList instanceof DOMTokenList,\
+               s instanceof SVGElement,s.className instanceof SVGAnimatedString,s.className.baseVal,\
+               seen.join(''),c.nextNode(),document.location===location,typeof ReadableStream,\
+               new DOMMatrix().translate(2,3).e,navigator.userAgent.indexOf('CosmoBrowse')>0];\
+             document.getElementById('out').textContent=r.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "true|true|true|true|k|13||true|function|2|true");
+    }
+
+    #[test]
+    fn streams_deliver_what_is_enqueued() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var rs=new ReadableStream({start:function(c){c.enqueue('a');c.enqueue('b');c.close();}});\
+             var r=rs.getReader(),got=[];\
+             (function next(){return r.read().then(function(x){if(x.done){\
+               document.getElementById('out').textContent=got.join('');return;}\
+               got.push(x.value);return next();});})();\
+             </script></body></html>",
+        );
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn the_legacy_parts_of_javascript_that_the_web_relies_on_work() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var o={};o.__defineGetter__('g',function(){return 'g';});\
+             document.getElementById('out').textContent=['abcdef'.substr(2,2),escape('a b'),o.g].join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "cd|a%20b|g");
+    }
+
+    #[test]
     fn scripts_inserted_by_script_load() {
         let out = run_page_on_site(
             vec![("/late.js", JS, vec![], "window.loaded='late';")],

@@ -969,13 +969,6 @@
     };
     return range;
   });
-  hide(documentProto, 'createTreeWalker', function (root) {
-    const list = [];
-    const collect = (node) => { for (let c = node.firstChild; c; c = c.nextSibling) { list.push(c); collect(c); } };
-    collect(root);
-    let index = -1;
-    return { root, currentNode: root, nextNode() { index++; this.currentNode = list[index] || null; return this.currentNode; } };
-  });
   hide(documentProto, 'importNode', function (node, deep) { return node.cloneNode(!!deep); });
   hide(documentProto, 'adoptNode', function (node) { node.remove && node.remove(); return node; });
   hide(documentProto, 'hasFocus', function () { return true; });
@@ -1274,7 +1267,7 @@
   };
   global.History = function () {};
 
-  const userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) CosmoBrowse/0.1 Safari/537.36';
+  const userAgent = native.userAgent;
   global.navigator = {
     userAgent, appVersion: userAgent.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', productSub: '20030107',
     vendor: '', vendorSub: '', platform: 'Linux x86_64', language: 'en-US', languages: ['en-US', 'en'], onLine: true,
@@ -1857,4 +1850,331 @@
       supportedValuesOf: () => [],
     };
   }
+  // ---- Interface objects -------------------------------------------------
+  // Libraries look these up by name and test against them with `instanceof`,
+  // including for things that aren't instances of a real class here.
+
+  const iface = (name, isInstance) => {
+    const ctor = illegal(name);
+    if (isInstance) Object.defineProperty(ctor, Symbol.hasInstance, { value: isInstance });
+    global[name] = ctor;
+    return ctor;
+  };
+  iface('NodeList', Array.isArray);
+  iface('HTMLCollection', Array.isArray);
+  iface('NamedNodeMap', Array.isArray);
+  iface('DOMRectList', Array.isArray);
+  iface('DOMTokenList', (x) => !!x && typeof x.toggle === 'function' && typeof x.contains === 'function');
+  iface('CSSStyleDeclaration', (x) => !!x && typeof x.getPropertyValue === 'function');
+  iface('MediaQueryList', (x) => !!x && 'matches' in x && 'media' in x);
+  iface('Attr', (x) => !!x && 'ownerElement' in x);
+  iface('Range', (x) => !!x && typeof x.selectNodeContents === 'function');
+  iface('Selection', (x) => !!x && 'rangeCount' in x);
+  iface('TreeWalker', (x) => !!x && typeof x.nextNode === 'function' && 'currentNode' in x);
+  iface('NodeIterator', (x) => !!x && typeof x.nextNode === 'function' && 'referenceNode' in x);
+  iface('CustomElementRegistry', (x) => x === global.customElements);
+  iface('Location', (x) => x === global.location);
+  iface('Screen', (x) => x === global.screen);
+  iface('IntersectionObserverEntry');
+  iface('ResizeObserverEntry');
+  iface('MutationRecord');
+  iface('PerformanceEntry');
+  iface('XMLHttpRequestUpload');
+  iface('Animation');
+  iface('KeyframeEffect');
+  for (const name of ['StyleSheet', 'StyleSheetList', 'CSSRule', 'CSSRuleList', 'CSSStyleRule', 'CSSMediaRule']) iface(name);
+  subclass('HTMLUnknownElement', global.HTMLElement);
+  const SVGElement = global.SVGElement;
+  const SVGGraphicsElement = subclass('SVGGraphicsElement', SVGElement);
+  subclass('SVGSVGElement', SVGGraphicsElement);
+
+  const SVGAnimatedString = iface('SVGAnimatedString');
+  // An SVG element's `className` isn't a string.
+  get(SVGElement.prototype, 'className', function () {
+    const element = this;
+    const value = Object.create(SVGAnimatedString.prototype);
+    define(value, 'baseVal', {
+      get() { return element.getAttribute('class') || ''; },
+      set(text) { element.setAttribute('class', text); },
+    });
+    define(value, 'animVal', { get() { return element.getAttribute('class') || ''; } });
+    return value;
+  }, function (text) { this.setAttribute('class', text); });
+
+  eventClass('PromiseRejectionEvent', Event, { promise: null, reason: null });
+  eventClass('MediaQueryListEvent', Event, { media: '', matches: false });
+
+  global.Audio = function (src) {
+    const element = global.document.createElement('audio');
+    if (src !== undefined) element.setAttribute('src', src);
+    return element;
+  };
+
+  global.NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8,
+    SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512,
+    SHOW_DOCUMENT_FRAGMENT: 1024,
+  };
+  // The nodes a walker or iterator visits under `root`, in document order. A node
+  // the filter rejects takes its descendants with it; one it skips doesn't.
+  const walkedNodes = (root, whatToShow, filter) => {
+    const accepts = (node) => {
+      if (!((whatToShow >>> 0) & (1 << (node.nodeType - 1)))) return 3;
+      if (!filter) return 1;
+      return typeof filter === 'function' ? filter(node) : filter.acceptNode(node);
+    };
+    const list = [];
+    const visit = (node) => {
+      for (let child = node.firstChild; child; child = child.nextSibling) {
+        const verdict = accepts(child);
+        if (verdict === 1) list.push(child);
+        if (verdict !== 2) visit(child);
+      }
+    };
+    visit(root);
+    return list;
+  };
+  hide(documentProto, 'createTreeWalker', function (root, whatToShow = 0xFFFFFFFF, filter = null) {
+    const list = () => walkedNodes(root, whatToShow, filter);
+    const step = (walker, by) => {
+      const nodes = list();
+      const at = nodes.indexOf(walker.currentNode);
+      // The root comes before every node it holds.
+      const next = nodes[at === -1 ? (by > 0 ? 0 : -1) : at + by];
+      if (!next) return null;
+      walker.currentNode = next;
+      return next;
+    };
+    const related = (walker, name) => {
+      const node = walker.currentNode[name];
+      if (!node || node === root || !list().includes(node)) return null;
+      walker.currentNode = node;
+      return node;
+    };
+    return {
+      root, whatToShow, filter, currentNode: root,
+      nextNode() { return step(this, 1); },
+      previousNode() { return step(this, -1); },
+      parentNode() { return related(this, 'parentNode'); },
+      firstChild() { return related(this, 'firstChild'); },
+      lastChild() { return related(this, 'lastChild'); },
+      nextSibling() { return related(this, 'nextSibling'); },
+      previousSibling() { return related(this, 'previousSibling'); },
+    };
+  });
+  hide(documentProto, 'createNodeIterator', function (root, whatToShow = 0xFFFFFFFF, filter = null) {
+    const nodes = () => [root, ...walkedNodes(root, whatToShow, filter)];
+    let index = -1;
+    return {
+      root, whatToShow, filter, referenceNode: root, pointerBeforeReferenceNode: true,
+      nextNode() { const node = nodes()[++index] || null; if (node) this.referenceNode = node; else index--; return node; },
+      previousNode() { if (index <= 0) return null; this.referenceNode = nodes()[--index]; return this.referenceNode; },
+      detach() {},
+    };
+  });
+
+  class DOMPoint {
+    constructor(x = 0, y = 0, z = 0, w = 1) { Object.assign(this, { x, y, z, w }); }
+    static fromPoint(p = {}) { return new DOMPoint(p.x, p.y, p.z, p.w); }
+    toJSON() { return Object.assign({}, this); }
+  }
+  global.DOMPoint = global.DOMPointReadOnly = DOMPoint;
+  class DOMMatrix {
+    constructor(init) {
+      const v = Array.isArray(init) && init.length >= 6 ? init : [1, 0, 0, 1, 0, 0];
+      [this.a, this.b, this.c, this.d, this.e, this.f] = v;
+    }
+    get m11() { return this.a; } get m12() { return this.b; }
+    get m21() { return this.c; } get m22() { return this.d; }
+    get m41() { return this.e; } get m42() { return this.f; }
+    get is2D() { return true; }
+    get isIdentity() { return this.a === 1 && this.b === 0 && this.c === 0 && this.d === 1 && this.e === 0 && this.f === 0; }
+    multiply(o) {
+      return new DOMMatrix([
+        this.a * o.a + this.c * o.b, this.b * o.a + this.d * o.b,
+        this.a * o.c + this.c * o.d, this.b * o.c + this.d * o.d,
+        this.a * o.e + this.c * o.f + this.e, this.b * o.e + this.d * o.f + this.f,
+      ]);
+    }
+    translate(x = 0, y = 0) { return this.multiply(new DOMMatrix([1, 0, 0, 1, x, y])); }
+    scale(x = 1, y = x) { return this.multiply(new DOMMatrix([x, 0, 0, y, 0, 0])); }
+    inverse() {
+      const det = this.a * this.d - this.b * this.c;
+      return new DOMMatrix([
+        this.d / det, -this.b / det, -this.c / det, this.a / det,
+        (this.c * this.f - this.d * this.e) / det, (this.b * this.e - this.a * this.f) / det,
+      ]);
+    }
+    transformPoint(p = {}) {
+      const { x = 0, y = 0 } = p;
+      return new DOMPoint(this.a * x + this.c * y + this.e, this.b * x + this.d * y + this.f);
+    }
+  }
+  global.DOMMatrix = global.DOMMatrixReadOnly = global.WebKitCSSMatrix = DOMMatrix;
+
+  class ReadableStream {
+    constructor(source = {}) {
+      this.__queue = [];
+      this.__waiting = [];
+      this.__done = false;
+      this.__failed = null;
+      this.__source = source;
+      this.locked = false;
+      const settle = () => {
+        while (this.__waiting.length) {
+          const { resolve, reject } = this.__waiting[0];
+          if (this.__queue.length) resolve({ value: this.__queue.shift(), done: false });
+          else if (this.__failed) reject(this.__failed);
+          else if (this.__done) resolve({ value: undefined, done: true });
+          else return;
+          this.__waiting.shift();
+        }
+      };
+      this.__controller = {
+        desiredSize: 1,
+        enqueue: (chunk) => { this.__queue.push(chunk); settle(); },
+        close: () => { this.__done = true; settle(); },
+        error: (error) => { this.__failed = error || new TypeError('stream errored'); settle(); },
+      };
+      this.__settle = settle;
+      if (source.start) source.start(this.__controller);
+    }
+    getReader() {
+      this.locked = true;
+      const stream = this;
+      return {
+        closed: new Promise(() => {}),
+        read() {
+          return new Promise((resolve, reject) => {
+            stream.__waiting.push({ resolve, reject });
+            if (!stream.__queue.length && !stream.__done && stream.__source.pull) stream.__source.pull(stream.__controller);
+            stream.__settle();
+          });
+        },
+        releaseLock() { stream.locked = false; },
+        cancel(reason) { return stream.cancel(reason); },
+      };
+    }
+    cancel(reason) {
+      this.__done = true;
+      this.__queue.length = 0;
+      this.__settle();
+      return Promise.resolve(this.__source.cancel ? this.__source.cancel(reason) : undefined);
+    }
+    pipeThrough(transform) { this.pipeTo(transform.writable); return transform.readable; }
+    async pipeTo(destination) {
+      const reader = this.getReader();
+      const writer = destination.getWriter();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+      }
+      await writer.close();
+    }
+    async *[Symbol.asyncIterator]() {
+      const reader = this.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        yield value;
+      }
+    }
+  }
+  global.ReadableStream = ReadableStream;
+  class WritableStream {
+    constructor(sink = {}) { this.__sink = sink; this.locked = false; if (sink.start) sink.start({ error() {} }); }
+    getWriter() {
+      this.locked = true;
+      const sink = this.__sink;
+      return {
+        ready: Promise.resolve(), closed: new Promise(() => {}), desiredSize: 1,
+        write: async (chunk) => { if (sink.write) await sink.write(chunk, { error() {} }); },
+        close: async () => { if (sink.close) await sink.close(); },
+        abort: async (reason) => { if (sink.abort) await sink.abort(reason); },
+        releaseLock: () => { this.locked = false; },
+      };
+    }
+  }
+  global.WritableStream = WritableStream;
+  global.TransformStream = class TransformStream {
+    constructor(transformer = {}) {
+      let controller;
+      this.readable = new ReadableStream({ start(c) { controller = c; } });
+      const transform = transformer.transform || ((chunk, c) => c.enqueue(chunk));
+      this.writable = new WritableStream({
+        write: (chunk) => transform(chunk, controller),
+        close: async () => { if (transformer.flush) await transformer.flush(controller); controller.close(); },
+      });
+    }
+  };
+
+  global.FontFace = class FontFace {
+    constructor(family, source) { this.family = family; this.source = source; this.status = 'unloaded'; this.loaded = Promise.resolve(this); }
+    load() { this.status = 'loaded'; return Promise.resolve(this); }
+  };
+  global.Notification = class Notification {
+    static permission = 'denied';
+    static requestPermission() { return Promise.resolve('denied'); }
+    constructor() { throw new TypeError('Notifications are not allowed'); }
+  };
+
+  // Secure contexts are the ones a page can tell apart: https and loopback.
+  const isLoopback = () => /^(localhost|127\.0\.0\.1|\[::1\])$/.test(global.location.hostname);
+  define(global, 'isSecureContext', { get() { return global.location.protocol === 'https:' || isLoopback(); }, configurable: true });
+  define(global, 'origin', { get() { return global.location.origin; }, configurable: true });
+  global.crossOriginIsolated = false;
+  global.status = '';
+
+  get(documentProto, 'location', function () { return global.location; }, function (url) { global.location.href = url; });
+  get(documentProto, 'anchors', function () { return Array.from(this.querySelectorAll('a[name]')); });
+  get(documentProto, 'plugins', function () { return []; });
+  get(documentProto, 'lastModified', function () { return new Date().toUTCString(); });
+  get(documentProto, 'dir', function () { return this.documentElement ? this.documentElement.getAttribute('dir') || '' : ''; },
+    function (value) { if (this.documentElement) this.documentElement.setAttribute('dir', value); });
+  hide(documentProto, 'getElementsByName', function (name) {
+    return Array.from(this.querySelectorAll('[name]')).filter((element) => element.getAttribute('name') === String(name));
+  });
+  hide(documentProto, 'exitFullscreen', function () { return Promise.resolve(); });
+  hide(documentProto, 'createAttribute', function (name) { return { name: String(name).toLowerCase(), value: '', ownerElement: null }; });
+
+  hide(Node.prototype, 'lookupNamespaceURI', function () { return this.namespaceURI || null; });
+  get(Node.prototype, 'baseURI', function () {
+    const base = global.document.querySelector && global.document.querySelector('base[href]');
+    return base ? new URL(base.getAttribute('href'), global.location.href).href : global.location.href;
+  });
+  hide(Element.prototype, 'webkitMatchesSelector', Element.prototype.matches);
+  hide(Element.prototype, 'getAttributeNode', function (name) {
+    const value = this.getAttribute(name);
+    return value === null ? null : { name, localName: name, nodeName: name, value, nodeValue: value, ownerElement: this, specified: true };
+  });
+  hide(Element.prototype, 'setAttributeNode', function (attribute) { this.setAttribute(attribute.name, attribute.value); return null; });
+  hide(Element.prototype, 'checkVisibility', function () {
+    return this.isConnected && global.getComputedStyle(this).display !== 'none';
+  });
+  hide(Element.prototype, 'attachInternals', function () {
+    return { form: null, labels: [], states: new Set(), validity: {}, willValidate: false, setFormValue() {}, setValidity() {}, checkValidity: () => true, reportValidity: () => true };
+  });
+  hide(Element.prototype, 'showPopover', function () { this.setAttribute('data-popover-open', ''); });
+  hide(Element.prototype, 'hidePopover', function () { this.removeAttribute('data-popover-open'); });
+  hide(Element.prototype, 'togglePopover', function () {
+    if (this.hasAttribute('data-popover-open')) this.hidePopover(); else this.showPopover();
+  });
+  const reflect = (name, attribute) => get(Element.prototype, name,
+    function () { return this.getAttribute(attribute); },
+    function (value) { if (value === null) this.removeAttribute(attribute); else this.setAttribute(attribute, value); });
+  reflect('role', 'role');
+  reflect('slot', 'slot');
+  reflect('nonce', 'nonce');
+  reflect('part', 'part');
+  reflect('popover', 'popover');
+  for (const [name, attribute] of [
+    ['ariaLabel', 'aria-label'], ['ariaHidden', 'aria-hidden'], ['ariaExpanded', 'aria-expanded'],
+    ['ariaChecked', 'aria-checked'], ['ariaSelected', 'aria-selected'], ['ariaDisabled', 'aria-disabled'],
+    ['ariaDescription', 'aria-description'], ['ariaLive', 'aria-live'], ['ariaBusy', 'aria-busy'],
+    ['ariaCurrent', 'aria-current'], ['ariaHasPopup', 'aria-haspopup'], ['ariaPressed', 'aria-pressed'],
+  ]) reflect(name, attribute);
+  get(global.HTMLElement.prototype, 'spellcheck', function () { return this.getAttribute('spellcheck') !== 'false'; },
+    function (value) { this.setAttribute('spellcheck', String(!!value)); });
 })(this);

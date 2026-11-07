@@ -489,6 +489,7 @@ pub(crate) fn make_native_object(node_base: JsObject, ctx: &mut Context) -> JsOb
     ObjectInitializer::new(ctx)
         .property(js_string!("nodeBase"), node_base, Attribute::all())
         .property(js_string!("documentMethods"), document_methods, Attribute::all())
+        .property(js_string!("userAgent"), js_string!(USER_AGENT), Attribute::all())
         .function(NativeFunction::from_fn_ptr(set_proto), js_string!("setProto"), 2)
         .function(NativeFunction::from_fn_ptr(set_window_dispatcher), js_string!("setWindowDispatcher"), 1)
         .function(NativeFunction::from_fn_ptr(set_lifecycle), js_string!("setLifecycle"), 1)
@@ -789,10 +790,17 @@ fn run_module(text: &str, base: &str, ctx: &mut Context) {
     let promise = module.load_link_evaluate(ctx);
     ctx.run_jobs();
     if let boa_engine::builtins::promise::PromiseState::Rejected(error) = promise.state() {
-        let message = error
-            .to_string(ctx)
-            .map(|s| s.to_std_string_escaped())
-            .unwrap_or_else(|_| "module failed".to_string());
+        let describe = |value: &JsValue, ctx: &mut Context| {
+            value.to_string(ctx).map(|s| s.to_std_string_escaped()).unwrap_or_default()
+        };
+        let mut message = describe(&error, ctx);
+        if let Some(stack) = error
+            .as_object()
+            .and_then(|object| object.get(js_string!("stack"), ctx).ok())
+            .filter(|stack| !stack.is_undefined())
+        {
+            message = format!("{message}\n{}", describe(&stack, ctx));
+        }
         log_script_error(base, message);
     }
 }

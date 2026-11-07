@@ -166,7 +166,11 @@ fn collect_stylesheet_links_internal(node: Option<Rc<RefCell<Node>>>, output: &m
     if let NodeKind::Element(element) = node.borrow().kind() {
         if element.kind() == ElementKind::Link {
             let rel = element.get_attribute("rel").unwrap_or_default();
-            if rel.eq_ignore_ascii_case("stylesheet") {
+            // `rel` is a list: `preload stylesheet` is a stylesheet too.
+            let is_stylesheet = rel
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"));
+            if is_stylesheet {
                 if let Some(href) = element.get_attribute("href") {
                     output.push(href);
                 }

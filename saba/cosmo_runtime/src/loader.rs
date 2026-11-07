@@ -161,6 +161,7 @@ fn shared_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         Client::builder()
+            .user_agent(cosmo_script::USER_AGENT)
             .pool_max_idle_per_host(8)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -174,6 +175,7 @@ fn insecure_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         Client::builder()
+            .user_agent(cosmo_script::USER_AGENT)
             .pool_max_idle_per_host(2)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
