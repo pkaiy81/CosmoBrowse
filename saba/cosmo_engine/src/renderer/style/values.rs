@@ -6,7 +6,10 @@ use crate::renderer::css::cssom::ComponentValue;
 use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::LinearGradient;
 use crate::renderer::layout::computed_style::FontSize;
-use crate::renderer::layout::computed_style::GridTrack;
+use crate::renderer::layout::computed_style::{
+    AlignContent, AlignItems, FlexWrap, GridAutoRepeat, GridLine, GridPlacement, GridTemplate,
+    GridTrack, JustifyContent,
+};
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -114,203 +117,282 @@ pub(crate) fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> 
     }
 }
 
-/// Parse the column tracks declared by a `grid-template-columns` value.
-/// Lengths become fixed tracks, `Nfr` flexible tracks, keywords/functions
-/// `Auto` (≈1fr); `repeat(N, tracks)` expands to N copies of its track list.
-/// Returns an empty Vec when nothing can be recognized.
-pub(crate) fn parse_grid_template_tracks(values: &[ComponentValue]) -> Vec<GridTrack> {
-    parse_grid_template_tracks_with_lines(values).0
+/// The values between the first pair of parentheses starting at `open`, and the
+/// index just past the closing one.
+fn function_args(values: &[ComponentValue], open: usize) -> (&[ComponentValue], usize) {
+    let mut depth = 1;
+    let mut j = open + 1;
+    while j < values.len() && depth > 0 {
+        match &values[j] {
+            ComponentValue::OpenParenthesis => depth += 1,
+            ComponentValue::CloseParenthesis => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    let end = if depth == 0 { j - 1 } else { j };
+    (&values[(open + 1).min(values.len())..end], j)
 }
 
-/// Like `parse_grid_template_tracks` but also returns the named grid lines:
-/// `line_names[i]` holds the names declared before track `i`
-/// (`[full-start left-sidebar-start] 1fr [left-sidebar-end] ...`), with a
-/// final entry after the last track. `grid-area: X` resolves against the
-/// `X-start`/`X-end` names.
-pub(crate) fn parse_grid_template_tracks_with_lines(
-    values: &[ComponentValue],
-) -> (Vec<GridTrack>, Vec<Vec<String>>) {
-    let mut tracks: Vec<GridTrack> = Vec::new();
-    let mut line_names: Vec<Vec<String>> = vec![Vec::new()];
-    let mut i = 0;
-    while i < values.len() {
-        // Named line block: collect idents until ']'.
-        if matches!(&values[i], ComponentValue::Delim('[')) {
-            i += 1;
-            while i < values.len() && !matches!(&values[i], ComponentValue::Delim(']')) {
-                if let ComponentValue::Ident(n) = &values[i] {
-                    line_names
-                        .last_mut()
-                        .expect("line_names is never empty")
-                        .push(n.to_ascii_lowercase());
-                }
-                i += 1;
-            }
-            i += 1; // skip ']'
-            continue;
-        }
-        let before = tracks.len();
-        i = parse_one_track(values, i, &mut tracks);
-        if tracks.len() > before {
-            line_names.push(Vec::new());
-        }
-    }
-    (tracks, line_names)
-}
-
-/// Consume one track (or a repeat()/minmax() construct) starting at `i`;
-/// returns the next index. Extracted from the old single-pass loop so the
-/// line-name variant can interleave.
-fn parse_one_track(values: &[ComponentValue], i: usize, tracks: &mut Vec<GridTrack>) -> usize {
-    if i >= values.len() {
-        return i;
-    }
-    {
-        match &values[i] {
-            ComponentValue::Ident(name) if name.eq_ignore_ascii_case("repeat") => {
-                // repeat(N, tracks) — recurse on the inner track list.
-                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
-                    let mut depth = 1;
-                    let mut j = i + 2;
-                    while j < values.len() && depth > 0 {
-                        match &values[j] {
-                            ComponentValue::OpenParenthesis => depth += 1,
-                            ComponentValue::CloseParenthesis => depth -= 1,
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    let inner = &values[(i + 2).min(values.len())..(j - 1).min(values.len())];
-                    let (n, rest) = match inner.first() {
-                        Some(ComponentValue::Number(v)) => (
-                            (*v as usize).max(1),
-                            inner
-                                .iter()
-                                .position(|t| *t == ComponentValue::Delim(','))
-                                .map(|p| &inner[p + 1..])
-                                .unwrap_or(&[]),
-                        ),
-                        // auto-fill / auto-fit have no fixed count: one copy.
-                        _ => (
-                            1,
-                            inner
-                                .iter()
-                                .position(|t| *t == ComponentValue::Delim(','))
-                                .map(|p| &inner[p + 1..])
-                                .unwrap_or(&[]),
-                        ),
-                    };
-                    let unit = parse_grid_template_tracks(rest);
-                    for _ in 0..n {
-                        tracks.extend(unit.iter().copied());
-                    }
-                    return j;
-                }
-                tracks.push(GridTrack::Auto);
-            }
-            ComponentValue::Dimension(v, unit) => {
-                if unit == "fr" {
-                    tracks.push(GridTrack::Fr((*v).max(0.0)));
-                } else if unit == "%" {
-                    // Percentage of the container ≈ flexible share.
-                    tracks.push(GridTrack::Fr((*v / 100.0).max(0.0)));
-                } else if let Some(px) = length_to_px(*v, unit, FontSize::Medium) {
-                    tracks.push(GridTrack::Px(px.max(0.0)));
-                } else {
-                    tracks.push(GridTrack::Auto);
-                }
-            }
-            ComponentValue::Number(v) => {
-                tracks.push(GridTrack::Px((*v).max(0.0)));
-            }
-            ComponentValue::Ident(name) if name.eq_ignore_ascii_case("minmax") => {
-                // minmax(min, max): size by the max part (a fr max flexes,
-                // a px max is fixed). The min clamp is approximated away.
-                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
-                    let mut depth = 1;
-                    let mut j = i + 2;
-                    while j < values.len() && depth > 0 {
-                        match &values[j] {
-                            ComponentValue::OpenParenthesis => depth += 1,
-                            ComponentValue::CloseParenthesis => depth -= 1,
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    let inner = &values[(i + 2).min(values.len())..(j - 1).min(values.len())];
-                    let parts = parse_grid_template_tracks(
-                        &inner
-                            .iter()
-                            .filter(|t| **t != ComponentValue::Delim(','))
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    );
-                    tracks.push(parts.last().copied().unwrap_or(GridTrack::Auto));
-                    return j;
-                }
-                tracks.push(GridTrack::Auto);
-            }
-            ComponentValue::Ident(_) => {
-                tracks.push(GridTrack::Auto);
-                // Skip a function's argument list so its contents don't count
-                // as extra tracks.
-                if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) {
-                    let mut depth = 1;
-                    let mut j = i + 2;
-                    while j < values.len() && depth > 0 {
-                        match &values[j] {
-                            ComponentValue::OpenParenthesis => depth += 1,
-                            ComponentValue::CloseParenthesis => depth -= 1,
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    return j;
-                }
+fn split_args(values: &[ComponentValue]) -> Vec<&[ComponentValue]> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, value) in values.iter().enumerate() {
+        match value {
+            ComponentValue::OpenParenthesis => depth += 1,
+            ComponentValue::CloseParenthesis => depth -= 1,
+            ComponentValue::Delim(',') if depth == 0 => {
+                parts.push(&values[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
     }
-    i + 1
+    parts.push(&values[start..]);
+    parts
 }
 
-/// Resolve column tracks to pixel widths for the given content width:
-/// gaps and fixed tracks are reserved first, then the remainder is split
-/// among Fr/Auto tracks in proportion to their flex factors (Auto = 1fr).
-/// https://www.w3.org/TR/css-grid-1/#algo-track-sizing
-pub(crate) fn resolve_grid_tracks(tracks: &[GridTrack], available: i64, column_gap: i64) -> Vec<i64> {
-    let n = tracks.len().max(1) as i64;
-    let gaps = column_gap * (n - 1).max(0);
-    let mut remaining = (available - gaps).max(0);
-    let mut total_fr = 0.0f64;
-    for t in tracks {
-        match t {
-            GridTrack::Px(px) => remaining -= *px as i64,
-            GridTrack::Fr(f) => total_fr += f.max(0.0),
-            GridTrack::Auto => total_fr += 1.0,
+/// A value list split at each top-level `/`, without white space.
+pub(crate) fn split_on_slash(values: &[ComponentValue]) -> Vec<Vec<ComponentValue>> {
+    let mut parts = vec![Vec::new()];
+    for value in values {
+        match value {
+            ComponentValue::Whitespace => {}
+            ComponentValue::Delim('/') => parts.push(Vec::new()),
+            other => parts.last_mut().expect("never empty").push(other.clone()),
         }
     }
-    let remaining = remaining.max(0);
-    tracks
+    parts
+}
+
+/// Parse a track list: `[names] <track> ... repeat(...) ...`.
+/// https://www.w3.org/TR/css-grid-1/#track-sizing
+pub(crate) fn parse_grid_template(values: &[ComponentValue]) -> GridTemplate {
+    let mut template = GridTemplate {
+        tracks: Vec::new(),
+        line_names: vec![Vec::new()],
+        auto_repeat: None,
+    };
+    let values: Vec<ComponentValue> = values
         .iter()
-        .map(|t| match t {
-            GridTrack::Px(px) => *px as i64,
-            GridTrack::Fr(f) => {
-                if total_fr > 0.0 {
-                    (remaining as f64 * f.max(0.0) / total_fr) as i64
-                } else {
-                    0
+        .filter(|v| !matches!(v, ComponentValue::Whitespace))
+        .cloned()
+        .collect();
+    parse_track_list(&values, &mut template);
+    template
+}
+
+fn parse_track_list(values: &[ComponentValue], template: &mut GridTemplate) {
+    let mut i = 0;
+    while i < values.len() {
+        match &values[i] {
+            ComponentValue::Delim('[') => {
+                i += 1;
+                while i < values.len() && !matches!(&values[i], ComponentValue::Delim(']')) {
+                    if let ComponentValue::Ident(name) = &values[i] {
+                        template
+                            .line_names
+                            .last_mut()
+                            .expect("line_names is never empty")
+                            .push(name.to_ascii_lowercase());
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            ComponentValue::Ident(name)
+                if name.eq_ignore_ascii_case("repeat")
+                    && matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) =>
+            {
+                let (args, next) = function_args(values, i + 1);
+                i = next;
+                let parts = split_args(args);
+                let (Some(count), Some(body)) = (parts.first(), parts.get(1)) else {
+                    continue;
+                };
+                let mut unit = GridTemplate {
+                    tracks: Vec::new(),
+                    line_names: vec![Vec::new()],
+                    auto_repeat: None,
+                };
+                parse_track_list(body, &mut unit);
+                match count.first() {
+                    Some(ComponentValue::Ident(keyword)) => {
+                        template.auto_repeat = Some(GridAutoRepeat {
+                            at: template.tracks.len(),
+                            tracks: unit.tracks,
+                            fit: keyword.eq_ignore_ascii_case("auto-fit"),
+                        });
+                    }
+                    Some(ComponentValue::Number(n)) => {
+                        // More tracks than this is not a layout anyone wants;
+                        // the bound keeps a hostile count from exhausting memory.
+                        for _ in 0..(*n as usize).clamp(1, 1000) {
+                            for (t, track) in unit.tracks.iter().enumerate() {
+                                template.tracks.push(track.clone());
+                                let names = unit.line_names.get(t + 1).cloned().unwrap_or_default();
+                                template.line_names.push(names);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            GridTrack::Auto => {
-                if total_fr > 0.0 {
-                    (remaining as f64 / total_fr) as i64
-                } else {
-                    0
+            _ => {
+                let (track, next) = parse_track(values, i);
+                i = next;
+                if let Some(track) = track {
+                    template.tracks.push(track);
+                    template.line_names.push(Vec::new());
                 }
             }
+        }
+    }
+}
+
+fn parse_track(values: &[ComponentValue], i: usize) -> (Option<GridTrack>, usize) {
+    match &values[i] {
+        ComponentValue::Dimension(v, unit) => (
+            Some(if unit == "fr" {
+                GridTrack::Fr(v.max(0.0))
+            } else if unit == "%" {
+                GridTrack::Percent((*v / 100.0).max(0.0))
+            } else if let Some(px) = length_to_px(*v, unit, FontSize::Medium) {
+                GridTrack::Px(px.max(0.0))
+            } else {
+                GridTrack::Auto
+            }),
+            i + 1,
+        ),
+        ComponentValue::Number(v) => (Some(GridTrack::Px(v.max(0.0))), i + 1),
+        ComponentValue::Ident(name)
+            if matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis)) =>
+        {
+            let (args, next) = function_args(values, i + 1);
+            let parts = split_args(args);
+            let one = |part: Option<&&[ComponentValue]>| {
+                part.filter(|p| !p.is_empty())
+                    .and_then(|p| parse_track(p, 0).0)
+                    .unwrap_or(GridTrack::Auto)
+            };
+            let track = if name.eq_ignore_ascii_case("minmax") {
+                GridTrack::MinMax(
+                    Box::new(one(parts.first())),
+                    Box::new(one(parts.get(1))),
+                )
+            } else if name.eq_ignore_ascii_case("fit-content") {
+                match one(parts.first()) {
+                    GridTrack::Px(px) => GridTrack::FitContent(px),
+                    _ => GridTrack::Auto,
+                }
+            } else {
+                GridTrack::Auto
+            };
+            (Some(track), next)
+        }
+        ComponentValue::Ident(name) => (
+            match name.to_ascii_lowercase().as_str() {
+                "min-content" => Some(GridTrack::MinContent),
+                "max-content" => Some(GridTrack::MaxContent),
+                "auto" => Some(GridTrack::Auto),
+                // `none` and anything else declares no tracks.
+                _ => None,
+            },
+            i + 1,
+        ),
+        _ => (None, i + 1),
+    }
+}
+
+/// `<line>`: `auto` | `<integer>` | `span <integer>` | `<name> [<integer>]`.
+pub(crate) fn parse_grid_line(values: &[ComponentValue]) -> GridLine {
+    let parts: Vec<&ComponentValue> = values
+        .iter()
+        .filter(|v| !matches!(v, ComponentValue::Whitespace))
+        .collect();
+    let number = parts.iter().find_map(|v| match v {
+        ComponentValue::Number(n) => Some(*n as i32),
+        _ => None,
+    });
+    let idents: Vec<&String> = parts
+        .iter()
+        .filter_map(|v| match v {
+            ComponentValue::Ident(name) => Some(name),
+            _ => None,
         })
-        .collect()
+        .collect();
+    let spanning = idents.iter().any(|name| name.eq_ignore_ascii_case("span"));
+    let name = idents
+        .iter()
+        .find(|name| !name.eq_ignore_ascii_case("span") && !name.eq_ignore_ascii_case("auto"));
+    match (spanning, name, number) {
+        (true, _, n) => GridLine::Span(n.unwrap_or(1).max(1)),
+        (false, Some(name), n) => GridLine::Name(name.to_ascii_lowercase(), n.unwrap_or(1)),
+        (false, None, Some(n)) if n != 0 => GridLine::Number(n),
+        _ => GridLine::Auto,
+    }
+}
+
+/// `grid-column`/`grid-row`: `<line> [ / <line> ]`. A named start with no end
+/// repeats on the end, where it resolves to that area's `-end` line.
+pub(crate) fn parse_grid_placement(values: &[ComponentValue]) -> GridPlacement {
+    let parts = split_on_slash(values);
+    let start = parts.first().map(|p| parse_grid_line(p)).unwrap_or_default();
+    let end = match parts.get(1) {
+        Some(part) => parse_grid_line(part),
+        None => match &start {
+            GridLine::Name(..) => start.clone(),
+            _ => GridLine::Auto,
+        },
+    };
+    GridPlacement { start, end }
+}
+
+pub(crate) fn parse_flex_wrap(value: &str) -> Option<FlexWrap> {
+    match value {
+        "nowrap" => Some(FlexWrap::NoWrap),
+        "wrap" => Some(FlexWrap::Wrap),
+        "wrap-reverse" => Some(FlexWrap::WrapReverse),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_justify_content(value: &str) -> Option<JustifyContent> {
+    match value {
+        "normal" | "stretch" => Some(JustifyContent::Normal),
+        "flex-start" | "start" | "left" => Some(JustifyContent::FlexStart),
+        "flex-end" | "end" | "right" => Some(JustifyContent::FlexEnd),
+        "center" => Some(JustifyContent::Center),
+        "space-between" => Some(JustifyContent::SpaceBetween),
+        "space-around" => Some(JustifyContent::SpaceAround),
+        "space-evenly" => Some(JustifyContent::SpaceEvenly),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_align_content(value: &str) -> Option<AlignContent> {
+    match value {
+        "normal" | "stretch" => Some(AlignContent::Stretch),
+        "flex-start" | "start" => Some(AlignContent::FlexStart),
+        "flex-end" | "end" => Some(AlignContent::FlexEnd),
+        "center" => Some(AlignContent::Center),
+        "space-between" => Some(AlignContent::SpaceBetween),
+        "space-around" => Some(AlignContent::SpaceAround),
+        "space-evenly" => Some(AlignContent::SpaceEvenly),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_align_keyword(value: &str) -> Option<AlignItems> {
+    match value {
+        "stretch" | "normal" => Some(AlignItems::Stretch),
+        "flex-start" | "start" | "self-start" | "left" => Some(AlignItems::FlexStart),
+        "center" => Some(AlignItems::Center),
+        "flex-end" | "end" | "self-end" | "right" => Some(AlignItems::FlexEnd),
+        "baseline" => Some(AlignItems::Baseline),
+        _ => None,
+    }
 }
 
 /// Parse a `transform` value list into (tx, tx_pct, ty, ty_pct, scale).
@@ -693,18 +775,20 @@ pub(crate) fn parse_margin_shorthand(
     }
 }
 
-pub(crate) fn parse_margin_auto_flags(value: &[ComponentValue]) -> (bool, bool) {
+/// Which of (top, right, bottom, left) a `margin` shorthand sets to `auto`.
+pub(crate) fn parse_margin_auto_flags(value: &[ComponentValue]) -> (bool, bool, bool, bool) {
     let flags = value
         .iter()
+        .filter(|component| !matches!(component, ComponentValue::Whitespace))
         .map(|component| matches!(component, ComponentValue::Ident(name) if name == "auto"))
         .collect::<Vec<_>>();
 
     match flags.as_slice() {
-        [all] => (*all, *all),
-        [_, horizontal] => (*horizontal, *horizontal),
-        [_, horizontal, _] => (*horizontal, *horizontal),
-        [_, right, _, left] => (*left, *right),
-        _ => (false, false),
+        [all] => (*all, *all, *all, *all),
+        [vertical, horizontal] => (*vertical, *horizontal, *vertical, *horizontal),
+        [top, horizontal, bottom] => (*top, *horizontal, *bottom, *horizontal),
+        [top, right, bottom, left] => (*top, *right, *bottom, *left),
+        _ => (false, false, false, false),
     }
 }
 

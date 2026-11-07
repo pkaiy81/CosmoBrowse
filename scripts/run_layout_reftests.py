@@ -17,6 +17,7 @@ and Pillow (python3 -m pip install pillow).
 
 from __future__ import annotations
 
+import shutil
 import argparse
 import http.server
 import os
@@ -131,7 +132,7 @@ def main() -> int:
                 else:
                     fail_out = GOLDEN_DIR.parent / "failures"
                     fail_out.mkdir(exist_ok=True)
-                    actual.replace(fail_out / f"{test.stem}.actual.png")
+                    shutil.move(actual, fail_out / f"{test.stem}.actual.png")
                     failures.append((test.stem, detail))
                     print(f"FAIL     {test.stem}: {detail}")
     finally:

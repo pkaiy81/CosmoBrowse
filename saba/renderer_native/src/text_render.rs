@@ -16,11 +16,10 @@ fn shared_font_chains() -> &'static (Arc<Vec<Font>>, Arc<Vec<Font>>) {
 }
 
 /// Layout-side metrics from the same fontdue fonts the painter draws with.
-/// Advances are rounded UP so layout never reserves less than is drawn.
 pub struct FontdueMetricsProvider {
     fonts: Arc<Vec<Font>>,
     bold_fonts: Arc<Vec<Font>>,
-    cache: Mutex<HashMap<(char, i64, bool), i64>>,
+    cache: Mutex<HashMap<(char, i64, bool), f64>>,
 }
 
 impl std::fmt::Debug for FontdueMetricsProvider {
@@ -41,20 +40,15 @@ impl FontdueMetricsProvider {
 }
 
 impl FontMetricsProvider for FontdueMetricsProvider {
-    fn char_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
+    fn advance(&self, c: char, font_size: FontSize, bold: bool) -> f64 {
         let px = font_size.px();
         let key = (c, px, bold);
         if let Some(v) = self.cache.lock().unwrap().get(&key) {
             return *v;
         }
-        let v = (self.exact_advance(c, px, bold).ceil() as i64).max(1);
+        let v = self.exact_advance(c, px, bold) as f64;
         self.cache.lock().unwrap().insert(key, v);
         v
-    }
-
-    /// `TextRenderer` moves its pen by the truncated advance.
-    fn painted_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
-        self.exact_advance(c, font_size.px(), bold) as i64
     }
 }
 
@@ -139,7 +133,7 @@ impl TextRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         text: &str,
-        mut x: i64,
+        x: i64,
         y: i64,
         font_px: u32,
         r: u8,
@@ -151,10 +145,14 @@ impl TextRenderer {
         clip: Option<(i64, i64, i64, i64)>,
     ) -> i64 {
         let baseline_y = y - scroll_y;
+        // The pen keeps its fraction, as layout's measurements do, and each
+        // glyph lands on the nearest pixel. Truncating every advance instead
+        // would paint a run narrower than the width layout gave it.
+        let mut pen = x as f64;
 
         for ch in text.chars() {
             let glyph = self.rasterize_glyph(ch, font_px, bold);
-            let gx = x + glyph.offset_x as i64;
+            let gx = pen.round() as i64 + glyph.offset_x as i64;
             let gy = baseline_y - glyph.offset_y as i64;
 
             for row in 0..glyph.height as i64 {
@@ -178,9 +176,9 @@ impl TextRenderer {
                 }
             }
 
-            x += glyph.advance_width as i64;
+            pen += glyph.advance_width as f64;
         }
-        x
+        pen.round() as i64
     }
 
     pub fn measure_text(&mut self, text: &str, font_px: u32) -> i64 {
@@ -252,7 +250,7 @@ impl TextRenderer {
     }
 }
 
-fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
+pub(crate) fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
     if a == 0 {
         return;
     }

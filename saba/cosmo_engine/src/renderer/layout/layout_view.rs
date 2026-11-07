@@ -5,6 +5,8 @@ use crate::renderer::dom::api::get_target_element_node;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::Node;
 use crate::renderer::dom::node::NodeKind;
+use crate::renderer::layout::computed_style::DisplayType;
+use crate::renderer::layout::{flex, grid};
 use crate::renderer::layout::layout_object::compute_box_model_metrics;
 use crate::renderer::layout::layout_object::create_layout_object;
 use crate::renderer::layout::layout_object::CaretStop;
@@ -199,6 +201,7 @@ fn build_layout_tree(
 
         obj.borrow_mut().set_first_child(first_child);
         obj.borrow_mut().set_next_sibling(next_sibling);
+        LayoutObject::normalize_children(obj);
     }
 
     layout_object
@@ -325,15 +328,31 @@ impl LayoutView {
                 n.borrow_mut().set_column_max_hints(max_hints);
             }
 
-            if n.borrow().kind() == LayoutObjectKind::Block {
+            let contains_children =
+                n.borrow().kind() == LayoutObjectKind::Block || n.borrow().is_inline_block();
+            if contains_children {
                 n.borrow_mut().compute_size(parent_size);
             }
 
-            let child_parent_size = if n.borrow().kind() == LayoutObjectKind::Block {
+            let child_parent_size = if contains_children {
                 n.borrow().content_size()
             } else {
                 parent_size
             };
+            let (is_flex, is_grid) = {
+                let b = n.borrow();
+                (
+                    b.style().display() == DisplayType::Flex,
+                    b.style().display() == DisplayType::Grid,
+                )
+            };
+            // Flex and grid containers fix their items' widths before the items
+            // are sized, and place them after.
+            if is_flex {
+                flex::assign_sizes(n);
+            } else if is_grid {
+                grid::assign_sizes(n);
+            }
             let first_child = n.borrow().first_child();
             Self::calculate_node_size(&first_child, child_parent_size);
 
@@ -341,6 +360,11 @@ impl LayoutView {
             Self::calculate_node_size(&next_sibling, parent_size);
 
             n.borrow_mut().compute_size(parent_size);
+            if is_flex {
+                flex::place_items(n, parent_size.height());
+            } else if is_grid {
+                grid::place_items(n, parent_size.height());
+            }
 
             // Phase 2.5: with the children sized, a block whose content is all
             // inline gets a real inline formatting context — shared line boxes
@@ -372,6 +396,7 @@ impl LayoutView {
                 previous_sibling_point,
                 previous_sibling_size,
             );
+            LayoutObject::assign_flow_offsets(n);
 
             let first_child = n.borrow().first_child();
             Self::calculate_node_position(
@@ -892,7 +917,6 @@ impl LayoutView {
             previous = placed;
         }
 
-        Self::layout_flex_alignment(&self.root);
         Self::align_inline_baselines(&self.root);
         self.reposition_fixed_far_edges(&self.root.clone());
         Self::apply_transforms(&self.root);
@@ -1248,137 +1272,6 @@ impl LayoutView {
     /// size — the translate(-50%,-50%) centering idiom). A uniform scale
     /// factor is stamped as a scale context (origin = the box's top-left
     /// after translation) for the mappers to scale command geometry.
-    /// Post pass: justify-content / align-items for single-line row flex
-    /// containers. Items were packed at flex-start by compute_position;
-    /// this pass translates each item subtree to its final main position and
-    /// aligns/stretches on the cross axis.
-    fn layout_flex_alignment(node: &Option<Rc<RefCell<LayoutObject>>>) {
-        use crate::renderer::layout::computed_style::{
-            AlignItems, DisplayType, FlexDirection, JustifyContent, PositionType,
-        };
-        let n = match node {
-            Some(n) => n,
-            None => return,
-        };
-        let is_row_flex = {
-            let b = n.borrow();
-            b.style().display() == DisplayType::Flex
-                && b.style().flex_direction() == FlexDirection::Row
-        };
-        if is_row_flex {
-            let (c_point, c_size, c_metrics, justify, align) = {
-                let b = n.borrow();
-                (
-                    b.point(),
-                    b.size(),
-                    compute_box_model_metrics(&b.style()),
-                    b.style().justify_content(),
-                    b.style().align_items(),
-                )
-            };
-            let content_w = c_size.width() - c_metrics.inner_horizontal();
-            let content_h = c_size.height() - c_metrics.inner_vertical();
-
-            // Collect in-flow element items.
-            let mut items: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
-            let mut child = n.borrow().first_child();
-            while let Some(c) = child {
-                let next = c.borrow().next_sibling();
-                {
-                    let b = c.borrow();
-                    if !b.is_whitespace_text()
-                        && !matches!(
-                            b.style().position(),
-                            PositionType::Absolute | PositionType::Fixed
-                        )
-                    {
-                        drop(b);
-                        items.push(c.clone());
-                    }
-                }
-                child = next;
-            }
-
-            if !items.is_empty() {
-                // Main axis: leftover after the flex-start packing.
-                let last = items.last().unwrap();
-                let (last_x, last_w) = {
-                    let b = last.borrow();
-                    (b.point().x(), b.size().width())
-                };
-                let first_x = items[0].borrow().point().x();
-                let used = last_x + last_w - first_x;
-                let leftover = (content_w - used).max(0);
-                let count = items.len() as i64;
-                let (lead, between) = match justify {
-                    JustifyContent::FlexStart => (0, 0),
-                    JustifyContent::FlexEnd => (leftover, 0),
-                    JustifyContent::Center => (leftover / 2, 0),
-                    JustifyContent::SpaceBetween if count > 1 => (0, leftover / (count - 1)),
-                    JustifyContent::SpaceBetween => (0, 0),
-                    JustifyContent::SpaceAround => {
-                        let unit = leftover / count;
-                        (unit / 2, unit)
-                    }
-                    JustifyContent::SpaceEvenly => {
-                        let unit = leftover / (count + 1);
-                        (unit, unit)
-                    }
-                };
-                for (i, item) in items.iter().enumerate() {
-                    let dx = lead + between * i as i64;
-                    if dx != 0 {
-                        Self::translate_subtree(item, dx, 0);
-                    }
-                }
-
-                // Cross axis.
-                let c_top = c_point.y();
-                for item in &items {
-                    let (item_h, item_y, align_self, has_explicit_h) = {
-                        let b = item.borrow();
-                        (
-                            b.size().height(),
-                            b.point().y(),
-                            b.style().align_self_or(align),
-                            b.style().height() > 0.0 || b.style().height_ratio().is_some(),
-                        )
-                    };
-                    match align_self {
-                        AlignItems::Stretch => {
-                            if !has_explicit_h && content_h > item_h {
-                                let mut b = item.borrow_mut();
-                                let mut sz = b.size();
-                                sz.set_height(content_h);
-                                b.size = sz;
-                            }
-                        }
-                        AlignItems::Center => {
-                            let dy = c_top + (content_h - item_h) / 2 - item_y;
-                            if dy != 0 {
-                                Self::translate_subtree(item, 0, dy);
-                            }
-                        }
-                        AlignItems::FlexEnd => {
-                            let dy = c_top + content_h - item_h - item_y;
-                            if dy != 0 {
-                                Self::translate_subtree(item, 0, dy);
-                            }
-                        }
-                        AlignItems::FlexStart | AlignItems::Baseline => {}
-                    }
-                }
-            }
-        }
-
-        let (first, next) = {
-            let b = n.borrow();
-            (b.first_child(), b.next_sibling())
-        };
-        Self::layout_flex_alignment(&first);
-        Self::layout_flex_alignment(&next);
-    }
-
     fn apply_transforms(node: &Option<Rc<RefCell<LayoutObject>>>) {
         if let Some(n) = node {
             let op = n.borrow().style().transform_op();
@@ -1497,8 +1390,9 @@ impl LayoutView {
             };
             for c in &children {
                 let kind = c.borrow().kind();
-                let is_inline =
-                    matches!(kind, LayoutObjectKind::Inline | LayoutObjectKind::Text);
+                // The inline formatting context already aligned what it placed.
+                let is_inline = matches!(kind, LayoutObjectKind::Inline | LayoutObjectKind::Text)
+                    && c.borrow().inline_offset.is_none();
                 let zero = {
                     let b = c.borrow();
                     b.size().width() == 0 && b.size().height() == 0
@@ -4162,7 +4056,7 @@ mod tests {
         let d = c.borrow().next_sibling().expect("d");
         assert_eq!(a.borrow().size().width(), 200, "fixed 200px track");
         assert_eq!(b.borrow().size().width(), 253, "1fr of remaining 760");
-        assert_eq!(c.borrow().size().width(), 506, "2fr of remaining 760");
+        assert_eq!(c.borrow().size().width(), 507, "2fr of remaining 760, rounding up");
         let (ax, ay) = (a.borrow().point().x(), a.borrow().point().y());
         let (bx, _) = (b.borrow().point().x(), b.borrow().point().y());
         let (cx, _) = (c.borrow().point().x(), c.borrow().point().y());
@@ -5234,5 +5128,449 @@ mod tests {
         // page is in wix_page.html for manual verification.
         let html = include_str!("../../../testdata/wix_page_small.html").to_string();
         let _view = create_layout_view(html, 1024);
+    }
+
+    /// `(background, x, y, width, height)` of each box painted with a background,
+    /// by the color it was given, in paint order.
+    fn colored_boxes(html: &str, viewport_width: i64) -> Vec<(String, i64, i64, i64, i64)> {
+        create_layout_view(html.to_string(), viewport_width)
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    layout_size,
+                    ..
+                } => {
+                    let background = style.background_color();
+                    let color = background.code();
+                    (color != "#000000" && color != "transparent" && color != "#ffffff").then(
+                        || {
+                            (
+                                color.to_string(),
+                                layout_point.x(),
+                                layout_point.y(),
+                                layout_size.width(),
+                                layout_size.height(),
+                            )
+                        },
+                    )
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn box_with(boxes: &[(String, i64, i64, i64, i64)], color: &str) -> (i64, i64, i64, i64) {
+        let found = boxes
+            .iter()
+            .find(|b| b.0 == color)
+            .unwrap_or_else(|| panic!("no {color} box in {boxes:?}"));
+        (found.1, found.2, found.3, found.4)
+    }
+
+    #[test]
+    fn sibling_margins_collapse_to_the_larger() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{height:10px}</style></head><body>
+            <div style="background:#ff0000;margin-bottom:20px"></div>
+            <div style="background:#00ff00;margin-top:30px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").1, 0);
+        assert_eq!(box_with(&boxes, "#00ff00").1, 40, "10 tall + max(20, 30)");
+    }
+
+    #[test]
+    fn negative_margins_subtract_when_collapsing() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{height:10px}</style></head><body>
+            <div style="background:#ff0000;margin-bottom:20px"></div>
+            <div style="background:#00ff00;margin-top:-5px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").1, 25, "10 tall + 20 - 5");
+    }
+
+    #[test]
+    fn a_first_childs_margin_escapes_its_parent() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="height:10px"></div>
+            <div style="background:#ff0000"><div style="background:#00ff00;margin:20px 0;height:10px"></div></div>
+            <div style="background:#0000ff;height:10px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(
+            box_with(&boxes, "#ff0000"),
+            (0, 30, 400, 10),
+            "the parent starts at its child: the margin is outside both"
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").1, 30);
+        assert_eq!(box_with(&boxes, "#0000ff").1, 60, "bottom margin escapes too");
+    }
+
+    #[test]
+    fn padding_keeps_a_childs_margin_inside() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="background:#ff0000;padding:1px 0"><div style="background:#00ff00;margin:20px 0;height:10px"></div></div>
+            </body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (0, 0, 400, 52));
+        assert_eq!(box_with(&boxes, "#00ff00").1, 21);
+    }
+
+    #[test]
+    fn margins_collapse_through_an_empty_block() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="background:#ff0000;height:10px;margin-bottom:5px"></div>
+            <div style="margin:15px 0"></div>
+            <div style="background:#00ff00;height:10px;margin-top:8px"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").1, 25, "10 tall + max(5, 15, 15, 8)");
+    }
+
+    #[test]
+    fn positioned_and_floated_children_do_not_grow_their_parent() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="background:#ff0000">
+              <div style="position:absolute;width:10px;height:100px"></div>
+              <div style="float:left;width:10px;height:100px"></div>
+              <div style="height:5px"></div>
+            </div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").3, 5);
+    }
+
+    #[test]
+    fn text_beside_a_block_gets_an_anonymous_block_of_its_own() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>before <b>bold</b><div id=x style="height:30px"></div>after</div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let y_of = |wanted: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text {
+                        text, layout_point, ..
+                    } if text.trim() == wanted => Some(layout_point.y()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?}"))
+        };
+        let line = y_of("before");
+        assert_eq!(y_of("bold"), line, "the run stays on one line");
+        assert!(
+            y_of("after") >= line + 30,
+            "text after the block goes below it"
+        );
+    }
+
+    #[test]
+    fn br_breaks_a_line_inside_flowing_text() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <p style="margin:0">one <i>two</i><br>three<br><br>four</p></body></html>"#
+                .to_string(),
+            400,
+        );
+        let ys: Vec<(String, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text {
+                    text, layout_point, ..
+                } => Some((text.trim().to_string(), layout_point.y())),
+                _ => None,
+            })
+            .collect();
+        let y = |w: &str| ys.iter().find(|(t, _)| t == w).unwrap_or_else(|| panic!("{ys:?}")).1;
+        assert_eq!(y("one"), y("two"));
+        let line = y("three") - y("one");
+        assert!(line > 0);
+        assert_eq!(y("four") - y("three"), 2 * line, "<br><br> leaves a blank line");
+    }
+
+    #[test]
+    fn inline_block_lays_out_blocks_inside_and_sits_on_the_line() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>x<span style="display:inline-block;background:#ff0000;padding:2px;margin-left:4px"><div style="background:#00ff00;width:50px;height:10px"></div><div style="background:#0000ff;width:30px;height:20px"></div></span>y</div></body></html>"#,
+            400,
+        );
+        let outer = box_with(&boxes, "#ff0000");
+        assert_eq!((outer.2, outer.3), (54, 34), "shrink-wrapped to the widest child");
+        let first = box_with(&boxes, "#00ff00");
+        assert_eq!((first.0, first.1), (outer.0 + 2, outer.1 + 2));
+        assert_eq!(box_with(&boxes, "#0000ff").1, first.1 + 10, "stacked inside");
+        assert!(outer.0 >= 4, "its margin takes up room on the line");
+    }
+
+    #[test]
+    fn inline_padding_takes_room_on_the_line_and_outlines_the_text() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>a<span style="background:#ff0000;padding:0 10px">b</span>c</div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let x_of = |wanted: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text {
+                        text, layout_point, ..
+                    } if text == wanted => Some(layout_point.x()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?}"))
+        };
+        let (a, b, c) = (x_of("a"), x_of("b"), x_of("c"));
+        let span = items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    layout_size,
+                    ..
+                } if style.background_color().code() == "#ff0000" => {
+                    Some((layout_point.x(), layout_size.width()))
+                }
+                _ => None,
+            })
+            .expect("span box");
+        assert_eq!(b - span.0, 10, "the text starts inside the padding");
+        assert!(b - a > 10, "padding pushes the run along");
+        assert_eq!(c - (span.0 + span.1), 0, "the next run follows the padding");
+    }
+
+    #[test]
+    fn a_background_on_wrapped_inline_text_follows_each_line() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div style="width:120px">aaaaaa <span style="background:#ff0000">bbbbbb cccccc</span></div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let rects: Vec<(i64, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    ..
+                } if style.background_color().code() == "#ff0000" => {
+                    Some((layout_point.x(), layout_point.y()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rects.len(), 2, "one box per line: {rects:?}");
+        assert!(rects[0].1 < rects[1].1);
+    }
+
+    #[test]
+    fn flex_wrap_starts_a_new_line_when_a_row_runs_out_of_room() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.f{display:flex;flex-wrap:wrap;width:100px;gap:4px}.f div{width:40px;height:10px}</style></head><body>
+            <div class=f><div style="background:#ff0000"></div><div style="background:#00ff00"></div><div style="background:#0000ff"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (0, 0, 40, 10));
+        assert_eq!(box_with(&boxes, "#00ff00"), (44, 0, 40, 10));
+        assert_eq!(box_with(&boxes, "#0000ff"), (0, 14, 40, 10));
+    }
+
+    #[test]
+    fn flex_auto_margin_takes_the_free_space() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.f{display:flex;width:200px}.f div{width:40px;height:10px}</style></head><body>
+            <div class=f><div style="background:#ff0000"></div><div style="background:#00ff00;margin-left:auto"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").0, 160);
+    }
+
+    #[test]
+    fn flex_order_and_reverse_rearrange_items() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.f{display:flex;width:200px}.f div{width:40px;height:10px}</style></head><body>
+            <div class=f><div style="background:#ff0000;order:2"></div><div style="background:#00ff00;order:1"></div></div>
+            <div class=f style="flex-direction:row-reverse"><div style="background:#0000ff"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00").0, 0);
+        assert_eq!(box_with(&boxes, "#ff0000").0, 40);
+        assert_eq!(box_with(&boxes, "#0000ff").0, 160);
+    }
+
+    #[test]
+    fn flex_grow_respects_max_width_and_gives_the_rest_to_others() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.f{display:flex;width:300px}.f div{flex:1;height:10px}</style></head><body>
+            <div class=f><div style="background:#ff0000;max-width:50px"></div><div style="background:#00ff00"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").2, 50);
+        assert_eq!(box_with(&boxes, "#00ff00"), (50, 0, 250, 10));
+    }
+
+    #[test]
+    fn column_flex_grows_an_item_to_fill_a_set_height() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="display:flex;flex-direction:column;height:100px">
+              <div style="background:#ff0000;height:10px"></div>
+              <div style="background:#00ff00;flex:1"></div>
+              <div style="background:#0000ff;height:20px"></div>
+            </div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#00ff00"), (0, 10, 400, 70));
+        assert_eq!(box_with(&boxes, "#0000ff").1, 80);
+    }
+
+    #[test]
+    fn a_stretched_flex_container_centers_within_its_stretched_height() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="display:flex;height:100px">
+              <div style="display:flex;align-items:center;width:100px"><div style="background:#ff0000;width:10px;height:10px"></div></div>
+            </div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").1, 45);
+    }
+
+    #[test]
+    fn inline_flex_sits_on_the_line_and_shrinks_to_its_items() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body>
+            <div>x<span style="display:inline-flex;gap:2px;background:#ff0000"><i style="width:10px;height:10px;background:#00ff00"></i><i style="width:10px;height:10px;background:#0000ff"></i></span>y</div></body></html>"#,
+            400,
+        );
+        let outer = box_with(&boxes, "#ff0000");
+        assert_eq!((outer.2, outer.3), (22, 10));
+        assert!(outer.0 > 0, "follows the text on the same line");
+        assert_eq!(box_with(&boxes, "#0000ff").0, outer.0 + 12);
+    }
+
+    #[test]
+    fn text_directly_in_a_flex_container_becomes_an_item() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0}</style></head><body>
+            <div style="display:flex;width:300px;justify-content:space-between">left<span>right</span></div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let x_of = |wanted: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text {
+                        text, layout_point, ..
+                    } if text == wanted => Some(layout_point.x()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?}"))
+        };
+        assert_eq!(x_of("left"), 0);
+        assert!(x_of("right") > 200);
+    }
+
+    #[test]
+    fn grid_lines_and_spans_place_items_explicitly() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;width:300px;grid-template-columns:repeat(3,1fr);grid-template-rows:20px 20px;gap:0}</style></head><body>
+            <div class=g>
+              <div style="background:#ff0000;grid-column:2/4;grid-row:1/3"></div>
+              <div style="background:#00ff00"></div>
+              <div style="background:#0000ff"></div>
+            </div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (100, 0, 200, 40));
+        assert_eq!(box_with(&boxes, "#00ff00"), (0, 0, 100, 20), "flows into what's free");
+        assert_eq!(box_with(&boxes, "#0000ff"), (0, 20, 100, 20));
+    }
+
+    #[test]
+    fn grid_negative_line_reaches_the_end_of_the_explicit_grid() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;width:300px;grid-template-columns:repeat(3,1fr)}</style></head><body>
+            <div class=g><div style="background:#ff0000;grid-column:1/-1;height:10px"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (0, 0, 300, 10));
+    }
+
+    #[test]
+    fn grid_auto_fill_repeats_tracks_as_room_allows() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;width:320px;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:10px}.g div{height:10px}</style></head><body>
+            <div class=g><div style="background:#ff0000"></div><div style="background:#00ff00"></div><div style="background:#0000ff"></div><div style="background:#ffff00"></div></div></body></html>"#,
+            400,
+        );
+        let first = box_with(&boxes, "#ff0000");
+        assert_eq!(first.2, 100, "three 100px tracks fit, sharing the spare room");
+        assert_eq!(box_with(&boxes, "#0000ff").0, 220);
+        assert_eq!(box_with(&boxes, "#ffff00"), (0, 20, 100, 10), "fourth wraps");
+    }
+
+    #[test]
+    fn grid_auto_fit_collapses_empty_tracks() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;width:300px;grid-template-columns:repeat(auto-fit,minmax(50px,1fr))}.g div{height:10px}</style></head><body>
+            <div class=g><div style="background:#ff0000"></div><div style="background:#00ff00"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").2, 150, "two items share all of it");
+    }
+
+    #[test]
+    fn grid_auto_track_fits_its_content_and_fr_takes_the_rest() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;width:300px;grid-template-columns:auto 1fr}</style></head><body>
+            <div class=g><div style="background:#ff0000"><div style="width:60px;height:10px"></div></div><div style="background:#00ff00;height:10px"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").2, 60);
+        assert_eq!(box_with(&boxes, "#00ff00"), (60, 0, 240, 10));
+    }
+
+    #[test]
+    fn grid_items_center_within_their_area() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;width:100px;height:100px;place-items:center}</style></head><body>
+            <div class=g><div style="background:#ff0000;width:20px;height:20px"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (40, 40, 20, 20));
+    }
+
+    #[test]
+    fn grid_row_gap_and_template_rows_size_explicit_rows() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}.g{display:grid;grid-template-rows:30px 1fr;height:100px;row-gap:10px}</style></head><body>
+            <div class=g><div style="background:#ff0000"></div><div style="background:#00ff00"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000"), (0, 0, 400, 30));
+        assert_eq!(box_with(&boxes, "#00ff00"), (0, 40, 400, 60));
     }
 }

@@ -115,23 +115,34 @@ impl LayoutObject {
                 if let NodeKind::Element(_) = self.node_kind() {
                     let mut items = Vec::new();
                     if self.size.width() > 0 && self.size.height() > 0 {
-                        let anchor_id = self.element_attribute("id");
-                        items.push(DisplayItem::Rect {
-                            style: self.style(),
-                            layout_point: self.point(),
-                            layout_size: self.size(),
-                            paint_order: PaintOrder {
-                                stacking_context: self.stacking_context_level(),
-                                z_index: self.style.z_index_or_default(),
-                            },
-                            clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
-                                x: x as i64,
-                                y: y as i64,
-                                width: w as i64,
-                                height: h as i64,
-                            }),
-                            anchor_id,
-                        });
+                        let mut anchor_id = self.element_attribute("id");
+                        let whole = [(0, 0, self.size().width(), self.size().height())];
+                        let boxes: &[(i64, i64, i64, i64)] = if self.inline_line_boxes.is_empty() {
+                            &whole
+                        } else {
+                            &self.inline_line_boxes
+                        };
+                        for (dx, dy, width, height) in boxes.iter().copied() {
+                            items.push(DisplayItem::Rect {
+                                style: self.style(),
+                                layout_point: LayoutPoint::new(
+                                    self.point().x() + dx,
+                                    self.point().y() + dy,
+                                ),
+                                layout_size: LayoutSize::new(width, height),
+                                paint_order: PaintOrder {
+                                    stacking_context: self.stacking_context_level(),
+                                    z_index: self.style.z_index_or_default(),
+                                },
+                                clip_rect: self.style.final_clip().map(|(x, y, w, h)| ClipRect {
+                                    x: x as i64,
+                                    y: y as i64,
+                                    width: w as i64,
+                                    height: h as i64,
+                                }),
+                                anchor_id: anchor_id.take(),
+                            });
+                        }
                     }
 
                     if self.element_kind() == Some(ElementKind::Img) {

@@ -130,7 +130,92 @@ impl LayoutObject {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         let display_type =
                             DisplayType::from_str(value).unwrap_or(DisplayType::Block);
-                        self.style.set_display(display_type)
+                        self.style.set_display(display_type);
+                        self.style
+                            .set_inline_outer(matches!(value.as_str(), "inline-flex" | "inline-grid"));
+                    }
+                }
+                "flex-wrap" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        if let Some(wrap) = parse_flex_wrap(value) {
+                            self.style.set_flex_wrap(wrap);
+                        }
+                    }
+                }
+                // flex-flow: <flex-direction> || <flex-wrap>
+                "flex-flow" => {
+                    for value in &declaration.value {
+                        if let ComponentValue::Ident(value) = value {
+                            if let Some(wrap) = parse_flex_wrap(value) {
+                                self.style.set_flex_wrap(wrap);
+                            } else {
+                                self.style.set_flex_direction(FlexDirection::from_str(value));
+                                self.style.set_flex_reverse(value.ends_with("-reverse"));
+                            }
+                        }
+                    }
+                }
+                "order" => {
+                    if let Some(ComponentValue::Number(v)) = first_value {
+                        self.style.set_order(*v as i32);
+                    }
+                }
+                "align-content" => {
+                    if let Some(ComponentValue::Ident(v)) = first_value {
+                        if let Some(value) = parse_align_content(v) {
+                            self.style.set_align_content(value);
+                        }
+                    }
+                }
+                "justify-items" | "justify-self" => {
+                    if let Some(ComponentValue::Ident(v)) = first_value {
+                        if let Some(value) = parse_align_keyword(v) {
+                            if declaration.property == "justify-items" {
+                                self.style.set_justify_items(value);
+                            } else {
+                                self.style.set_justify_self(value);
+                            }
+                        }
+                    }
+                }
+                // place-*: <align> [<justify>]
+                "place-items" | "place-self" | "place-content" => {
+                    let idents: Vec<&String> = declaration
+                        .value
+                        .iter()
+                        .filter_map(|v| match v {
+                            ComponentValue::Ident(i) => Some(i),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(align) = idents.first() {
+                        let justify = idents.get(1).unwrap_or(align);
+                        match declaration.property.as_str() {
+                            "place-items" => {
+                                if let Some(v) = parse_align_keyword(align) {
+                                    self.style.set_align_items(v);
+                                }
+                                if let Some(v) = parse_align_keyword(justify) {
+                                    self.style.set_justify_items(v);
+                                }
+                            }
+                            "place-self" => {
+                                if let Some(v) = parse_align_keyword(align) {
+                                    self.style.set_align_self(v);
+                                }
+                                if let Some(v) = parse_align_keyword(justify) {
+                                    self.style.set_justify_self(v);
+                                }
+                            }
+                            _ => {
+                                if let Some(v) = parse_align_content(align) {
+                                    self.style.set_align_content(v);
+                                }
+                                if let Some(v) = parse_justify_content(justify) {
+                                    self.style.set_justify_content(v);
+                                }
+                            }
+                        }
                     }
                 }
                 "flex-grow" => {
@@ -149,13 +234,22 @@ impl LayoutObject {
                     }
                     Some(ComponentValue::Number(v)) if *v == 0.0 => {
                         self.style.set_flex_basis(Some(0.0));
+                        self.style.set_flex_basis_ratio(None);
                     }
-                    Some(ComponentValue::Dimension(v, unit)) if unit != "%" => {
+                    Some(ComponentValue::Dimension(v, unit)) if unit == "%" => {
+                        self.style.set_flex_basis_ratio(Some(*v / 100.0));
+                    }
+                    Some(ComponentValue::Dimension(v, unit)) => {
                         if let Some(px) =
                             length_to_px(*v, unit, self.style.font_size_or_default())
                         {
                             self.style.set_flex_basis(Some(px));
+                            self.style.set_flex_basis_ratio(None);
                         }
+                    }
+                    Some(ComponentValue::Ident(_)) => {
+                        self.style.set_flex_basis(None);
+                        self.style.set_flex_basis_ratio(None);
                     }
                     _ => {}
                 },
@@ -196,39 +290,36 @@ impl LayoutObject {
                                 _ => None,
                             }) {
                                 self.style.set_flex_basis(Some(px));
+                                self.style.set_flex_basis_ratio(None);
+                            }
+                            if let Some(ratio) = non_ws.iter().find_map(|v| match v {
+                                ComponentValue::Dimension(n, unit) if unit == "%" => {
+                                    Some(*n / 100.0)
+                                }
+                                _ => None,
+                            }) {
+                                self.style.set_flex_basis_ratio(Some(ratio));
+                            }
+                            // `flex: 1 auto`: grow from the content's own size.
+                            if non_ws
+                                .iter()
+                                .any(|v| matches!(v, ComponentValue::Ident(i) if i == "auto"))
+                            {
+                                self.style.set_flex_basis(None);
                             }
                         }
                     }
                 }
                 "justify-content" => {
                     if let Some(ComponentValue::Ident(v)) = first_value {
-                        let jc = match v.as_str() {
-                            "flex-start" | "start" | "left" | "normal" => {
-                                Some(JustifyContent::FlexStart)
-                            }
-                            "flex-end" | "end" | "right" => Some(JustifyContent::FlexEnd),
-                            "center" => Some(JustifyContent::Center),
-                            "space-between" => Some(JustifyContent::SpaceBetween),
-                            "space-around" => Some(JustifyContent::SpaceAround),
-                            "space-evenly" => Some(JustifyContent::SpaceEvenly),
-                            _ => None,
-                        };
-                        if let Some(jc) = jc {
+                        if let Some(jc) = parse_justify_content(v) {
                             self.style.set_justify_content(jc);
                         }
                     }
                 }
                 "align-items" | "align-self" => {
                     if let Some(ComponentValue::Ident(v)) = first_value {
-                        let ai = match v.as_str() {
-                            "stretch" | "normal" => Some(AlignItems::Stretch),
-                            "flex-start" | "start" | "self-start" => Some(AlignItems::FlexStart),
-                            "center" => Some(AlignItems::Center),
-                            "flex-end" | "end" | "self-end" => Some(AlignItems::FlexEnd),
-                            "baseline" => Some(AlignItems::Baseline),
-                            _ => None,
-                        };
-                        if let Some(ai) = ai {
+                        if let Some(ai) = parse_align_keyword(v) {
                             if declaration.property == "align-items" {
                                 self.style.set_align_items(ai);
                             } else {
@@ -240,6 +331,7 @@ impl LayoutObject {
                 "flex-direction" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
                         self.style.set_flex_direction(FlexDirection::from_str(value));
+                        self.style.set_flex_reverse(value.ends_with("-reverse"));
                     }
                 }
                 "grid-template-areas" => {
@@ -260,17 +352,95 @@ impl LayoutObject {
                         self.style.set_grid_template_areas(rows);
                     }
                 }
-                // grid-area: <name> (line-number forms are not supported yet).
+                // grid-area: <name> | <row-start> / <column-start> / <row-end> / <column-end>
                 "grid-area" => {
-                    if let Some(ComponentValue::Ident(name)) = first_value {
-                        self.style.set_grid_area_name(name.clone());
+                    let parts = split_on_slash(&declaration.value);
+                    if parts.len() == 1 {
+                        match parts[0].as_slice() {
+                            [ComponentValue::Ident(name)] if name != "auto" => {
+                                self.style.set_grid_area_name(name.clone());
+                            }
+                            _ => {
+                                let line = parse_grid_line(&parts[0]);
+                                self.style.set_grid_row_start(line.clone());
+                                self.style.set_grid_column_start(line);
+                            }
+                        }
+                    } else {
+                        let line = |i: usize| {
+                            parts.get(i).map(|p| parse_grid_line(p)).unwrap_or_default()
+                        };
+                        self.style.set_grid_row_start(line(0));
+                        self.style.set_grid_column_start(line(1));
+                        self.style.set_grid_row_end(line(2));
+                        self.style.set_grid_column_end(line(3));
                     }
                 }
+                "grid-column" => self.style.set_grid_column(parse_grid_placement(&declaration.value)),
+                "grid-row" => self.style.set_grid_row(parse_grid_placement(&declaration.value)),
+                "grid-column-start" => {
+                    self.style.set_grid_column_start(parse_grid_line(&declaration.value))
+                }
+                "grid-column-end" => {
+                    self.style.set_grid_column_end(parse_grid_line(&declaration.value))
+                }
+                "grid-row-start" => {
+                    self.style.set_grid_row_start(parse_grid_line(&declaration.value))
+                }
+                "grid-row-end" => {
+                    self.style.set_grid_row_end(parse_grid_line(&declaration.value))
+                }
                 "grid-template-columns" => {
-                    let (tracks, lines) =
-                        parse_grid_template_tracks_with_lines(&declaration.value);
-                    self.style.set_grid_template_columns(tracks);
-                    self.style.set_grid_column_line_names(lines);
+                    self.style
+                        .set_grid_columns_template(parse_grid_template(&declaration.value));
+                }
+                "grid-template-rows" => {
+                    self.style
+                        .set_grid_rows_template(parse_grid_template(&declaration.value));
+                }
+                "grid-auto-columns" => {
+                    self.style
+                        .set_grid_auto_columns(parse_grid_template(&declaration.value).tracks);
+                }
+                "grid-auto-rows" => {
+                    self.style
+                        .set_grid_auto_rows(parse_grid_template(&declaration.value).tracks);
+                }
+                "grid-auto-flow" => {
+                    self.style.set_grid_auto_flow_column(declaration.value.iter().any(
+                        |v| matches!(v, ComponentValue::Ident(i) if i == "column"),
+                    ));
+                }
+                // grid-template: <columns> alone isn't valid; handled forms are
+                // `<rows> / <columns>` and `"areas" <row>? ... / <columns>`.
+                "grid-template" => {
+                    let parts = split_on_slash(&declaration.value);
+                    let rows_part = parts.first().cloned().unwrap_or_default();
+                    let areas: Vec<Vec<String>> = rows_part
+                        .iter()
+                        .filter_map(|v| match v {
+                            ComponentValue::StringToken(s) => Some(
+                                s.split_ascii_whitespace()
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>(),
+                            ),
+                            _ => None,
+                        })
+                        .filter(|r| !r.is_empty())
+                        .collect();
+                    if !areas.is_empty() {
+                        self.style.set_grid_template_areas(areas);
+                    }
+                    let without_strings: Vec<ComponentValue> = rows_part
+                        .iter()
+                        .filter(|v| !matches!(v, ComponentValue::StringToken(_)))
+                        .cloned()
+                        .collect();
+                    self.style
+                        .set_grid_rows_template(parse_grid_template(&without_strings));
+                    if let Some(columns) = parts.get(1) {
+                        self.style.set_grid_columns_template(parse_grid_template(columns));
+                    }
                 }
                 // gap shorthand: one value = both axes, two = row then column.
                 // https://www.w3.org/TR/css-align-3/#gap-shorthand
@@ -451,12 +621,16 @@ impl LayoutObject {
                         first_value,
                         Some(ComponentValue::Ident(v)) if v == "auto"
                     );
-                    if is_margin && auto {
-                        if declaration.property.ends_with("left") {
-                            self.style.set_margin_left_auto(true);
-                        } else if declaration.property.ends_with("right") {
-                            self.style.set_margin_right_auto(true);
+                    if is_margin {
+                        match declaration.property.as_str() {
+                            p if p.ends_with("left") => self.style.set_margin_left_auto(auto),
+                            p if p.ends_with("right") => self.style.set_margin_right_auto(auto),
+                            p if p.ends_with("top") => self.style.set_margin_top_auto(auto),
+                            _ => self.style.set_margin_bottom_auto(auto),
                         }
+                    }
+                    if is_margin && auto {
+                        // The auto flags above carry it.
                     } else if let Some(px) =
                         first_value.and_then(|v| spacing_component_to_px(v, base))
                     {
@@ -501,9 +675,12 @@ impl LayoutObject {
                             ),
                         );
                     }
-                    let (left_auto, right_auto) = parse_margin_auto_flags(&declaration.value);
-                    self.style.set_margin_left_auto(left_auto);
+                    let (top_auto, right_auto, bottom_auto, left_auto) =
+                        parse_margin_auto_flags(&declaration.value);
+                    self.style.set_margin_top_auto(top_auto);
                     self.style.set_margin_right_auto(right_auto);
+                    self.style.set_margin_bottom_auto(bottom_auto);
+                    self.style.set_margin_left_auto(left_auto);
                 }
                 "padding" => {
                     let base_font_size = self.style.font_size_or_default();

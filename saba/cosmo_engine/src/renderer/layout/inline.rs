@@ -58,6 +58,11 @@ pub enum InlineItem {
         /// Distance from the box's top to its baseline.
         baseline: i64,
     },
+    /// A `<br>`: ends the line, and gives an otherwise empty one its height.
+    ForcedBreak { line_height: i64 },
+    /// The margin, border and padding at the edge of an inline element. It
+    /// takes up room on the line but adds nothing to the line's height.
+    Spacer { width: i64 },
 }
 
 impl InlineItem {
@@ -71,6 +76,8 @@ impl InlineItem {
         match self {
             Self::Text(run) => run.line_height,
             Self::Atomic { height, .. } => *height,
+            Self::ForcedBreak { line_height } => *line_height,
+            Self::Spacer { .. } => 0,
         }
     }
 
@@ -84,6 +91,7 @@ impl InlineItem {
         match self {
             Self::Text(run) => run.font_size.px(),
             Self::Atomic { baseline, .. } => *baseline,
+            Self::ForcedBreak { .. } | Self::Spacer { .. } => 0,
         }
     }
 }
@@ -205,6 +213,27 @@ pub fn layout_inline_items_aligned(
 
     for (index, item) in items.iter().enumerate() {
         match item {
+            InlineItem::ForcedBreak { line_height } => {
+                current.height = current.height.max(*line_height);
+                lines.push(current.close());
+                let y = next_y(&lines);
+                current = OpenLine::new(y, band_left(floats, content_width, y, *line_height));
+            }
+            InlineItem::Spacer { width } => {
+                current.push(
+                    Fragment {
+                        item: index,
+                        trailing_space_width: 0,
+                        text: None,
+                        x: current.x,
+                        y: current.y,
+                        width: *width,
+                        height: 0,
+                    },
+                    item,
+                );
+            }
+            InlineItem::Text(run) if run.text.is_empty() => {}
             InlineItem::Atomic { width, height, .. } => {
                 let band = band_for(floats, content_width, current.y, (*height).max(probe_height));
                 if options.wrap && current.needs_break(*width, band.right) {
@@ -415,17 +444,23 @@ fn collapse_across_items(items: &[InlineItem]) -> Vec<InlineItem> {
                 if previous_ended_with_space {
                     text = text.trim_start_matches(is_break_space);
                 }
-                if text.is_empty() {
-                    // Nothing left: the run was pure white space already
-                    // represented by the preceding one.
-                    continue;
+                // A run left empty (pure white space already represented by
+                // the preceding one) stays in the list: fragments refer to
+                // items by index, so dropping it would hand every later
+                // fragment to the wrong box.
+                if !text.is_empty() {
+                    previous_ended_with_space = text.ends_with(is_break_space);
                 }
-                previous_ended_with_space = text.ends_with(is_break_space);
                 out.push(InlineItem::Text(TextRun {
                     text: text.to_string(),
                     ..run.clone()
                 }));
             }
+            InlineItem::ForcedBreak { .. } => {
+                previous_ended_with_space = true;
+                out.push(item.clone());
+            }
+            InlineItem::Spacer { .. } => out.push(item.clone()),
             atomic => {
                 previous_ended_with_space = false;
                 out.push(atomic.clone());
@@ -498,8 +533,9 @@ fn break_text<'a>(
 ) -> (&'a str, &'a str) {
     // Walk once, recording each opportunity together with the width of the
     // content up to it excluding any trailing spaces.
-    let mut width = 0i64;
-    let mut width_without_trailing_space = 0i64;
+    let available = available as f64;
+    let mut width = 0f64;
+    let mut width_without_trailing_space = 0f64;
     let mut best: Option<usize> = None;
     let mut next_break = breaks.partition_point(|b| *b <= base);
 

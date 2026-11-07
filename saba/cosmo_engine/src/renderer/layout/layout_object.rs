@@ -19,16 +19,17 @@ use crate::renderer::layout::computed_style::ComputedStyle;
 use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::EdgeSize;
 use crate::renderer::layout::computed_style::FlexDirection;
+use crate::renderer::layout::computed_style::FlexWrap;
 use crate::renderer::layout::computed_style::Clear;
 use crate::renderer::layout::computed_style::Float;
 use crate::renderer::layout::computed_style::FontSize;
-use crate::renderer::layout::computed_style::GridTrack;
 use crate::renderer::layout::computed_style::PositionType;
 use crate::renderer::layout::computed_style::TextAlign;
 use crate::renderer::layout::floats::{FloatContext, FloatSide};
 use crate::renderer::layout::inline::{
     layout_inline_items_aligned, InlineItem, LineAlign, LineOptions, TextRun,
 };
+use std::collections::HashMap;
 use std::format;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -40,11 +41,9 @@ use std::cell::RefCell;
 use crate::renderer::style::selector::dom_node_selected;
 use crate::renderer::style::values::{
     parse_dimension_attr, parse_dimension_pct_attr,
-    resolve_grid_tracks,
 };
 use crate::renderer::text::legacy_metrics::{
-    painted_advance,
-    bold_width_adjust, char_width_px,
+    bold_width_adjust, char_advance, char_width_px,
     is_wide_char, measure_text_width, split_text,
     styled_line_height,
 };
@@ -199,6 +198,7 @@ pub fn create_layout_object(
         if layout_object.borrow().style().display() == DisplayType::DisplayNone {
             return None;
         }
+        layout_object.borrow_mut().blockify_if_needed(parent_obj);
 
         layout_object.borrow_mut().update_kind();
         return Some(layout_object);
@@ -407,6 +407,46 @@ impl BoxModelMetrics {
     }
 }
 
+/// A set of margins that collapse together. The result is the largest positive
+/// margin plus the most negative one.
+/// Spec: CSS 2.2 §8.3.1. https://www.w3.org/TR/CSS22/box.html#collapsing-margins
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AdjoiningMargins {
+    positive: i64,
+    negative: i64,
+}
+
+impl AdjoiningMargins {
+    fn of(margin: i64) -> Self {
+        Self {
+            positive: margin.max(0),
+            negative: margin.min(0),
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            positive: self.positive.max(other.positive),
+            negative: self.negative.min(other.negative),
+        }
+    }
+
+    fn used(self) -> i64 {
+        self.positive + self.negative
+    }
+}
+
+/// The result of stacking a box's block-level children.
+pub(crate) struct BlockFlow {
+    /// Height of the stacked content.
+    height: i64,
+    top: AdjoiningMargins,
+    bottom: AdjoiningMargins,
+    collapses_through: bool,
+    /// Each child's offset from the parent's content box.
+    offsets: Vec<(Rc<RefCell<LayoutObject>>, i64)>,
+}
+
 /// A position a text caret can occupy, in document coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaretStop {
@@ -447,7 +487,7 @@ fn caret_stops(
     };
 
     for (text, x, y) in fragments {
-        let mut pen = *x;
+        let mut pen = *x as f64;
         let mut line_started = false;
         for painted in text.chars() {
             // A painted character the value does not have (`text-transform`,
@@ -458,13 +498,13 @@ fn caret_stops(
                 }
                 if !line_started {
                     line_started = true;
-                    at = (pen, *y);
+                    at = (pen.round() as i64, *y);
                 }
-                stops.push(CaretStop { x: pen, y: *y, height });
+                stops.push(CaretStop { x: pen.round() as i64, y: *y, height });
                 index += 1;
-                at.0 = pen + painted_advance(painted, font_size, bold);
+                at.0 = (pen + char_advance(painted, font_size, bold)).round() as i64;
             }
-            pen += painted_advance(painted, font_size, bold);
+            pen += char_advance(painted, font_size, bold);
         }
     }
     while index < chars.len() {
@@ -480,11 +520,12 @@ pub fn compute_box_model_metrics(style: &ComputedStyle) -> BoxModelMetrics {
     let border = style.border();
 
     BoxModelMetrics {
+        // Unlike padding and border, margins can be negative.
         margin: BoxEdges {
-            top: edge_to_i64(margin.top()),
-            right: edge_to_i64(margin.right()),
-            bottom: edge_to_i64(margin.bottom()),
-            left: edge_to_i64(margin.left()),
+            top: margin.top() as i64,
+            right: margin.right() as i64,
+            bottom: margin.bottom() as i64,
+            left: margin.left() as i64,
         },
         padding: BoxEdges {
             top: edge_to_i64(padding.top()),
@@ -539,6 +580,30 @@ pub struct LayoutObject {
     /// position it assigned last time, or each pass takes its own output as the
     /// input and the float can only ever drift downwards.
     pub(crate) flow_y: i64,
+    /// Offset of this box's top from its parent's content box in block flow,
+    /// margins collapsed. Worked out by the parent, because how a child's
+    /// margins collapse depends on the siblings around it.
+    pub(crate) flow_offset_y: Option<i64>,
+    /// Content width a flex or grid container decided on for this item.
+    pub(crate) assigned_width: Option<i64>,
+    /// Height a flex or grid container stretched this box to.
+    pub(crate) stretched_height: Option<i64>,
+    /// A flex container's items, by line.
+    pub(crate) flex_lines: Vec<Vec<Rc<RefCell<LayoutObject>>>>,
+    /// A grid container's placement and columns, kept for the row step.
+    pub(crate) grid_layout: Option<crate::renderer::layout::grid::GridLayout>,
+    /// The margins adjoining this box's top and bottom edges, which include
+    /// those of a first or last child they collapse with.
+    pub(crate) margin_top_set: AdjoiningMargins,
+    pub(crate) margin_bottom_set: AdjoiningMargins,
+    /// No height, padding or border: margins collapse straight through it.
+    pub(crate) collapses_through: bool,
+    /// Distance from this box's top to the baseline of its last line box.
+    pub(crate) last_line_baseline: Option<i64>,
+    /// An inline element's box on each line it spans, relative to its own
+    /// origin. Only filled when it spans more than one line: a single rect
+    /// around all of them would paint over the text beside it.
+    pub(crate) inline_line_boxes: Vec<(i64, i64, i64, i64)>,
     /// Flow-end cursor of a wrapped text run: width of the LAST line, the
     /// number of lines, and the line height used. A following inline sibling
     /// continues after the last line, not at the bounding box's top-right.
@@ -588,12 +653,431 @@ impl LayoutObject {
             inline_offset: None,
             float_context: None,
             flow_y: 0,
+            flow_offset_y: None,
+            assigned_width: None,
+            stretched_height: None,
+            flex_lines: Vec::new(),
+            grid_layout: None,
+            margin_top_set: AdjoiningMargins::default(),
+            margin_bottom_set: AdjoiningMargins::default(),
+            collapses_through: false,
+            last_line_baseline: None,
+            inline_line_boxes: Vec::new(),
             text_last_line_width: 0,
             text_line_count: 0,
             text_line_height: 0,
             column_min_hints: None,
             column_max_hints: None,
         }
+    }
+
+    /// An anonymous block box under `parent`, for a run of inline content that
+    /// has block-level siblings. It gets a stand-in node of its own: sharing the
+    /// parent's would make it count as a second `<li>`, `<td>` and so on. The
+    /// stand-in's DOM parent is the real element, so walks up the DOM still work.
+    /// Spec: CSS 2.2 §9.2.1.1. https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level
+    fn new_anonymous_block(parent: &Rc<RefCell<LayoutObject>>) -> Rc<RefCell<LayoutObject>> {
+        let node = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+            "div",
+            Vec::new(),
+        )))));
+        node.borrow_mut()
+            .set_parent(Rc::downgrade(&parent.borrow().node));
+        let object = Rc::new(RefCell::new(LayoutObject::new(
+            node.clone(),
+            &Some(parent.clone()),
+        )));
+        let parent_style = Some(parent.borrow().style());
+        object.borrow_mut().defaulting_style(&node, parent_style);
+        object.borrow_mut().update_kind();
+        object
+    }
+
+    /// Flex and grid items, floats and absolutely positioned boxes are block-level
+    /// whatever their `display` says. Text is left alone: a run of it gets an
+    /// anonymous box of its own later.
+    /// Spec: CSS 2.2 §9.7; CSS Flexbox §4; CSS Grid §6.
+    /// https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo
+    fn blockify_if_needed(&mut self, parent: &Option<Rc<RefCell<LayoutObject>>>) {
+        if !matches!(self.node_kind(), NodeKind::Element(_)) || self.is_replaced_box() {
+            return;
+        }
+        let mut container = parent.clone();
+        while let Some(p) = container.clone() {
+            if p.borrow().style.display() != DisplayType::Contents {
+                break;
+            }
+            container = p.borrow().parent.upgrade();
+        }
+        let in_flex_or_grid = container.is_some_and(|p| {
+            let p = p.borrow();
+            p.is_flex_container() || p.style.display() == DisplayType::Grid
+        });
+        if in_flex_or_grid || self.is_out_of_flow() {
+            if self.style.is_inline_outer() {
+                self.style.set_inline_outer(false);
+            } else if matches!(
+                self.style.display(),
+                DisplayType::Inline | DisplayType::InlineBlock
+            ) {
+                self.style.set_display(DisplayType::Block);
+            }
+        }
+    }
+
+    /// Give a block container uniform children: when it holds both block-level
+    /// and inline-level boxes, each run of inline ones moves into an anonymous
+    /// block, so every box lays out either blocks or line boxes and never a mix.
+    ///
+    /// Floats and absolutely positioned boxes stay with whichever run they are
+    /// in, so lines can flow around them. An inline element holding a block
+    /// child becomes a block itself, which is what splitting it around that
+    /// child comes to when, as is usual, it holds nothing else.
+    pub(crate) fn normalize_children(object: &Rc<RefCell<LayoutObject>>) {
+        let mut children = Vec::new();
+        let mut child = object.borrow().first_child();
+        while let Some(c) = child {
+            child = c.borrow().next_sibling();
+            children.push(c);
+        }
+        let places_items = {
+            let b = object.borrow();
+            b.is_flex_container() || b.style.display() == DisplayType::Grid
+        };
+        if places_items {
+            Self::wrap_text_runs(object, children);
+            return;
+        }
+        let holds_block = children.iter().any(|c| c.borrow().is_in_flow_block());
+        {
+            let mut b = object.borrow_mut();
+            if holds_block
+                && b.kind() == LayoutObjectKind::Inline
+                && b.style.display() == DisplayType::Inline
+            {
+                b.style.set_display(DisplayType::Block);
+                b.update_kind();
+            }
+        }
+        let b = object.borrow();
+        if !holds_block
+            || !b.is_block_container()
+            || !children.iter().any(|c| c.borrow().is_inline_level_content())
+        {
+            return;
+        }
+        drop(b);
+
+        let mut result: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+        let mut run: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+        let flush = |run: &mut Vec<Rc<RefCell<LayoutObject>>>,
+                     result: &mut Vec<Rc<RefCell<LayoutObject>>>| {
+            if run.iter().any(|c| c.borrow().is_inline_level_content()) {
+                let anonymous = Self::new_anonymous_block(object);
+                let mut next = None;
+                for c in run.drain(..).rev() {
+                    let mut borrowed = c.borrow_mut();
+                    borrowed.parent = Rc::downgrade(&anonymous);
+                    borrowed.next_sibling = next.take();
+                    drop(borrowed);
+                    next = Some(c);
+                }
+                anonymous.borrow_mut().first_child = next;
+                result.push(anonymous);
+            } else {
+                result.append(run);
+            }
+        };
+        for c in children {
+            if c.borrow().is_in_flow_block() {
+                flush(&mut run, &mut result);
+                result.push(c);
+            } else {
+                run.push(c);
+            }
+        }
+        flush(&mut run, &mut result);
+
+        let mut next = None;
+        for c in result.into_iter().rev() {
+            c.borrow_mut().next_sibling = next.take();
+            next = Some(c);
+        }
+        object.borrow_mut().first_child = next;
+    }
+
+    /// Each run of text directly inside a flex or grid container becomes one item.
+    fn wrap_text_runs(object: &Rc<RefCell<LayoutObject>>, children: Vec<Rc<RefCell<LayoutObject>>>) {
+        let mut result: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+        let mut run: Vec<Rc<RefCell<LayoutObject>>> = Vec::new();
+        let flush = |run: &mut Vec<Rc<RefCell<LayoutObject>>>,
+                     result: &mut Vec<Rc<RefCell<LayoutObject>>>| {
+            if run.iter().any(|c| !c.borrow().is_whitespace_text()) {
+                let anonymous = Self::new_anonymous_block(object);
+                let mut next = None;
+                for c in run.drain(..).rev() {
+                    let mut borrowed = c.borrow_mut();
+                    borrowed.parent = Rc::downgrade(&anonymous);
+                    borrowed.next_sibling = next.take();
+                    drop(borrowed);
+                    next = Some(c);
+                }
+                anonymous.borrow_mut().first_child = next;
+                result.push(anonymous);
+            } else {
+                result.append(run);
+            }
+        };
+        for c in children {
+            if c.borrow().kind() == LayoutObjectKind::Text {
+                run.push(c);
+            } else {
+                flush(&mut run, &mut result);
+                result.push(c);
+            }
+        }
+        flush(&mut run, &mut result);
+        let mut next = None;
+        for c in result.into_iter().rev() {
+            c.borrow_mut().next_sibling = next.take();
+            next = Some(c);
+        }
+        object.borrow_mut().first_child = next;
+    }
+
+    /// Whether this box's own contents follow block and inline flow, rather
+    /// than being table parts or flex and grid items.
+    fn is_block_container(&self) -> bool {
+        (self.kind() == LayoutObjectKind::Block || self.is_inline_block())
+            && !self.is_flex_container()
+            && self.style.display() != DisplayType::Grid
+            && self.style.display() != DisplayType::Contents
+            && !self.is_table()
+            && !self.is_table_row()
+            && !self.is_row_group()
+    }
+
+    fn is_out_of_flow(&self) -> bool {
+        self.style.float_or_default() != Float::None
+            || matches!(
+                self.style.position(),
+                PositionType::Absolute | PositionType::Fixed
+            )
+    }
+
+    fn is_in_flow_block(&self) -> bool {
+        self.kind().normal_flow_spec().stacks_vertically && !self.is_out_of_flow()
+    }
+
+    /// Inline-level content that makes a line box: anything inline except white
+    /// space and boxes taken out of flow.
+    fn is_inline_level_content(&self) -> bool {
+        !self.kind().normal_flow_spec().stacks_vertically
+            && !self.is_out_of_flow()
+            && !self.is_whitespace_text()
+    }
+
+    /// A `display: inline-block` box that lays out its own contents. Replaced
+    /// elements and form controls size themselves instead.
+    pub(crate) fn is_inline_block(&self) -> bool {
+        self.kind() == LayoutObjectKind::Inline
+            && (self.style.display() == DisplayType::InlineBlock || self.style.is_inline_outer())
+            && !matches!(
+                self.element_kind(),
+                Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
+            )
+    }
+
+    /// Stack this box's block-level children, collapsing margins. `None` when it
+    /// holds inline content (that takes line boxes), or children placed some
+    /// other way.
+    ///
+    /// Both the size pass and the position pass call this. Other passes change
+    /// heights in between (tables settle late), so the position pass has to
+    /// recompute from the final sizes rather than reuse what the size pass found.
+    pub(crate) fn block_flow(&self) -> Option<BlockFlow> {
+        if self.is_flex_container()
+            || self.style.display() == DisplayType::Grid
+            || self.is_table_row()
+        {
+            return None;
+        }
+        let metrics = compute_box_model_metrics(&self.style);
+        let mut own_top = AdjoiningMargins::of(metrics.margin.top);
+        let mut own_bottom = AdjoiningMargins::of(metrics.margin.bottom);
+        // Margins do not cross into a new formatting context, past padding or
+        // border, or (at the bottom) out of a box whose height is set.
+        // Table parts stack without collapsing: they take no margins.
+        let isolated = self.establishes_block_formatting_context()
+            || self.is_table()
+            || self.is_row_group()
+            || self.style.display() == DisplayType::Contents
+            || self
+                .parent
+                .upgrade()
+                .is_some_and(|p| {
+                    let p = p.borrow();
+                    p.is_flex_container() || p.style.display() == DisplayType::Grid
+                });
+        let top_adjoins =
+            !isolated && metrics.padding.top == 0 && metrics.border.top == 0;
+        let bottom_adjoins = !isolated
+            && metrics.padding.bottom == 0
+            && metrics.border.bottom == 0
+            && !self.style.has_author_height();
+
+        let mut offsets = Vec::new();
+        let mut cursor = 0i64;
+        let mut pending = AdjoiningMargins::default();
+        let mut placed_any = false;
+        let mut child = self.first_child();
+        while let Some(c) = child {
+            let b = c.borrow();
+            let next = b.next_sibling();
+            if b.is_out_of_flow() {
+                // Keeps a static position in the flow and takes up no room.
+                let at = if placed_any || !top_adjoins {
+                    cursor + pending.used()
+                } else {
+                    cursor
+                };
+                drop(b);
+                offsets.push((c, at));
+                child = next;
+                continue;
+            }
+            if b.is_whitespace_text() {
+                drop(b);
+                child = next;
+                continue;
+            }
+            if !b.kind().normal_flow_spec().stacks_vertically {
+                return None;
+            }
+            let c_metrics = compute_box_model_metrics(&b.style);
+            let (c_top, c_bottom, through, height) = if b.margin_sets_valid() {
+                (
+                    b.margin_top_set,
+                    b.margin_bottom_set,
+                    b.collapses_through,
+                    b.size().height(),
+                )
+            } else {
+                (
+                    AdjoiningMargins::of(c_metrics.margin.top),
+                    AdjoiningMargins::of(c_metrics.margin.bottom),
+                    false,
+                    b.size().height(),
+                )
+            };
+            let clear = b.style.clear_or_default();
+            drop(b);
+
+            if through && clear == Clear::None {
+                pending = pending.join(c_top).join(c_bottom);
+                let at = if placed_any || !top_adjoins {
+                    cursor + pending.used()
+                } else {
+                    cursor
+                };
+                offsets.push((c, at));
+                child = next;
+                continue;
+            }
+            pending = pending.join(c_top);
+            let mut at = if !placed_any && top_adjoins {
+                own_top = own_top.join(pending);
+                cursor
+            } else {
+                cursor + pending.used()
+            };
+            if clear != Clear::None {
+                if let Some(floats) = &self.float_context {
+                    at = at.max(floats.clearance(clear, at));
+                }
+            }
+            offsets.push((c, at));
+            cursor = at + height;
+            pending = c_bottom;
+            placed_any = true;
+            child = next;
+        }
+
+        let collapses_through = !placed_any
+            && top_adjoins
+            && bottom_adjoins
+            && !self.style.has_size_limits()
+            && !self.is_table()
+            && !matches!(
+                self.element_kind(),
+                Some(ElementKind::Hr) | Some(ElementKind::Br)
+            );
+        if collapses_through {
+            own_top = own_top.join(pending);
+            own_bottom = own_bottom.join(pending);
+        } else if bottom_adjoins {
+            own_bottom = own_bottom.join(pending);
+        } else {
+            cursor += pending.used();
+        }
+        // A box that establishes a formatting context contains its floats.
+        if isolated {
+            if let Some(floats) = &self.float_context {
+                cursor = cursor.max(floats.lowest_bottom());
+            }
+        }
+        Some(BlockFlow {
+            height: cursor.max(0),
+            top: own_top,
+            bottom: own_bottom,
+            collapses_through,
+            offsets,
+        })
+    }
+
+    /// A box that never ran [`Self::block_flow`] (legacy paths, inline content)
+    /// has the margin sets it was reset to, so its own margins stand in.
+    fn margin_sets_valid(&self) -> bool {
+        self.margin_top_set != AdjoiningMargins::default()
+            || self.margin_bottom_set != AdjoiningMargins::default()
+            || self.collapses_through
+    }
+
+    /// Hand each child its place in the flow, for the position pass.
+    pub(crate) fn assign_flow_offsets(object: &Rc<RefCell<LayoutObject>>) {
+        let flow = object.borrow().block_flow();
+        if let Some(flow) = flow {
+            for (child, y) in flow.offsets {
+                child.borrow_mut().flow_offset_y = Some(y);
+            }
+        }
+    }
+
+    /// Where a line of the enclosing inline context should align this box: the
+    /// baseline of its last line, or its bottom edge when it has none or clips
+    /// its contents. Spec: CSS 2.2 §10.8.1 (`inline-block`).
+    fn inline_block_baseline(&self) -> i64 {
+        let bottom = self.size().height();
+        if self.style.overflow_clip() || self.style.overflow_scrollable() {
+            return bottom;
+        }
+        self.last_baseline_within().unwrap_or(bottom)
+    }
+
+    fn last_baseline_within(&self) -> Option<i64> {
+        if let Some(baseline) = self.last_line_baseline {
+            return Some(baseline);
+        }
+        let flow = self.block_flow()?;
+        let metrics = compute_box_model_metrics(&self.style);
+        flow.offsets.iter().rev().find_map(|(child, y)| {
+            let c = child.borrow();
+            if c.is_out_of_flow() {
+                return None;
+            }
+            c.last_baseline_within()
+                .map(|b| metrics.padding.top + metrics.border.top + y + b)
+        })
     }
 
     pub(crate) fn link_href(&self) -> Option<String> {
@@ -695,308 +1179,62 @@ impl LayoutObject {
         None
     }
 
-    /// Scan descendants (up to `depth` levels) for elements that imply a
-    /// minimum width (e.g. `<img width="350">`, `<table width="256">`).
-    /// Returns the maximum such hint, or 0 if none found.
-    /// If this object's parent is a flex container (`display:flex`), return the
-    /// container's main-axis direction; otherwise `None`. Used so a flex item
-    /// can size and position itself against the flex algorithm.
-    fn parent_flex_direction(&self) -> Option<FlexDirection> {
-        let parent = self.parent.upgrade()?;
-        let p = parent.borrow();
-        if p.style.display() == DisplayType::Flex {
-            Some(p.style.flex_direction())
-        } else {
-            None
-        }
-    }
-
-    /// Resolve this row-flex item's CONTENT width by running the flex line
-    /// distribution over all the container's items (each item independently
-    /// computes the same distribution — the table-cell pattern).
-    fn flex_row_main_size(&self, container_content_width: i64) -> i64 {
-        let parent = match self.parent.upgrade() {
-            Some(p) => p,
-            None => return 0,
-        };
-        let gap = parent.borrow().style().column_gap();
-
-        struct Item {
-            base_content: f64,
-            box_overhead: f64, // padding+border+margins
-            min_content: f64,
-            grow: f64,
-            shrink: f64,
-            is_self: bool,
-        }
-        let mut items: Vec<Item> = Vec::new();
-        let build = |st: &ComputedStyle,
-                     max_content: f64,
-                     min_content: f64,
-                     is_self: bool|
-         -> Item {
-            let m = compute_box_model_metrics(st);
-            let base_content = if let Some(basis) = st.flex_basis() {
-                basis
-            } else if let Some(ratio) = st.width_ratio() {
-                (container_content_width as f64 * ratio).max(0.0)
-            } else if st.width() > 0.0 {
-                st.width()
-            } else {
-                max_content
-            };
-            Item {
-                base_content,
-                box_overhead: (m.inner_horizontal() + m.outer_horizontal()) as f64,
-                min_content,
-                grow: st.flex_grow(),
-                shrink: st.flex_shrink(),
-                is_self,
-            }
-        };
-        let mut child = parent.borrow().first_child();
-        while let Some(c) = child {
-            // compute_size holds `self` mutably borrowed; the failing borrow
-            // in this walk IS self — read our own fields directly.
-            match c.try_borrow() {
-                Ok(b) => {
-                    let next = b.next_sibling();
-                    if !b.is_whitespace_text()
-                        && !matches!(
-                            b.style().position(),
-                            PositionType::Absolute | PositionType::Fixed
-                        )
-                    {
-                        let st = b.style();
-                        let item = build(
-                            &st,
-                            b.max_content_width() as f64,
-                            b.min_content_width_hint() as f64,
-                            false,
-                        );
-                        drop(b);
-                        items.push(item);
-                    }
-                    child = next;
-                }
-                Err(_) => {
-                    let next = self.next_sibling.clone();
-                    items.push(build(
-                        &self.style,
-                        self.max_content_width() as f64,
-                        self.min_content_width_hint() as f64,
-                        true,
-                    ));
-                    child = next;
-                }
-            }
-        }
-        if items.is_empty() {
-            return 0;
-        }
-
-        let total: f64 = items.iter().map(|i| i.base_content + i.box_overhead).sum();
-        let gaps = (gap * (items.len() as i64 - 1)) as f64;
-        let free = container_content_width as f64 - total - gaps;
-
-        let me = items.iter().find(|i| i.is_self);
-        let me = match me {
-            Some(m) => m,
-            None => return 0,
-        };
-        let mut target = me.base_content;
-        if free > 0.0 {
-            let total_grow: f64 = items.iter().map(|i| i.grow).sum();
-            if total_grow > 0.0 {
-                target += free * me.grow / total_grow;
-            }
-        } else if free < 0.0 {
-            let total_scaled: f64 = items
-                .iter()
-                .map(|i| i.shrink * (i.base_content + i.box_overhead))
-                .sum();
-            if total_scaled > 0.0 {
-                target += free * (me.shrink * (me.base_content + me.box_overhead)) / total_scaled;
-            }
-        }
-        // Never shrink below the item's min-content (long unbreakable words).
-        (target.max(me.min_content).max(0.0)) as i64
-    }
-
     fn is_flex_container(&self) -> bool {
         self.style.display() == DisplayType::Flex
     }
 
-    /// If this object's parent is a grid container (`display:grid`), return
-    /// its (column tracks, column gap, row gap); otherwise `None`.
-    /// Nearest ancestor that generates a real box (skipping display:contents
-    /// wrappers) — the parent grid/flex placement resolves against.
-    fn effective_placement_parent(&self) -> Option<Rc<RefCell<LayoutObject>>> {
-        let mut anc = self.parent.upgrade();
-        while let Some(a) = anc {
-            let step: Option<Option<Rc<RefCell<LayoutObject>>>> = match a.try_borrow() {
-                Ok(b) => {
-                    if b.style().display() == DisplayType::Contents {
-                        Some(b.parent.upgrade())
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            };
-            match step {
-                None => return Some(a),
-                Some(next) => anc = next,
-            }
-        }
-        None
+    pub(crate) fn is_out_of_flow_box(&self) -> bool {
+        self.is_out_of_flow()
     }
 
-    fn parent_grid_info(&self) -> Option<(Vec<GridTrack>, i64, i64)> {
-        let parent = self.effective_placement_parent()?;
-        let p = match parent.try_borrow() {
-            Ok(p) => p,
-            Err(_) => return None,
-        };
-        if p.style.display() == DisplayType::Grid {
-            let mut tracks = p.style.grid_template_columns();
-            // grid-template-areas implies a column count. When the explicit
-            // grid-template-columns declares fewer tracks than the areas have
-            // columns (e.g. Wikipedia's `columns: minmax(0,1fr)` with
-            // `areas: 'columnStart pageContent'`), the missing tracks default
-            // to `auto` — without this the 2nd-column items get a zero-width
-            // out-of-range track and collapse against the right edge.
-            if let Some(areas) = p.style.grid_template_areas() {
-                let cols = areas.iter().map(|r| r.len()).max().unwrap_or(0);
-                while tracks.len() < cols {
-                    tracks.push(GridTrack::Auto);
-                }
-            }
-            Some((tracks, p.style.column_gap(), p.style.row_gap()))
-        } else {
-            None
-        }
+    /// Replaced elements and form controls size themselves.
+    pub(crate) fn is_replaced_box(&self) -> bool {
+        matches!(
+            self.element_kind(),
+            Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
+        )
     }
 
-    /// True for a whitespace-only text node. Such nodes are formatting
-    /// artifacts of the markup (newlines/indentation between elements) and are
-    /// not grid items per CSS Grid §6 (only inter-element whitespace that
-    /// collapses away).
+    pub(crate) fn resolved_width_for(&self, parent: LayoutSize) -> i64 {
+        self.resolved_width(parent)
+    }
+
+    /// A replaced box's own width, padding and border included.
+    pub(crate) fn replaced_width_for(&self, parent: LayoutSize) -> f64 {
+        let metrics = compute_box_model_metrics(&self.style);
+        self.intrinsic_inline_size(parent)
+            .map(|s| (s.width() + metrics.inner_horizontal()) as f64)
+            .unwrap_or(0.0)
+    }
+
+    pub(crate) fn max_content_width_for_flex(&self) -> i64 {
+        self.max_content_width()
+    }
+
+    pub(crate) fn min_content_width_for_flex(&self) -> i64 {
+        self.min_content_width_hint()
+    }
+
+    pub(crate) fn first_baseline_for_flex(&self) -> i64 {
+        self.last_baseline_within().unwrap_or(self.size().height())
+    }
+
+    /// This box's content height when something other than its contents sets
+    /// it: a stretching parent, or `height`.
+    pub(crate) fn definite_content_height(&self, parent_height: i64) -> Option<i64> {
+        let metrics = compute_box_model_metrics(&self.style);
+        if let Some(stretched) = self.stretched_height {
+            return Some((stretched - metrics.inner_vertical()).max(0));
+        }
+        let explicit = self.resolved_height(LayoutSize::new(0, parent_height));
+        (explicit > 0 || self.style.explicit_zero_height()).then_some(explicit)
+    }
+
     pub(crate) fn is_whitespace_text(&self) -> bool {
         match self.node.borrow().kind() {
             NodeKind::Text(ref t) => t.trim().is_empty(),
             _ => false,
         }
-    }
-
-    /// 0-based grid-item index of this object among its parent's children:
-    /// whitespace-only text siblings are skipped (they are not grid items).
-    /// Identified by pointer identity, so it works while `self` is inside an
-    /// active borrow.
-    /// (row_start, row_span, col_start, col_span) of `name` inside a
-    /// grid-template-areas matrix.
-    pub(crate) fn area_rect_in(
-        areas: &[Vec<String>],
-        name: &str,
-    ) -> Option<(usize, usize, usize, usize)> {
-        let (mut r0, mut r1, mut c0, mut c1) = (usize::MAX, 0usize, usize::MAX, 0usize);
-        for (r, row) in areas.iter().enumerate() {
-            for (c, cell) in row.iter().enumerate() {
-                if cell == name {
-                    r0 = r0.min(r);
-                    r1 = r1.max(r);
-                    c0 = c0.min(c);
-                    c1 = c1.max(c);
-                }
-            }
-        }
-        if r0 == usize::MAX {
-            return None;
-        }
-        Some((r0, r1 - r0 + 1, c0, c1 - c0 + 1))
-    }
-
-    /// This item's grid-area rectangle within its parent's template areas,
-    /// or (row 0) between the parent's named column lines `name-start` /
-    /// `name-end` when no template area defines it.
-    fn grid_area_rect(&self) -> Option<(usize, usize, usize, usize)> {
-        let name = self.style.grid_area_name()?.to_string();
-        let parent = self.effective_placement_parent()?;
-        let pstyle = match parent.try_borrow() {
-            Ok(p) => p.style(),
-            Err(_) => return None,
-        };
-        if let Some(areas) = pstyle.grid_template_areas() {
-            if let Some(r) = Self::area_rect_in(&areas, &name) {
-                return Some(r);
-            }
-        }
-        let lines = pstyle.grid_column_line_names()?;
-        let start_name = format!("{name}-start");
-        let end_name = format!("{name}-end");
-        let start = lines
-            .iter()
-            .position(|ns| ns.contains(&start_name) || ns.contains(&name));
-        let end = lines.iter().position(|ns| ns.contains(&end_name));
-        match (start, end) {
-            (Some(s), Some(e)) if e > s => Some((0, 1, s, e - s)),
-            (Some(s), None) => Some((0, 1, s, 1)),
-            _ => None,
-        }
-    }
-
-    /// Heights of the parent grid's area rows: for each template row, the
-    /// max outer height of the items whose area starts there. Sizes are
-    /// final by position time, and the walk tolerates `self` being mutably
-    /// borrowed (try_borrow failure = self).
-    fn grid_area_row_heights(&self) -> Vec<i64> {
-        let parent = match self.effective_placement_parent() {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
-        let areas = match parent.try_borrow().ok().and_then(|p| p.style().grid_template_areas()) {
-            Some(a) => a,
-            None => return Vec::new(),
-        };
-        let mut heights = vec![0i64; areas.len()];
-        // Walk the grid's items; display:contents children are transparent —
-        // descend into them so their children (the real grid items) tally.
-        let mut stack: Vec<Option<Rc<RefCell<LayoutObject>>>> =
-            vec![parent.try_borrow().ok().and_then(|p| p.first_child())];
-        while let Some(slot) = stack.pop() {
-            let mut child = slot;
-            while let Some(c) = child {
-                match c.try_borrow() {
-                    Ok(b) => {
-                        let next = b.next_sibling();
-                        if b.style().display() == DisplayType::Contents {
-                            stack.push(b.first_child());
-                        } else if !b.is_whitespace_text() {
-                            if let Some(name) = b.style().grid_area_name() {
-                                if let Some((r0, _, _, _)) = Self::area_rect_in(&areas, name) {
-                                    let m = compute_box_model_metrics(&b.style());
-                                    heights[r0] = heights[r0]
-                                        .max(b.size.height() + m.margin.top + m.margin.bottom);
-                                }
-                            }
-                        }
-                        drop(b);
-                        child = next;
-                    }
-                    Err(_) => {
-                        if let Some(name) = self.style.grid_area_name() {
-                            if let Some((r0, _, _, _)) = Self::area_rect_in(&areas, name) {
-                                let m = compute_box_model_metrics(&self.style);
-                                heights[r0] = heights[r0]
-                                    .max(self.size.height() + m.margin.top + m.margin.bottom);
-                            }
-                        }
-                        child = self.next_sibling.clone();
-                    }
-                }
-            }
-        }
-        heights
     }
 
     /// The layout sibling directly before `self`, skipping zero-size boxes
@@ -1073,34 +1311,12 @@ impl LayoutObject {
         }
     }
 
-    fn grid_item_index(&self) -> usize {
-        let parent = match self.parent.upgrade() {
-            Some(p) => p,
-            None => return 0,
-        };
-        let mut idx = 0;
-        let mut child = parent.borrow().first_child();
-        while let Some(c) = child {
-            if std::ptr::eq(c.as_ptr() as *const LayoutObject, self as *const LayoutObject) {
-                return idx;
-            }
-            let b = c.borrow();
-            if !b.is_whitespace_text() {
-                idx += 1;
-            }
-            let next = b.next_sibling();
-            drop(b);
-            child = next;
-        }
-        idx
-    }
-
     /// Preferred (max-content) width: the width this subtree would take with no
     /// line wrapping. Inline/text runs accumulate on a line; block children
     /// each take their own line (we take the max). Used to shrink-to-fit flex
     /// row items so siblings sit side by side instead of each filling the row.
     fn max_content_width(&self) -> i64 {
-        self.max_content_width_depth(6)
+        self.max_content_width_depth(8)
     }
 
     fn max_content_width_depth(&self, depth: u32) -> i64 {
@@ -1110,6 +1326,14 @@ impl LayoutObject {
         if let Some(w) = parse_dimension_attr(self.element_attribute("width")) {
             return w;
         }
+        // A flex row or grid puts its items beside each other, not in a stack. For
+        // grid this counts every item in one row, which over-reserves a wrapping
+        // grid but never wraps a fixed one.
+        let lays_out_side_by_side = (self.is_flex_container()
+            && self.style.flex_direction() == FlexDirection::Row
+            && self.style.flex_wrap() == FlexWrap::NoWrap)
+            || self.style.display() == DisplayType::Grid;
+        let side_gap = self.style.column_gap();
         let mut max_line: i64 = 0; // widest block-level line seen
         let mut cur_line: i64 = 0; // current inline run accumulation
         let mut child = self.first_child();
@@ -1119,17 +1343,43 @@ impl LayoutObject {
                 NodeKind::Text(ref t) => {
                     let fs = b.style.font_size();
                     let bold = b.style.is_bold();
-                    // Each hard line within the text starts a new line box.
-                    let widest = t
-                        .split('\n')
-                        .map(|line| measure_text_width(line.trim(), fs, bold))
-                        .max()
-                        .unwrap_or(0);
-                    cur_line += widest;
+                    if b.style.white_space_preserves_newlines() {
+                        // Each hard line within the text starts a new line box.
+                        let mut lines = t.split('\n');
+                        cur_line += lines
+                            .next()
+                            .map(|line| measure_text_width(line, fs, bold))
+                            .unwrap_or(0);
+                        for line in lines {
+                            max_line = max_line.max(cur_line);
+                            cur_line = measure_text_width(line, fs, bold);
+                        }
+                    } else {
+                        // Source newlines are only white space here.
+                        let joined = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let edge_spaces = (cur_line > 0 && t.starts_with(char::is_whitespace))
+                            as i64
+                            + (b.next_sibling().is_some() && t.ends_with(char::is_whitespace))
+                                as i64;
+                        if !joined.is_empty() {
+                            cur_line += measure_text_width(&joined, fs, bold);
+                        }
+                        cur_line += edge_spaces * measure_text_width(" ", fs, bold);
+                    }
                 }
+                _ if b.element_kind() == Some(ElementKind::Br) => {
+                    max_line = max_line.max(cur_line);
+                    cur_line = 0;
+                }
+                _ if matches!(
+                    b.style.position(),
+                    PositionType::Absolute | PositionType::Fixed
+                ) => {}
                 _ => {
-                    let child_pref = b.max_content_width_depth(depth - 1);
-                    if b.kind().normal_flow_spec().stacks_vertically {
+                    let child_pref = b.outer_max_content_width(depth - 1);
+                    if b.is_table_cell() || lays_out_side_by_side {
+                        cur_line += child_pref + if cur_line > 0 { side_gap } else { 0 };
+                    } else if b.kind().normal_flow_spec().stacks_vertically {
                         // Block-level child: flush the inline run and stand alone.
                         max_line = max_line.max(cur_line);
                         cur_line = 0;
@@ -1144,6 +1394,23 @@ impl LayoutObject {
             child = next;
         }
         max_line.max(cur_line)
+    }
+
+    /// Max-content width of this box's margin box, as its parent sees it.
+    fn outer_max_content_width(&self, depth: u32) -> i64 {
+        let metrics = compute_box_model_metrics(&self.style);
+        let content = if self.style.width_ratio().is_none() && self.style.width() > 0.0 {
+            edge_to_i64(self.style.width())
+        } else if matches!(
+            self.element_kind(),
+            Some(ElementKind::Img) | Some(ElementKind::Input) | Some(ElementKind::Button)
+        ) {
+            // Sizes itself; the box already includes its padding and border.
+            return self.size().width() + metrics.margin.left + metrics.margin.right;
+        } else {
+            self.max_content_width_depth(depth)
+        };
+        content + metrics.outer_horizontal()
     }
 
     fn min_content_width_hint(&self) -> i64 {
@@ -2060,13 +2327,6 @@ impl LayoutObject {
         offset + n_rowspan_cols * cs
     }
 
-    /// Whether this is an inline-level `<textarea>`: one box to the line around
-    /// it, and its own inline formatting context inside.
-    fn is_atomic_field(&self) -> bool {
-        self.kind() == LayoutObjectKind::Inline
-            && self.node_ref().borrow().element_tag_name().as_deref() == Some("textarea")
-    }
-
     /// Where a caret can sit in this field, given the value it holds. An
     /// `<input>` paints its value at a fixed inset; a `<textarea>` paints its
     /// value as the text box inside it, which the inline layout has already
@@ -2214,8 +2474,15 @@ impl LayoutObject {
     pub fn compute_size(&mut self, parent_size: LayoutSize) {
         let mut size = LayoutSize::new(0, 0);
         let metrics = compute_box_model_metrics(&self.style);
+        // An inline-block is a block on the inside; only how its parent places
+        // it differs.
+        let sizing_kind = if self.is_inline_block() {
+            LayoutObjectKind::Block
+        } else {
+            self.kind()
+        };
 
-        match self.kind() {
+        match sizing_kind {
             LayoutObjectKind::Block => {
                 let available_width = (parent_size.width() - metrics.outer_horizontal()).max(0);
                 let explicit_width = self.resolved_width(parent_size);
@@ -2233,7 +2500,9 @@ impl LayoutObject {
                 // after subtracting explicitly-sized sibling cells.
                 // When total explicit widths exceed available space, scale
                 // proportionally to fit.
-                let content_width = if self.style.display() == DisplayType::Contents {
+                let content_width = if let Some(assigned) = self.assigned_width {
+                    assigned
+                } else if self.style.display() == DisplayType::Contents {
                     // No box of its own: span the full containing width so
                     // children's grid-column offsets (resolved against the
                     // real grid ancestor) land where the tracks are.
@@ -2265,30 +2534,6 @@ impl LayoutObject {
                         explicit_width.min(available_width)
                     } else {
                         self.table_cell_auto_width(available_width)
-                    }
-                } else if let Some(FlexDirection::Row) = self.parent_flex_direction() {
-                    // Flex item on a single-line row: resolve the main size by
-                    // distributing the container's free space per
-                    // flex-grow/shrink over the items' base sizes.
-                    // https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths
-                    self.flex_row_main_size(parent_size.width())
-                } else if let Some((tracks, col_gap, _)) = self.parent_grid_info() {
-                    // Grid item: the width of its column track(s); the item's
-                    // content box is the track minus its own margins. An item
-                    // with a grid-area spans that area's columns.
-                    let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
-                    let (col, span) = self
-                        .grid_area_rect()
-                        .map(|(_, _, c, sp)| (c, sp))
-                        .unwrap_or((self.grid_item_index() % tracks.len().max(1), 1));
-                    let end = (col + span).min(widths.len());
-                    let spanned: i64 = widths[col.min(widths.len())..end].iter().sum::<i64>()
-                        + col_gap * (span as i64 - 1).max(0);
-                    let track = (spanned - metrics.outer_horizontal()).max(0);
-                    if explicit_width > 0 {
-                        explicit_width.min(track)
-                    } else {
-                        track
                     }
                 } else if explicit_width > 0 {
                     // Inside an overflow container the explicit width stands
@@ -2342,7 +2587,9 @@ impl LayoutObject {
                     } else {
                         available_width
                     }
-                } else if self.style.float_or_default() != Float::None {
+                } else if self.style.float_or_default() != Float::None
+                    || self.is_inline_block()
+                {
                     // A floated box with `width: auto` shrink-wraps its content
                     // rather than filling the containing block — otherwise it
                     // leaves no room beside itself and the whole point of
@@ -2362,26 +2609,23 @@ impl LayoutObject {
                     available_width
                 };
 
-                let mut content_height = 0;
-                let mut child = self.first_child();
-                let is_row = self.is_table_row();
-                // Flex row: items are placed side by side, so the container's
-                // height is the tallest item (max), not the sum.
-                let is_flex_row = self.is_flex_container()
-                    && self.style.flex_direction() == FlexDirection::Row;
-                // Grid: children fill rows of N columns; the container's height
-                // is the sum of each row's tallest item.
-                let grid_cols = if self.style.display() == DisplayType::Grid {
-                    Some(self.style.grid_columns())
-                } else {
+                let flow = self.block_flow();
+                if let Some(flow) = &flow {
+                    self.margin_top_set = flow.top;
+                    self.margin_bottom_set = flow.bottom;
+                    self.collapses_through = flow.collapses_through;
+                }
+                let mut content_height = flow.as_ref().map(|f| f.height).unwrap_or(0);
+                // A flex or grid container sets its own height after this, once
+                // it has placed its items.
+                let places_own_items =
+                    self.is_flex_container() || self.style.display() == DisplayType::Grid;
+                let mut child = if flow.is_some() || places_own_items {
                     None
+                } else {
+                    self.first_child()
                 };
-                let grid_row_gap = self.style.row_gap();
-                let mut area_row_heights: Vec<i64> = Vec::new();
-                let mut area_row_heights_extra: i64 = 0;
-                let mut grid_idx = 0usize;
-                let mut grid_rows_done = 0usize;
-                let mut grid_row_height = 0i64;
+                let is_row = self.is_table_row();
                 let mut previous_child_kind = LayoutObjectKind::Block;
                 while child.is_some() {
                     let c = child.expect("first child should exist");
@@ -2395,52 +2639,6 @@ impl LayoutObject {
                         .unwrap_or(1);
                         if rowspan <= 1 {
                             content_height = content_height.max(c.borrow().size.height());
-                        }
-                    } else if is_flex_row {
-                        let c_metrics = compute_box_model_metrics(&c.borrow().style());
-                        content_height = content_height.max(
-                            c.borrow().size.height()
-                                + c_metrics.margin.top
-                                + c_metrics.margin.bottom,
-                        );
-                    } else if let Some(areas) = self.style.grid_template_areas() {
-                        // Areas grid: rows are sized after the loop from the
-                        // per-row max of the items placed in them.
-                        if !c.borrow().is_whitespace_text() {
-                            let b = c.borrow();
-                            let m = compute_box_model_metrics(&b.style());
-                            let outer_h = b.size.height() + m.margin.top + m.margin.bottom;
-                            let rect = b
-                                .style()
-                                .grid_area_name()
-                                .and_then(|nm| Self::area_rect_in(&areas, nm));
-                            if let Some((r0, _rspan, _, _)) = rect {
-                                if area_row_heights.len() < areas.len() {
-                                    area_row_heights.resize(areas.len(), 0);
-                                }
-                                area_row_heights[r0] = area_row_heights[r0].max(outer_h);
-                            } else {
-                                area_row_heights_extra = area_row_heights_extra.max(outer_h);
-                            }
-                        }
-                    } else if let Some(n) = grid_cols {
-                        // Whitespace-only text children are not grid items.
-                        if !c.borrow().is_whitespace_text() {
-                            let c_metrics = compute_box_model_metrics(&c.borrow().style());
-                            grid_row_height = grid_row_height.max(
-                                c.borrow().size.height()
-                                    + c_metrics.margin.top
-                                    + c_metrics.margin.bottom,
-                            );
-                            grid_idx += 1;
-                            if grid_idx % n == 0 {
-                                if grid_rows_done > 0 {
-                                    content_height += grid_row_gap;
-                                }
-                                content_height += grid_row_height;
-                                grid_rows_done += 1;
-                                grid_row_height = 0;
-                            }
                         }
                     } else if previous_child_kind.normal_flow_spec().stacks_vertically
                         || c_kind.normal_flow_spec().stacks_vertically
@@ -2460,21 +2658,6 @@ impl LayoutObject {
                     previous_child_kind = c_kind;
                     child = c.borrow().next_sibling();
                 }
-                // Areas grid: container height = sum of the area rows.
-                if !area_row_heights.is_empty() || area_row_heights_extra > 0 {
-                    let rows: i64 = area_row_heights.iter().sum();
-                    let gaps = grid_row_gap
-                        * (area_row_heights.iter().filter(|h| **h > 0).count() as i64 - 1).max(0);
-                    content_height += rows + gaps + area_row_heights_extra;
-                }
-                // Final, possibly partial grid row.
-                if grid_row_height > 0 {
-                    if grid_rows_done > 0 {
-                        content_height += grid_row_gap;
-                    }
-                    content_height += grid_row_height;
-                }
-
                 // <br> and <hr> have intrinsic heights even without children.
                 let content_height = if self.element_kind() == Some(ElementKind::Br) {
                     styled_line_height(&self.style)
@@ -2484,6 +2667,7 @@ impl LayoutObject {
                 } else {
                     let explicit_height = self.resolved_height(parent_size);
                     if explicit_height > 0 || self.style.explicit_zero_height() {
+                        self.collapses_through = false;
                         explicit_height
                     } else {
                         content_height.max(0)
@@ -2498,8 +2682,11 @@ impl LayoutObject {
                 size.set_height((content_height + metrics.inner_vertical() + 2 * cp).max(0));
             }
             LayoutObjectKind::Inline => {
+                self.margin_top_set = AdjoiningMargins::of(metrics.margin.top);
+                self.margin_bottom_set = AdjoiningMargins::of(metrics.margin.bottom);
                 if let Some(intrinsic) = self.intrinsic_inline_size(parent_size) {
-                    size.set_width((intrinsic.width() + metrics.inner_horizontal()).max(0));
+                    let width = self.assigned_width.unwrap_or(intrinsic.width());
+                    size.set_width((width + metrics.inner_horizontal()).max(0));
                     size.set_height((intrinsic.height() + metrics.inner_vertical()).max(0));
                 } else {
                     // Track per-line width separately and use the maximum across
@@ -2699,105 +2886,17 @@ impl LayoutObject {
                 point.set_x(parent_point.x() + rowspan_offset + metrics.margin.left + cs);
                 point.set_y(parent_point.y() + metrics.margin.top + v_offset);
             }
-        } else if let Some((tracks, col_gap, row_gap)) = self.parent_grid_info() {
-            let widths = resolve_grid_tracks(&tracks, parent_size.width(), col_gap);
-            if let Some((row_start, _row_span, col_start, _col_span)) = self.grid_area_rect() {
-                // Area placement: x from the column prefix, y from the
-                // heights of the area rows above (each item computes the
-                // row table independently from its siblings' sizes).
-                let x_offset: i64 = widths[..col_start.min(widths.len())].iter().sum::<i64>()
-                    + col_start as i64 * col_gap;
-                point.set_x(parent_point.x() + x_offset + metrics.margin.left);
-                let row_heights = self.grid_area_row_heights();
-                let mut y_off = 0i64;
-                for h in row_heights.iter().take(row_start) {
-                    if *h > 0 {
-                        y_off += h + row_gap;
-                    }
-                }
-                point.set_y(parent_point.y() + y_off + metrics.margin.top);
-            } else {
-            // Row-major placement into the column tracks.
-            let n = tracks.len().max(1);
-            let idx = self.grid_item_index();
-            let col = idx % n;
-            let x_offset: i64 =
-                widths[..col.min(widths.len())].iter().sum::<i64>() + col as i64 * col_gap;
-            point.set_x(parent_point.x() + x_offset + metrics.margin.left);
-            if col == 0 {
-                // First track: a new grid row below the previous sibling (which
-                // ended the previous row), separated by the row gap.
-                if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
-                    point.set_y(
-                        pos.y()
-                            + size.height()
-                            + metrics.margin.top
-                            + metrics.margin.bottom
-                            + row_gap,
-                    );
-                } else {
-                    point.set_y(parent_point.y() + metrics.margin.top);
-                }
-            } else {
-                // Same row: share the previous sibling's top edge.
-                point.set_y(
-                    previous_sibling_point
-                        .map(|p| p.y())
-                        .unwrap_or(parent_point.y() + metrics.margin.top),
-                );
-            }
-            }
-        } else if let Some(dir) = self.parent_flex_direction() {
-            // Flex item placement (main-axis start packing; no grow/shrink yet).
-            match dir {
-                FlexDirection::Row => {
-                    // Lay out to the right of the previous item (plus the
-                    // container's column-gap), aligned to the container's top;
-                    // justify-content/align-items adjust in a post pass.
-                    let gap = self
-                        .parent
-                        .upgrade()
-                        .map(|p| p.borrow().style().column_gap())
-                        .unwrap_or(0);
-                    if let (Some(size), Some(pos)) =
-                        (previous_sibling_size, previous_sibling_point)
-                    {
-                        point.set_x(pos.x() + size.width() + gap + metrics.margin.left);
-                    } else {
-                        point.set_x(parent_point.x() + metrics.margin.left);
-                    }
-                    point.set_y(parent_point.y() + metrics.margin.top);
-                }
-                FlexDirection::Column => {
-                    // Stack vertically (plus row-gap) like a block context.
-                    let gap = self
-                        .parent
-                        .upgrade()
-                        .map(|p| p.borrow().style().row_gap())
-                        .unwrap_or(0);
-                    if let (Some(size), Some(pos)) =
-                        (previous_sibling_size, previous_sibling_point)
-                    {
-                        point.set_y(
-                            pos.y()
-                                + size.height()
-                                + gap
-                                + metrics.margin.top
-                                + metrics.margin.bottom,
-                        );
-                    } else {
-                        point.set_y(parent_point.y() + metrics.margin.top);
-                    }
-                    point.set_x(parent_point.x() + metrics.margin.left);
-                }
-            }
         } else {
         match (
             self.kind().normal_flow_spec().flow,
             previous_sibling_kind.normal_flow_spec().flow,
         ) {
             (LayoutFlow::BlockFormattingContext, _) | (_, LayoutFlow::BlockFormattingContext) => {
-                if let (Some(size), Some(pos)) = (previous_sibling_size, previous_sibling_point) {
+                if let Some(y) = self.flow_offset_y {
+                    point.set_y(parent_point.y() + y);
+                } else if let (Some(size), Some(pos)) =
+                    (previous_sibling_size, previous_sibling_point)
+                {
                     point.set_y(pos.y() + size.height() + metrics.margin.top + metrics.margin.bottom);
                 } else {
                     point.set_y(parent_point.y() + metrics.margin.top);
@@ -2969,6 +3068,9 @@ impl LayoutObject {
             NodeKind::Element(_) => match self.style.display() {
                 // A flex container is itself a block-level box; flex affects how
                 // its children are sized and positioned, not its own outer flow.
+                DisplayType::Flex | DisplayType::Grid if self.style.is_inline_outer() => {
+                    self.kind = LayoutObjectKind::Inline
+                }
                 DisplayType::Block | DisplayType::Flex | DisplayType::Grid => {
                     self.kind = LayoutObjectKind::Block
                 }
@@ -3011,6 +3113,16 @@ impl LayoutObject {
         self.text_line_count = 0;
         self.text_line_height = 0;
         self.inline_fragments.clear();
+        self.flow_offset_y = None;
+        self.assigned_width = None;
+        self.stretched_height = None;
+        self.flex_lines.clear();
+        self.grid_layout = None;
+        self.margin_top_set = AdjoiningMargins::default();
+        self.margin_bottom_set = AdjoiningMargins::default();
+        self.collapses_through = false;
+        self.last_line_baseline = None;
+        self.inline_line_boxes.clear();
         // A float's placement is the one thing the layout iteration carries
         // between passes — it is what the fixed point solves for. Every other
         // box's offset is re-derived by the pass about to run.
@@ -3093,21 +3205,41 @@ impl LayoutObject {
         content_width: i64,
         options: LineOptions,
         floats: &FloatContext,
-    ) -> Option<i64> {
+    ) -> Option<(i64, Option<i64>)> {
         let lines =
             layout_inline_items_aligned(&items, floats, content_width, 0, 0, options);
 
         // Fragments per item, in block coordinates, shifted onto their line's
         // shared baseline so items of different heights line up.
         let mut fragments: Vec<Vec<(String, i64, i64)>> = vec![Vec::new(); boxes.len()];
-        for line in &lines {
+        // The rect each inline element takes up on each line it reaches.
+        let mut line_rects: HashMap<(*const LayoutObject, usize), Rect> = HashMap::new();
+        for (line_index, line) in lines.iter().enumerate() {
             for fragment in &line.fragments {
-                let y = fragment.y + (line.baseline - items[fragment.item].baseline_offset());
-                fragments[fragment.item].push((
-                    fragment.text.clone().unwrap_or_default(),
-                    fragment.x,
-                    y,
-                ));
+                if matches!(items[fragment.item], InlineItem::Spacer { .. }) {
+                    continue;
+                }
+                let boxed = &boxes[fragment.item];
+                let mut x = fragment.x;
+                let mut y = fragment.y + (line.baseline - items[fragment.item].baseline_offset());
+                // A fragment is an atomic box's margin box; the box itself sits
+                // inside that.
+                if matches!(items[fragment.item], InlineItem::Atomic { .. }) {
+                    let metrics = compute_box_model_metrics(&boxed.borrow().style);
+                    x += metrics.margin.left;
+                    y += metrics.margin.top;
+                }
+                let placed = (fragment.text.clone().unwrap_or_default(), x, y);
+                if let Some(rect) = fragment_rect(boxed, std::slice::from_ref(&placed)) {
+                    for ancestor in inline_ancestors(boxed, root) {
+                        let key = (ancestor.as_ptr() as *const LayoutObject, line_index);
+                        line_rects
+                            .entry(key)
+                            .and_modify(|existing| *existing = existing.union(rect))
+                            .or_insert(rect);
+                    }
+                }
+                fragments[fragment.item].push(placed);
             }
         }
 
@@ -3132,7 +3264,12 @@ impl LayoutObject {
         // Offsets are expressed against each box's *own* parent, because that
         // is what the position pass adds them to: an inline element between a
         // run and the block would otherwise be applied twice.
-        let mut assign = |node: &Rc<RefCell<LayoutObject>>| -> Option<Rect> {
+        //
+        // An inline element's padding and border lie outside the rect around its
+        // contents, so its box starts that much further out and its content
+        // origin lands back on the rect, which is what its children are placed
+        // against.
+        let assign = |node: &Rc<RefCell<LayoutObject>>, inset: (i64, i64)| -> Option<Rect> {
             let rect = rect_of(node)?;
             let origin = node
                 .borrow()
@@ -3141,12 +3278,13 @@ impl LayoutObject {
                 .and_then(|p| rect_of(&p))
                 .map(|r| (r.x, r.y))
                 .unwrap_or((0, 0));
-            node.borrow_mut().inline_offset = Some((rect.x - origin.0, rect.y - origin.1));
+            node.borrow_mut().inline_offset =
+                Some((rect.x - inset.0 - origin.0, rect.y - inset.1 - origin.1));
             Some(rect)
         };
 
         for (index, boxed) in boxes.iter().enumerate() {
-            let Some(rect) = assign(boxed) else { continue };
+            let Some(rect) = assign(boxed, (0, 0)) else { continue };
             let mut b = boxed.borrow_mut();
             // Fragment positions are stored relative to the box's own origin so
             // paint can emit them without knowing the containing block.
@@ -3163,13 +3301,44 @@ impl LayoutObject {
         }
         for boxed in boxes.iter() {
             for ancestor in inline_ancestors(boxed, root) {
-                let Some(rect) = assign(&ancestor) else { continue };
+                let metrics = compute_box_model_metrics(&ancestor.borrow().style);
+                let left = metrics.padding.left + metrics.border.left;
+                let right = metrics.padding.right + metrics.border.right;
+                let top = metrics.padding.top + metrics.border.top;
+                let Some(rect) = assign(&ancestor, (left, top)) else { continue };
+                let key = ancestor.as_ptr() as *const LayoutObject;
+                let spanned: Vec<Rect> = (0..lines.len())
+                    .filter_map(|line| line_rects.get(&(key, line)).copied())
+                    .collect();
                 let mut b = ancestor.borrow_mut();
-                b.size.set_width(rect.width());
-                b.size.set_height(rect.height());
+                b.size.set_width(rect.width() + left + right);
+                b.size.set_height(rect.height() + metrics.inner_vertical());
+                b.inline_line_boxes = if spanned.len() > 1 {
+                    let last = spanned.len() - 1;
+                    spanned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            // Padding belongs at the element's two ends, not at
+                            // every line break.
+                            let lead = if i == 0 { left } else { 0 };
+                            let tail = if i == last { right } else { 0 };
+                            (
+                                r.x - lead - (rect.x - left),
+                                r.y - top - (rect.y - top),
+                                r.width() + lead + tail,
+                                r.height() + metrics.inner_vertical(),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             }
         }
-        Some(lines.iter().map(|l| l.height).sum())
+        let height = lines.iter().map(|l| l.height).sum();
+        let last_baseline = lines.last().map(|l| l.y + l.baseline);
+        Some((height, last_baseline))
     }
 
     /// Run the inline formatting context for `block`, if it establishes one,
@@ -3205,7 +3374,7 @@ impl LayoutObject {
             // https://www.w3.org/TR/css-flexbox-1/#flex-items
             if b.kind() != LayoutObjectKind::Block
                 && !is_flex_or_grid_item
-                && !b.is_atomic_field()
+                && !b.is_inline_block()
             {
                 return false;
             }
@@ -3263,12 +3432,22 @@ impl LayoutObject {
         for placed in own_floats.placed() {
             floats.adopt(*placed);
         }
-        let Some(height) =
+        let Some((height, last_baseline)) =
             Self::layout_inline_context_inner(block, boxes, items, content_width, options, &floats)
         else {
             return false;
         };
         let mut b = block.borrow_mut();
+        let inset = {
+            let metrics = compute_box_model_metrics(&b.style);
+            let cellpadding = if b.is_table_cell() {
+                b.ancestor_table_cellpadding()
+            } else {
+                0
+            };
+            metrics.padding.top + metrics.border.top + cellpadding
+        };
+        b.last_line_baseline = last_baseline.map(|baseline| inset + baseline);
         // An explicit height wins over the content's own.
         if b.style.has_author_height() {
             return true;
@@ -3691,15 +3870,11 @@ fn collect_inline_items_from(
     }
     // A textarea sits in the line as one box, with its text inside it: that text
     // wraps at the textarea's edge, not the surrounding block's.
-    if node.borrow().is_atomic_field() {
+    if node.borrow().is_inline_block() {
         let b = node.borrow();
-        let size = b.size();
+        let baseline = b.inline_block_baseline();
         boxes.push(node.clone());
-        items.push(InlineItem::Atomic {
-            width: size.width(),
-            height: size.height(),
-            baseline: size.height(),
-        });
+        items.push(atomic_item(&b, baseline));
         return true;
     }
     if kind == LayoutObjectKind::Text {
@@ -3730,29 +3905,56 @@ fn collect_inline_items_from(
         }));
         return true;
     }
+    if node.borrow().element_kind() == Some(ElementKind::Br) {
+        let line_height = styled_line_height(&node.borrow().style);
+        boxes.push(node.clone());
+        items.push(InlineItem::ForcedBreak { line_height });
+        return true;
+    }
     // An inline box with children contributes its children; one without (an
     // image, a sized span) is atomic.
     let first_child = node.borrow().first_child();
     if first_child.is_none() {
         let b = node.borrow();
-        let size = b.size();
+        let bottom = b.size().height();
         boxes.push(node.clone());
-        items.push(InlineItem::Atomic {
-            width: size.width(),
-            height: size.height(),
-            baseline: size.height(),
-        });
+        items.push(atomic_item(&b, bottom));
         return true;
+    }
+    let metrics = compute_box_model_metrics(&node.borrow().style);
+    let leading = metrics.margin.left + metrics.border.left + metrics.padding.left;
+    let trailing = metrics.margin.right + metrics.border.right + metrics.padding.right;
+    if leading > 0 {
+        boxes.push(node.clone());
+        items.push(InlineItem::Spacer { width: leading });
     }
     let mut child = first_child;
     while let Some(c) = child {
-        if !collect_inline_items_from(&c, boxes, items) {
+        // A float or positioned box inside an inline element is placed apart
+        // from the line; it must not stop the rest being laid out as text.
+        if !c.borrow().is_out_of_flow() && !collect_inline_items_from(&c, boxes, items) {
             return false;
         }
         let next = c.borrow().next_sibling();
         child = next;
     }
+    if trailing > 0 {
+        boxes.push(node.clone());
+        items.push(InlineItem::Spacer { width: trailing });
+    }
     true
+}
+
+/// The item for a box placed whole on a line: its margin box, with `baseline`
+/// measured from its border box's top.
+fn atomic_item(b: &LayoutObject, baseline: i64) -> InlineItem {
+    let metrics = compute_box_model_metrics(&b.style);
+    let size = b.size();
+    InlineItem::Atomic {
+        width: size.width() + metrics.margin.left + metrics.margin.right,
+        height: size.height() + metrics.margin.top + metrics.margin.bottom,
+        baseline: baseline + metrics.margin.top,
+    }
 }
 
 /// A rect in the inline formatting context's (block-relative) coordinates.
