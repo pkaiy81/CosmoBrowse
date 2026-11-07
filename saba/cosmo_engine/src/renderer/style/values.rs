@@ -38,6 +38,10 @@ thread_local! {
     static FOCUS_CHAIN: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
+pub(crate) fn styling_viewport() -> (i64, i64) {
+    STYLING_VIEWPORT.with(|v| v.get())
+}
+
 pub(crate) fn set_styling_viewport(width: i64, height: i64) {
     STYLING_VIEWPORT.with(|v| v.set((width, height)));
 }

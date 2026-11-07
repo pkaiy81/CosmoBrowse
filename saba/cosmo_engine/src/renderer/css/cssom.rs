@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::string::ToString;
 use crate::renderer::css::media::{parse_media_query_list, MediaContext, MediaQueryList};
 use crate::renderer::css::token::CssToken;
@@ -1348,6 +1349,73 @@ fn substitute_vars_depth(
     out
 }
 
+/// Which rules could match an element, found from its id, classes and tag instead
+/// of trying every rule against it.
+#[derive(Debug, Clone, Default)]
+pub struct RuleIndex {
+    by_id: HashMap<String, Vec<u32>>,
+    by_class: HashMap<String, Vec<u32>>,
+    by_tag: HashMap<String, Vec<u32>>,
+    /// Rules that can match with no particular id, class or tag.
+    unkeyed: Vec<u32>,
+    /// `::before`/`::after` rules, which are found separately.
+    pseudo_elements: Vec<u32>,
+}
+
+/// What an element has to have for a selector to match it.
+enum RuleKey<'a> {
+    Id(&'a str),
+    Class(&'a str),
+    Tag(&'a str),
+}
+
+/// The keys of which a matching element has at least one, or None if a selector
+/// can match without any.
+fn rule_keys(selector: &Selector) -> Option<Vec<RuleKey<'_>>> {
+    match selector {
+        Selector::IdSelector(id) => Some(vec![RuleKey::Id(id)]),
+        Selector::ClassSelector(class) => Some(vec![RuleKey::Class(class)]),
+        Selector::TypeSelector(tag) => Some(vec![RuleKey::Tag(tag)]),
+        Selector::Never => Some(Vec::new()),
+        // Any one part will do, since all have to match. The rarest kind is best.
+        Selector::Compound(parts) => {
+            let rank = |keys: &Vec<RuleKey<'_>>| match keys.first() {
+                Some(RuleKey::Id(_)) => 0,
+                Some(RuleKey::Class(_)) => 1,
+                _ => 2,
+            };
+            parts
+                .iter()
+                .filter_map(rule_keys)
+                .filter(|keys| !keys.is_empty())
+                .min_by_key(rank)
+        }
+        Selector::Descendant(_, subject)
+        | Selector::Child(_, subject)
+        | Selector::NextSibling(_, subject)
+        | Selector::SubsequentSibling(_, subject) => rule_keys(subject),
+        Selector::Is(inner) | Selector::Where(inner) => rule_keys(inner),
+        Selector::List(alternatives) => {
+            let mut keys = Vec::new();
+            for alternative in alternatives {
+                keys.extend(rule_keys(alternative)?);
+            }
+            Some(keys)
+        }
+        _ => None,
+    }
+}
+
+/// Built on first use: stylesheets aren't touched after parsing.
+#[derive(Debug, Clone, Default)]
+pub struct RuleIndexCell(std::cell::OnceCell<RuleIndex>);
+
+impl PartialEq for RuleIndexCell {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyleSheet {
     pub rules: Vec<QualifiedRule>,
@@ -1355,6 +1423,7 @@ pub struct StyleSheet {
     pub media_conditions: Vec<MediaQueryList>,
     /// `@keyframes` rules, looked up by `animation-name`.
     pub keyframes: Vec<KeyframesRule>,
+    index: RuleIndexCell,
 }
 
 impl StyleSheet {
@@ -1363,7 +1432,72 @@ impl StyleSheet {
             rules: Vec::new(),
             media_conditions: Vec::new(),
             keyframes: Vec::new(),
+            index: RuleIndexCell::default(),
         }
+    }
+
+    fn index(&self) -> &RuleIndex {
+        self.index.0.get_or_init(|| {
+            let mut index = RuleIndex::default();
+            for (i, rule) in self.rules.iter().enumerate() {
+                let i = i as u32;
+                if matches!(rule.selector, Selector::PseudoElement(..)) {
+                    index.pseudo_elements.push(i);
+                    continue;
+                }
+                let Some(keys) = rule_keys(&rule.selector) else {
+                    index.unkeyed.push(i);
+                    continue;
+                };
+                for key in keys {
+                    let (map, name) = match key {
+                        RuleKey::Id(name) => (&mut index.by_id, name),
+                        RuleKey::Class(name) => (&mut index.by_class, name),
+                        RuleKey::Tag(name) => (&mut index.by_tag, name),
+                    };
+                    let list = map.entry(name.to_string()).or_default();
+                    // An alternative of the same rule may have the same key.
+                    if list.last() != Some(&i) {
+                        list.push(i);
+                    }
+                }
+            }
+            index
+        })
+    }
+
+    /// The rules that could match an element with this id, classes and tag, in
+    /// document order. Every rule not returned certainly doesn't match it.
+    pub fn candidate_rules<'a>(
+        &self,
+        id: Option<&str>,
+        classes: impl Iterator<Item = &'a str>,
+        tag: &str,
+    ) -> Vec<&QualifiedRule> {
+        let index = self.index();
+        let mut found: Vec<u32> = index.unkeyed.clone();
+        if let Some(rules) = id.and_then(|id| index.by_id.get(id)) {
+            found.extend_from_slice(rules);
+        }
+        for class in classes {
+            if let Some(rules) = index.by_class.get(class) {
+                found.extend_from_slice(rules);
+            }
+        }
+        if let Some(rules) = index.by_tag.get(tag) {
+            found.extend_from_slice(rules);
+        }
+        found.sort_unstable();
+        found.dedup();
+        found.iter().map(|&i| &self.rules[i as usize]).collect()
+    }
+
+    /// The `::before` and `::after` rules, in document order.
+    pub fn pseudo_element_rules(&self) -> impl Iterator<Item = &QualifiedRule> {
+        self.index()
+            .pseudo_elements
+            .iter()
+            .map(|&i| &self.rules[i as usize])
     }
 
     /// The `@keyframes` rule named `name`, if the document declares one. A
@@ -1436,6 +1570,7 @@ impl StyleSheet {
             // Keyframes are unconditional (a `@keyframes` inside `@media` is
             // skipped by the parser), so they survive the filter as-is.
             keyframes: self.keyframes.clone(),
+            index: RuleIndexCell::default(),
         }
     }
 }

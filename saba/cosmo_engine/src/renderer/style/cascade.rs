@@ -45,6 +45,31 @@ fn font_weight_is_bold(value: &ComponentValue) -> Option<bool> {
     }
 }
 
+/// The physical property a logical one means, for those that name a single one.
+fn physical_property(property: &str) -> Option<String> {
+    let simple = match property {
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "max-inline-size" => "max-width",
+        "min-block-size" => "min-height",
+        "max-block-size" => "max-height",
+        "overflow-inline" => "overflow-x",
+        "overflow-block" => "overflow-y",
+        _ => "",
+    };
+    if !simple.is_empty() {
+        return Some(simple.to_string());
+    }
+    let side = |name: &str| {
+        name.replace("inline-start", "left")
+            .replace("inline-end", "right")
+            .replace("block-start", "top")
+            .replace("block-end", "bottom")
+    };
+    (property.starts_with("border-") && property != side(property)).then(|| side(property))
+}
+
 impl LayoutObject {
     fn apply_font_shorthand(&mut self, values: &[ComponentValue], parent_font_size: FontSize) {
         // A system font keyword stands for the whole shorthand.
@@ -142,6 +167,48 @@ impl LayoutObject {
             if value_has_var(&declaration.value) {
                 if let Some(scope) = &custom_scope {
                     declaration.value = substitute_vars(&declaration.value, scope);
+                }
+            }
+            // Logical properties, in the only writing mode there is here:
+            // horizontal, left to right.
+            // https://www.w3.org/TR/css-logical-1/
+            if let Some(physical) = physical_property(&declaration.property) {
+                declaration.property = physical;
+            }
+            // The CSS-wide keywords work on every property, and take back whatever
+            // an earlier rule (the browser's own, often) declared.
+            if let [ComponentValue::Ident(keyword)] = declaration.value.as_slice() {
+                let keyword = keyword.to_ascii_lowercase();
+                if keyword == "inherit" {
+                    match self.parent.upgrade() {
+                        Some(parent) => {
+                            let parent = parent.borrow().style();
+                            self.style.inherit_property(&declaration.property, &parent);
+                        }
+                        None => self.style.reset_property(&declaration.property),
+                    }
+                    continue;
+                }
+                let is_color_keyword = declaration.property == "color" && keyword == "currentcolor";
+                if is_color_keyword || matches!(keyword.as_str(), "unset" | "revert" | "revert-layer") {
+                    self.style.reset_property(&declaration.property);
+                    continue;
+                }
+                if keyword == "initial" {
+                    self.style.reset_property(&declaration.property);
+                    // These inherit, so the parent's value isn't what's asked for.
+                    match declaration.property.as_str() {
+                        "color" => self.style.set_color(Color::black()),
+                        "text-decoration" | "text-decoration-line" => {
+                            self.style.set_text_decoration(TextDecoration::None)
+                        }
+                        "font-size" => self.style.set_font_size(FontSize::Medium),
+                        "font-weight" => self.style.set_bold(false),
+                        "font-style" => self.style.set_italic(false),
+                        "line-height" => self.style.set_line_height(LineHeight::Normal),
+                        _ => {}
+                    }
+                    continue;
                 }
             }
             // Sizes that can depend on the containing block keep the expression
@@ -743,6 +810,9 @@ impl LayoutObject {
                             self.style.set_offset_right(px)
                         }
                     }
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
+                        self.style.set_offset_right_ratio(*value / 100.0)
+                    }
                     _ => {}
                 },
                 "bottom" => match first_value {
@@ -753,6 +823,9 @@ impl LayoutObject {
                         {
                             self.style.set_offset_bottom(px)
                         }
+                    }
+                    Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
+                        self.style.set_offset_bottom_ratio(*value / 100.0)
                     }
                     _ => {}
                 },
@@ -1289,6 +1362,50 @@ impl LayoutObject {
                     });
                 }
                 // Logical properties, for horizontal left-to-right text.
+                // One value, or two for start and end, on the two sides of an axis.
+                "inset-inline" | "inset-block" => {
+                    let sides = if declaration.property == "inset-inline" {
+                        ["left", "right"]
+                    } else {
+                        ["top", "bottom"]
+                    };
+                    let values: Vec<&ComponentValue> = declaration
+                        .value
+                        .iter()
+                        .filter(|v| !matches!(v, ComponentValue::Whitespace))
+                        .collect();
+                    if let Some(first) = values.first() {
+                        let second = values.get(1).unwrap_or(first);
+                        let expanded = [(sides[0], *first), (sides[1], *second)]
+                            .into_iter()
+                            .map(|(side, value)| Declaration {
+                                property: side.to_string(),
+                                value: vec![value.clone()],
+                                important: declaration.important,
+                            })
+                            .collect();
+                        self.cascading_style(expanded, parent_font_size);
+                    }
+                }
+                "border-inline" | "border-block" | "border-inline-width" | "border-block-width"
+                | "border-inline-color" | "border-block-color" | "border-inline-style"
+                | "border-block-style" => {
+                    let inline = declaration.property.starts_with("border-inline");
+                    let suffix = declaration
+                        .property
+                        .trim_start_matches("border-inline")
+                        .trim_start_matches("border-block");
+                    let sides = if inline { ["left", "right"] } else { ["top", "bottom"] };
+                    let expanded = sides
+                        .iter()
+                        .map(|side| Declaration {
+                            property: format!("border-{side}{suffix}"),
+                            value: declaration.value.clone(),
+                            important: declaration.important,
+                        })
+                        .collect();
+                    self.cascading_style(expanded, parent_font_size);
+                }
                 "margin-inline" | "margin-block" | "padding-inline" | "padding-block" => {
                     let inline = declaration.property.ends_with("inline");
                     let (start, end) = if inline { ("left", "right") } else { ("top", "bottom") };

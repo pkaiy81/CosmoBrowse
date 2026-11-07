@@ -84,7 +84,7 @@ pub(crate) fn prepare_root_style(body: &Rc<RefCell<Node>>, cssom: &StyleSheet) {
     let Some(html) = body.borrow().parent().upgrade() else {
         return;
     };
-    if !matches!(html.borrow().kind(), NodeKind::Element(_)) {
+    if !matches!(html.borrow().kind, NodeKind::Element(_)) {
         return;
     }
     let Some(object) = create_layout_object(&Some(html), &None, cssom) else {
@@ -135,9 +135,25 @@ pub fn create_layout_object(
         // document; the stable sort keeps document order for equal
         // specificity (later rule wins). Spec: CSS Cascade §6.
         // https://www.w3.org/TR/css-cascade-4/#cascade-specificity
-        let mut matched: Vec<&QualifiedRule> = cssom
-            .rules
-            .iter()
+        let candidates = match &n.borrow().kind {
+            NodeKind::Element(element) => {
+                let attribute = |name: &str| {
+                    element
+                        .attribute_list()
+                        .iter()
+                        .find(|attr| attr.name_str() == name)
+                        .map(|attr| attr.value_str())
+                };
+                cssom.candidate_rules(
+                    attribute("id"),
+                    attribute("class").unwrap_or_default().split_ascii_whitespace(),
+                    element.tag_name(),
+                )
+            }
+            _ => Vec::new(),
+        };
+        let mut matched: Vec<&QualifiedRule> = candidates
+            .into_iter()
             .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
             .collect();
         matched.sort_by_key(|rule| (!rule.user_agent, !rule.layered, rule.selector.specificity()));
@@ -178,7 +194,7 @@ pub fn create_layout_object(
                     let mut chain: Vec<Rc<RefCell<Node>>> = Vec::new();
                     let mut current = n.borrow().parent().upgrade();
                     while let Some(p) = current {
-                        if matches!(p.borrow().kind(), NodeKind::Element(_)) {
+                        if matches!(p.borrow().kind, NodeKind::Element(_)) {
                             chain.push(p.clone());
                         }
                         let next = p.borrow().parent().upgrade();
@@ -277,8 +293,7 @@ pub fn build_pseudo_element(
     // Collect matching pseudo-element rules (host part matches host_node),
     // sorted by specificity.
     let mut matched: Vec<&QualifiedRule> = cssom
-        .rules
-        .iter()
+        .pseudo_element_rules()
         .filter(|rule| match &rule.selector {
             Selector::PseudoElement(host_sel, kind) => {
                 *kind == pe && dom_node_selected(host_node, host_sel)
@@ -1423,28 +1438,71 @@ impl LayoutObject {
         None
     }
 
-    /// Containing block for an absolutely positioned box: the content box of
-    /// the nearest positioned ancestor. None = no positioned ancestor (the
-    /// caller anchors to its direct parent, the legacy approximation of the
-    /// initial containing block).
+    /// Containing block for a box taken out of flow by `position`: the padding box
+    /// of the nearest positioned ancestor, or the viewport. None means neither is
+    /// known, and the caller anchors to its direct parent.
+    /// Spec: CSS 2.2 §10.1. https://www.w3.org/TR/CSS22/visudet.html#containing-block-details
     fn absolute_containing_block(&self) -> Option<(LayoutPoint, LayoutSize)> {
-        let mut anc = self.parent.upgrade();
-        while let Some(a) = anc {
-            let step = match a.try_borrow() {
-                Ok(b) => {
-                    let positioned = b.style().position() != PositionType::Static;
-                    if positioned {
-                        return Some((b.content_origin(), b.content_size()));
-                    }
-                    b.parent.upgrade()
-                }
-                // An ancestor is mid-borrow (shouldn't happen in the position
-                // walk): fall back to the legacy anchor.
-                Err(_) => return None,
-            };
-            anc = step;
+        self.containing_block_of_positioned().map(|(point, size, _)| (point, size))
+    }
+
+    /// As [`Self::absolute_containing_block`], and whether its height is known
+    /// before its contents are laid out.
+    fn containing_block_of_positioned(&self) -> Option<(LayoutPoint, LayoutSize, bool)> {
+        let (viewport_width, viewport_height) = crate::renderer::style::values::styling_viewport();
+        let viewport = (viewport_width > 0).then(|| {
+            (
+                LayoutPoint::new(0, 0),
+                LayoutSize::new(viewport_width, viewport_height),
+                viewport_height > 0,
+            )
+        });
+        if self.style.position() == PositionType::Fixed {
+            return viewport;
         }
-        None
+        let mut ancestor = self.parent.upgrade();
+        while let Some(a) = ancestor {
+            let step = {
+                let b = a.try_borrow().ok()?;
+                if b.style().position() != PositionType::Static {
+                    let border = compute_box_model_metrics(&b.style).border;
+                    return Some((
+                        LayoutPoint::new(b.point.x() + border.left, b.point.y() + border.top),
+                        LayoutSize::new(
+                            (b.size.width() - border.horizontal()).max(0),
+                            (b.size.height() - border.vertical()).max(0),
+                        ),
+                        b.style.height() > 0.0 || b.style.explicit_zero_height(),
+                    ));
+                }
+                b.parent.upgrade()
+            };
+            ancestor = step;
+        }
+        viewport
+    }
+
+    /// Whether `position` takes this box out of flow.
+    fn is_absolutely_positioned(&self) -> bool {
+        matches!(
+            self.style.position(),
+            PositionType::Absolute | PositionType::Fixed
+        )
+    }
+
+    /// `left`, `right`, `top` and `bottom` in px against `containing`. None is auto.
+    fn positioned_offsets(&self, containing: LayoutSize) -> [Option<i64>; 4] {
+        let style = &self.style;
+        let (width, height) = (containing.width() as f64, containing.height() as f64);
+        let left = style.offset_left_author().then(|| {
+            style.offset_left_ratio().map(|r| width * r).unwrap_or(style.offset_left())
+        });
+        let right = style.offset_right_ratio().map(|r| width * r).or(style.offset_right());
+        let top = style.offset_top_author().then(|| {
+            style.offset_top_ratio().map(|r| height * r).unwrap_or(style.offset_top())
+        });
+        let bottom = style.offset_bottom_ratio().map(|r| height * r).or(style.offset_bottom());
+        [left, right, top, bottom].map(|edge| edge.map(|px| px as i64))
     }
 
     /// Marker text for a <li> with a non-none list-style-type: bullet glyphs,
@@ -1488,12 +1546,11 @@ impl LayoutObject {
         if let Some(w) = parse_dimension_attr(self.element_attribute("width")) {
             return w;
         }
-        // A flex row or grid puts its items beside each other, not in a stack. For
-        // grid this counts every item in one row, which over-reserves a wrapping
-        // grid but never wraps a fixed one.
+        // A flex row or grid puts its items beside each other, not in a stack, and
+        // with room for it a wrapping one doesn't wrap. For grid this counts every
+        // item in one row, which over-reserves but never wraps a fixed one.
         let lays_out_side_by_side = (self.is_flex_container()
-            && self.style.flex_direction() == FlexDirection::Row
-            && self.style.flex_wrap() == FlexWrap::NoWrap)
+            && self.style.flex_direction() == FlexDirection::Row)
             || self.style.display() == DisplayType::Grid;
         let side_gap = self.style.column_gap();
         let mut max_line: i64 = 0; // widest block-level line seen
@@ -1581,6 +1638,10 @@ impl LayoutObject {
     fn min_content_width_hint_depth(&self, depth: u32) -> i64 {
         if depth == 0 {
             return 0;
+        }
+        // With nowhere to break, the minimum is all of it.
+        if self.style.white_space_nowrap() {
+            return self.max_content_width_depth(depth);
         }
         let mut max_hint: i64 = 0;
         let mut child = self.first_child();
@@ -2605,6 +2666,11 @@ impl LayoutObject {
 
     pub fn compute_size(&mut self, parent_size: LayoutSize) {
         let mut size = LayoutSize::new(0, 0);
+        // A positioned box measures itself against its containing block.
+        let positioned = self.is_absolutely_positioned();
+        let containing = positioned.then(|| self.containing_block_of_positioned()).flatten();
+        let parent_size = containing.map(|(_, size, _)| size).unwrap_or(parent_size);
+        let height_is_definite = containing.is_some_and(|(_, _, definite)| definite);
         self.style.resolve_percent_edges(parent_size.width());
         let metrics = compute_box_model_metrics(&self.style);
         // An inline-block is a block on the inside; only how its parent places
@@ -2681,7 +2747,7 @@ impl LayoutObject {
                         .parent_object()
                         .map(|p| p.borrow().style().overflow_clip())
                         .unwrap_or(false);
-                    if parent_clips {
+                    if parent_clips || positioned {
                         explicit_width
                     } else {
                         explicit_width.min(available_width)
@@ -2723,6 +2789,21 @@ impl LayoutObject {
                         max_row_width.min(available_width)
                     } else {
                         available_width
+                    }
+                } else if positioned {
+                    // Between `left` and `right` if it has both, otherwise as wide
+                    // as its contents with what room they leave.
+                    // Spec: CSS 2.2 §10.3.7.
+                    let [left, right, ..] = self.positioned_offsets(parent_size);
+                    let room = (parent_size.width()
+                        - left.unwrap_or(0)
+                        - right.unwrap_or(0)
+                        - metrics.outer_horizontal())
+                    .max(0);
+                    if left.is_some() && right.is_some() {
+                        room
+                    } else {
+                        self.max_content_width().min(self.min_content_width_hint().max(room))
                     }
                 } else if self.style.float_or_default() != Float::None
                     || self.is_inline_block()
@@ -2811,6 +2892,14 @@ impl LayoutObject {
                         // Spec: CSS Sizing 4 §4.1. The content can still make it taller.
                         self.collapses_through = false;
                         ((content_width as f64 / ratio).round() as i64).max(content_height)
+                    } else if let (true, [_, _, Some(top), Some(bottom)]) =
+                        (height_is_definite, self.positioned_offsets(parent_size))
+                    {
+                        // Between `top` and `bottom`. Spec: CSS 2.2 §10.6.4.
+                        let stretched = (parent_size.height() - top - bottom - metrics.outer_vertical())
+                            .max(0);
+                        self.stretched_height = Some(stretched + metrics.inner_vertical());
+                        stretched
                     } else {
                         content_height.max(0)
                     }
@@ -3130,42 +3219,87 @@ impl LayoutObject {
             // Sticky flows normally; the painter pins it at scroll time.
             PositionType::Static | PositionType::Sticky => {}
             PositionType::Relative => {
-                point.set_x(point.x() + self.style.offset_left() as i64);
-                point.set_y(point.y() + self.style.offset_top() as i64);
+                // `left` wins over `right`, and `top` over `bottom`. A percentage
+                // of a height that depends on this box's contents means nothing.
+                let height_is_definite = self.parent.upgrade().is_some_and(|parent| {
+                    parent
+                        .try_borrow()
+                        .map(|p| p.style.height() > 0.0 || p.style.explicit_zero_height())
+                        .unwrap_or(false)
+                });
+                let width = parent_size.width() as f64;
+                let height = if height_is_definite { parent_size.height() as f64 } else { 0.0 };
+                let style = &self.style;
+                let dx = match (style.offset_left_author(), style.offset_left_ratio()) {
+                    (true, Some(ratio)) => width * ratio,
+                    (true, None) => style.offset_left(),
+                    (false, _) => -style
+                        .offset_right_ratio()
+                        .map(|ratio| width * ratio)
+                        .or(style.offset_right())
+                        .unwrap_or(0.0),
+                };
+                let dy = match (style.offset_top_author(), style.offset_top_ratio()) {
+                    (true, Some(ratio)) => height * ratio,
+                    (true, None) => style.offset_top(),
+                    (false, _) => -style
+                        .offset_bottom_ratio()
+                        .map(|ratio| height * ratio)
+                        .or(style.offset_bottom())
+                        .unwrap_or(0.0),
+                };
+                point.set_x(point.x() + dx as i64);
+                point.set_y(point.y() + dy as i64);
             }
-            PositionType::Absolute => {
-                // Containing block: the nearest positioned ancestor's content
-                // box (CSS2.2 §10.1); the direct parent's box when none.
+            PositionType::Absolute | PositionType::Fixed => {
                 let (cb_point, cb_size) = self
                     .absolute_containing_block()
                     .unwrap_or((parent_point, parent_size));
-                if self.style.offset_left_author() {
-                    let dx = self
-                        .style
-                        .offset_left_ratio()
-                        .map(|r| (cb_size.width() as f64 * r) as i64)
-                        .unwrap_or_else(|| self.style.offset_left() as i64);
-                    point.set_x(cb_point.x() + dx);
-                } else if let Some(r) = self.style.offset_right() {
-                    point.set_x(cb_point.x() + cb_size.width() - self.size.width() - r as i64);
+                let [left, right, top, bottom] = self.positioned_offsets(cb_size);
+                let margin = metrics.margin;
+                // With both edges and no width to spare, `margin: auto` centers.
+                let free = cb_size.width() - left.unwrap_or(0) - right.unwrap_or(0) - self.size.width();
+                match (left, right) {
+                    (Some(left), Some(_))
+                        if self.style.margin_left_auto()
+                            && self.style.margin_right_auto()
+                            && free > 0 =>
+                    {
+                        point.set_x(cb_point.x() + left + free / 2);
+                    }
+                    (Some(left), _) => point.set_x(cb_point.x() + left + margin.left),
+                    (None, Some(right)) => point.set_x(
+                        cb_point.x() + cb_size.width() - self.size.width() - right - margin.right,
+                    ),
+                    // Both auto: keep the static (flow) position.
+                    (None, None) => {}
                 }
-                // left/right both auto: keep the static (flow) x.
-                if self.style.offset_top_author() {
-                    let dy = self
-                        .style
-                        .offset_top_ratio()
-                        .map(|r| (cb_size.height() as f64 * r) as i64)
-                        .unwrap_or_else(|| self.style.offset_top() as i64);
-                    point.set_y(cb_point.y() + dy);
-                } else if let Some(b) = self.style.offset_bottom() {
-                    point.set_y(cb_point.y() + cb_size.height() - self.size.height() - b as i64);
+                // Heights that depend on the containing block's contents are only
+                // known now, too late for this box's contents to use them.
+                let auto_height = self.style.height() <= 0.0
+                    && !self.style.explicit_zero_height()
+                    && self.style.aspect_ratio().is_none()
+                    && self.kind() == LayoutObjectKind::Block;
+                if let (true, Some(top), Some(bottom)) = (auto_height, top, bottom) {
+                    self.size.set_height(
+                        (cb_size.height() - top - bottom - margin.vertical()).max(0),
+                    );
                 }
-            }
-            // Fixed: anchored to the viewport origin; the painter additionally
-            // exempts it from the scroll offset.
-            PositionType::Fixed => {
-                point.set_x(edge_to_i64(self.style.offset_left()));
-                point.set_y(edge_to_i64(self.style.offset_top()));
+                let free = cb_size.height() - top.unwrap_or(0) - bottom.unwrap_or(0) - self.size.height();
+                match (top, bottom) {
+                    (Some(top), Some(_))
+                        if self.style.margin_top_auto()
+                            && self.style.margin_bottom_auto()
+                            && free > 0 =>
+                    {
+                        point.set_y(cb_point.y() + top + free / 2);
+                    }
+                    (Some(top), _) => point.set_y(cb_point.y() + top + margin.top),
+                    (None, Some(bottom)) => point.set_y(
+                        cb_point.y() + cb_size.height() - self.size.height() - bottom - margin.bottom,
+                    ),
+                    (None, None) => {}
+                }
             }
         }
 
@@ -3205,6 +3339,14 @@ impl LayoutObject {
 
 
     pub fn update_kind(&mut self) {
+        // A box out of flow has no line to sit in, so it's a block whatever it says.
+        // Spec: CSS 2.2 §9.7. https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo
+        if self.is_absolutely_positioned()
+            && matches!(self.style.display(), DisplayType::Inline | DisplayType::InlineBlock)
+            && matches!(self.node.borrow().kind, NodeKind::Element(_))
+        {
+            self.style.set_display(DisplayType::Block);
+        }
         match self.node_kind() {
             NodeKind::Document => panic!("should not create a layout object for a document node"),
             NodeKind::Element(_) => match self.style.display() {
@@ -3299,11 +3441,11 @@ impl LayoutObject {
         let mut items = Vec::new();
         let mut child = self.first_child();
         while let Some(c) = child {
-            // Floats are out of flow: they are placed separately and the lines
-            // flow *around* them, so they contribute no inline item — and a
-            // floated block child must not disqualify the context either.
-            let floated = c.borrow().style.float_or_default() != Float::None;
-            if !floated {
+            // Floats and positioned boxes are out of flow: they are placed
+            // separately, so they contribute no inline item — and a block child
+            // of that sort must not disqualify the context either.
+            let out_of_flow = c.borrow().is_out_of_flow();
+            if !out_of_flow {
                 if c.borrow().kind().normal_flow_spec().stacks_vertically {
                     return None;
                 }

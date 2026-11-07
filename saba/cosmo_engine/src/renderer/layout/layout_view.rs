@@ -123,7 +123,7 @@ fn build_layout_tree(
             // CSS generated content: a ::before box becomes the first child and a
             // ::after box the last child of the element.
             // https://www.w3.org/TR/css-content-3/
-            if matches!(n.borrow().kind(), NodeKind::Element(_)) {
+            if matches!(n.borrow().kind, NodeKind::Element(_)) {
                 use crate::renderer::css::cssom::PseudoElement;
                 if let Some(before) = crate::renderer::layout::layout_object::build_pseudo_element(
                     &n,
@@ -872,7 +872,6 @@ impl LayoutView {
         }
 
         Self::align_inline_baselines(&self.root);
-        self.reposition_fixed_far_edges(&self.root.clone());
         Self::apply_transforms(&self.root);
         let mut next_scroll_id: u32 = 1;
         Self::stamp_sticky_contexts(
@@ -1371,45 +1370,6 @@ impl LayoutView {
             Self::align_inline_baselines(&first_child);
             let next_sibling = n.borrow().next_sibling();
             Self::align_inline_baselines(&next_sibling);
-        }
-    }
-
-    /// Post-layout pass: a fixed box anchored with `right`/`bottom` resolves
-    /// against the viewport's far edges, which requires its final size —
-    /// so it (and its whole subtree) is translated here, after positioning.
-    /// `bottom` needs a known viewport height (0 = headless default width-only
-    /// layout → bottom anchoring is skipped).
-    fn reposition_fixed_far_edges(&self, node: &Option<Rc<RefCell<LayoutObject>>>) {
-        if let Some(n) = node {
-            let (is_fixed, right, bottom, size, point) = {
-                let b = n.borrow();
-                (
-                    b.style().position_or_default() == PositionType::Fixed,
-                    b.style().offset_right(),
-                    b.style().offset_bottom(),
-                    b.size(),
-                    b.point(),
-                )
-            };
-            if is_fixed {
-                let mut dx = 0i64;
-                let mut dy = 0i64;
-                if let Some(r) = right {
-                    dx = (self.viewport_width - size.width() - r as i64) - point.x();
-                }
-                if let Some(bm) = bottom {
-                    if self.viewport_height > 0 {
-                        dy = (self.viewport_height - size.height() - bm as i64) - point.y();
-                    }
-                }
-                if dx != 0 || dy != 0 {
-                    Self::translate_subtree(n, dx, dy);
-                }
-            }
-            let first_child = n.borrow().first_child();
-            self.reposition_fixed_far_edges(&first_child);
-            let next_sibling = n.borrow().next_sibling();
-            self.reposition_fixed_far_edges(&next_sibling);
         }
     }
 

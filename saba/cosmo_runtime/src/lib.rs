@@ -21,6 +21,7 @@ pub use model::{
 pub use layout::{CaretMove, CaretRect, ClickOutcome, LayoutScene, LivePage};
 pub use loader::{parse_navigate_message, queue_form_post, FetchWaker, NavigateRequest};
 pub use paint::scene_items_to_paint_commands;
+pub use cosmo_script::USER_AGENT;
 pub use session::BrowserApp;
 
 pub use cosmo_engine::paint_commands::{
