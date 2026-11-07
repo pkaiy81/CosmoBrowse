@@ -188,6 +188,18 @@ pub fn get_style_content(root: Rc<RefCell<Node>>) -> String {
     styles.join("\n")
 }
 
+/// The text of the `<style>` elements at and under `node`, not its siblings.
+pub fn get_style_content_within(node: &Rc<RefCell<Node>>) -> String {
+    let mut styles = Vec::new();
+    if node.borrow().element_kind() == Some(ElementKind::Style) {
+        let mut text = String::new();
+        collect_text(node.borrow().first_child(), &mut text);
+        styles.push(text);
+    }
+    collect_tag_texts(node.borrow().first_child(), ElementKind::Style, &mut styles);
+    styles.join("\n")
+}
+
 pub fn get_js_content(root: Rc<RefCell<Node>>) -> String {
     // Only collect <script> elements whose `type` is a JavaScript MIME type
     // (or unset, which per HTML defaults to JavaScript).  CMS pages embed
@@ -275,7 +287,8 @@ pub fn query_selector_all(
             current = n.borrow().next_sibling();
         }
     }
-    walk(Some(root), &sheet.rules, &mut out);
+    // What's under `root`: not `root`, and not what comes after it.
+    walk(root.borrow().first_child(), &sheet.rules, &mut out);
     out
 }
 
@@ -330,9 +343,66 @@ pub fn element_closest(node: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<Ref
         if element_matches(&n, selector) {
             return Some(n);
         }
-        current = n.borrow().parent().upgrade();
+        // The search doesn't leave the shadow tree it started in.
+        current = n.borrow().parent().upgrade().filter(|p| !p.borrow().is_shadow_root());
     }
     None
+}
+
+/// Turns `<template shadowrootmode>` into the shadow tree it declares.
+/// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inhead
+pub fn attach_declarative_shadow_roots(root: &Rc<RefCell<Node>>) {
+    use crate::renderer::dom::node::SHADOW_ROOT_TAG;
+    use crate::renderer::html::attribute::Attribute;
+    let mut child = root.borrow().first_child();
+    while let Some(c) = child {
+        let next = c.borrow().next_sibling();
+        let mode = match &c.borrow().kind {
+            NodeKind::Element(element) if element.tag_name() == "template" => element
+                .get_attribute("shadowrootmode")
+                .map(|mode| mode.to_ascii_lowercase())
+                .filter(|mode| mode == "open" || mode == "closed"),
+            _ => None,
+        };
+        let can_host =
+            matches!(root.borrow().kind, NodeKind::Element(_)) && root.borrow().shadow_root().is_none();
+        if let (Some(mode), true) = (mode, can_host) {
+            let mut attribute = Attribute::new();
+            for character in "mode".chars() {
+                attribute.add_char(character, true);
+            }
+            for character in mode.chars() {
+                attribute.add_char(character, false);
+            }
+            let shadow = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+                SHADOW_ROOT_TAG,
+                vec![attribute],
+            )))));
+            shadow.borrow_mut().set_parent(Rc::downgrade(root));
+            detach_node(&c);
+            while let Some(grandchild) = {
+                let first = c.borrow().first_child();
+                first
+            } {
+                detach_node(&grandchild);
+                let last = shadow.borrow().last_child().upgrade();
+                grandchild.borrow_mut().set_parent(Rc::downgrade(&shadow));
+                match last {
+                    Some(last) => {
+                        grandchild.borrow_mut().set_previous_sibling(Rc::downgrade(&last));
+                        last.borrow_mut().set_next_sibling(Some(grandchild.clone()));
+                    }
+                    None => shadow.borrow_mut().set_first_child(Some(grandchild.clone())),
+                }
+                shadow.borrow_mut().set_last_child(Rc::downgrade(&grandchild));
+            }
+            root.borrow_mut().set_shadow_root(shadow.clone());
+            attach_declarative_shadow_roots(&shadow);
+        } else {
+            attach_declarative_shadow_roots(&c);
+        }
+        child = next;
+    }
 }
 
 /// Take a node out of its parent, closing the gap between its siblings.

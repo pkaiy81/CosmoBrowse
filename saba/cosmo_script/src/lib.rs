@@ -182,6 +182,8 @@ struct PageState {
     /// Its callback may clear it, and an interval then mustn't be rescheduled.
     firing_timer: std::cell::Cell<Option<u32>>,
     import_map: RefCell<platform::ImportMap>,
+    /// What `customElements` wants told about elements entering and leaving.
+    tree_observer: RefCell<Option<(JsObject, JsObject)>>,
     /// Monotonic virtual clock advanced as timers fire.
     virtual_clock: std::cell::Cell<u64>,
     /// Bumped on every DOM mutation (see LivePage::pump_and_relayout).
@@ -231,6 +233,7 @@ impl Default for PageState {
             next_timer_id: std::cell::Cell::new(1),
             firing_timer: std::cell::Cell::new(None),
             import_map: RefCell::new(platform::ImportMap::default()),
+            tree_observer: RefCell::new(None),
             virtual_clock: std::cell::Cell::new(0),
             dom_generation: std::cell::Cell::new(0),
             location_href: RefCell::new(String::from("about:blank")),
@@ -291,6 +294,7 @@ page_field!(TIMERS, timers, RefCell<Vec<Timer>>);
 page_field!(NEXT_TIMER_ID, next_timer_id, std::cell::Cell<u32>);
 page_field!(FIRING_TIMER, firing_timer, std::cell::Cell<Option<u32>>);
 page_field!(IMPORT_MAP, import_map, RefCell<platform::ImportMap>);
+page_field!(TREE_OBSERVER, tree_observer, RefCell<Option<(JsObject, JsObject)>>);
 page_field!(VIRTUAL_CLOCK, virtual_clock, std::cell::Cell<u64>);
 page_field!(DOM_GENERATION, dom_generation, std::cell::Cell<u64>);
 page_field!(LOCATION_HREF, location_href, RefCell<String>);
@@ -616,10 +620,12 @@ fn element_append_child(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsR
         return Ok(JsValue::null());
     };
     check_insertion(&parent, &child)?;
-    for node in nodes_to_insert(&child) {
-        append_child_node(&parent, &node);
-        platform::run_inserted_scripts(&node, ctx);
+    let inserted = nodes_to_insert(&child);
+    for node in &inserted {
+        append_child_node(&parent, node);
+        platform::run_inserted_scripts(node, ctx);
     }
+    platform::notify_tree_change(&inserted, true, ctx);
     Ok(JsValue::from(make_element(child, ctx)))
 }
 
@@ -645,6 +651,7 @@ fn element_remove_child(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsR
         return Ok(JsValue::null());
     }
     detach_node(&child);
+    platform::notify_tree_change(std::slice::from_ref(&child), false, ctx);
     Ok(JsValue::from(make_element(child, ctx)))
 }
 
@@ -671,17 +678,19 @@ fn element_insert_before(this: &JsValue, a: &[JsValue], ctx: &mut Context) -> Js
             .with_message("NotFoundError: the reference node is not a child of this node")
             .into());
     }
-    for node in inserted {
-        insert_before_node(&parent, &node, reference.as_ref());
-        platform::run_inserted_scripts(&node, ctx);
+    for node in &inserted {
+        insert_before_node(&parent, node, reference.as_ref());
+        platform::run_inserted_scripts(node, ctx);
     }
+    platform::notify_tree_change(&inserted, true, ctx);
     Ok(JsValue::from(make_element(new_node, ctx)))
 }
 
 /// `element.remove()` — detach the element from its parent.
-fn element_remove(this: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+fn element_remove(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     if let Some(node) = handle_node(this) {
         detach_node(&node);
+        platform::notify_tree_change(std::slice::from_ref(&node), false, ctx);
     }
     Ok(JsValue::undefined())
 }
@@ -837,6 +846,8 @@ fn build_event(
     set_event_field(&obj, js_string!("srcElement"), JsValue::null());
     set_event_field(&obj, js_string!("eventPhase"), JsValue::from(0));
     set_event_field(&obj, js_string!("isTrusted"), JsValue::from(false));
+    // What the browser itself sends crosses shadow boundaries. `new Event()` says.
+    set_event_field(&obj, js_string!("composed"), JsValue::from(true));
     set_event_field(&obj, js_string!("timeStamp"), JsValue::from(VIRTUAL_CLOCK.with(|c| c.get()) as f64));
     let realm = ctx.realm().clone();
     obj.insert_property(
@@ -935,13 +946,39 @@ fn dispatch_event_object(
     set_event_field(&event, js_string!("target"), target_value.clone());
     set_event_field(&event, js_string!("srcElement"), target_value);
 
-    // Propagation path: [target, parent, ..., root].
+    // Propagation path: [target, parent, ..., root]. An event stops at the edge of
+    // a shadow tree unless it's `composed`, and beyond that edge its target is the
+    // host: what's inside is none of the outside's business.
+    // https://dom.spec.whatwg.org/#retarget
+    let composed = event
+        .get(js_string!("composed"), ctx)
+        .map(|v| v.to_boolean())
+        .unwrap_or(true);
     let mut path = vec![target.clone()];
+    let mut retargeted_at: Vec<(usize, Rc<RefCell<Node>>)> = Vec::new();
     let mut cur = target.borrow().parent().upgrade();
     while let Some(p) = cur {
         path.push(p.clone());
+        let is_shadow_root = p.borrow().is_shadow_root();
+        if is_shadow_root && !composed {
+            break;
+        }
         cur = p.borrow().parent().upgrade();
+        if is_shadow_root {
+            if let Some(host) = &cur {
+                retargeted_at.push((path.len(), host.clone()));
+            }
+        }
     }
+    // The target as seen from `path[index]`.
+    let target_at = |index: usize| -> Rc<RefCell<Node>> {
+        retargeted_at
+            .iter()
+            .rev()
+            .find(|(from, _)| index >= *from)
+            .map(|(_, host)| host.clone())
+            .unwrap_or_else(|| target.clone())
+    };
 
     let stopped = |event: &JsObject| {
         event
@@ -1028,13 +1065,22 @@ fn dispatch_event_object(
         true
     }
 
+    let retarget = |index: usize, event: &JsObject, ctx: &mut Context| {
+        if !retargeted_at.is_empty() {
+            let value = JsValue::from(make_element(target_at(index), ctx));
+            set_event_field(event, js_string!("target"), value.clone());
+            set_event_field(event, js_string!("srcElement"), value);
+        }
+    };
     // Capture phase: root down to (but not including) the target.
-    for node in path[1..].iter().rev() {
+    for (index, node) in path.iter().enumerate().skip(1).rev() {
+        retarget(index, &event, ctx);
         if !fire(node, event_type, Some(true), &event, &stopped, ctx) {
             return default_allowed(&event);
         }
     }
     // At target: both capture and bubble listeners.
+    retarget(0, &event, ctx);
     if !fire(&target, event_type, None, &event, &stopped, ctx) {
         return default_allowed(&event);
     }
@@ -1042,7 +1088,8 @@ fn dispatch_event_object(
         return default_allowed(&event);
     }
     // Bubble phase: parent up to root.
-    for node in path[1..].iter() {
+    for (index, node) in path.iter().enumerate().skip(1) {
+        retarget(index, &event, ctx);
         if !fire(node, event_type, Some(false), &event, &stopped, ctx) {
             return default_allowed(&event);
         }
@@ -1162,7 +1209,10 @@ fn elem_query_selector_all(this: &JsValue, a: &[JsValue], c: &mut Context) -> Js
 }
 
 fn element_get_parent_node(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let parent = handle_node(this).and_then(|n| n.borrow().parent().upgrade());
+    // A shadow root's way out is `host`, not its parent.
+    let parent = handle_node(this)
+        .filter(|n| !n.borrow().is_shadow_root())
+        .and_then(|n| n.borrow().parent().upgrade());
     Ok(node_or_null(parent, ctx))
 }
 fn element_get_first_child(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1742,6 +1792,7 @@ fn element_set_inner_html(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
     let html = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
 
     // Remove the target's existing children.
+    let mut removed = Vec::new();
     {
         let mut cur = target.borrow().first_child();
         while let Some(child) = cur {
@@ -1749,21 +1800,26 @@ fn element_set_inner_html(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsR
             child.borrow_mut().set_parent(Weak::new());
             child.borrow_mut().set_previous_sibling(Weak::new());
             child.borrow_mut().set_next_sibling(None);
+            removed.push(child);
             cur = next;
         }
         target.borrow_mut().set_first_child(None);
         target.borrow_mut().set_last_child(Weak::new());
     }
+    platform::notify_tree_change(&removed, false, c);
 
     // Parse the fragment in the target's context, so `<tr>` works in a `<tbody>`
     // and text in a `<textarea>` stays text.
     let context = target.borrow().element_tag_name().unwrap_or_else(|| "div".to_string());
+    let mut inserted = Vec::new();
     for child in HtmlParser::parse_fragment(&context, html) {
         cosmo_engine::renderer::dom::api::detach_node(&child);
         append_child_node(&target, &child);
+        inserted.push(child);
     }
     // Covers the case of clearing to empty (no appends above).
     bump_dom_generation();
+    platform::notify_tree_change(&inserted, true, c);
     Ok(JsValue::undefined())
 }
 
@@ -1859,6 +1915,7 @@ impl Default for ScriptHost {
 impl ScriptHost {
     pub fn new() -> Self {
         let context = Context::builder()
+            .job_executor(Rc::new(platform::PageJobExecutor::default()))
             .module_loader(Rc::new(platform::PageModuleLoader::new()))
             .build()
             .expect("the default realm builds");
@@ -2247,7 +2304,11 @@ impl ScriptHost {
     /// the page has an ongoing animation the GUI should keep driving frames for.
     pub fn has_pending_timers(&self) -> bool {
         self.activate();
-        TIMERS.with(|t| !t.borrow().is_empty())
+        let unfinished_jobs = self
+            .context
+            .downcast_job_executor::<platform::PageJobExecutor>()
+            .is_some_and(|executor| executor.has_jobs());
+        unfinished_jobs || TIMERS.with(|t| !t.borrow().is_empty())
     }
 
     /// Install the host's network backend for `fetch`/XHR.

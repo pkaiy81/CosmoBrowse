@@ -103,6 +103,17 @@ fn form_or_link_state(
     })
 }
 
+/// A combinator's left side at the edge of a shadow tree: nothing outside can be
+/// named from inside, other than the host.
+fn matches_across_shadow_boundary(root: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
+    selector.mentions_host()
+        && root
+            .borrow()
+            .parent()
+            .upgrade()
+            .is_some_and(|host| dom_node_selected(&host, selector))
+}
+
 /// Selector matching against a DOM node. Combinators walk DOM relationships
 /// (parent / preceding siblings); simple selectors test the element itself.
 pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
@@ -115,13 +126,16 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             return parts.iter().all(|s| dom_node_selected(node, s));
         }
         Selector::Child(ancestor, this) => {
-            return dom_node_selected(node, this)
-                && node
-                    .borrow()
-                    .parent()
-                    .upgrade()
-                    .map(|p| dom_node_selected(&p, ancestor))
-                    .unwrap_or(false);
+            if !dom_node_selected(node, this) {
+                return false;
+            }
+            let Some(parent) = node.borrow().parent().upgrade() else {
+                return false;
+            };
+            if parent.borrow().is_shadow_root() {
+                return matches_across_shadow_boundary(&parent, ancestor);
+            }
+            return dom_node_selected(&parent, ancestor);
         }
         Selector::Descendant(ancestor, this) => {
             if !dom_node_selected(node, this) {
@@ -129,11 +143,31 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             }
             let mut current = node.borrow().parent().upgrade();
             while let Some(p) = current {
+                if p.borrow().is_shadow_root() {
+                    return matches_across_shadow_boundary(&p, ancestor);
+                }
                 if dom_node_selected(&p, ancestor) {
                     return true;
                 }
                 let next = p.borrow().parent().upgrade();
                 current = next;
+            }
+            return false;
+        }
+        Selector::Host(inner) => {
+            return node.borrow().shadow_root().is_some()
+                && inner.as_ref().is_none_or(|inner| dom_node_selected(node, inner));
+        }
+        Selector::HostContext(inner) => {
+            if node.borrow().shadow_root().is_none() {
+                return false;
+            }
+            let mut current = Some(node.clone());
+            while let Some(n) = current {
+                if dom_node_selected(&n, inner) {
+                    return true;
+                }
+                current = n.borrow().parent().upgrade();
             }
             return false;
         }

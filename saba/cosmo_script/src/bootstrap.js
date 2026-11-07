@@ -96,7 +96,7 @@
   hide(Event.prototype, 'composedPath', function () {
     const path = [];
     let node = this.target;
-    while (node) { path.push(node); node = node.parentNode; }
+    while (node) { path.push(node); node = node.parentNode || (this.composed && node.host) || null; }
     if (path.length) path.push(global);
     return path;
   });
@@ -298,13 +298,14 @@
 
   get(Node.prototype, 'isConnected', function () {
     let node = this;
-    while (node) { if (node.nodeType === 9) return true; node = node.parentNode; }
+    while (node) { if (node.nodeType === 9) return true; node = node.parentNode || node.host; }
     return false;
   });
   get(Node.prototype, 'ownerDocument', function () { return this.nodeType === 9 ? null : global.document; });
-  hide(Node.prototype, 'getRootNode', function () {
+  hide(Node.prototype, 'getRootNode', function (options) {
     let node = this;
-    while (node.parentNode) node = node.parentNode;
+    const composed = !!(options && options.composed);
+    while (node.parentNode || (composed && node.host)) node = node.parentNode || node.host;
     return node;
   });
   hide(Node.prototype, 'hasChildNodes', function () { return this.firstChild !== null; });
@@ -518,24 +519,60 @@
   // Shadow DOM isn't there: a shadow root is a box inside the element, without
   // the encapsulation, so components at least render.
   hide(Element.prototype, 'attachShadow', function (init) {
-    const root = native.createElement('cosmo-shadow-root');
-    root.setAttribute('style', 'display:contents');
-    Object.setPrototypeOf(root, global.ShadowRoot.prototype);
-    Object.defineProperty(root, 'host', { value: this, enumerable: true });
-    Object.defineProperty(root, 'mode', { value: (init && init.mode) || 'open', enumerable: true });
-    get(root, 'innerHTML',
-      function () { return native.innerHTMLOf(root); },
-      function (html) { native.setInnerHTML(root, html); });
-    this.insertBefore(root, this.firstChild);
-    Object.defineProperty(this, 'shadowRoot', { value: init && init.mode === 'closed' ? null : root, configurable: true });
+    const mode = (init && init.mode) || 'open';
+    const existing = native.shadowRootOf(this);
+    // A tree the page's markup declared is taken over once, emptied, by the
+    // element's own script.
+    if (existing && !existing.__claimed) {
+      hide(existing, '__claimed', true);
+      while (existing.firstChild) existing.removeChild(existing.firstChild);
+      existing.setAttribute('mode', mode);
+      return existing;
+    }
+    if (existing) throw new global.DOMException('Shadow root cannot be created on a host which already hosts a shadow tree.', 'NotSupportedError');
+    const root = native.attachShadowRoot(this);
+    root.setAttribute('mode', mode);
+    hide(root, '__claimed', true);
     return root;
   });
-  get(Element.prototype, 'shadowRoot', function () { return null; });
-  get(global.ShadowRoot.prototype, 'activeElement', function () { return null; });
-  for (const name of ['querySelector', 'querySelectorAll', 'getElementById']) {
-    if (Node.prototype[name]) hide(global.ShadowRoot.prototype, name, Node.prototype[name]);
+  get(Element.prototype, 'shadowRoot', function () {
+    const root = native.shadowRootOf(this);
+    return root && root.getAttribute('mode') === 'open' ? root : null;
+  });
+  const ShadowRootProto = global.ShadowRoot.prototype;
+  get(ShadowRootProto, 'activeElement', function () { return null; });
+  get(ShadowRootProto, 'host', function () { return native.hostOf(this); });
+  get(ShadowRootProto, 'mode', function () { return this.getAttribute('mode'); });
+  get(ShadowRootProto, 'innerHTML',
+    function () { return native.innerHTMLOf(this); },
+    function (html) { native.setInnerHTML(this, html); });
+  for (const name of ['querySelector', 'querySelectorAll']) {
+    if (Node.prototype[name]) hide(ShadowRootProto, name, Node.prototype[name]);
   }
-  hide(global.ShadowRoot.prototype, 'getElementById', function (id) { return this.querySelector('#' + id); });
+  hide(ShadowRootProto, 'getElementById', function (id) { return this.querySelector('#' + global.CSS.escape(id)); });
+  native.setProto('cosmo-shadow-root', ShadowRootProto);
+  const HTMLSlotElement = subclass('HTMLSlotElement', global.HTMLElement);
+  native.setProto('slot', HTMLSlotElement.prototype);
+  hide(HTMLSlotElement.prototype, 'assignedNodes', function (options) {
+    const root = this.getRootNode();
+    const name = this.getAttribute('name') || '';
+    const assigned = root.host ? Array.from(root.host.childNodes).filter((node) => {
+      if (node.nodeType === 1) return (node.getAttribute('slot') || '') === name;
+      return node.nodeType === 3 && name === '';
+    }) : [];
+    return assigned.length || !(options && options.flatten) ? assigned : Array.from(this.childNodes);
+  });
+  hide(HTMLSlotElement.prototype, 'assignedElements', function (options) {
+    return this.assignedNodes(options).filter((node) => node.nodeType === 1);
+  });
+  hide(HTMLSlotElement.prototype, 'assign', function () {});
+  get(Element.prototype, 'assignedSlot', function () {
+    const parent = this.parentNode;
+    const root = parent && native.shadowRootOf(parent);
+    if (!root) return null;
+    const name = this.getAttribute('slot') || '';
+    return Array.from(root.querySelectorAll('slot')).find((slot) => (slot.getAttribute('name') || '') === name) || null;
+  });
 
   // HTMLElement.
   const reflect = (proto, property, attribute = property.toLowerCase()) => get(proto, property,
@@ -904,7 +941,36 @@
   get(proto('TableCell'), 'cellIndex', function () { return this.parentNode ? Array.from(this.parentNode.children).indexOf(this) : -1; });
   reflectNumber(proto('TableCell'), 'colSpan', 1, 'colspan');
   reflectNumber(proto('TableCell'), 'rowSpan', 1, 'rowspan');
-  get(proto('Template'), 'content', function () { return this; });
+  // A template's contents live in a fragment of their own, outside the document.
+  // Markup parsed into a template arrives as its children, and moves on first use.
+  const Template = proto('Template');
+  const templateContent = (template) => {
+    let content = template.__content;
+    if (!content) {
+      content = native.createElement('cosmo-fragment');
+      while (template.firstChild) content.appendChild(template.firstChild);
+      hide(template, '__content', content);
+    }
+    return content;
+  };
+  get(Template, 'content', function () { return templateContent(this); });
+  get(Template, 'innerHTML',
+    function () { return native.innerHTMLOf(templateContent(this)); },
+    function (html) {
+      const content = templateContent(this);
+      native.setInnerHTML(this, html);
+      while (content.firstChild) content.removeChild(content.firstChild);
+      while (this.firstChild) content.appendChild(this.firstChild);
+    });
+  hide(Template, 'cloneNode', function (deep) {
+    const clone = Node.prototype.cloneNode.call(this, false);
+    if (deep) {
+      for (let child = templateContent(this).firstChild; child; child = child.nextSibling) {
+        clone.content.appendChild(child.cloneNode(true));
+      }
+    }
+    return clone;
+  });
   reflectNumber(proto('LI'), 'value', 0);
   reflectNumber(proto('OList'), 'start', 1);
   reflect(proto('Time'), 'dateTime', 'datetime');
@@ -1017,7 +1083,6 @@
   get(documentProto, 'scripts', collection('script'));
   get(documentProto, 'embeds', collection('embed'));
   get(documentProto, 'styleSheets', function () { return Array.from(this.querySelectorAll('style')).map(makeStyleSheet); });
-  get(documentProto, 'adoptedStyleSheets', function () { return []; }, function () {});
   get(documentProto, 'readyState', function () { return readyState; });
   get(documentProto, 'URL', function () { return global.location.href; });
   get(documentProto, 'documentURI', function () { return global.location.href; });
@@ -1057,21 +1122,89 @@
   });
   get(documentProto, 'timeline', function () { return { currentTime: 0 }; });
 
-  function makeStyleSheet(element) {
+  // The top-level rules in a stylesheet's text.
+  const splitRules = (text) => {
     const rules = [];
-    return {
-      ownerNode: element, href: null, disabled: false, type: 'text/css', media: { mediaText: '' }, cssRules: rules, rules,
-      insertRule(rule, index) {
-        element.textContent = (element.textContent || '') + '\n' + rule;
-        rules.splice(index === undefined ? 0 : index, 0, { cssText: rule });
-        return index || 0;
-      },
-      deleteRule(index) { rules.splice(index, 1); },
-    };
-  }
-  global.CSSStyleSheet = function () {
-    return { cssRules: [], insertRule() { return 0; }, deleteRule() {}, replace() { return Promise.resolve(this); }, replaceSync() {} };
+    let depth = 0, start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === '{') depth++;
+      else if (c === '}' && --depth === 0) { rules.push(text.slice(start, i + 1).trim()); start = i + 1; }
+    }
+    return rules;
   };
+  // Holds its rules as text. The elements it's shown through take that text, which
+  // is how the engine gets to see it.
+  class CSSStyleSheet {
+    constructor() {
+      hide(this, '__rules', []);
+      hide(this, '__owners', new Set());
+      this.ownerNode = null;
+      this.href = null;
+      this.disabled = false;
+      this.media = [];
+      this.title = null;
+      this.type = 'text/css';
+    }
+    get cssRules() {
+      return this.__rules.map((cssText) => ({
+        cssText, type: 1, parentStyleSheet: this, selectorText: cssText.split('{')[0].trim(), style: {},
+      }));
+    }
+    get rules() { return this.cssRules; }
+    __changed() {
+      const text = this.__rules.join('\n');
+      for (const owner of this.__owners) owner.textContent = text;
+    }
+    insertRule(rule, index = 0) {
+      this.__rules.splice(index, 0, String(rule));
+      this.__changed();
+      return index;
+    }
+    deleteRule(index) { this.__rules.splice(index, 1); this.__changed(); }
+    addRule(selector, style, index = this.__rules.length) { return this.insertRule(selector + '{' + style + '}', index); }
+    removeRule(index) { this.deleteRule(index); }
+    replaceSync(text) { this.__rules.splice(0, this.__rules.length, ...splitRules(String(text))); this.__changed(); }
+    replace(text) { this.replaceSync(text); return Promise.resolve(this); }
+  }
+  global.CSSStyleSheet = CSSStyleSheet;
+  const sheetsOfElements = new WeakMap();
+  function makeStyleSheet(element) {
+    let sheet = sheetsOfElements.get(element);
+    if (!sheet) {
+      sheet = new CSSStyleSheet();
+      sheet.ownerNode = element;
+      sheet.__rules.push(...splitRules(element.textContent));
+      sheet.__owners.add(element);
+      sheetsOfElements.set(element, sheet);
+    }
+    return sheet;
+  }
+  // `adoptedStyleSheets` on a document or a shadow root: each sheet shows through
+  // a `<style>` of its own at the end of `container()`.
+  const adoptedSheets = (proto, container) => {
+    const adopted = new WeakMap();
+    get(proto, 'adoptedStyleSheets', function () {
+      const entry = adopted.get(this);
+      return entry ? entry.sheets : [];
+    }, function (sheets) {
+      const previous = adopted.get(this);
+      if (previous) {
+        for (const [sheet, style] of previous.styles) { sheet.__owners.delete(style); style.remove(); }
+      }
+      const parent = container(this);
+      const styles = Array.from(sheets).map((sheet) => {
+        const style = global.document.createElement('style');
+        style.textContent = sheet.__rules.join('\n');
+        sheet.__owners.add(style);
+        parent.appendChild(style);
+        return [sheet, style];
+      });
+      adopted.set(this, { sheets: Array.from(sheets), styles });
+    });
+  };
+  adoptedSheets(documentProto, (document) => document.head);
+  adoptedSheets(global.ShadowRoot.prototype, (root) => root);
   global.CSS = {
     supports: (a, b) => native.cssSupports(b === undefined ? String(a) : '(' + a + ':' + b + ')'),
     escape: (text) => String(text).replace(/[^a-zA-Z0-9_\-\u0080-￿]/g, (c) => '\\' + c),
@@ -1099,17 +1232,57 @@
         }
       }
     }
-    if (element.isConnected && element.connectedCallback) {
+    if (element.isConnected) connect(element);
+  }
+  function connect(element) {
+    if (element.__connected) return;
+    hide(element, '__connected', true);
+    if (element.connectedCallback) {
       try { element.connectedCallback(); } catch (error) { reportError(error); }
     }
   }
+  function onInserted(elements) {
+    for (const element of elements) {
+      if (!element.isConnected) continue;
+      if (element.__upgraded) { connect(element); continue; }
+      const definition = customRegistry.get(element.localName);
+      if (definition) upgrade(element, definition);
+    }
+  }
+  function onRemoved(elements) {
+    for (const element of elements) {
+      if (!element.__connected || element.isConnected) continue;
+      hide(element, '__connected', false);
+      if (element.disconnectedCallback) {
+        try { element.disconnectedCallback(); } catch (error) { reportError(error); }
+      }
+    }
+  }
+  // An element's own attribute changes are what `observedAttributes` asks about.
+  for (const method of ['setAttribute', 'removeAttribute']) {
+    const original = Element.prototype[method];
+    hide(Element.prototype, method, function (name, value) {
+      if (!this.__upgraded || !this.attributeChangedCallback) return original.call(this, name, value);
+      const observed = this.constructor.observedAttributes;
+      const key = String(name).toLowerCase();
+      if (!observed || !observed.includes(key)) return original.call(this, name, value);
+      const before = this.getAttribute(key);
+      const result = original.call(this, name, value);
+      try { this.attributeChangedCallback(key, before, this.getAttribute(key), null); } catch (error) { reportError(error); }
+      return result;
+    });
+  }
+
   const waiters = new Map();
   global.customElements = {
     define(name, ctor) {
       if (customRegistry.has(name)) throw new DOMException(name + ' is already defined', 'NotSupportedError');
       const definition = { ctor };
       customRegistry.set(name, definition);
-      for (const element of document.querySelectorAll(name)) upgrade(element, definition);
+      native.setTreeObserver(onInserted, onRemoved);
+      for (const element of native.customElementsIn(global.document)) {
+        if (element.localName === name) upgrade(element, definition);
+      }
       const waiter = waiters.get(name);
       if (waiter) waiter.resolve(ctor);
     },
@@ -1916,60 +2089,135 @@
     SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512,
     SHOW_DOCUMENT_FRAGMENT: 1024,
   };
-  // The nodes a walker or iterator visits under `root`, in document order. A node
-  // the filter rejects takes its descendants with it; one it skips doesn't.
-  const walkedNodes = (root, whatToShow, filter) => {
-    const accepts = (node) => {
-      if (!((whatToShow >>> 0) & (1 << (node.nodeType - 1)))) return 3;
-      if (!filter) return 1;
-      return typeof filter === 'function' ? filter(node) : filter.acceptNode(node);
-    };
-    const list = [];
-    const visit = (node) => {
-      for (let child = node.firstChild; child; child = child.nextSibling) {
-        const verdict = accepts(child);
-        if (verdict === 1) list.push(child);
-        if (verdict !== 2) visit(child);
+  // https://dom.spec.whatwg.org/#traversal
+  const nodeVerdict = (node, whatToShow, filter) => {
+    if (!((whatToShow >>> 0) & (1 << (node.nodeType - 1)))) return 3;
+    if (!filter) return 1;
+    return typeof filter === 'function' ? filter(node) : filter.acceptNode(node);
+  };
+  // The node after `node` in document order under `root`, as far as `verdict` lets
+  // the search descend. Starting outside `root` is allowed, and ends at the top.
+  const nextInDocumentOrder = (node, root, verdict) => {
+    let result = 1;
+    for (;;) {
+      while (result !== 2 && node.firstChild) {
+        node = node.firstChild;
+        result = verdict(node);
+        if (result === 1) return node;
       }
-    };
-    visit(root);
-    return list;
+      let after = null;
+      for (let at = node; at; at = at.parentNode) {
+        if (at === root) return null;
+        after = at.nextSibling;
+        if (after) break;
+      }
+      if (!after) return null;
+      node = after;
+      result = verdict(node);
+      if (result === 1) return node;
+    }
   };
   hide(documentProto, 'createTreeWalker', function (root, whatToShow = 0xFFFFFFFF, filter = null) {
-    const list = () => walkedNodes(root, whatToShow, filter);
-    const step = (walker, by) => {
-      const nodes = list();
-      const at = nodes.indexOf(walker.currentNode);
-      // The root comes before every node it holds.
-      const next = nodes[at === -1 ? (by > 0 ? 0 : -1) : at + by];
-      if (!next) return null;
-      walker.currentNode = next;
-      return next;
+    const verdict = (node) => nodeVerdict(node, whatToShow, filter);
+    const move = (walker, node) => { if (node) walker.currentNode = node; return node || null; };
+    // https://dom.spec.whatwg.org/#concept-traverse-children
+    const children = (walker, first, next) => {
+      let node = walker.currentNode[first];
+      while (node) {
+        const result = verdict(node);
+        if (result === 1) return move(walker, node);
+        if (result === 3 && node[first]) { node = node[first]; continue; }
+        for (;;) {
+          const sibling = node[next];
+          if (sibling) { node = sibling; break; }
+          const parent = node.parentNode;
+          if (!parent || parent === root || parent === walker.currentNode) return null;
+          node = parent;
+        }
+      }
+      return null;
     };
-    const related = (walker, name) => {
-      const node = walker.currentNode[name];
-      if (!node || node === root || !list().includes(node)) return null;
-      walker.currentNode = node;
-      return node;
+    // https://dom.spec.whatwg.org/#concept-traverse-siblings
+    const siblings = (walker, next, first) => {
+      let node = walker.currentNode;
+      if (node === root) return null;
+      for (;;) {
+        let sibling = node[next];
+        while (sibling) {
+          node = sibling;
+          const result = verdict(node);
+          if (result === 1) return move(walker, node);
+          sibling = node[first];
+          if (result === 2 || !sibling) sibling = node[next];
+        }
+        node = node.parentNode;
+        if (!node || node === root) return null;
+        if (verdict(node) === 1) return null;
+      }
     };
     return {
       root, whatToShow, filter, currentNode: root,
-      nextNode() { return step(this, 1); },
-      previousNode() { return step(this, -1); },
-      parentNode() { return related(this, 'parentNode'); },
-      firstChild() { return related(this, 'firstChild'); },
-      lastChild() { return related(this, 'lastChild'); },
-      nextSibling() { return related(this, 'nextSibling'); },
-      previousSibling() { return related(this, 'previousSibling'); },
+      nextNode() { return move(this, nextInDocumentOrder(this.currentNode, root, verdict)); },
+      previousNode() {
+        let node = this.currentNode;
+        while (node !== root) {
+          let sibling = node.previousSibling;
+          while (sibling) {
+            node = sibling;
+            let result = verdict(node);
+            while (result !== 2 && node.lastChild) {
+              node = node.lastChild;
+              result = verdict(node);
+            }
+            if (result === 1) return move(this, node);
+            sibling = node.previousSibling;
+          }
+          if (node === root || !node.parentNode) return null;
+          node = node.parentNode;
+          if (verdict(node) === 1) return move(this, node);
+        }
+        return null;
+      },
+      parentNode() {
+        let node = this.currentNode;
+        while (node && node !== root) {
+          node = node.parentNode;
+          if (node && verdict(node) === 1) return move(this, node);
+        }
+        return null;
+      },
+      firstChild() { return children(this, 'firstChild', 'nextSibling'); },
+      lastChild() { return children(this, 'lastChild', 'previousSibling'); },
+      nextSibling() { return siblings(this, 'nextSibling', 'firstChild'); },
+      previousSibling() { return siblings(this, 'previousSibling', 'lastChild'); },
     };
   });
   hide(documentProto, 'createNodeIterator', function (root, whatToShow = 0xFFFFFFFF, filter = null) {
-    const nodes = () => [root, ...walkedNodes(root, whatToShow, filter)];
-    let index = -1;
+    // An iterator has no use for rejecting a subtree: it only ever skips.
+    const verdict = (node) => { const result = nodeVerdict(node, whatToShow, filter); return result === 2 ? 3 : result; };
+    let started = false;
     return {
       root, whatToShow, filter, referenceNode: root, pointerBeforeReferenceNode: true,
-      nextNode() { const node = nodes()[++index] || null; if (node) this.referenceNode = node; else index--; return node; },
-      previousNode() { if (index <= 0) return null; this.referenceNode = nodes()[--index]; return this.referenceNode; },
+      nextNode() {
+        if (!started) {
+          started = true;
+          if (verdict(root) === 1) return root;
+        }
+        const node = nextInDocumentOrder(this.referenceNode, root, verdict);
+        if (node) { this.referenceNode = node; this.pointerBeforeReferenceNode = false; }
+        return node;
+      },
+      previousNode() {
+        let node = this.referenceNode;
+        while (node !== root) {
+          let before = node.previousSibling;
+          if (before) { while (before.lastChild) before = before.lastChild; node = before; }
+          else node = node.parentNode;
+          if (!node) return null;
+          if (verdict(node) === 1) { this.referenceNode = node; return node; }
+        }
+        return null;
+      },
       detach() {},
     };
   });

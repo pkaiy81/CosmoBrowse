@@ -7,7 +7,8 @@ use boa_engine::object::builtins::JsArray;
 use boa_engine::{JsNativeError, JsString, Module};
 use cosmo_engine::renderer::css::media::{parse_media_query_list, MediaContext};
 use cosmo_engine::renderer::css::token::CssTokenizer;
-use cosmo_engine::renderer::dom::node::Namespace;
+use cosmo_engine::renderer::dom::node::{Namespace, SHADOW_ROOT_TAG};
+use std::future::Future;
 use std::path::Path;
 
 /// What script can ask of layout. The host answers from the page's current
@@ -54,6 +55,105 @@ pub(crate) fn proto_for(node: &Rc<RefCell<Node>>) -> Option<JsObject> {
             .or_else(|| protos.get("Node"))
             .cloned()
     })
+}
+
+/// Gives an element a shadow tree: a root whose parent is the element, though it
+/// isn't among the element's children.
+fn attach_shadow_root(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let Some(host) = a.first().and_then(handle_node) else {
+        return Ok(JsValue::null());
+    };
+    let root = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+        SHADOW_ROOT_TAG,
+        Vec::new(),
+    )))));
+    root.borrow_mut().set_parent(Rc::downgrade(&host));
+    host.borrow_mut().set_shadow_root(root.clone());
+    bump_dom_generation();
+    Ok(make_element(root, c).into())
+}
+
+fn shadow_root_of(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let root = a.first().and_then(handle_node).and_then(|host| host.borrow().shadow_root());
+    Ok(root.map(|root| make_element(root, c).into()).unwrap_or(JsValue::null()))
+}
+
+fn host_of(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let host = a
+        .first()
+        .and_then(handle_node)
+        .filter(|root| root.borrow().is_shadow_root())
+        .and_then(|root| root.borrow().parent().upgrade());
+    Ok(host.map(|host| make_element(host, c).into()).unwrap_or(JsValue::null()))
+}
+
+/// Registers what `customElements` wants told about elements going in and out of
+/// the document. Nothing is walked until a page defines one.
+fn set_tree_observer(_t: &JsValue, a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    if let (Some(inserted), Some(removed)) = (
+        a.first().and_then(|v| v.as_object()),
+        a.get(1).and_then(|v| v.as_object()),
+    ) {
+        TREE_OBSERVER.with(|observer| *observer.borrow_mut() = Some((inserted, removed)));
+    }
+    Ok(JsValue::undefined())
+}
+
+/// The elements with a custom element's sort of name at or under `node`, shadow
+/// trees included, in order.
+fn collect_custom_elements(node: &Rc<RefCell<Node>>, out: &mut Vec<Rc<RefCell<Node>>>) {
+    if let NodeKind::Element(element) = &node.borrow().kind {
+        if element.tag_name().contains('-') && !element.tag_name().starts_with("cosmo-") {
+            out.push(node.clone());
+        }
+    }
+    if let Some(root) = node.borrow().shadow_root() {
+        collect_custom_elements(&root, out);
+    }
+    let mut child = node.borrow().first_child();
+    while let Some(c) = child {
+        collect_custom_elements(&c, out);
+        child = c.borrow().next_sibling();
+    }
+}
+
+fn custom_elements_in(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let mut found = Vec::new();
+    if let Some(node) = a.first().and_then(handle_node) {
+        collect_custom_elements(&node, &mut found);
+    }
+    let list = JsArray::new(c)?;
+    for element in found {
+        list.push(make_element(element, c), c)?;
+    }
+    Ok(list.into())
+}
+
+/// Tells `customElements` that `nodes` went in or out of a tree.
+pub(crate) fn notify_tree_change(nodes: &[Rc<RefCell<Node>>], inserted: bool, c: &mut Context) {
+    let Some(callback) = TREE_OBSERVER.with(|observer| {
+        observer
+            .borrow()
+            .as_ref()
+            .map(|(on_inserted, on_removed)| if inserted { on_inserted.clone() } else { on_removed.clone() })
+    }) else {
+        return;
+    };
+    let mut found = Vec::new();
+    for node in nodes {
+        collect_custom_elements(node, &mut found);
+    }
+    if found.is_empty() {
+        return;
+    }
+    let Ok(list) = JsArray::new(c) else { return };
+    for element in found {
+        let wrapper = make_element(element, c);
+        let _ = list.push(wrapper, c);
+    }
+    if let Err(error) = callback.call(&JsValue::undefined(), &[list.into()], c) {
+        log_script_error("custom element", error);
+    }
 }
 
 fn string_arg(args: &[JsValue], index: usize, ctx: &mut Context) -> JsResult<String> {
@@ -404,7 +504,7 @@ fn dom_generation_value(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsRes
 /// `node.nodeType`.
 pub(crate) fn node_get_type(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     let kind = handle_node(this).map(|n| match n.borrow().kind {
-        NodeKind::Element(ref e) if e.tag_name() == "cosmo-fragment" => 11,
+        NodeKind::Element(ref e) if e.tag_name() == "cosmo-fragment" || e.tag_name() == SHADOW_ROOT_TAG => 11,
         NodeKind::Element(_) => 1,
         NodeKind::Text(_) => 3,
         NodeKind::Comment(_) => 8,
@@ -417,7 +517,7 @@ pub(crate) fn node_get_type(this: &JsValue, _a: &[JsValue], _c: &mut Context) ->
 /// `node.nodeName`.
 pub(crate) fn node_get_name(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     let name = handle_node(this).map(|n| match n.borrow().kind {
-        NodeKind::Element(ref e) if e.tag_name() == "cosmo-fragment" => {
+        NodeKind::Element(ref e) if e.tag_name() == "cosmo-fragment" || e.tag_name() == SHADOW_ROOT_TAG => {
             "#document-fragment".to_string()
         }
         NodeKind::Element(ref e) if e.namespace() == Namespace::Html => e.tag_name().to_uppercase(),
@@ -491,6 +591,11 @@ pub(crate) fn make_native_object(node_base: JsObject, ctx: &mut Context) -> JsOb
         .property(js_string!("documentMethods"), document_methods, Attribute::all())
         .property(js_string!("userAgent"), js_string!(USER_AGENT), Attribute::all())
         .function(NativeFunction::from_fn_ptr(set_proto), js_string!("setProto"), 2)
+        .function(NativeFunction::from_fn_ptr(attach_shadow_root), js_string!("attachShadowRoot"), 1)
+        .function(NativeFunction::from_fn_ptr(shadow_root_of), js_string!("shadowRootOf"), 1)
+        .function(NativeFunction::from_fn_ptr(host_of), js_string!("hostOf"), 1)
+        .function(NativeFunction::from_fn_ptr(set_tree_observer), js_string!("setTreeObserver"), 2)
+        .function(NativeFunction::from_fn_ptr(custom_elements_in), js_string!("customElementsIn"), 1)
         .function(NativeFunction::from_fn_ptr(set_window_dispatcher), js_string!("setWindowDispatcher"), 1)
         .function(NativeFunction::from_fn_ptr(set_lifecycle), js_string!("setLifecycle"), 1)
         .function(NativeFunction::from_fn_ptr(new_event), js_string!("newEvent"), 4)
@@ -738,6 +843,7 @@ impl ScriptHost {
     ) {
         CURRENT_SCRIPT.with(|s| *s.borrow_mut() = Some(node.clone()));
         let label = url.unwrap_or("inline script").to_string();
+        let started = std::time::Instant::now();
         match kind {
             ScriptKind::Classic => {
                 let base = url.map(str::to_string).unwrap_or_else(location_href);
@@ -752,6 +858,9 @@ impl ScriptHost {
             }
         }
         CURRENT_SCRIPT.with(|s| *s.borrow_mut() = None);
+        if std::env::var_os("COSMO_DEBUG_CONSOLE").is_some() {
+            eprintln!("[script] {label}: {:?}", started.elapsed());
+        }
     }
 
     /// Tell the page it has finished loading.
@@ -802,6 +911,76 @@ fn run_module(text: &str, base: &str, ctx: &mut Context) {
             message = format!("{message}\n{}", describe(&stack, ctx));
         }
         log_script_error(base, message);
+    }
+}
+
+/// How long the microtasks queued up may run before the page gets to paint. They
+/// carry on in the next frame.
+const JOB_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Runs promise reactions and module loading. Boa's own executor runs until nothing
+/// is left, so a page that keeps queueing more never gives the browser back.
+#[derive(Default)]
+pub(crate) struct PageJobExecutor {
+    promise_jobs: RefCell<std::collections::VecDeque<boa_engine::job::PromiseJob>>,
+    async_jobs: RefCell<std::collections::VecDeque<boa_engine::job::NativeAsyncJob>>,
+    generic_jobs: RefCell<std::collections::VecDeque<boa_engine::job::GenericJob>>,
+}
+
+impl PageJobExecutor {
+    pub(crate) fn has_jobs(&self) -> bool {
+        !self.promise_jobs.borrow().is_empty()
+            || !self.async_jobs.borrow().is_empty()
+            || !self.generic_jobs.borrow().is_empty()
+    }
+}
+
+impl boa_engine::job::JobExecutor for PageJobExecutor {
+    fn enqueue_job(self: Rc<Self>, job: boa_engine::job::Job, _context: &mut Context) {
+        use boa_engine::job::Job;
+        match job {
+            Job::PromiseJob(job) => self.promise_jobs.borrow_mut().push_back(job),
+            Job::AsyncJob(job) => self.async_jobs.borrow_mut().push_back(job),
+            Job::GenericJob(job) => self.generic_jobs.borrow_mut().push_back(job),
+            // Nothing a page can reach schedules these, and timers are our own.
+            _ => {}
+        }
+    }
+
+    fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
+        let started = std::time::Instant::now();
+        loop {
+            // Nothing awaited here waits on anything but the module loader, which
+            // finishes before it returns.
+            let next_async = self.async_jobs.borrow_mut().pop_front();
+            if let Some(job) = next_async {
+                let cell = RefCell::new(&mut *context);
+                let mut future = std::pin::pin!(job.call(&cell));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                if let std::task::Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) {
+                    log_script_error("async job", error);
+                }
+                continue;
+            }
+            let next_promise = self.promise_jobs.borrow_mut().pop_front();
+            if let Some(job) = next_promise {
+                if let Err(error) = job.call(context) {
+                    log_script_error("promise job", error);
+                }
+                if started.elapsed() > JOB_TIME_BUDGET {
+                    return Ok(());
+                }
+                continue;
+            }
+            let next_generic = self.generic_jobs.borrow_mut().pop_front();
+            let Some(job) = next_generic else {
+                context.clear_kept_objects();
+                return Ok(());
+            };
+            if let Err(error) = job.call(context) {
+                log_script_error("job", error);
+            }
+        }
     }
 }
 

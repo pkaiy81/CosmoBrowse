@@ -1941,6 +1941,35 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_walker_follows_the_spec() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><a><i>1</i>2</a><!--c--><b>3</b></div><template id=t><u>x</u>y</template><script>\
+             var d=document.getElementById('d'),r=[];\
+             var names=function(w,step){var o=[],n;while((n=w[step]()))o.push(n.nodeName);return o.join(',');};\
+             r.push(names(document.createTreeWalker(d,NodeFilter.SHOW_ALL),'nextNode'));\
+             var skip=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT,function(n){return n.nodeName==='A'?NodeFilter.FILTER_SKIP:NodeFilter.FILTER_ACCEPT;});\
+             r.push(names(skip,'nextNode'));\
+             var reject=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT,function(n){return n.nodeName==='A'?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT;});\
+             r.push(names(reject,'nextNode'));\
+             var back=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT);back.currentNode=d.lastChild;\
+             r.push(names(back,'previousNode'));\
+             var outside=document.createTreeWalker(document,129);\
+             outside.currentNode=document.getElementById('t').content;\
+             r.push(names(outside,'nextNode'));\
+             var family=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT);\
+             r.push(family.firstChild().nodeName,family.nextSibling().nodeName,family.parentNode().nodeName);\
+             var it=document.createNodeIterator(d,NodeFilter.SHOW_TEXT);r.push(it.nextNode().data,it.nextNode().data,it.previousNode().data);\
+             document.getElementById('out').textContent=r.join(' ');\
+             </script></body></html>",
+        );
+        assert_eq!(
+            out,
+            "A,I,#text,#text,#comment,B,#text I,B B I,A,DIV U A B DIV 1 2 1"
+        );
+    }
+
+    #[test]
     fn streams_deliver_what_is_enqueued() {
         let out = run_page_on_site(
             vec![],
@@ -1965,6 +1994,125 @@ mod tests {
              </script></body></html>",
         );
         assert_eq!(out, "cd|a%20b|g");
+    }
+
+    #[test]
+    fn a_shadow_tree_is_kept_apart_from_the_document() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=h><span id=light>light</span></div><script>\
+             var h=document.getElementById('h'),r=h.attachShadow({mode:'open'});\
+             r.innerHTML='<b id=inner class=x>shadow</b><slot></slot>';\
+             var inner=r.getElementById('inner'),o=[\
+               document.getElementById('inner')===null,document.querySelector('.x')===null,\
+               h.children.length,h.textContent,h.shadowRoot===r,r.nodeType,r.parentNode,r.host===h,\
+               inner.getRootNode()===r,inner.isConnected,inner.getRootNode({composed:true})===document,\
+               inner.closest('body'),r.querySelector('slot').assignedNodes().length,\
+               h.querySelector('#light').assignedSlot===r.querySelector('slot')];\
+             var c=document.createElement('div').attachShadow({mode:'closed'});\
+             o.push(c.host.shadowRoot);\
+             document.getElementById('out').textContent=o.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(
+            out,
+            "true|true|1|light|true|11||true|true|true|true||1|true|"
+        );
+    }
+
+    #[test]
+    fn markup_can_declare_a_shadow_tree() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p>\
+             <div id=open><template shadowrootmode=open><b id=in>shadow</b><slot></slot></template>light</div>\
+             <div id=closed><template shadowrootmode=closed><b>hidden</b></template></div>\
+             <div id=plain><template><b>inert</b></template></div><script>\
+             var o=document.getElementById('open'),c=document.getElementById('closed'),p=document.getElementById('plain');\
+             var r=o.shadowRoot,seen=[r.mode,r.host===o,r.getElementById('in').textContent,\
+               o.querySelector('template'),o.textContent,c.shadowRoot,c.children.length,\
+               p.shadowRoot,p.querySelector('template').content.firstChild.textContent];\
+             var again=o.attachShadow({mode:'open'});seen.push(again===r,r.childNodes.length);\
+             var threw='no';try{o.attachShadow({mode:'open'});}catch(e){threw=e.name;}seen.push(threw);\
+             document.getElementById('out').textContent=seen.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "open|true|shadow||light||0||inert|true|0|NotSupportedError");
+    }
+
+    #[test]
+    fn events_are_retargeted_at_the_edge_of_a_shadow_tree() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=h></div><script>\
+             var h=document.getElementById('h'),r=h.attachShadow({mode:'open'});\
+             r.innerHTML='<i id=t></i>';var t=r.querySelector('#t'),log=[];\
+             var note=function(where){return function(e){log.push(where+':'+(e.target.id||e.target.nodeName));};};\
+             t.addEventListener('x',note('in'));r.addEventListener('x',note('root'));\
+             h.addEventListener('x',note('host'));document.addEventListener('x',note('doc'));\
+             t.dispatchEvent(new Event('x',{bubbles:true}));log.push('/');\
+             t.dispatchEvent(new Event('x',{bubbles:true,composed:true}));\
+             document.getElementById('out').textContent=log.join(' ');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "in:t root:t / in:t root:t host:h doc:h");
+    }
+
+    #[test]
+    fn custom_elements_hear_about_their_lifecycle() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><x-a id=early></x-a><script>\
+             var log=[];\
+             class A extends HTMLElement{\
+               static get observedAttributes(){return ['k'];}\
+               connectedCallback(){log.push('in:'+this.id);}\
+               disconnectedCallback(){log.push('out:'+this.id);}\
+               attributeChangedCallback(n,o,v){log.push(n+':'+o+'>'+v);}\
+             }\
+             customElements.define('x-a',A);\
+             var late=document.createElement('x-a');late.id='late';\
+             log.push(late instanceof A);\
+             late.setAttribute('k','1');late.setAttribute('other','1');\
+             document.body.appendChild(late);document.body.appendChild(late);\
+             late.remove();\
+             var holder=document.createElement('div');document.body.appendChild(holder);\
+             holder.innerHTML='<x-a id=parsed></x-a>';\
+             var r=document.createElement('div');document.body.appendChild(r);\
+             r.attachShadow({mode:'open'}).innerHTML='<x-a id=shadowed></x-a>';\
+             holder.innerHTML='';\
+             document.getElementById('out').textContent=log.join(' ');\
+             </script></body></html>",
+        );
+        assert_eq!(
+            out,
+            "in:early true k:null>1 in:late out:late in:parsed in:shadowed out:parsed"
+        );
+    }
+
+    #[test]
+    fn a_stylesheet_object_reaches_layout() {
+        let html = "<html><head><style id=s></style></head><body style=margin:0>\
+            <div id=a>a</div><div id=b>b</div><div id=h></div><script>\
+            document.getElementById('s').sheet.insertRule('#a{height:31px}',0);\
+            var sheet=new CSSStyleSheet();sheet.replaceSync('#b{height:32px}');\
+            document.adoptedStyleSheets=[sheet];\
+            var r=document.getElementById('h').attachShadow({mode:'open'});\
+            r.innerHTML='<div id=in>x</div>';\
+            var inner=new CSSStyleSheet();inner.replaceSync(':host{display:block;height:33px}#in{height:34px}');\
+            r.adoptedStyleSheets=[inner];\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        let height = |page: &mut LivePage, script: &str| {
+            page.eval_for_test(&format!("{script}.getBoundingClientRect().height"))
+        };
+        assert_eq!(height(&mut page, "document.getElementById('a')"), "31");
+        assert_eq!(height(&mut page, "document.getElementById('b')"), "32");
+        assert_eq!(height(&mut page, "document.getElementById('h')"), "33");
+        assert_eq!(height(&mut page, "document.getElementById('h').shadowRoot.getElementById('in')"), "34");
+        page.eval_for_test("document.getElementById('s').sheet.deleteRule(0)");
+        assert_eq!(page.eval_for_test("document.getElementById('s').sheet.cssRules.length"), "0");
     }
 
     #[test]
@@ -1998,11 +2146,12 @@ mod tests {
              var f=document.createDocumentFragment();f.appendChild(document.createElement('b'));f.appendChild(document.createElement('i'));\
              d.appendChild(f);r.push(d.querySelectorAll('b,i').length);\
              r.push(d.cloneNode(true).children.length);\
+             r.push(d.querySelector('p'),d.querySelector('div'));\
              d.remove();r.push(document.getElementById('d')===null);\
              document.getElementById('out').textContent=r.join(',');\
              </script></body></html>",
         );
-        assert_eq!(out, "true,true,v,true,SPAN,2,x,3,z,2,4,true");
+        assert_eq!(out, "true,true,v,true,SPAN,2,x,3,z,2,4,,,true");
     }
 
     #[test]
@@ -2125,6 +2274,9 @@ mod tests {
                         stream.set_nonblocking(false).ok();
                         let mut buf = [0u8; 1024];
                         let _ = stream.read(&mut buf);
+                        // Slow enough that the response can't beat the page's load,
+                        // since these tests are about what happens after it.
+                        std::thread::sleep(std::time::Duration::from_millis(300));
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",

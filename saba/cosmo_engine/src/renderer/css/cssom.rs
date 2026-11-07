@@ -388,6 +388,20 @@ impl CssParser {
                         false
                     };
                     let name = self.consume_ident().to_lowercase();
+                    if name == "host" || name == "host-context" {
+                        let has_argument = self.t.peek() == Some(&CssToken::OpenParenthesis);
+                        let argument = has_argument.then(|| {
+                            let mut inner = Self::from_tokens(self.take_parenthesized());
+                            inner.nesting = self.nesting.clone();
+                            Box::new(inner.consume_selector_list())
+                        });
+                        parts.push(match (name.as_str(), argument) {
+                            ("host", argument) => Selector::Host(argument),
+                            (_, Some(argument)) => Selector::HostContext(argument),
+                            (_, None) => Selector::Never,
+                        });
+                        continue;
+                    }
                     // `:not(...)` takes a real selector argument: parse it
                     // inline with the selector machinery, then expect `)`.
                     if name == "not" && self.t.peek() == Some(&CssToken::OpenParenthesis) {
@@ -1466,6 +1480,13 @@ impl StyleSheet {
         })
     }
 
+    /// The rules that can match the host of the shadow tree this sheet is for.
+    pub fn host_rules(&self) -> impl Iterator<Item = &QualifiedRule> {
+        self.index().unkeyed.iter().map(|&i| &self.rules[i as usize]).filter(|rule| {
+            !rule.user_agent && rule.selector.mentions_host()
+        })
+    }
+
     /// The rules that could match an element with this id, classes and tag, in
     /// document order. Every rule not returned certainly doesn't match it.
     pub fn candidate_rules<'a>(
@@ -1662,6 +1683,11 @@ pub enum Selector {
     Has(Rc<Selector>),
     /// The element `:has()` is being tested against.
     HasSubject,
+    /// `:host` or `:host(...)`: the element whose shadow tree this sheet styles.
+    /// https://www.w3.org/TR/css-scoping-1/#host-selector
+    Host(Option<Box<Selector>>),
+    /// `:host-context(...)`: the same, when it or an ancestor matches.
+    HostContext(Box<Selector>),
     /// `host::before` / `host::after` — never matches a real element (so its
     /// declarations don't leak onto the host); the layout tree builder uses
     /// `pseudo_element_target` to find these and synthesize a generated box.
@@ -1818,6 +1844,24 @@ impl Selector {
     /// at parse time so its value here (max of alternatives) is only a
     /// fallback. Spec: Selectors L4 §17.
     /// https://www.w3.org/TR/selectors-4/#specificity
+    /// Whether this selector reaches out of its shadow tree to the host.
+    pub fn mentions_host(&self) -> bool {
+        match self {
+            Selector::Host(_) | Selector::HostContext(_) => true,
+            Selector::Compound(parts) | Selector::List(parts) => {
+                parts.iter().any(Selector::mentions_host)
+            }
+            Selector::Is(inner) | Selector::Where(inner) | Selector::Not(inner) => inner.mentions_host(),
+            Selector::Descendant(left, right)
+            | Selector::Child(left, right)
+            | Selector::NextSibling(left, right)
+            | Selector::SubsequentSibling(left, right) => {
+                left.mentions_host() || right.mentions_host()
+            }
+            _ => false,
+        }
+    }
+
     pub fn specificity(&self) -> u32 {
         let (a, b, c) = self.specificity_abc();
         (a.min(255) << 16) | (b.min(255) << 8) | c.min(255)
@@ -1838,6 +1882,14 @@ impl Selector {
             | Selector::Where(_)
             | Selector::HasSubject => (0, 0, 0),
             Selector::Has(inner) => inner.specificity_abc(),
+            Selector::Host(inner) => {
+                let (a, b, c) = inner.as_ref().map(|i| i.specificity_abc()).unwrap_or_default();
+                (a, b + 1, c)
+            }
+            Selector::HostContext(inner) => {
+                let (a, b, c) = inner.specificity_abc();
+                (a, b + 1, c)
+            }
             Selector::Compound(parts) => parts.iter().fold((0, 0, 0), |acc, p| {
                 let (a, b, c) = p.specificity_abc();
                 (acc.0 + a, acc.1 + b, acc.2 + c)

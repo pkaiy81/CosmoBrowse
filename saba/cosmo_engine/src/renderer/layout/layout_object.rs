@@ -95,6 +95,16 @@ pub(crate) fn prepare_root_style(body: &Rc<RefCell<Node>>, cssom: &StyleSheet) {
     ROOT_STYLE.with(|root| *root.borrow_mut() = Some(style));
 }
 
+thread_local! {
+    /// The sheet of the shadow tree belonging to the element about to be styled.
+    static HOST_SHEET: RefCell<Option<Rc<StyleSheet>>> = const { RefCell::new(None) };
+}
+
+/// Styles the next element as the host of a shadow tree with this sheet.
+pub(crate) fn set_host_sheet(sheet: Rc<StyleSheet>) {
+    HOST_SHEET.with(|host| *host.borrow_mut() = Some(sheet));
+}
+
 pub fn create_layout_object(
     node: &Option<Rc<RefCell<Node>>>,
     parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
@@ -157,6 +167,18 @@ pub fn create_layout_object(
             .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
             .collect();
         matched.sort_by_key(|rule| (!rule.user_agent, !rule.layered, rule.selector.specificity()));
+        // Its shadow tree's `:host` rules style a host, under any rule from outside.
+        // https://www.w3.org/TR/css-scoping-1/#shadow-cascading
+        let host_sheet = HOST_SHEET.with(|sheet| sheet.borrow_mut().take());
+        if let Some(sheet) = &host_sheet {
+            let mut from_inside: Vec<&QualifiedRule> = sheet
+                .host_rules()
+                .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
+                .collect();
+            from_inside.sort_by_key(|rule| (!rule.layered, rule.selector.specificity()));
+            let authors_start = matched.iter().position(|rule| !rule.user_agent).unwrap_or(matched.len());
+            matched.splice(authors_start..authors_start, from_inside);
+        }
 
         // Inline `style="..."` attribute declarations (parsed once, applied in
         // the importance tiers below).

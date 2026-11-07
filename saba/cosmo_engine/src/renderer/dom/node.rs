@@ -33,6 +33,9 @@ impl Window {
     }
 }
 
+/// What a shadow root is, to the parts of the engine that only know elements.
+pub const SHADOW_ROOT_TAG: &str = "cosmo-shadow-root";
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub kind: NodeKind,
@@ -42,6 +45,10 @@ pub struct Node {
     last_child: Weak<RefCell<Node>>,
     previous_sibling: Weak<RefCell<Node>>,
     next_sibling: Option<Rc<RefCell<Node>>>,
+    /// This element's shadow tree. Its root's parent is this element, but it isn't
+    /// among this element's children, which is what keeps it apart from the rest
+    /// of the document.
+    shadow_root: Option<Rc<RefCell<Node>>>,
 }
 
 impl PartialEq for Node {
@@ -57,6 +64,7 @@ impl Node {
             window: Weak::new(),
             parent: Weak::new(),
             first_child: None,
+            shadow_root: None,
             last_child: Weak::new(),
             previous_sibling: Weak::new(),
             next_sibling: None,
@@ -109,6 +117,19 @@ impl Node {
 
     pub fn kind(&self) -> NodeKind {
         self.kind.clone()
+    }
+
+    pub fn shadow_root(&self) -> Option<Rc<RefCell<Node>>> {
+        self.shadow_root.clone()
+    }
+
+    pub fn set_shadow_root(&mut self, root: Rc<RefCell<Node>>) {
+        self.shadow_root = Some(root);
+    }
+
+    /// Whether this is the root of a shadow tree.
+    pub fn is_shadow_root(&self) -> bool {
+        matches!(self.kind, NodeKind::Element(ref e) if e.tag_name() == SHADOW_ROOT_TAG)
     }
 
     /// Mutable access to this node's kind, for in-place DOM mutation

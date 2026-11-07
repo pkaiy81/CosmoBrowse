@@ -1,0 +1,31 @@
+<!doctype html><style>
+body{margin:8px;font:14px sans-serif}
+a{color:green}
+.shared{background:#fd8}
+x-card{margin:6px 0;border:1px solid #888}
+</style>
+<script>
+class Card extends HTMLElement {
+  connectedCallback() {
+    const root = this.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+      :host { display: block; padding: 8px; background: #eef }
+      :host(.alert) { background: #fee }
+      a { color: red; display: block }
+      .shared { background: #8df }
+      header { font-weight: bold }
+      .scoped { color: purple }
+      :host(.alert) .scoped { color: #c00 }
+    </style>
+    <header><slot name=title>no title</slot></header>
+    <a href=#>inner link, block and red</a>
+    <p class="shared scoped"><slot>no content</slot></p>
+    <footer><slot name=missing>fallback footer</slot></footer>`;
+  }
+}
+customElements.define('x-card', Card);
+</script>
+<x-card><b slot=title>Title</b>light <a href=#>green link</a> in a line</x-card>
+<x-card class=alert><span slot=title>Alert</span><span class=shared>outer style on slotted</span></x-card>
+<p class=scoped>outside, no scoped color</p>
+<a href=#>document link, not block</a> <a href=#>still on the line</a>

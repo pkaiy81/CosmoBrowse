@@ -108,56 +108,182 @@ fn build_layout_tree(
     node: &Option<Rc<RefCell<Node>>>,
     parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
     cssom: &StyleSheet,
+    scope: Option<&ShadowScope>,
 ) -> Option<Rc<RefCell<LayoutObject>>> {
     // Siblings go in a loop and only depth recurses: a page can have tens of
     // thousands of siblings, but its nesting is limited.
-    let mut first = None;
-    let mut last: Option<Rc<RefCell<LayoutObject>>> = None;
+    let mut chain = LayoutChain::default();
     let mut current = node.clone();
     while let Some(n) = current {
-        if let Some(obj) = create_layout_object(&Some(n.clone()), parent_obj, cssom) {
-            let original_first_child = n.borrow().first_child();
-            let mut first_child =
-                build_layout_tree(&original_first_child, &Some(obj.clone()), cssom);
-
-            // CSS generated content: a ::before box becomes the first child and a
-            // ::after box the last child of the element.
-            // https://www.w3.org/TR/css-content-3/
-            if matches!(n.borrow().kind, NodeKind::Element(_)) {
-                use crate::renderer::css::cssom::PseudoElement;
-                if let Some(before) = crate::renderer::layout::layout_object::build_pseudo_element(
-                    &n,
-                    &obj,
-                    cssom,
-                    PseudoElement::Before,
-                ) {
-                    before.borrow_mut().set_next_sibling(first_child.take());
-                    first_child = Some(before);
-                }
-                if let Some(after) = crate::renderer::layout::layout_object::build_pseudo_element(
-                    &n,
-                    &obj,
-                    cssom,
-                    PseudoElement::After,
-                ) {
-                    match &first_child {
-                        Some(fc) => append_layout_sibling(fc, after),
-                        None => first_child = Some(after),
-                    }
-                }
-            }
-
-            obj.borrow_mut().set_first_child(first_child);
-            LayoutObject::normalize_children(&obj);
-            match &last {
-                Some(previous) => previous.borrow_mut().set_next_sibling(Some(obj.clone())),
-                None => first = Some(obj.clone()),
-            }
-            last = Some(obj);
-        }
+        chain.push(build_layout_object(&n, parent_obj, cssom, scope));
         current = n.borrow().next_sibling();
     }
-    first
+    chain.first
+}
+
+/// The shadow tree a walk is inside.
+/// https://dom.spec.whatwg.org/#concept-shadow-including-tree-order
+struct ShadowScope<'a> {
+    host: Rc<RefCell<Node>>,
+    /// What the host's own children are styled with: slotted content belongs to
+    /// the tree it came from.
+    outer_sheet: &'a StyleSheet,
+    outer: Option<&'a ShadowScope<'a>>,
+}
+
+/// Boxes linked up as siblings as they are made.
+#[derive(Default)]
+struct LayoutChain {
+    first: Option<Rc<RefCell<LayoutObject>>>,
+    last: Option<Rc<RefCell<LayoutObject>>>,
+}
+
+impl LayoutChain {
+    fn push(&mut self, object: Option<Rc<RefCell<LayoutObject>>>) {
+        let Some(object) = object else { return };
+        match &self.last {
+            Some(previous) => previous.borrow_mut().set_next_sibling(Some(object.clone())),
+            None => self.first = Some(object.clone()),
+        }
+        self.last = Some(object);
+    }
+}
+
+/// The children of `host` a `<slot name=...>` displays.
+/// https://dom.spec.whatwg.org/#find-slotables
+fn assigned_nodes(host: &Rc<RefCell<Node>>, slot_name: &str) -> Vec<Rc<RefCell<Node>>> {
+    let mut assigned = Vec::new();
+    let mut child = host.borrow().first_child();
+    while let Some(c) = child {
+        let name = match &c.borrow().kind {
+            NodeKind::Element(element) => Some(element.get_attribute("slot").unwrap_or_default()),
+            NodeKind::Text(_) => Some(String::new()),
+            _ => None,
+        };
+        if name.as_deref() == Some(slot_name) {
+            assigned.push(c.clone());
+        }
+        child = c.borrow().next_sibling();
+    }
+    assigned
+}
+
+/// The sheet for a shadow tree: its own `<style>` elements, with the browser's
+/// rules in front. Trees that come out the same share one.
+fn shadow_stylesheet(root: &Rc<RefCell<Node>>) -> Rc<StyleSheet> {
+    use crate::renderer::css::cssom::CssParser;
+    use crate::renderer::css::token::CssTokenizer;
+    use std::hash::{Hash, Hasher};
+    thread_local! {
+        static SHEETS: RefCell<std::collections::HashMap<(u64, (i64, i64)), Rc<StyleSheet>>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    let mut css = String::new();
+    let mut child = root.borrow().first_child();
+    while let Some(c) = child {
+        css.push_str(&crate::renderer::dom::api::get_style_content_within(&c));
+        css.push('\n');
+        child = c.borrow().next_sibling();
+    }
+    let viewport = crate::renderer::style::values::styling_viewport();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    css.hash(&mut hasher);
+    let key = (hasher.finish(), viewport);
+    SHEETS.with(|sheets| {
+        let mut sheets = sheets.borrow_mut();
+        if let Some(sheet) = sheets.get(&key) {
+            return sheet.clone();
+        }
+        if sheets.len() >= 256 {
+            sheets.clear();
+        }
+        let parsed = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
+        let context = crate::renderer::css::media::MediaContext {
+            viewport_width: viewport.0 as f64,
+            viewport_height: viewport.1 as f64,
+            prefers_dark: std::env::var("COSMO_PREFERS_DARK").ok().as_deref() == Some("1"),
+        };
+        let sheet = Rc::new(parsed.filter_for_media(&context).with_user_agent_rules());
+        sheets.insert(key, sheet.clone());
+        sheet
+    })
+}
+
+/// One node's box and everything under it, in the flattened tree: a host displays
+/// its shadow tree instead of its children, which appear at the slots they're
+/// assigned to.
+/// https://www.w3.org/TR/css-scoping-1/#flattening
+fn build_layout_object(
+    n: &Rc<RefCell<Node>>,
+    parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
+    cssom: &StyleSheet,
+    scope: Option<&ShadowScope>,
+) -> Option<Rc<RefCell<LayoutObject>>> {
+    let shadow_root = n.borrow().shadow_root();
+    let shadow = shadow_root.map(|root| {
+        let sheet = shadow_stylesheet(&root);
+        crate::renderer::layout::layout_object::set_host_sheet(sheet.clone());
+        (root, sheet)
+    });
+    let obj = create_layout_object(&Some(n.clone()), parent_obj, cssom)?;
+    let own = Some(obj.clone());
+    let slot_name = scope.filter(|_| n.borrow().element_tag_name().as_deref() == Some("slot")).map(|_| {
+        match &n.borrow().kind {
+            NodeKind::Element(element) => element.get_attribute("name").unwrap_or_default(),
+            _ => String::new(),
+        }
+    });
+    let mut first_child = if let Some((root, sheet)) = &shadow {
+        let inner = ShadowScope { host: n.clone(), outer_sheet: cssom, outer: scope };
+        let first = root.borrow().first_child();
+        build_layout_tree(&first, &own, sheet, Some(&inner))
+    } else {
+        let assigned = match (scope, &slot_name) {
+            (Some(scope), Some(name)) => assigned_nodes(&scope.host, name),
+            _ => Vec::new(),
+        };
+        if let (Some(scope), false) = (scope, assigned.is_empty()) {
+            let mut chain = LayoutChain::default();
+            for node in &assigned {
+                chain.push(build_layout_object(node, &own, scope.outer_sheet, scope.outer));
+            }
+            chain.first
+        } else {
+            let first = n.borrow().first_child();
+            build_layout_tree(&first, &own, cssom, scope)
+        }
+    };
+
+    // CSS generated content: a ::before box becomes the first child and a
+    // ::after box the last child of the element.
+    // https://www.w3.org/TR/css-content-3/
+    if matches!(n.borrow().kind, NodeKind::Element(_)) {
+        use crate::renderer::css::cssom::PseudoElement;
+        if let Some(before) = crate::renderer::layout::layout_object::build_pseudo_element(
+            n,
+            &obj,
+            cssom,
+            PseudoElement::Before,
+        ) {
+            before.borrow_mut().set_next_sibling(first_child.take());
+            first_child = Some(before);
+        }
+        if let Some(after) = crate::renderer::layout::layout_object::build_pseudo_element(
+            n,
+            &obj,
+            cssom,
+            PseudoElement::After,
+        ) {
+            match &first_child {
+                Some(fc) => append_layout_sibling(fc, after),
+                None => first_child = Some(after),
+            }
+        }
+    }
+
+    obj.borrow_mut().set_first_child(first_child);
+    LayoutObject::normalize_children(&obj);
+    Some(obj)
 }
 
 /// Append `tail` after the last sibling in the chain starting at `head`.
@@ -228,7 +354,7 @@ impl LayoutView {
 
         let html_background = crate::renderer::layout::layout_object::root_background();
         let mut tree = Self {
-            root: build_layout_tree(&body_root, &None, cssom),
+            root: build_layout_tree(&body_root, &None, cssom, None),
             viewport_width: viewport_width.max(1),
             viewport_height: viewport_height.max(0),
         };

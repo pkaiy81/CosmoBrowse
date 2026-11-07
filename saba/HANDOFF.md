@@ -769,6 +769,8 @@ $BIN --screenshot    <URL> /tmp/out.png                    # 既定サイズ
 - スクリーンショットは `settle_async` が最大 5 秒フレームを回すので、無限アニメーションのあるページは実際の読み込み時間より長くかかる。
 - `Intl` は bootstrap.js のスタブ(Boa の `intl` 機能は未有効)。`IntersectionObserver` と `ResizeObserver` は 1 回発火するだけ、`MutationObserver` はポーリング、`WebSocket`/`EventSource`/`Worker` は実体なし。canvas 2D は未実装。
 - 確認済み(目視): example.com、rust-lang.org、react.dev、vuejs.org、github.com のリポジトリページ、en.wikipedia.org の記事、bbc.com/news、apple.com。GitHub は code-view のチャンクが protobuf の記述子で失敗する(残課題)。
+- **Shadow DOM は本物。** シャドウルートは host の子リストの外にある要素(`SHADOW_ROOT_TAG`)で、親だけが host を指す。レイアウトは flattened tree(`layout_view.rs` の `build_layout_object`)を辿り、ツリーごとに `shadow_stylesheet` のシートを使う。宣言的 Shadow DOM は `construct_tree` の最後に解決する。未対応: `::slotted`、`::part`、`slotchange`、`manual` スロット割り当て。
+- `ctx.run_jobs()` は `PageJobExecutor` が実行し、2 秒でフレームに制御を返す(無限マイクロタスク対策)。
 - `@keyframes` と transition は毎フレーム全レイアウトする(react.dev で約 200ms/フレーム)。合成だけで済むプロパティの最適化は未着手。
 
 ## 5. 動作確認できているサイト
