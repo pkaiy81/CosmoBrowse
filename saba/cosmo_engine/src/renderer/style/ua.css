@@ -86,3 +86,4 @@ progress, meter { border-radius: 3px; }
 /* Embedded content. */
 iframe { border: 2px inset #767676; }
 video { background-color: black; }
+slot { display: contents; }

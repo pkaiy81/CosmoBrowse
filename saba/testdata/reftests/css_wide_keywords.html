@@ -1,0 +1,14 @@
+<!doctype html><style>
+body{margin:8px;font:16px sans-serif;color:#222}
+a{color:inherit;text-decoration:inherit}
+#green{color:green}#red{color:red;text-decoration:underline}
+.current{color:currentColor}.init{color:initial}
+.parent{display:flex;gap:8px;background:#cdf;border:2px solid #36c;padding:6px;margin-top:8px}
+.same{display:inherit;background:inherit;border:inherit;padding:inherit}
+.contents{display:contents}.follow{display:inherit}.item{background:#fd8;padding:0 4px}
+</style>
+<div id=green><a href=#>green, no underline</a></div>
+<div id=red><a href=#>red, underlined by its parent</a></div>
+<div id=green><a class=current href=#>currentColor</a> <a class=init href=#>initial is black</a></div>
+<div class=parent><div class=same><span class=item>inherited flex</span><span class=item>beside it</span></div></div>
+<div class=parent><div class=contents><div class=follow><div class=item>one</div><div class=item>two</div></div></div><div class=item>three</div></div>
