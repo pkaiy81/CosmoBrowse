@@ -1862,13 +1862,63 @@ mod tests {
             vec![
                 ("/m.js", JS, vec![], "import {n} from './dep.js';\
                     import d from '/sub/def.js';\
-                    document.getElementById('out').textContent=n+d+(typeof document.currentScript);"),
+                    document.getElementById('out').textContent=n+d+(typeof document.currentScript)\
+                      +new URL(import.meta.url).pathname;"),
                 ("/dep.js", JS, vec![], "export const n = 'dep';"),
                 ("/sub/def.js", JS, vec![], "export default 'def';"),
             ],
             "<html><body><p id=out></p><script type=module src=m.js></script></body></html>",
         );
-        assert_eq!(out, "depdefobject");
+        assert_eq!(out, "depdefobject/m.js");
+    }
+
+    #[test]
+    fn import_maps_resolve_bare_names_and_prefixes() {
+        let out = run_page_on_site(
+            vec![
+                ("/m.js", JS, vec![], "import a from 'lib';import b from 'pkg/deep/b.js';\
+                    import c from './rel.js';\
+                    document.getElementById('out').textContent=a+b+c;"),
+                ("/vendor/lib.v2.js", JS, vec![], "export default 'lib';"),
+                ("/vendor/pkg/deep/b.js", JS, vec![], "export default 'b';"),
+                ("/mapped-rel.js", JS, vec![], "export default 'mapped';"),
+            ],
+            "<html><head><script type=importmap>{\"imports\":{\
+               \"lib\":\"/vendor/lib.v2.js\",\
+               \"pkg/\":\"/vendor/pkg/\",\
+               \"./rel.js\":\"/mapped-rel.js\"}}</script></head>\
+             <body><p id=out></p><script type=module src=m.js></script></body></html>",
+        );
+        assert_eq!(out, "libbmapped");
+    }
+
+    #[test]
+    fn clearing_an_interval_from_its_own_callback_stops_it() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var n=0,id=setInterval(function(){n++;if(n===3)clearInterval(id);\
+               document.getElementById('out').textContent=String(n);},1);\
+             </script></body></html>",
+        );
+        assert_eq!(out, "3");
+    }
+
+    #[test]
+    fn character_data_reads_and_writes_in_place() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><!--note-->x</div><script>\
+             var d=document.getElementById('d'),c=d.firstChild,t=d.lastChild;\
+             var seen=[c.nodeType,c.data,t.nodeValue];\
+             c.data='changed';t.nodeValue='y';d.lastChild.data+='z';\
+             seen.push(d.innerHTML,d.textContent);\
+             d.textContent='';seen.push(d.childNodes.length,d.firstChild);\
+             d.textContent='a';d.append('b');seen.push(d.childNodes.length,d.lastChild.parentNode===d);\
+             document.getElementById('out').textContent=seen.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "8|note|x|<!--changed-->yz|yz|0||2|true");
     }
 
     #[test]
@@ -1907,6 +1957,36 @@ mod tests {
              </script></body></html>",
         );
         assert_eq!(out, "true,true,v,true,SPAN,2,x,3,z,2,4,true");
+    }
+
+    #[test]
+    fn moving_a_node_to_where_it_already_is_leaves_the_tree_whole() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><i id=a>a</i><i id=b>b</i></div><script>\
+             var d=document.getElementById('d'),a=document.getElementById('a'),b=document.getElementById('b');\
+             d.prepend(a);d.insertBefore(b,b);d.insertBefore(a,a);\
+             var inner='';try{a.appendChild(d);}catch(e){inner=e.message.split(':')[0];}\
+             var wrong='';try{d.insertBefore(document.createElement('u'),document.body);}catch(e){wrong=e.message.split(':')[0];}\
+             document.getElementById('out').textContent=d.textContent+'|'+inner+'|'+wrong;\
+             </script></body></html>",
+        );
+        assert_eq!(out, "ab|HierarchyRequestError|NotFoundError");
+    }
+
+    #[test]
+    fn a_collection_with_live_weak_map_values_finishes() {
+        // Boa before 0.22 never finished marking a cycle reachable from a WeakMap
+        // value, and ran out of memory trying.
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var key={},map=new WeakMap(),cycle={};cycle.self=cycle;map.set(key,cycle);\
+             var keep=[];for(var i=0;i<200000;i++){keep.push({i:i});}\
+             document.getElementById('out').textContent=map.get(key)===cycle?'alive':'lost';\
+             </script></body></html>",
+        );
+        assert_eq!(out, "alive");
     }
 
     #[test]

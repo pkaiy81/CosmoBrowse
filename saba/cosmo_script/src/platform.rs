@@ -2,7 +2,7 @@
 //! engine, and running a document's scripts.
 
 use super::*;
-use boa_engine::module::{ModuleLoader, Referrer};
+use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::builtins::JsArray;
 use boa_engine::{JsNativeError, JsString, Module};
 use cosmo_engine::renderer::css::media::{parse_media_query_list, MediaContext};
@@ -71,19 +71,19 @@ fn js_str(text: &str) -> JsValue {
 
 fn set_proto(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let name = string_arg(a, 0, c)?;
-    if let Some(proto) = a.get(1).and_then(|v| v.as_object()).cloned() {
+    if let Some(proto) = a.get(1).and_then(|v| v.as_object()) {
         PROTOS.with(|protos| protos.borrow_mut().insert(name, proto));
     }
     Ok(JsValue::undefined())
 }
 
 fn set_window_dispatcher(_t: &JsValue, a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
-    WINDOW_DISPATCHER.with(|slot| *slot.borrow_mut() = a.first().and_then(|v| v.as_object()).cloned());
+    WINDOW_DISPATCHER.with(|slot| *slot.borrow_mut() = a.first().and_then(|v| v.as_object()));
     Ok(JsValue::undefined())
 }
 
 fn set_lifecycle(_t: &JsValue, a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
-    LIFECYCLE.with(|slot| *slot.borrow_mut() = a.first().and_then(|v| v.as_object()).cloned());
+    LIFECYCLE.with(|slot| *slot.borrow_mut() = a.first().and_then(|v| v.as_object()));
     Ok(JsValue::undefined())
 }
 
@@ -91,7 +91,7 @@ fn new_event(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> 
     let event_type = string_arg(a, 0, c)?;
     let bubbles = a.get(1).is_some_and(|v| v.to_boolean());
     let cancelable = a.get(2).is_some_and(|v| v.to_boolean());
-    let proto = a.get(3).and_then(|v| v.as_object()).cloned();
+    let proto = a.get(3).and_then(|v| v.as_object());
     Ok(JsValue::from(build_event(&event_type, bubbles, cancelable, proto, c)))
 }
 
@@ -142,11 +142,11 @@ fn namespace_of(_t: &JsValue, a: &[JsValue], _c: &mut Context) -> JsResult<JsVal
 }
 
 fn attributes(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
-    let list = JsArray::new(c);
+    let list = JsArray::new(c)?;
     if let Some(node) = a.first().and_then(handle_node) {
         if let NodeKind::Element(ref element) = node.borrow().kind {
             for attribute in element.attributes() {
-                let pair = JsArray::new(c);
+                let pair = JsArray::new(c)?;
                 pair.push(js_str(&attribute.name()), c)?;
                 pair.push(js_str(&attribute.value()), c)?;
                 list.push(pair, c)?;
@@ -189,7 +189,7 @@ fn mark_scripts_started(node: &Rc<RefCell<Node>>) {
 fn parse_fragment(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let context = string_arg(a, 0, c)?;
     let html = string_arg(a, 1, c)?;
-    let list = JsArray::new(c);
+    let list = JsArray::new(c)?;
     for node in HtmlParser::parse_fragment(&context, html) {
         cosmo_engine::renderer::dom::api::detach_node(&node);
         mark_scripts_started(&node);
@@ -256,7 +256,7 @@ fn rect_of(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let Some(rect) = rect else {
         return Ok(JsValue::null());
     };
-    let list = JsArray::new(c);
+    let list = JsArray::new(c)?;
     for value in rect {
         list.push(JsValue::from(value), c)?;
     }
@@ -280,7 +280,7 @@ fn computed_style(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsVa
 
 fn viewport(_t: &JsValue, _a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let (width, height) = current_viewport();
-    let list = JsArray::new(c);
+    let list = JsArray::new(c)?;
     list.push(JsValue::from(width), c)?;
     list.push(JsValue::from(height), c)?;
     Ok(list.into())
@@ -385,10 +385,10 @@ fn current_script(_t: &JsValue, _a: &[JsValue], c: &mut Context) -> JsResult<JsV
 }
 
 fn form_data(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
-    let list = JsArray::new(c);
+    let list = JsArray::new(c)?;
     if let Some(form) = a.first().and_then(handle_node) {
         for (name, value) in cosmo_engine::renderer::dom::forms::form_data(&form, None) {
-            let pair = JsArray::new(c);
+            let pair = JsArray::new(c)?;
             pair.push(js_str(&name), c)?;
             pair.push(js_str(&value), c)?;
             list.push(pair, c)?;
@@ -633,6 +633,16 @@ impl ScriptHost {
         };
         let mut scripts = Vec::new();
         collect_scripts(&document, &mut scripts);
+        for script in &scripts {
+            let is_import_map = attribute_of(script, "type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"));
+            if is_import_map {
+                if let Some(map) = ImportMap::parse(&script_text(script), &location_href()) {
+                    IMPORT_MAP.with(|current| *current.borrow_mut() = map);
+                }
+                break;
+            }
+        }
 
         // Start every fetch up front, as a browser's preload scanner would, so
         // they overlap. They still run in order.
@@ -729,7 +739,9 @@ impl ScriptHost {
         let label = url.unwrap_or("inline script").to_string();
         match kind {
             ScriptKind::Classic => {
-                if let Err(error) = self.context.eval(Source::from_bytes(text)) {
+                let base = url.map(str::to_string).unwrap_or_else(location_href);
+                let source = Source::from_bytes(text).with_path(Path::new(&base));
+                if let Err(error) = self.context.eval(source) {
                     log_script_error(&label, error);
                 }
             }
@@ -785,6 +797,85 @@ fn run_module(text: &str, base: &str, ctx: &mut Context) {
     }
 }
 
+/// A document's `<script type="importmap">`, with its keys and targets resolved.
+/// https://html.spec.whatwg.org/multipage/webappapis.html#import-maps
+#[derive(Default)]
+pub(crate) struct ImportMap {
+    imports: Vec<(String, String)>,
+    /// Scope prefix and its map, longest prefix first.
+    scopes: Vec<(String, Vec<(String, String)>)>,
+}
+
+impl ImportMap {
+    /// A specifier as a URL, if it looks like one: absolute, or relative with a
+    /// leading `/`, `./` or `../`.
+    fn url_like(specifier: &str, base: &str) -> Option<String> {
+        if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") {
+            return url::Url::parse(base)
+                .ok()?
+                .join(specifier)
+                .ok()
+                .map(|u| u.to_string());
+        }
+        url::Url::parse(specifier).ok().map(|u| u.to_string())
+    }
+
+    fn parse(text: &str, base: &str) -> Option<ImportMap> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let entries = |map: &serde_json::Value| -> Vec<(String, String)> {
+            let mut out: Vec<(String, String)> = map
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, target)| {
+                    let key = Self::url_like(key, base).unwrap_or_else(|| key.clone());
+                    Some((key, Self::url_like(target.as_str()?, base)?))
+                })
+                .collect();
+            // The most specific prefix wins.
+            out.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+            out
+        };
+        let mut scopes: Vec<(String, Vec<(String, String)>)> = value
+            .get("scopes")
+            .and_then(|s| s.as_object())
+            .into_iter()
+            .flatten()
+            .filter_map(|(scope, map)| Some((Self::url_like(scope, base)?, entries(map))))
+            .collect();
+        scopes.sort_by_key(|(scope, _)| std::cmp::Reverse(scope.len()));
+        Some(ImportMap {
+            imports: value.get("imports").map(&entries).unwrap_or_default(),
+            scopes,
+        })
+    }
+
+    fn look_up(entries: &[(String, String)], key: &str) -> Option<String> {
+        entries.iter().find_map(|(from, to)| {
+            if from == key {
+                return Some(to.clone());
+            }
+            let rest = key.strip_prefix(from.as_str()).filter(|_| from.ends_with('/'))?;
+            url::Url::parse(to).ok()?.join(rest).ok().map(|u| u.to_string())
+        })
+    }
+
+    /// The URL a module imports `specifier` from, or None for a bare name nothing
+    /// maps.
+    fn resolve(&self, specifier: &str, base: &str) -> Option<String> {
+        let url_like = Self::url_like(specifier, base);
+        let key = url_like.as_deref().unwrap_or(specifier);
+        for (scope, entries) in &self.scopes {
+            if base.starts_with(scope.as_str()) {
+                if let Some(found) = Self::look_up(entries, key) {
+                    return Some(found);
+                }
+            }
+        }
+        Self::look_up(&self.imports, key).or(url_like)
+    }
+}
+
 /// Loads `import`s through the page's own network path.
 pub(crate) struct PageModuleLoader {
     loaded: RefCell<std::collections::HashMap<String, Module>>,
@@ -799,40 +890,43 @@ impl PageModuleLoader {
 }
 
 impl ModuleLoader for PageModuleLoader {
-    fn load_imported_module(
-        &self,
+    async fn load_imported_module(
+        self: Rc<Self>,
         referrer: Referrer,
-        specifier: JsString,
-        finish_load: Box<dyn FnOnce(JsResult<Module>, &mut Context)>,
-        context: &mut Context,
-    ) {
-        let specifier = specifier.to_std_string_escaped();
+        request: ModuleRequest,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        let specifier = request.specifier().to_std_string_escaped();
         let base = referrer
             .path()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(location_href);
-        let resolved = url::Url::parse(&base)
-            .ok()
-            .and_then(|b| b.join(&specifier).ok())
-            .map(|u| u.to_string());
-        let Some(resolved) = resolved else {
-            let error = JsNativeError::typ().with_message(format!("bad import: {specifier}"));
-            return finish_load(Err(error.into()), context);
-        };
+        let resolved = IMPORT_MAP
+            .with(|map| map.borrow().resolve(&specifier, &base))
+            .ok_or_else(|| JsNativeError::typ().with_message(format!("bad import: {specifier}")))?;
         if let Some(module) = self.loaded.borrow().get(&resolved).cloned() {
-            return finish_load(Ok(module), context);
+            return Ok(module);
         }
-        let text = start_script_fetch(&resolved).and_then(|rx| receive_script(&rx));
-        let Some(text) = text else {
-            let error = JsNativeError::typ().with_message(format!("failed to load {resolved}"));
-            return finish_load(Err(error.into()), context);
-        };
+        let text = start_script_fetch(&resolved)
+            .and_then(|rx| receive_script(&rx))
+            .ok_or_else(|| JsNativeError::typ().with_message(format!("failed to load {resolved}")))?;
         let source = Source::from_bytes(text.as_bytes()).with_path(Path::new(&resolved));
-        let module = Module::parse(source, None, context);
-        if let Ok(module) = &module {
-            self.loaded.borrow_mut().insert(resolved, module.clone());
-        }
-        finish_load(module, context);
+        let module = Module::parse(source, None, &mut context.borrow_mut())?;
+        self.loaded.borrow_mut().insert(resolved, module.clone());
+        Ok(module)
+    }
+
+    fn init_import_meta(
+        self: Rc<Self>,
+        import_meta: &JsObject,
+        module: &Module,
+        context: &mut Context,
+    ) {
+        let url = module
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(location_href);
+        let _ = import_meta.set(js_string!("url"), js_str(&url), false, context);
     }
 }
 

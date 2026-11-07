@@ -316,6 +316,7 @@
   hide(Node.prototype, 'isSameNode', function (other) { return this === other; });
   hide(Node.prototype, 'isEqualNode', function (other) { return !!other && this.outerHTML === other.outerHTML; });
   hide(Node.prototype, 'replaceChild', function (fresh, old) {
+    if (fresh === old) return old;
     this.insertBefore(fresh, old);
     this.removeChild(old);
     return old;
