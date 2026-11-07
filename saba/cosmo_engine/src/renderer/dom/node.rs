@@ -119,15 +119,15 @@ impl Node {
 
     pub fn get_element(&self) -> Option<Element> {
         match self.kind {
-            NodeKind::Document | NodeKind::Text(_) => None,
             NodeKind::Element(ref e) => Some(e.clone()),
+            _ => None,
         }
     }
 
     pub fn element_kind(&self) -> Option<ElementKind> {
         match self.kind {
-            NodeKind::Document | NodeKind::Text(_) => None,
             NodeKind::Element(ref e) => Some(e.kind()),
+            _ => None,
         }
     }
 
@@ -135,8 +135,8 @@ impl Node {
     /// non-element nodes.
     pub fn element_tag_name(&self) -> Option<String> {
         match self.kind {
-            NodeKind::Document | NodeKind::Text(_) => None,
             NodeKind::Element(ref e) => Some(e.tag_name().to_string()),
+            _ => None,
         }
     }
 }
@@ -146,6 +146,12 @@ pub enum NodeKind {
     Document,
     Element(Element),
     Text(String),
+    Comment(String),
+    Doctype {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
 }
 
 impl PartialEq for NodeKind {
@@ -157,8 +163,20 @@ impl PartialEq for NodeKind {
                 _ => false,
             },
             NodeKind::Text(_) => matches!(other, NodeKind::Text(_)),
+            NodeKind::Comment(_) => matches!(other, NodeKind::Comment(_)),
+            NodeKind::Doctype { .. } => matches!(other, NodeKind::Doctype { .. }),
         }
     }
+}
+
+/// Which vocabulary an element belongs to. A `<title>` inside `<svg>` isn't the
+/// document's title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Namespace {
+    #[default]
+    Html,
+    Svg,
+    MathMl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +184,7 @@ pub struct Element {
     tag: String,
     kind: ElementKind,
     attributes: Vec<Attribute>,
+    namespace: Namespace,
 }
 
 impl Element {
@@ -180,7 +199,25 @@ impl Element {
             tag: element_name.to_string(),
             kind,
             attributes,
+            namespace: Namespace::Html,
         }
+    }
+
+    /// An element in another vocabulary: none of the HTML kinds apply to it.
+    pub fn new_in(element_name: &str, attributes: Vec<Attribute>, namespace: Namespace) -> Self {
+        if namespace == Namespace::Html {
+            return Self::new(element_name, attributes);
+        }
+        Self {
+            tag: element_name.to_string(),
+            kind: ElementKind::Unknown,
+            attributes,
+            namespace,
+        }
+    }
+
+    pub fn namespace(&self) -> Namespace {
+        self.namespace
     }
 
     pub fn kind(&self) -> ElementKind {
@@ -204,7 +241,8 @@ impl Element {
         matches!(
             self.tag.as_str(),
             "head" | "link" | "style" | "script" | "title" | "meta" | "base" | "noscript"
-                | "template"
+                | "template" | "area" | "basefont" | "datalist" | "noembed" | "noframes"
+                | "param" | "rp"
         )
     }
 

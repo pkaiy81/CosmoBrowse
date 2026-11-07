@@ -1,3 +1,4 @@
+use crate::renderer::layout::computed_style::{ComputedStyle, TextDecoration};
 use std::string::String;
 use std::vec::Vec;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ impl PaintCommand {
             font_family: String::from("monospace"),
             underline: false,
             bold: false,
+            detail: TextDetail::default(),
             opacity,
             href,
             target: None,
@@ -149,6 +151,49 @@ pub struct DrawText {
     pub target: Option<String>,
     pub z_index: i32,
     pub clip_rect: Option<(i64, i64, i64, i64)>,
+    #[serde(default, skip_serializing_if = "TextDetail::is_plain")]
+    pub detail: TextDetail,
+}
+
+/// The less common parts of how a text run is drawn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TextDetail {
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub letter_spacing: f64,
+    #[serde(default)]
+    pub word_spacing: f64,
+    #[serde(default)]
+    pub line_through: bool,
+    #[serde(default)]
+    pub overline: bool,
+    /// (x offset, y offset, color)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<(i64, i64, String)>,
+}
+
+impl TextDetail {
+    pub fn is_plain(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn from_style(style: &ComputedStyle) -> Self {
+        Self {
+            italic: style.is_italic(),
+            letter_spacing: style.letter_spacing(),
+            word_spacing: style.word_spacing(),
+            line_through: style.text_decoration() == TextDecoration::LineThrough,
+            overline: style.text_decoration() == TextDecoration::Overline,
+            shadow: style.text_shadow().map(|shadow| {
+                (
+                    shadow.x as i64,
+                    shadow.y as i64,
+                    shadow.color.code().to_string(),
+                )
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

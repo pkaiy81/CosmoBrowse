@@ -7,7 +7,7 @@ use crate::renderer::layout::computed_style::Color;
 use crate::renderer::layout::computed_style::LinearGradient;
 use crate::renderer::layout::computed_style::FontSize;
 use crate::renderer::layout::computed_style::{
-    AlignContent, AlignItems, FlexWrap, GridAutoRepeat, GridLine, GridPlacement, GridTemplate,
+    AlignContent, AlignItems, FlexWrap, MathExpr, VerticalAlign, GridAutoRepeat, GridLine, GridPlacement, GridTemplate,
     GridTrack, JustifyContent,
 };
 
@@ -20,6 +20,9 @@ thread_local! {
     /// single-threaded per page so a thread-local is sufficient (same
     /// transitional pattern as the font-metrics provider).
     static STYLING_VIEWPORT: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
+
+    /// The root element's font size, which `rem` is relative to.
+    static ROOT_FONT_PX: Cell<f64> = const { Cell::new(16.0) };
 
     /// Node identities (`Rc::as_ptr`) of the element under the pointer and its
     /// ancestors — everything `:hover` currently matches. Published by the
@@ -89,7 +92,15 @@ pub(crate) fn length_to_px(value: f64, unit: &str, base_font_size: FontSize) -> 
     match unit {
         "px" => Some(value),
         "em" => Some(value * base_font_size.px() as f64),
-        "rem" => Some(value * FontSize::Medium.px() as f64),
+        "rem" => Some(value * ROOT_FONT_PX.with(|root| root.get())),
+        // Approximations: an `ex` is about half an em, a `ch` the width of "0".
+        "ex" | "ch" => Some(value * base_font_size.px() as f64 * 0.5),
+        "pt" => Some(value * 96.0 / 72.0),
+        "pc" => Some(value * 16.0),
+        "in" => Some(value * 96.0),
+        "cm" => Some(value * 96.0 / 2.54),
+        "mm" => Some(value * 96.0 / 25.4),
+        "q" | "Q" => Some(value * 96.0 / 101.6),
         // Viewport-relative units resolve against the viewport captured at
         // the start of the pass; unknown (0) viewport skips the declaration.
         "vw" | "vh" | "vmin" | "vmax" => {
@@ -711,11 +722,80 @@ pub(crate) fn extract_css_url(values: &[ComponentValue]) -> Option<String> {
     None
 }
 
+pub(crate) fn set_root_font_px(px: f64) {
+    ROOT_FONT_PX.with(|root| root.set(px));
+}
+
+/// The first entry of a `font-family` list this engine can match, as a generic
+/// family name. Tokens of an unquoted name (`Helvetica Neue`) join into one entry.
 pub(crate) fn first_font_family(value: &[ComponentValue]) -> Option<String> {
-    value.iter().find_map(|component| match component {
-        ComponentValue::Ident(name) | ComponentValue::StringToken(name) => Some(name.clone()),
+    let mut entry = String::new();
+    let mut settle = |entry: &mut String| {
+        let class = crate::renderer::text::face::FontClass::from_family(entry);
+        entry.clear();
+        class
+    };
+    for component in value {
+        match component {
+            ComponentValue::Ident(name) | ComponentValue::StringToken(name) => {
+                if !entry.is_empty() {
+                    entry.push(' ');
+                }
+                entry.push_str(name);
+            }
+            ComponentValue::Delim(',') => {
+                if let Some(class) = settle(&mut entry) {
+                    return Some(class.name().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    settle(&mut entry).map(|class| class.name().to_string())
+}
+
+/// `vertical-align`. https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align
+pub(crate) fn parse_vertical_align(
+    value: Option<&ComponentValue>,
+    base: FontSize,
+) -> Option<VerticalAlign> {
+    match value? {
+        ComponentValue::Ident(keyword) => Some(match keyword.as_str() {
+            "baseline" => VerticalAlign::Baseline,
+            "sub" => VerticalAlign::Sub,
+            "super" => VerticalAlign::Super,
+            "middle" => VerticalAlign::Middle,
+            "top" => VerticalAlign::Top,
+            "bottom" => VerticalAlign::Bottom,
+            "text-top" => VerticalAlign::TextTop,
+            "text-bottom" => VerticalAlign::TextBottom,
+            _ => return None,
+        }),
+        ComponentValue::Number(v) => Some(VerticalAlign::Raise(*v)),
+        ComponentValue::Dimension(v, unit) if unit == "%" => {
+            Some(VerticalAlign::RaiseRatio(*v / 100.0))
+        }
+        ComponentValue::Dimension(v, unit) => {
+            length_to_px(*v, unit, base).map(VerticalAlign::Raise)
+        }
         _ => None,
-    })
+    }
+}
+
+/// `aspect-ratio`: `<width> [ / <height> ]`, or `auto`.
+pub(crate) fn parse_aspect_ratio(values: &[ComponentValue]) -> Option<f64> {
+    let numbers: Vec<f64> = values
+        .iter()
+        .filter_map(|v| match v {
+            ComponentValue::Number(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    match numbers.as_slice() {
+        [w] if *w > 0.0 => Some(*w),
+        [w, h] if *w > 0.0 && *h > 0.0 => Some(*w / *h),
+        _ => None,
+    }
 }
 pub(crate) fn spacing_component_to_px(component: &ComponentValue, base_font_size: FontSize) -> Option<f64> {
     match component {
@@ -1035,9 +1115,29 @@ mod tests {
         assert_eq!(folded, vals("-320px"), "{:?}", folded);
         let folded = fold_calc(&vals("calc(100px + 2em - (4px / 2))"), FontSize::Medium);
         assert_eq!(folded, vals("130px"), "{:?}", folded);
-        // Percentages are left unresolved.
-        let kept = fold_calc(&vals("calc(100% - 20px)"), FontSize::Medium);
-        assert!(kept.iter().any(|v| matches!(v, ComponentValue::Ident(s) if s == "calc")));
+        let folded = fold_calc(&vals("clamp(10px, max(5px, 2em), 20px)"), FontSize::Medium);
+        assert_eq!(folded, vals("20px"), "{:?}", folded);
+    }
+
+    #[test]
+    fn math_with_a_percentage_waits_for_the_containing_block() {
+        use crate::renderer::layout::computed_style::FontSize;
+        let expr = parse_math_value(&vals("calc(100% - 20px)"), FontSize::Medium).unwrap();
+        assert_eq!(expr.eval(200.0), 180.0);
+        let expr = parse_math_value(&vals("min(50%, 300px)"), FontSize::Medium).unwrap();
+        assert_eq!(expr.eval(200.0), 100.0);
+        assert_eq!(expr.eval(1000.0), 300.0);
+    }
+
+    #[test]
+    fn font_family_takes_the_first_entry_it_knows() {
+        let family = |css: &str| first_font_family(&vals(css));
+        assert_eq!(family("Inter, Georgia, serif").as_deref(), Some("sans-serif"));
+        assert_eq!(family("WebFontX, Georgia, sans-serif").as_deref(), Some("serif"));
+        assert_eq!(family("'Courier New', monospace").as_deref(), Some("monospace"));
+        assert_eq!(family("Helvetica Neue, Arial").as_deref(), Some("sans-serif"));
+        assert_eq!(family("Verdana").as_deref(), Some("wide-sans-serif"));
+        assert_eq!(family("WebFontX"), None);
     }
 
     #[test]
@@ -1089,36 +1189,54 @@ mod tests {
     }
 }
 
-/// Fold every resolvable `calc(...)` in a declaration value into a plain
-/// px Dimension token (absolute lengths and numbers only; percentages and
-/// unknown units leave the calc unresolved and untouched). Runs after var()
-/// substitution so `calc(var(--x)*2)` folds too.
+/// Whether a declaration value contains a math function to fold.
+pub(crate) fn has_math_function(values: &[ComponentValue]) -> bool {
+    values.windows(2).any(|pair| {
+        matches!(&pair[0], ComponentValue::Ident(name) if is_math_function(name))
+            && matches!(pair[1], ComponentValue::OpenParenthesis)
+    })
+}
+
+fn is_math_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "calc" | "min" | "max" | "clamp" | "-webkit-calc" | "-moz-calc"
+    )
+}
+
+/// Parse the math function at the start of `values`, if that's what's there.
+pub(crate) fn parse_math_value(values: &[ComponentValue], base: FontSize) -> Option<MathExpr> {
+    if !matches!(values.first(), Some(ComponentValue::Ident(name)) if is_math_function(name)) {
+        return None;
+    }
+    let mut it = values.iter().peekable();
+    let expr = parse_math_atom(&mut it, base)?;
+    Some(expr)
+}
+
+/// Fold every math function in a declaration value into a plain px length.
+/// A percentage has nothing to resolve against here, so it counts against the
+/// viewport's width, which is the right order of magnitude; `width` and `height`
+/// avoid this by keeping the expression for layout.
+/// Runs after var() substitution so `calc(var(--x)*2)` folds too.
 pub(crate) fn fold_calc(values: &[ComponentValue], base_font_size: FontSize) -> Vec<ComponentValue> {
+    let (viewport_width, _) = STYLING_VIEWPORT.with(|v| v.get());
     let mut out = Vec::with_capacity(values.len());
     let mut i = 0;
     while i < values.len() {
-        let is_calc = matches!(&values[i], ComponentValue::Ident(s) if s.eq_ignore_ascii_case("calc"))
+        let is_math = matches!(&values[i], ComponentValue::Ident(s) if is_math_function(s))
             && matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
-        if is_calc {
-            // Find the matching close paren.
-            let mut depth = 1;
-            let mut j = i + 2;
-            while j < values.len() && depth > 0 {
-                match &values[j] {
-                    ComponentValue::OpenParenthesis => depth += 1,
-                    ComponentValue::CloseParenthesis => depth -= 1,
-                    _ => {}
-                }
-                j += 1;
-            }
-            let inner = &values[i + 2..(j - 1).max(i + 2)];
-            if let Some(px) = eval_calc_sum(&mut inner.iter().peekable(), base_font_size) {
-                out.push(ComponentValue::Dimension(px, "px".to_string()));
-            } else {
+        if is_math {
+            let (_, next) = function_args(values, i + 1);
+            match parse_math_value(&values[i..next], base_font_size) {
+                Some(expr) => out.push(ComponentValue::Dimension(
+                    expr.eval(viewport_width as f64),
+                    "px".to_string(),
+                )),
                 // Unresolvable: keep the original tokens (arms will skip).
-                out.extend_from_slice(&values[i..j]);
+                None => out.extend_from_slice(&values[i..next]),
             }
-            i = j;
+            i = next;
         } else {
             out.push(values[i].clone());
             i += 1;
@@ -1129,76 +1247,104 @@ pub(crate) fn fold_calc(values: &[ComponentValue], base_font_size: FontSize) -> 
 
 type CalcIter<'a> = core::iter::Peekable<core::slice::Iter<'a, ComponentValue>>;
 
-fn eval_calc_sum(it: &mut CalcIter, base: FontSize) -> Option<f64> {
-    let mut acc = eval_calc_product(it, base)?;
-    loop {
-        match it.peek() {
-            Some(ComponentValue::Delim(op @ ('+' | '-'))) => {
-                let op = *op;
-                it.next();
-                let rhs = eval_calc_product(it, base)?;
-                if op == '+' {
-                    acc += rhs;
-                } else {
-                    acc -= rhs;
-                }
-            }
-            // The CSS tokenizer's negative-number handling emits a lone
-            // minus/plus between spaces as an Ident.
-            Some(ComponentValue::Ident(ops)) if ops == "-" || ops == "+" => {
-                let op = if ops == "-" { '-' } else { '+' };
-                it.next();
-                let rhs = eval_calc_product(it, base)?;
-                if op == '+' {
-                    acc += rhs;
-                } else {
-                    acc -= rhs;
-                }
-            }
-            Some(ComponentValue::Whitespace) => {
-                it.next();
-            }
-            Some(ComponentValue::CloseParenthesis) | None => return Some(acc),
-            _ => return None,
-        }
+fn skip_math_whitespace(it: &mut CalcIter) {
+    while matches!(it.peek(), Some(ComponentValue::Whitespace)) {
+        it.next();
     }
 }
 
-fn eval_calc_product(it: &mut CalcIter, base: FontSize) -> Option<f64> {
-    let mut acc = eval_calc_atom(it, base)?;
+fn parse_math_sum(it: &mut CalcIter, base: FontSize) -> Option<MathExpr> {
+    let mut acc = parse_math_product(it, base)?;
     loop {
-        match it.peek() {
-            Some(ComponentValue::Delim(op @ ('*' | '/'))) => {
-                let op = *op;
-                it.next();
-                let rhs = eval_calc_atom(it, base)?;
-                if op == '*' {
-                    acc *= rhs;
-                } else if rhs != 0.0 {
-                    acc /= rhs;
-                } else {
-                    return None;
-                }
+        skip_math_whitespace(it);
+        let plus = match it.peek() {
+            Some(ComponentValue::Delim('+')) => true,
+            Some(ComponentValue::Delim('-')) => false,
+            // The CSS tokenizer's negative-number handling emits a lone
+            // minus/plus between spaces as an Ident.
+            Some(ComponentValue::Ident(op)) if op == "+" => true,
+            Some(ComponentValue::Ident(op)) if op == "-" => false,
+            // A sign the tokenizer folded into the next number: `10px -2px`
+            // arrives as two lengths.
+            Some(ComponentValue::Dimension(v, _)) | Some(ComponentValue::Number(v))
+                if *v < 0.0 =>
+            {
+                let rhs = parse_math_product(it, base)?;
+                acc = MathExpr::Add(Box::new(acc), Box::new(rhs));
+                continue;
             }
-            Some(ComponentValue::Whitespace) => {
+            _ => return Some(acc),
+        };
+        it.next();
+        let rhs = parse_math_product(it, base)?;
+        acc = if plus {
+            MathExpr::Add(Box::new(acc), Box::new(rhs))
+        } else {
+            MathExpr::Sub(Box::new(acc), Box::new(rhs))
+        };
+    }
+}
+
+fn parse_math_product(it: &mut CalcIter, base: FontSize) -> Option<MathExpr> {
+    let mut acc = parse_math_atom(it, base)?;
+    loop {
+        skip_math_whitespace(it);
+        match it.peek() {
+            Some(ComponentValue::Delim('*')) => {
                 it.next();
+                let rhs = parse_math_atom(it, base)?;
+                acc = MathExpr::Mul(Box::new(acc), Box::new(rhs));
+            }
+            Some(ComponentValue::Delim('/')) => {
+                it.next();
+                let rhs = parse_math_atom(it, base)?;
+                acc = MathExpr::Div(Box::new(acc), Box::new(rhs));
             }
             _ => return Some(acc),
         }
     }
 }
 
-fn eval_calc_atom(it: &mut CalcIter, base: FontSize) -> Option<f64> {
-    while matches!(it.peek(), Some(ComponentValue::Whitespace)) {
-        it.next();
+fn parse_math_args(it: &mut CalcIter, base: FontSize) -> Option<Vec<MathExpr>> {
+    let mut args = Vec::new();
+    loop {
+        args.push(parse_math_sum(it, base)?);
+        skip_math_whitespace(it);
+        match it.next()? {
+            ComponentValue::Delim(',') => {}
+            ComponentValue::CloseParenthesis => return Some(args),
+            _ => return None,
+        }
     }
+}
+
+fn parse_math_atom(it: &mut CalcIter, base: FontSize) -> Option<MathExpr> {
+    skip_math_whitespace(it);
     match it.next()? {
-        ComponentValue::Number(n) => Some(*n),
-        ComponentValue::Dimension(n, unit) if unit != "%" => length_to_px(*n, unit, base),
+        ComponentValue::Number(n) => Some(MathExpr::Number(*n)),
+        ComponentValue::Dimension(n, unit) if unit == "%" => Some(MathExpr::Ratio(*n / 100.0)),
+        ComponentValue::Dimension(n, unit) => length_to_px(*n, unit, base).map(MathExpr::Px),
         ComponentValue::OpenParenthesis => {
-            let v = eval_calc_sum(it, base)?;
+            let inner = parse_math_sum(it, base)?;
+            skip_math_whitespace(it);
             match it.next() {
-                Some(ComponentValue::CloseParenthesis) => Some(v),
+                Some(ComponentValue::CloseParenthesis) => Some(inner),
+                _ => None,
+            }
+        }
+        ComponentValue::Ident(name) if matches!(it.peek(), Some(ComponentValue::OpenParenthesis)) => {
+            it.next();
+            let mut args = parse_math_args(it, base)?;
+            match name.to_ascii_lowercase().as_str() {
+                "calc" | "-webkit-calc" | "-moz-calc" if args.len() == 1 => args.pop(),
+                "min" => Some(MathExpr::Min(args)),
+                "max" => Some(MathExpr::Max(args)),
+                "clamp" if args.len() == 3 => {
+                    let max = args.pop()?;
+                    let value = args.pop()?;
+                    let min = args.pop()?;
+                    Some(MathExpr::Clamp(Box::new(min), Box::new(value), Box::new(max)))
+                }
                 _ => None,
             }
         }

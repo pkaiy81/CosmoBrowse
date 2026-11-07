@@ -109,102 +109,55 @@ fn build_layout_tree(
     parent_obj: &Option<Rc<RefCell<LayoutObject>>>,
     cssom: &StyleSheet,
 ) -> Option<Rc<RefCell<LayoutObject>>> {
-    let mut target_node = node.clone();
-    let mut layout_object = create_layout_object(node, parent_obj, cssom);
+    // Siblings go in a loop and only depth recurses: a page can have tens of
+    // thousands of siblings, but its nesting is limited.
+    let mut first = None;
+    let mut last: Option<Rc<RefCell<LayoutObject>>> = None;
+    let mut current = node.clone();
+    while let Some(n) = current {
+        if let Some(obj) = create_layout_object(&Some(n.clone()), parent_obj, cssom) {
+            let original_first_child = n.borrow().first_child();
+            let mut first_child =
+                build_layout_tree(&original_first_child, &Some(obj.clone()), cssom);
 
-    while layout_object.is_none() {
-        if let Some(n) = target_node {
-            target_node = n.borrow().next_sibling().clone();
-            layout_object = create_layout_object(&target_node, parent_obj, cssom);
-        } else {
-            return layout_object;
+            // CSS generated content: a ::before box becomes the first child and a
+            // ::after box the last child of the element.
+            // https://www.w3.org/TR/css-content-3/
+            if matches!(n.borrow().kind(), NodeKind::Element(_)) {
+                use crate::renderer::css::cssom::PseudoElement;
+                if let Some(before) = crate::renderer::layout::layout_object::build_pseudo_element(
+                    &n,
+                    &obj,
+                    cssom,
+                    PseudoElement::Before,
+                ) {
+                    before.borrow_mut().set_next_sibling(first_child.take());
+                    first_child = Some(before);
+                }
+                if let Some(after) = crate::renderer::layout::layout_object::build_pseudo_element(
+                    &n,
+                    &obj,
+                    cssom,
+                    PseudoElement::After,
+                ) {
+                    match &first_child {
+                        Some(fc) => append_layout_sibling(fc, after),
+                        None => first_child = Some(after),
+                    }
+                }
+            }
+
+            obj.borrow_mut().set_first_child(first_child);
+            LayoutObject::normalize_children(&obj);
+            match &last {
+                Some(previous) => previous.borrow_mut().set_next_sibling(Some(obj.clone())),
+                None => first = Some(obj.clone()),
+            }
+            last = Some(obj);
         }
+        current = n.borrow().next_sibling();
     }
-
-    if let Some(n) = target_node {
-        let original_first_child = n.borrow().first_child();
-        let original_next_sibling = n.borrow().next_sibling();
-        let mut first_child = build_layout_tree(&original_first_child, &layout_object, cssom);
-        // Siblings share the same parent as the current node.
-        let mut next_sibling = build_layout_tree(&original_next_sibling, parent_obj, cssom);
-
-        if first_child.is_none() && original_first_child.is_some() {
-            let mut original_dom_node = original_first_child
-                .expect("first child should exist")
-                .borrow()
-                .next_sibling();
-
-            loop {
-                first_child = build_layout_tree(&original_dom_node, &layout_object, cssom);
-
-                if first_child.is_none() && original_dom_node.is_some() {
-                    original_dom_node = original_dom_node
-                        .expect("next sibling should exist")
-                        .borrow()
-                        .next_sibling();
-                    continue;
-                }
-
-                break;
-            }
-        }
-
-        if next_sibling.is_none() && n.borrow().next_sibling().is_some() {
-            let mut original_dom_node = original_next_sibling
-                .expect("next sibling should exist")
-                .borrow()
-                .next_sibling();
-
-            loop {
-                next_sibling = build_layout_tree(&original_dom_node, parent_obj, cssom);
-
-                if next_sibling.is_none() && original_dom_node.is_some() {
-                    original_dom_node = original_dom_node
-                        .expect("next sibling should exist")
-                        .borrow()
-                        .next_sibling();
-                    continue;
-                }
-
-                break;
-            }
-        }
-
-        let obj = layout_object
-            .as_ref()
-            .expect("render object should exist here");
-
-        // CSS generated content: a ::before box becomes the first child and a
-        // ::after box the last child of the element.
-        // https://www.w3.org/TR/css-content-3/
-        if matches!(n.borrow().kind(), NodeKind::Element(_)) {
-            use crate::renderer::css::cssom::PseudoElement;
-            if let Some(before) =
-                crate::renderer::layout::layout_object::build_pseudo_element(
-                    &n, obj, cssom, PseudoElement::Before,
-                )
-            {
-                before.borrow_mut().set_next_sibling(first_child.take());
-                first_child = Some(before);
-            }
-            if let Some(after) =
-                crate::renderer::layout::layout_object::build_pseudo_element(
-                    &n, obj, cssom, PseudoElement::After,
-                )
-            {
-                match &first_child {
-                    Some(fc) => append_layout_sibling(fc, after),
-                    None => first_child = Some(after),
-                }
-            }
-        }
-
-        obj.borrow_mut().set_first_child(first_child);
-        obj.borrow_mut().set_next_sibling(next_sibling);
-        LayoutObject::normalize_children(obj);
-    }
-
-    layout_object
+    first
 }
 
 /// Append `tail` after the last sibling in the chain starting at `head`.
@@ -267,13 +220,22 @@ impl LayoutView {
             filtered = cssom.filter_for_media(&media_ctx);
             &filtered
         };
+        let with_user_agent = cssom.with_user_agent_rules();
+        let cssom = &with_user_agent;
+        if let Some(body) = &body_root {
+            crate::renderer::layout::layout_object::prepare_root_style(body, cssom);
+        }
 
+        let html_background = crate::renderer::layout::layout_object::root_background();
         let mut tree = Self {
             root: build_layout_tree(&body_root, &None, cssom),
             viewport_width: viewport_width.max(1),
             viewport_height: viewport_height.max(0),
         };
 
+        if let Some(root) = &tree.root {
+            root.borrow_mut().html_background = html_background;
+        }
         tree.update_layout();
         tree
     }
@@ -285,6 +247,9 @@ impl LayoutView {
         {
             let mut b = n.borrow_mut();
             b.float_context = None;
+            // Positions carry into the next pass too, so a new layout starts
+            // without the last one's.
+            b.point = LayoutPoint::new(0, 0);
             if b.style().float_or_default() != Float::None {
                 b.inline_offset = None;
             }
@@ -317,13 +282,14 @@ impl LayoutView {
     // for normal-flow block/inline boxes in a containing block.
     // https://www.w3.org/TR/CSS22/visuren.html
     fn calculate_node_size(node: &Option<Rc<RefCell<LayoutObject>>>, parent_size: LayoutSize) {
-        if let Some(n) = node {
+        let mut current = node.clone();
+        while let Some(n) = current {
             // Pre-pass: populate per-column content hints once per table so
             // that the very first row's cells already see the max hint of any
             // later row's cell in the same column. Spec: CSS 2.2 §17.5.2.
             if n.borrow().is_table() && n.borrow().column_min_hints().is_none() {
-                let min_hints = LayoutObject::compute_table_column_min_hints(n);
-                let max_hints = LayoutObject::compute_table_column_max_hints(n);
+                let min_hints = LayoutObject::compute_table_column_min_hints(&n);
+                let max_hints = LayoutObject::compute_table_column_max_hints(&n);
                 n.borrow_mut().set_column_min_hints(min_hints);
                 n.borrow_mut().set_column_max_hints(max_hints);
             }
@@ -349,21 +315,18 @@ impl LayoutView {
             // Flex and grid containers fix their items' widths before the items
             // are sized, and place them after.
             if is_flex {
-                flex::assign_sizes(n);
+                flex::assign_sizes(&n);
             } else if is_grid {
-                grid::assign_sizes(n);
+                grid::assign_sizes(&n);
             }
             let first_child = n.borrow().first_child();
             Self::calculate_node_size(&first_child, child_parent_size);
 
-            let next_sibling = n.borrow().next_sibling();
-            Self::calculate_node_size(&next_sibling, parent_size);
-
             n.borrow_mut().compute_size(parent_size);
             if is_flex {
-                flex::place_items(n, parent_size.height());
+                flex::place_items(&n, parent_size.height());
             } else if is_grid {
-                grid::place_items(n, parent_size.height());
+                grid::place_items(&n, parent_size.height());
             }
 
             // Phase 2.5: with the children sized, a block whose content is all
@@ -372,8 +335,9 @@ impl LayoutView {
             // actually has, instead of every text node wrapping independently
             // against the full block width.
             if use_new_inline() {
-                LayoutObject::layout_inline_context(n);
+                LayoutObject::layout_inline_context(&n);
             }
+            current = n.borrow().next_sibling();
         }
     }
 
@@ -388,15 +352,19 @@ impl LayoutView {
         previous_sibling_point: Option<LayoutPoint>,
         previous_sibling_size: Option<LayoutSize>,
     ) {
-        if let Some(n) = node {
+        let mut current = node.clone();
+        let mut previous_kind = previous_sibling_kind;
+        let mut previous_point = previous_sibling_point;
+        let mut previous_size = previous_sibling_size;
+        while let Some(n) = current {
             n.borrow_mut().compute_position(
                 parent_point,
                 parent_size,
-                previous_sibling_kind,
-                previous_sibling_point,
-                previous_sibling_size,
+                previous_kind,
+                previous_point,
+                previous_size,
             );
-            LayoutObject::assign_flow_offsets(n);
+            LayoutObject::assign_flow_offsets(&n);
 
             let first_child = n.borrow().first_child();
             Self::calculate_node_position(
@@ -408,7 +376,6 @@ impl LayoutView {
                 None,
             );
 
-            let next_sibling = n.borrow().next_sibling();
             // A node must not become the next sibling's flow anchor when it
             // does not participate in normal flow:
             //  - zero-size nodes (whitespace-only text collapsed at a block
@@ -437,25 +404,12 @@ impl LayoutView {
                     b.style().float_or_default() != Float::None && b.inline_offset.is_some();
                 zero_sized || positioned || floated_and_placed
             };
-            if out_of_flow {
-                Self::calculate_node_position(
-                    &next_sibling,
-                    parent_point,
-                    parent_size,
-                    previous_sibling_kind,
-                    previous_sibling_point,
-                    previous_sibling_size,
-                );
-            } else {
-                Self::calculate_node_position(
-                    &next_sibling,
-                    parent_point,
-                    parent_size,
-                    n.borrow().kind(),
-                    Some(n.borrow().point()),
-                    Some(n.borrow().size()),
-                );
+            if !out_of_flow {
+                previous_kind = n.borrow().kind();
+                previous_point = Some(n.borrow().point());
+                previous_size = Some(n.borrow().size());
             }
+            current = n.borrow().next_sibling();
         }
     }
 
@@ -1912,14 +1866,15 @@ mod tests {
     #[test]
     fn test_empty() {
         let layout_view = create_layout_view("".to_string(), 600);
-        assert_eq!(None, layout_view.root());
+        // Even an empty document has a `<body>`.
+        assert!(layout_view.root().is_some());
     }
 
     #[test]
     fn test_absolute_containing_block_and_far_edges() {
         // The absolute box anchors to the nearest positioned ancestor
         // (.rel at 100,50 within body flow), not its direct static parent.
-        let html = r#"<html><head><style>
+        let html = r#"<html><head><style>body{margin:0}
             .pad { height: 50px; }
             .rel { position: relative; width: 400px; height: 200px; margin: 0 0 0 100px; background-color: gray; }
             .wrap { width: 300px; }
@@ -1954,7 +1909,7 @@ mod tests {
     fn test_display_contents_grid_wrapper_is_transparent() {
         // MDN idiom: a display:contents wrapper between the grid and its
         // items — the items must still resolve their named-line placement.
-        let html = r#"<html><head><style>
+        let html = r#"<html><head><style>body{margin:0}
             .shell { display: grid; width: 600px;
                      grid-template-columns: [sb-start] 150px [sb-end main-start] 1fr [main-end]; }
             .wrap { display: contents; }
@@ -1985,7 +1940,7 @@ mod tests {
     #[test]
     fn test_grid_named_lines_placement() {
         // MDN-style named-line tracks: sidebar between its -start/-end lines.
-        let html = r#"<html><head><style>
+        let html = r#"<html><head><style>body{margin:0}
             .shell { display: grid; width: 600px;
                      grid-template-columns: [full-start sb-start] 150px [sb-end main-start] 1fr [main-end full-end]; }
             .sb { grid-area: sb; height: 30px; background-color: blue; }
@@ -2015,7 +1970,7 @@ mod tests {
     #[test]
     fn test_grid_template_areas_placement() {
         // Header spans both columns; sidebar 100px + content share row 2.
-        let html = r#"<html><head><style>
+        let html = r#"<html><head><style>body{margin:0}
             .shell { display: grid; grid-template-columns: 100px 1fr;
                      grid-template-areas: 'hd hd' 'sb ct'; width: 600px; }
             .hd { grid-area: hd; height: 30px; background-color: red; }
@@ -2098,7 +2053,7 @@ mod tests {
 
     #[test]
     fn test_flex_justify_and_align() {
-        let html = r#"<html><head><style>
+        let html = r#"<html><head><style>body{margin:0}
             .row { display: flex; flex-direction: row; width: 600px; height: 100px;
                    justify-content: space-between; align-items: center; }
             .i { width: 100px; height: 20px; background-color: red; }
@@ -2213,7 +2168,7 @@ mod tests {
 
     #[test]
     fn test_min_max_width_clamp_used_size() {
-        let html = r#"<html><head><style>
+        let html = r#"<html><head><style>body{margin:0}
             .capped { width: 600px; max-width: 300px; height: 20px; background-color: red; }
             .floored { width: 50px; min-width: 200px; height: 20px; background-color: blue; }
             .pct { max-width: 50%; height: 20px; background-color: green; }
@@ -2438,7 +2393,7 @@ mod tests {
             item,
             DisplayItem::Text { text, style, .. }
                 if text == "Example Domain"
-                    && style.font_family() == "system-ui"
+                    && style.font_family() == "sans-serif"
                     && (style.opacity() - 0.8).abs() < f64::EPSILON
         )));
         assert!(display_items.iter().any(|item| matches!(
@@ -3515,7 +3470,7 @@ mod tests {
     #[test]
     fn test_sticky_context_bound_to_containing_block() {
         let html = concat!(
-            "<html><head><style>",
+            "<html><head><style>body{margin:0}",
             ".section{height:260px;}",
             ".sbar{position:sticky;top:0;height:40px;}",
             "</style></head><body>",
@@ -3653,7 +3608,7 @@ mod tests {
     #[test]
     fn test_transform_rotate_context() {
         let html = concat!(
-            "<html><head><style>",
+            "<html><head><style>body{margin:0}",
             ".frame{position:relative;height:200px;}",
             ".badge{position:absolute;top:50px;left:50px;width:80px;height:40px;",
             "transform:rotate(45deg);}",
@@ -4037,7 +3992,7 @@ mod tests {
         // 200px fixed + 1fr + 2fr with 20px gaps in a 1000px container:
         // remaining = 1000 - 2*20 - 200 = 760; 1fr = 253, 2fr = 506.
         let html = concat!(
-            "<html><head><style>",
+            "<html><head><style>body{margin:0}",
             ".grid{display:grid;grid-template-columns:200px 1fr 2fr;gap:10px 20px;}",
             ".item{height:40px;}",
             "</style></head><body>",
@@ -4072,7 +4027,7 @@ mod tests {
     #[test]
     fn test_display_grid_three_columns_row_major() {
         let html = concat!(
-            "<html><head><style>",
+            "<html><head><style>body{margin:0}",
             ".grid{display:grid;grid-template-columns:repeat(3, 1fr);}",
             ".card{height:50px;}",
             "</style></head><body>",
@@ -5572,5 +5527,306 @@ mod tests {
         );
         assert_eq!(box_with(&boxes, "#ff0000"), (0, 0, 400, 30));
         assert_eq!(box_with(&boxes, "#00ff00"), (0, 40, 400, 60));
+    }
+
+    fn background_of(html: &str, id_color_probe: &str) -> bool {
+        colored_boxes(html, 400).iter().any(|b| b.0 == id_color_probe)
+    }
+
+    #[test]
+    fn visited_never_matches_and_link_needs_an_href() {
+        assert!(!background_of(
+            r#"<html><head><style>a:visited{background:#ff0000}</style></head><body><a href=x>t</a></body></html>"#,
+            "#ff0000"
+        ));
+        assert!(background_of(
+            r#"<html><head><style>a:link{background:#ff0000}</style></head><body><a href=x>t</a></body></html>"#,
+            "#ff0000"
+        ));
+        assert!(!background_of(
+            r#"<html><head><style>a:link{background:#ff0000}</style></head><body><a>t</a></body></html>"#,
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_pseudo_class_invalidates_its_selector() {
+        assert!(!background_of(
+            r#"<html><head><style>div:madeup{background:#ff0000;height:9px}</style></head><body><div></div></body></html>"#,
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn has_looks_at_descendants_and_following_siblings() {
+        let page = |css: &str, body: &str| {
+            format!("<html><head><style>{css}</style></head><body>{body}</body></html>")
+        };
+        assert!(background_of(
+            &page("div:has(i){background:#ff0000;height:9px}", "<div><b><i>x</i></b></div>"),
+            "#ff0000"
+        ));
+        assert!(!background_of(
+            &page("div:has(> i){background:#ff0000;height:9px}", "<div><b><i>x</i></b></div>"),
+            "#ff0000"
+        ));
+        assert!(background_of(
+            &page("h1:has(+ p){background:#ff0000;height:9px}", "<h1></h1><p>x</p>"),
+            "#ff0000"
+        ));
+        assert!(!background_of(
+            &page("div:has(u){background:#ff0000;height:9px}", "<div><i>x</i></div><u>y</u>"),
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn where_adds_no_specificity() {
+        assert!(background_of(
+            r#"<html><head><style>div{background:#ff0000;height:9px}:where(#a){background:#00ff00}</style></head><body><div id=a></div></body></html>"#,
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn form_state_pseudo_classes_read_attributes() {
+        let page = |css: &str, body: &str| {
+            format!("<html><head><style>{css}</style></head><body>{body}</body></html>")
+        };
+        assert!(background_of(
+            &page("input:checked + div{background:#ff0000;height:9px}", "<input type=checkbox checked><div></div>"),
+            "#ff0000"
+        ));
+        assert!(!background_of(
+            &page("input:checked + div{background:#ff0000;height:9px}", "<input type=checkbox><div></div>"),
+            "#ff0000"
+        ));
+        assert!(background_of(
+            &page("div:empty{background:#ff0000;height:9px}", "<div></div>"),
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn nested_rules_apply_relative_to_their_parent() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}
+            .a{height:9px;background:#ff0000;
+              &.b{background:#00ff00}
+              .c{background:#0000ff;height:3px}
+              > .d{background:#ffff00;height:3px}
+              @media (min-width:1px){.e{background:#00ffff;height:3px}}
+            }</style></head><body>
+            <div class="a b"><div class=c></div><div class=d></div><div class=e></div></div></body></html>"#,
+            400,
+        );
+        assert!(boxes.iter().any(|b| b.0 == "#00ff00"), "&.b: {boxes:?}");
+        assert!(boxes.iter().any(|b| b.0 == "#0000ff"), "descendant: {boxes:?}");
+        assert!(boxes.iter().any(|b| b.0 == "#ffff00"), "leading combinator: {boxes:?}");
+        assert!(boxes.iter().any(|b| b.0 == "#00ffff"), "nested @media: {boxes:?}");
+    }
+
+    #[test]
+    fn supports_keeps_or_drops_its_rules() {
+        let page = |css: &str| {
+            format!("<html><head><style>{css}</style></head><body><div></div></body></html>")
+        };
+        assert!(background_of(
+            &page("@supports (display:grid){div{background:#ff0000;height:9px}}"),
+            "#ff0000"
+        ));
+        assert!(!background_of(
+            &page("@supports (made-up:1){div{background:#ff0000;height:9px}}"),
+            "#ff0000"
+        ));
+        assert!(background_of(
+            &page("@supports not (made-up:1){div{background:#ff0000;height:9px}}"),
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn layered_rules_lose_to_unlayered_ones() {
+        assert!(background_of(
+            r#"<html><head><style>div{background:#ff0000;height:9px}@layer x{#a{background:#00ff00}}</style></head><body><div id=a></div></body></html>"#,
+            "#ff0000"
+        ));
+    }
+
+    #[test]
+    fn page_rules_beat_the_browsers_whatever_the_specificity() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{margin:0}p{margin:0;background:#ff0000}</style></head><body><p>x</p></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").1, 0);
+    }
+
+    #[test]
+    fn hidden_attribute_and_closed_details_hide_content() {
+        let view = create_layout_view(
+            r#"<html><body><div hidden>gone</div><details><summary>head</summary>gone too</details></body></html>"#
+                .to_string(),
+            400,
+        );
+        let text: String = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("head"), "{text}");
+        assert!(!text.contains("gone"), "{text}");
+    }
+
+    #[test]
+    fn width_calc_with_a_percentage_uses_the_containing_block() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body><div style="width:200px"><div style="width:calc(100% - 20px);height:9px;background:#ff0000"></div><div style="width:min(50%,30px);height:9px;background:#00ff00"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").2, 180);
+        assert_eq!(box_with(&boxes, "#00ff00").2, 30);
+    }
+
+    #[test]
+    fn width_auto_undoes_an_earlier_width() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{width:50px;height:9px;background:#ff0000}div{width:auto}</style></head><body><div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").2, 400);
+    }
+
+    #[test]
+    fn em_lengths_use_the_elements_own_font_size_wherever_it_is_declared() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}div{width:2em;height:1em;background:#ff0000;font-size:10px}</style></head><body><div></div></body></html>"#,
+            400,
+        );
+        assert_eq!((box_with(&boxes, "#ff0000").2, box_with(&boxes, "#ff0000").3), (20, 10));
+    }
+
+    #[test]
+    fn rem_follows_the_root_font_size() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>html{font-size:10px}body{margin:0}div{width:3rem;height:1rem;background:#ff0000}</style></head><body><div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").2, 30);
+    }
+
+    #[test]
+    fn body_inherits_from_html() {
+        let view = create_layout_view(
+            r#"<html><head><style>html{font-size:20px;color:#ff0000}</style></head><body>x</body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let style = items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text == "x" => Some(style.clone()),
+                _ => None,
+            })
+            .expect("text");
+        assert_eq!(style.font_size().px(), 20);
+        assert_eq!(style.color().code(), "#ff0000");
+    }
+
+    #[test]
+    fn percentage_padding_resolves_against_the_containing_width() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body><div style="width:200px"><div style="padding:10% 0 0;background:#ff0000"></div></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").3, 20);
+    }
+
+    #[test]
+    fn aspect_ratio_derives_height_from_width() {
+        let boxes = colored_boxes(
+            r#"<html><head><style>body{margin:0}</style></head><body><div style="width:200px;aspect-ratio:2/1;background:#ff0000"></div></body></html>"#,
+            400,
+        );
+        assert_eq!(box_with(&boxes, "#ff0000").3, 100);
+    }
+
+    #[test]
+    fn font_shorthand_sets_size_weight_and_line_height() {
+        let view = create_layout_view(
+            r#"<html><head><style>p{font:italic bold 20px/30px Georgia,serif;margin:0}</style></head><body><p>x</p></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let style = items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, style, .. } if text == "x" => Some(style.clone()),
+                _ => None,
+            })
+            .expect("text");
+        assert_eq!(style.font_size().px(), 20);
+        assert!(style.is_bold());
+        assert!(style.is_italic());
+        assert_eq!(style.font_family(), "serif");
+    }
+
+    #[test]
+    fn superscript_rises_and_a_lines_strut_keeps_its_height() {
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px}</style></head><body><p style="margin:0">a<sup>b</sup></p></body></html>"#
+                .to_string(),
+            400,
+        );
+        let items = view.paint();
+        let y_of = |wanted: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text { text, layout_point, style, .. } if text == wanted => {
+                        Some(layout_point.y() + style.font_size().px())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?}"))
+        };
+        assert!(y_of("b") < y_of("a"), "its baseline is higher");
+    }
+
+    #[test]
+    fn a_float_declared_further_down_shortens_the_right_lines() {
+        // The lines of a paragraph below the top of the float's container have to
+        // look up the float at their position in the container, not at their
+        // offset within their own paragraph.
+        let view = create_layout_view(
+            r#"<html><head><style>body{margin:0;font-size:16px;line-height:20px}p{margin:0}</style></head><body><div style="width:300px">
+            <p style="height:200px"></p>
+            <div style="float:left;width:100px;height:40px"></div>
+            <p>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx</p>
+            </div></body></html>"#
+                .to_string(),
+            400,
+        );
+        let lines: Vec<(i64, i64)> = view
+            .paint()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { layout_point, .. } => {
+                    Some((layout_point.x(), layout_point.y()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(lines.len() > 3, "{lines:?}");
+        assert!(lines[0].0 >= 100, "first line clears the float: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.0 == 0),
+            "lines below the float reclaim the width: {lines:?}"
+        );
     }
 }

@@ -1,0 +1,64 @@
+/* The browser's own stylesheet, following the rendering section of the HTML
+   standard. https://html.spec.whatwg.org/multipage/rendering.html */
+
+/* Elements that are not rendered. */
+area, base, basefont, datalist, head, link, meta, noembed, noframes, param, rp,
+script, style, template, title, noscript { display: none; }
+[hidden], input[type=hidden i] { display: none; }
+dialog:not([open]) { display: none; }
+
+/* Flow content. */
+address, blockquote, center, dialog, div, figure, figcaption, footer, form,
+header, hr, legend, listing, main, p, plaintext, pre, search, xmp, article,
+aside, h1, h2, h3, h4, h5, h6, hgroup, nav, section, dir, dd, dl, dt, menu, ol,
+ul, summary, details, fieldset, optgroup { display: block; }
+li { display: list-item; }
+
+body { margin: 8px; }
+
+/* Sections and headings. */
+h1 { margin: 0.67em 0; font-size: 2em; font-weight: bold; }
+h2 { margin: 0.83em 0; font-size: 1.5em; font-weight: bold; }
+h3 { margin: 1em 0; font-size: 1.17em; font-weight: bold; }
+h4 { margin: 1.33em 0; font-size: 1em; font-weight: bold; }
+h5 { margin: 1.67em 0; font-size: 0.83em; font-weight: bold; }
+h6 { margin: 2.33em 0; font-size: 0.67em; font-weight: bold; }
+
+/* Grouping. */
+p, dl { margin: 1em 0; }
+blockquote, figure { margin: 1em 40px; }
+dd { margin-left: 40px; }
+ol, ul, menu, dir { margin: 1em 0; padding-left: 40px; }
+ol ol, ol ul, ul ol, ul ul, menu ul, ul menu, ol menu, menu ol, menu menu { margin: 0; }
+ul ul, menu ul, ul menu { list-style-type: circle; }
+ul ul ul, ul menu ul, menu ul ul { list-style-type: square; }
+hr { margin: 8px 0; }
+pre, listing, plaintext, xmp {
+  margin: 1em 0; font-family: monospace; font-size: 0.8125em; white-space: pre;
+}
+address, cite, dfn, em, i, var { font-style: italic; }
+
+/* Text-level. */
+a:link { color: #0000ee; text-decoration: underline; }
+b, strong { font-weight: bold; }
+code, kbd, samp, tt { font-family: monospace; font-size: 0.8125em; }
+big { font-size: larger; }
+small { font-size: smaller; }
+sub { vertical-align: sub; font-size: smaller; }
+sup { vertical-align: super; font-size: smaller; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+mark { background-color: yellow; color: black; }
+nobr { white-space: nowrap; }
+
+/* Tables. */
+th { font-weight: bold; text-align: center; }
+caption { text-align: center; }
+
+/* Disclosure. */
+summary { list-style-type: disc; }
+details:not([open]) > :not(summary) { display: none; }
+
+/* Forms. */
+fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px solid #c0c0c0; }
+legend { padding: 0 2px; }

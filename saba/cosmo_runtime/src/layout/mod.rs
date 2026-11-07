@@ -1152,6 +1152,7 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     // (root canvas −2M, normal flow 0, contexts ±1M+z).
                     z_index: style.paint_z(),
                     clip_rect: clip_rect.map(|c| (c.x + rect.x, c.y + rect.y, c.width, c.height)),
+                    detail: cosmo_engine::paint_commands::TextDetail::from_style(&style),
                 });
             }
             DisplayItem::Image {
@@ -1239,6 +1240,8 @@ fn layout_object_to_render_node(node: &Rc<RefCell<LayoutObject>>, rect: &FrameRe
         NodeKind::Document => ("#document".to_string(), None),
         NodeKind::Element(element) => (element.kind().to_string(), None),
         NodeKind::Text(value) => ("#text".to_string(), Some(value)),
+        NodeKind::Comment(value) => ("#comment".to_string(), Some(value)),
+        NodeKind::Doctype { name, .. } => ("#doctype".to_string(), Some(name)),
     };
 
     let mut children = Vec::new();

@@ -11,10 +11,125 @@ use crate::renderer::layout::computed_style::*;
 use crate::renderer::layout::layout_object::LayoutObject;
 use crate::renderer::style::values::*;
 
+/// Which of (top, right, bottom, left) a `margin` or `padding` shorthand gives as
+/// percentages, by the same 1-to-4 value expansion as the lengths.
+fn percent_edges(values: &[ComponentValue]) -> [Option<f64>; 4] {
+    let ratio = |value: &ComponentValue| match value {
+        ComponentValue::Dimension(v, unit) if unit == "%" => Some(*v / 100.0),
+        _ => None,
+    };
+    match values {
+        [all] => [ratio(all); 4],
+        [vertical, horizontal] => {
+            [ratio(vertical), ratio(horizontal), ratio(vertical), ratio(horizontal)]
+        }
+        [top, horizontal, bottom] => {
+            [ratio(top), ratio(horizontal), ratio(bottom), ratio(horizontal)]
+        }
+        [top, right, bottom, left] => [ratio(top), ratio(right), ratio(bottom), ratio(left)],
+        _ => [None; 4],
+    }
+}
+
+/// `bolder`/`lighter` resolve as their common effect (relative weights would need
+/// real weight tracking).
+fn font_weight_is_bold(value: &ComponentValue) -> Option<bool> {
+    match value {
+        ComponentValue::Ident(value) => match value.as_str() {
+            "bold" | "bolder" => Some(true),
+            "normal" | "lighter" => Some(false),
+            _ => None,
+        },
+        ComponentValue::Number(value) => Some(*value >= 600.0),
+        _ => None,
+    }
+}
+
 impl LayoutObject {
+    fn apply_font_shorthand(&mut self, values: &[ComponentValue], parent_font_size: FontSize) {
+        // A system font keyword stands for the whole shorthand.
+        if let [ComponentValue::Ident(keyword)] = values {
+            if matches!(
+                keyword.as_str(),
+                "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
+            ) {
+                self.style.set_font_family(crate::renderer::text::face::FontClass::Sans.name().to_string());
+            }
+            return;
+        }
+        // The shorthand resets what it doesn't mention.
+        let mut bold = false;
+        let mut italic = false;
+        let mut index = 0;
+        let mut size = None;
+        while index < values.len() {
+            let value = &values[index];
+            let as_size = match value {
+                ComponentValue::Dimension(v, unit) => match unit.as_str() {
+                    "em" => Some(*v * parent_font_size.px() as f64),
+                    "%" => Some(*v / 100.0 * parent_font_size.px() as f64),
+                    _ => length_to_px(*v, unit, parent_font_size),
+                },
+                ComponentValue::Number(v) if *v == 0.0 => Some(0.0),
+                ComponentValue::Ident(keyword) => match keyword.as_str() {
+                    "smaller" => Some(parent_font_size.px() as f64 * 0.83),
+                    "larger" => Some(parent_font_size.px() as f64 * 1.2),
+                    other => FontSize::from_str(other).ok().map(|s| s.px() as f64),
+                },
+                _ => None,
+            };
+            if let Some(px) = as_size {
+                size = Some(px);
+                index += 1;
+                break;
+            }
+            match value {
+                ComponentValue::Ident(keyword) if keyword == "italic" || keyword == "oblique" => {
+                    italic = true
+                }
+                other => {
+                    if let Some(value) = font_weight_is_bold(other) {
+                        bold = value;
+                    }
+                }
+            }
+            index += 1;
+        }
+        let Some(size) = size else { return };
+        self.style.set_bold(bold);
+        self.style.set_italic(italic);
+        self.style.set_font_size(FontSize::from_px(size));
+        self.style.set_line_height(LineHeight::Normal);
+        if matches!(values.get(index), Some(ComponentValue::Delim('/'))) {
+            match values.get(index + 1) {
+                Some(ComponentValue::Number(v)) => {
+                    self.style.set_line_height(LineHeight::Factor(*v));
+                }
+                Some(ComponentValue::Dimension(v, unit)) if unit == "%" => {
+                    self.style.set_line_height(LineHeight::Factor(*v / 100.0));
+                }
+                Some(ComponentValue::Dimension(v, unit)) => {
+                    if let Some(px) = length_to_px(*v, unit, FontSize::from_px(size)) {
+                        self.style.set_line_height(LineHeight::Px(px));
+                    }
+                }
+                _ => {}
+            }
+            index += 2;
+        }
+        if let Some(family) = first_font_family(&values[index.min(values.len())..]) {
+            self.style.set_font_family(family);
+        }
+    }
+
     pub fn cascading_style(&mut self, declarations: Vec<Declaration>, parent_font_size: FontSize) {
         use crate::renderer::css::cssom::{substitute_vars, value_has_var};
         let custom_scope = self.style.custom_properties().cloned();
+        // Font size first: other lengths in the same rule are relative to it,
+        // wherever in the rule it was written. The sort is stable, so their
+        // relative order, which decides what overrides what, is untouched.
+        let mut declarations = declarations;
+        declarations.sort_by_key(|d| !matches!(d.property.as_str(), "font" | "font-size"));
         for mut declaration in declarations {
             // Custom-property definitions are collected into the element's
             // scope before the cascade (create_layout_object); they are not
@@ -29,15 +144,37 @@ impl LayoutObject {
                     declaration.value = substitute_vars(&declaration.value, scope);
                 }
             }
-            // Fold resolvable calc() into plain px so every property arm
-            // sees ordinary Dimension tokens.
-            if declaration
-                .value
-                .iter()
-                .any(|v| matches!(v, ComponentValue::Ident(s) if s.eq_ignore_ascii_case("calc")))
-            {
-                declaration.value =
-                    fold_calc(&declaration.value, self.style.font_size_or_default());
+            // Sizes that can depend on the containing block keep the expression
+            // for layout. Every other math function folds into plain px, so the
+            // property arms see ordinary Dimension tokens.
+            if has_math_function(&declaration.value) {
+                let base = if declaration.property == "font-size" {
+                    parent_font_size
+                } else {
+                    self.style.font_size_or_default()
+                };
+                let expr = parse_math_value(&declaration.value, base);
+                match (declaration.property.as_str(), expr) {
+                    ("width", Some(expr)) => {
+                        self.style.set_width_expr(expr);
+                        continue;
+                    }
+                    ("height", Some(expr)) => {
+                        self.style.set_height_expr(expr);
+                        continue;
+                    }
+                    ("min-width" | "max-width" | "min-height" | "max-height", Some(expr)) => {
+                        let limit = Some(SizeLimit::Expr(Rc::new(expr)));
+                        match declaration.property.as_str() {
+                            "min-width" => self.style.set_min_width(limit),
+                            "max-width" => self.style.set_max_width(limit),
+                            "min-height" => self.style.set_min_height(limit),
+                            _ => self.style.set_max_height(limit),
+                        }
+                        continue;
+                    }
+                    _ => declaration.value = fold_calc(&declaration.value, base),
+                }
             }
             let first_value = declaration.first_value();
             match declaration.property.as_str() {
@@ -117,7 +254,7 @@ impl LayoutObject {
                     }
                     // `normal` resets to the default leading.
                     Some(ComponentValue::Ident(v)) if v.eq_ignore_ascii_case("normal") => {
-                        self.style.set_line_height(LineHeight::Factor(1.25));
+                        self.style.set_line_height(LineHeight::Normal);
                     }
                     _ => {}
                 },
@@ -487,10 +624,18 @@ impl LayoutObject {
                         self.style.set_width_ratio(*value / 100.0);
                     }
                     Some(ComponentValue::Dimension(value, unit)) => {
-                        if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
+                        if let Some(px) =
+                            length_to_px(*value, unit, self.style.font_size_or_default())
+                        {
                             self.style.set_width(px);
                         }
                     }
+                    Some(ComponentValue::Ident(keyword)) => match keyword.as_str() {
+                        "auto" => self.style.clear_width(),
+                        "fit-content" | "max-content" | "min-content" | "-moz-fit-content"
+                        | "-webkit-fit-content" => self.style.set_width_fit(),
+                        _ => {}
+                    },
                     _ => {}
                 },
                 "height" => match first_value {
@@ -501,10 +646,13 @@ impl LayoutObject {
                         self.style.set_height_ratio(*value / 100.0);
                     }
                     Some(ComponentValue::Dimension(value, unit)) => {
-                        if let Some(px) = length_to_px(*value, unit, FontSize::Medium) {
+                        if let Some(px) =
+                            length_to_px(*value, unit, self.style.font_size_or_default())
+                        {
                             self.style.set_height(px);
                         }
                     }
+                    Some(ComponentValue::Ident(_)) => self.style.clear_height(),
                     _ => {}
                 },
                 "position" => {
@@ -560,8 +708,12 @@ impl LayoutObject {
                 }
                 "top" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_top(*value),
-                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
-                        self.style.set_offset_top(*value)
+                    Some(ComponentValue::Dimension(value, unit)) if unit != "%" => {
+                        if let Some(px) =
+                            length_to_px(*value, unit, self.style.font_size_or_default())
+                        {
+                            self.style.set_offset_top(px)
+                        }
                     }
                     Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
                         self.style.set_offset_top_ratio(*value / 100.0)
@@ -570,8 +722,12 @@ impl LayoutObject {
                 },
                 "left" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_left(*value),
-                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
-                        self.style.set_offset_left(*value)
+                    Some(ComponentValue::Dimension(value, unit)) if unit != "%" => {
+                        if let Some(px) =
+                            length_to_px(*value, unit, self.style.font_size_or_default())
+                        {
+                            self.style.set_offset_left(px)
+                        }
                     }
                     Some(ComponentValue::Dimension(value, unit)) if unit == "%" => {
                         self.style.set_offset_left_ratio(*value / 100.0)
@@ -580,15 +736,23 @@ impl LayoutObject {
                 },
                 "right" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_right(*value),
-                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
-                        self.style.set_offset_right(*value)
+                    Some(ComponentValue::Dimension(value, unit)) if unit != "%" => {
+                        if let Some(px) =
+                            length_to_px(*value, unit, self.style.font_size_or_default())
+                        {
+                            self.style.set_offset_right(px)
+                        }
                     }
                     _ => {}
                 },
                 "bottom" => match first_value {
                     Some(ComponentValue::Number(value)) => self.style.set_offset_bottom(*value),
-                    Some(ComponentValue::Dimension(value, unit)) if unit == "px" => {
-                        self.style.set_offset_bottom(*value)
+                    Some(ComponentValue::Dimension(value, unit)) if unit != "%" => {
+                        if let Some(px) =
+                            length_to_px(*value, unit, self.style.font_size_or_default())
+                        {
+                            self.style.set_offset_bottom(px)
+                        }
                     }
                     _ => {}
                 },
@@ -621,6 +785,21 @@ impl LayoutObject {
                         first_value,
                         Some(ComponentValue::Ident(v)) if v == "auto"
                     );
+                    let side = match declaration.property.as_str() {
+                        p if p.ends_with("top") => 0,
+                        p if p.ends_with("right") => 1,
+                        p if p.ends_with("bottom") => 2,
+                        _ => 3,
+                    };
+                    let ratio = match first_value {
+                        Some(ComponentValue::Dimension(v, unit)) if unit == "%" => Some(*v / 100.0),
+                        _ => None,
+                    };
+                    if is_margin {
+                        self.style.set_margin_ratio(side, ratio);
+                    } else {
+                        self.style.set_padding_ratio(side, ratio);
+                    }
                     if is_margin {
                         match declaration.property.as_str() {
                             p if p.ends_with("left") => self.style.set_margin_left_auto(auto),
@@ -659,6 +838,9 @@ impl LayoutObject {
                     }
                 }
                 "margin" => {
+                    for (side, ratio) in percent_edges(&declaration.value).into_iter().enumerate() {
+                        self.style.set_margin_ratio(side, ratio);
+                    }
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =
                         parse_margin_shorthand(&declaration.value, base_font_size)
@@ -683,6 +865,9 @@ impl LayoutObject {
                     self.style.set_margin_left_auto(left_auto);
                 }
                 "padding" => {
+                    for (side, ratio) in percent_edges(&declaration.value).into_iter().enumerate() {
+                        self.style.set_padding_ratio(side, ratio);
+                    }
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =
                         parse_spacing_shorthand(&declaration.value, base_font_size)
@@ -868,19 +1053,11 @@ impl LayoutObject {
                         self.style.set_opacity(*value);
                     }
                 }
-                "font-weight" => match first_value {
-                    // bolder/lighter are resolved as their common effect
-                    // (relative-to-parent weights need real weight tracking).
-                    Some(ComponentValue::Ident(value)) => match value.as_str() {
-                        "bold" | "bolder" => self.style.set_bold(true),
-                        "normal" | "lighter" => self.style.set_bold(false),
-                        _ => {}
-                    },
-                    Some(ComponentValue::Number(value)) => {
-                        self.style.set_bold(*value >= 600.0);
+                "font-weight" => {
+                    if let Some(bold) = first_value.and_then(font_weight_is_bold) {
+                        self.style.set_bold(bold);
                     }
-                    _ => {}
-                },
+                }
                 "min-width" | "max-width" | "min-height" | "max-height" => {
                     // Outer None = unparseable (leave untouched);
                     // Some(None) = explicit `none` (clears an earlier rule's limit).
@@ -949,6 +1126,14 @@ impl LayoutObject {
                     }
                 }
                 "font-size" => match first_value {
+                    Some(ComponentValue::Ident(value)) if value == "smaller" => {
+                        self.style
+                            .set_font_size(FontSize::from_px(parent_font_size.px() as f64 * 0.83));
+                    }
+                    Some(ComponentValue::Ident(value)) if value == "larger" => {
+                        self.style
+                            .set_font_size(FontSize::from_px(parent_font_size.px() as f64 * 1.2));
+                    }
                     Some(ComponentValue::Ident(value)) => {
                         if let Ok(font_size) = FontSize::from_str(value) {
                             self.style.set_font_size(font_size);
@@ -972,11 +1157,194 @@ impl LayoutObject {
                     }
                     _ => {}
                 },
-                "text-decoration" => {
+                // The shorthand may also carry a style and color, in any order.
+                "text-decoration" | "text-decoration-line" => {
+                    let line = declaration.value.iter().find_map(|v| match v {
+                        ComponentValue::Ident(value) => TextDecoration::from_str(value).ok(),
+                        _ => None,
+                    });
+                    if let Some(decoration) = line {
+                        self.style.set_text_decoration(decoration);
+                    }
+                }
+                "font-style" => {
                     if let Some(ComponentValue::Ident(value)) = first_value {
-                        if let Ok(decoration) = TextDecoration::from_str(value) {
-                            self.style.set_text_decoration(decoration);
+                        self.style.set_italic(value != "normal");
+                    }
+                }
+                // font: [style || weight || variant || stretch]? size[/line-height]? family
+                // https://www.w3.org/TR/css-fonts-4/#font-prop
+                "font" => self.apply_font_shorthand(&declaration.value, parent_font_size),
+                "letter-spacing" | "word-spacing" => {
+                    let px = match first_value {
+                        Some(ComponentValue::Ident(_)) => Some(0.0),
+                        Some(ComponentValue::Number(v)) => Some(*v),
+                        Some(ComponentValue::Dimension(v, unit)) => {
+                            length_to_px(*v, unit, self.style.font_size_or_default())
                         }
+                        _ => None,
+                    };
+                    if let Some(px) = px {
+                        if declaration.property == "letter-spacing" {
+                            self.style.set_letter_spacing(px);
+                        } else {
+                            self.style.set_word_spacing(px);
+                        }
+                    }
+                }
+                "vertical-align" => {
+                    let base = self.style.font_size_or_default();
+                    if let Some(value) = parse_vertical_align(first_value, base) {
+                        self.style.set_vertical_align(value);
+                    }
+                }
+                "text-indent" => {
+                    if let Some(px) = first_value
+                        .and_then(|v| spacing_component_to_px(v, self.style.font_size_or_default()))
+                    {
+                        self.style.set_text_indent(px);
+                    }
+                }
+                "aspect-ratio" => {
+                    self.style.set_aspect_ratio(parse_aspect_ratio(&declaration.value));
+                }
+                "outline" => {
+                    let base = self.style.font_size_or_default();
+                    let none = declaration.value.iter().any(
+                        |v| matches!(v, ComponentValue::Ident(i) if i == "none" || i == "hidden"),
+                    );
+                    if none {
+                        self.style.set_outline(None);
+                    } else {
+                        let width = declaration
+                            .value
+                            .iter()
+                            .find_map(|v| spacing_component_to_px(v, base))
+                            .unwrap_or(3.0);
+                        let color = parse_color_value(&declaration.value)
+                            .unwrap_or_else(|| self.style.color_or_black());
+                        let offset = self.style.outline().map(|o| o.offset).unwrap_or(0.0);
+                        self.style.set_outline((width > 0.0).then_some(Outline {
+                            width,
+                            offset,
+                            color,
+                        }));
+                    }
+                }
+                "outline-offset" => {
+                    let base = self.style.font_size_or_default();
+                    if let Some(px) = first_value.and_then(|v| spacing_component_to_px(v, base)) {
+                        if let Some(mut outline) = self.style.outline().cloned() {
+                            outline.offset = px;
+                            self.style.set_outline(Some(outline));
+                        }
+                    }
+                }
+                // Only the first shadow, and without its blur.
+                "text-shadow" => {
+                    let base = self.style.font_size_or_default();
+                    let first: Vec<ComponentValue> = declaration
+                        .value
+                        .split(|v| matches!(v, ComponentValue::Delim(',')))
+                        .next()
+                        .unwrap_or(&[])
+                        .to_vec();
+                    let lengths: Vec<f64> = first
+                        .iter()
+                        .filter_map(|v| spacing_component_to_px(v, base))
+                        .collect();
+                    self.style.set_text_shadow(match lengths.as_slice() {
+                        [x, y, ..] => Some(TextShadow {
+                            x: *x,
+                            y: *y,
+                            color: parse_color_value(&first)
+                                .unwrap_or_else(|| self.style.color_or_black()),
+                        }),
+                        _ => None,
+                    });
+                }
+                // Logical properties, for horizontal left-to-right text.
+                "margin-inline" | "margin-block" | "padding-inline" | "padding-block" => {
+                    let inline = declaration.property.ends_with("inline");
+                    let (start, end) = if inline { ("left", "right") } else { ("top", "bottom") };
+                    let kind = if declaration.property.starts_with("margin") {
+                        "margin"
+                    } else {
+                        "padding"
+                    };
+                    let values: Vec<ComponentValue> = declaration.value.clone();
+                    let first = values.first().cloned();
+                    let second = values.get(1).cloned().or_else(|| first.clone());
+                    let mut expanded = Vec::new();
+                    if let (Some(first), Some(second)) = (first, second) {
+                        let mut a = Declaration::new();
+                        a.set_property(format!("{kind}-{start}"));
+                        a.set_values(vec![first]);
+                        let mut b = Declaration::new();
+                        b.set_property(format!("{kind}-{end}"));
+                        b.set_values(vec![second]);
+                        expanded.push(a);
+                        expanded.push(b);
+                    }
+                    self.cascading_style(expanded, parent_font_size);
+                }
+                "margin-inline-start" | "margin-inline-end" | "margin-block-start"
+                | "margin-block-end" | "padding-inline-start" | "padding-inline-end"
+                | "padding-block-start" | "padding-block-end" | "inset-inline-start"
+                | "inset-inline-end" | "inset-block-start" | "inset-block-end" => {
+                    let physical = declaration
+                        .property
+                        .replace("inset-", "")
+                        .replace("inline-start", "left")
+                        .replace("inline-end", "right")
+                        .replace("block-start", "top")
+                        .replace("block-end", "bottom");
+                    let mut expanded = Declaration::new();
+                    expanded.set_property(physical);
+                    expanded.set_values(declaration.value.clone());
+                    self.cascading_style(vec![expanded], parent_font_size);
+                }
+                // inset: top right bottom left, as margin expands.
+                "inset" => {
+                    let values = &declaration.value;
+                    let at = |i: usize| match values.len() {
+                        1 => values.first(),
+                        2 => values.get(i % 2),
+                        3 => match i {
+                            0 => values.first(),
+                            2 => values.get(2),
+                            _ => values.get(1),
+                        },
+                        _ => values.get(i),
+                    };
+                    let mut expanded = Vec::new();
+                    for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+                        if let Some(value) = at(i) {
+                            let mut d = Declaration::new();
+                            d.set_property(side.to_string());
+                            d.set_values(vec![value.clone()]);
+                            expanded.push(d);
+                        }
+                    }
+                    self.cascading_style(expanded, parent_font_size);
+                }
+                // Per-side colors and styles share the box's one border color.
+                "border-top-color" | "border-right-color" | "border-bottom-color"
+                | "border-left-color" => {
+                    if let Some(color) = parse_color_value(&declaration.value) {
+                        self.style.set_border_color(color);
+                    }
+                }
+                "border-top-style" | "border-right-style" | "border-bottom-style"
+                | "border-left-style" => {
+                    if matches!(first_value, Some(ComponentValue::Ident(v)) if v == "none" || v == "hidden") {
+                        let side = match declaration.property.as_str() {
+                            p if p.starts_with("border-top") => 0,
+                            p if p.starts_with("border-right") => 1,
+                            p if p.starts_with("border-bottom") => 2,
+                            _ => 3,
+                        };
+                        self.style.set_border_side(side, 0.0);
                     }
                 }
                 "text-align" => {

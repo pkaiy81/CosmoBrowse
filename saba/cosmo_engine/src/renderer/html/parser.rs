@@ -1,40 +1,307 @@
-use crate::renderer::dom::node::Element;
-use crate::renderer::dom::node::ElementKind;
-use crate::renderer::dom::node::Node;
-use crate::renderer::dom::node::NodeKind;
-use crate::renderer::dom::node::Window;
+//! The HTML tree builder: every insertion mode of the standard, with the adoption
+//! agency algorithm, foster parenting and foreign content.
+//! https://html.spec.whatwg.org/multipage/parsing.html#tree-construction
+
+use crate::renderer::dom::api::detach_node as detach;
+use crate::renderer::dom::node::{Element, Namespace, Node, NodeKind, Window};
 use crate::renderer::html::attribute::Attribute;
-use crate::renderer::html::token::HtmlToken;
-use crate::renderer::html::token::HtmlTokenizer;
+use crate::renderer::html::token::{HtmlToken, HtmlTokenizer, State};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::string::String;
+use std::string::ToString;
 use std::vec::Vec;
-use std::cell::RefCell;
-use std::str::FromStr;
 
-/// https://html.spec.whatwg.org/multipage/parsing.html#the-insertion-mode
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+type NodeRef = Rc<RefCell<Node>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertionMode {
     Initial,
     BeforeHtml,
     BeforeHead,
     InHead,
+    InHeadNoscript,
     AfterHead,
     InBody,
     Text,
+    InTable,
+    InTableText,
+    InCaption,
+    InColumnGroup,
+    InTableBody,
+    InRow,
+    InCell,
+    InTemplate,
     AfterBody,
+    InFrameset,
+    AfterFrameset,
     AfterAfterBody,
+    AfterAfterFrameset,
+}
+
+/// An entry in the list of active formatting elements.
+#[derive(Debug, Clone)]
+enum Formatting {
+    Marker,
+    Element {
+        node: NodeRef,
+        tag: String,
+        attributes: Vec<Attribute>,
+    },
+}
+
+/// Where a new node goes.
+struct InsertionPlace {
+    parent: NodeRef,
+    /// Before this child; at the end when `None`.
+    before: Option<NodeRef>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HtmlParser {
     window: Rc<RefCell<Window>>,
     mode: InsertionMode,
-    /// https://html.spec.whatwg.org/multipage/parsing.html#original-insertion-mode
-    original_insertion_mode: InsertionMode,
-    /// https://html.spec.whatwg.org/multipage/parsing.html#the-stack-of-open-elements
-    stack_of_open_elements: Vec<Rc<RefCell<Node>>>,
+    original_mode: InsertionMode,
+    template_modes: Vec<InsertionMode>,
+    open_elements: Vec<NodeRef>,
+    active_formatting: Vec<Formatting>,
+    head_element: Option<NodeRef>,
+    form_element: Option<NodeRef>,
+    /// Whether a `<frameset>` could still replace the body.
+    frameset_ok: bool,
+    foster_parenting: bool,
+    quirks: bool,
+    /// Characters held while deciding whether table text needs foster parenting.
+    pending_table_text: Vec<char>,
+    /// The next newline is dropped, right after `<pre>`, `<listing>` or `<textarea>`.
+    ignore_next_newline: bool,
+    /// Set for a fragment: what the fragment is being parsed into.
+    fragment_context: Option<NodeRef>,
     t: HtmlTokenizer,
+}
+
+fn tag_of(node: &NodeRef) -> String {
+    node.borrow().element_tag_name().unwrap_or_default()
+}
+
+fn namespace_of(node: &NodeRef) -> Namespace {
+    match node.borrow().kind {
+        NodeKind::Element(ref e) => e.namespace(),
+        _ => Namespace::Html,
+    }
+}
+
+fn is_html(node: &NodeRef, tag: &str) -> bool {
+    match node.borrow().kind {
+        NodeKind::Element(ref e) => e.namespace() == Namespace::Html && e.tag_name() == tag,
+        _ => false,
+    }
+}
+
+fn is_html_any(node: &NodeRef, tags: &[&str]) -> bool {
+    match node.borrow().kind {
+        NodeKind::Element(ref e) => {
+            e.namespace() == Namespace::Html && tags.contains(&e.tag_name())
+        }
+        _ => false,
+    }
+}
+
+fn attribute_of(node: &NodeRef, name: &str) -> Option<String> {
+    match node.borrow().kind {
+        NodeKind::Element(ref e) => e.get_attribute(name),
+        _ => None,
+    }
+}
+
+const SPECIAL_HTML: &[&str] = &[
+    "address", "applet", "area", "article", "aside", "base", "basefont", "bgsound", "blockquote",
+    "body", "br", "button", "caption", "center", "col", "colgroup", "dd", "details", "dir", "div",
+    "dl", "dt", "embed", "fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset",
+    "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "iframe", "img",
+    "input", "keygen", "li", "link", "listing", "main", "marquee", "menu", "meta", "nav",
+    "noembed", "noframes", "noscript", "object", "ol", "p", "param", "plaintext", "pre", "script",
+    "search", "section", "select", "source", "style", "summary", "table", "tbody", "td",
+    "template", "textarea", "tfoot", "th", "thead", "title", "tr", "track", "ul", "wbr", "xmp",
+];
+
+fn is_special(node: &NodeRef) -> bool {
+    let tag = tag_of(node);
+    match namespace_of(node) {
+        Namespace::Html => SPECIAL_HTML.contains(&tag.as_str()),
+        Namespace::MathMl => matches!(
+            tag.as_str(),
+            "mi" | "mo" | "mn" | "ms" | "mtext" | "annotation-xml"
+        ),
+        Namespace::Svg => matches!(tag.as_str(), "foreignObject" | "desc" | "title"),
+    }
+}
+
+fn is_formatting_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small" | "strike"
+            | "strong" | "tt" | "u"
+    )
+}
+
+fn is_mathml_text_integration(node: &NodeRef) -> bool {
+    namespace_of(node) == Namespace::MathMl
+        && matches!(tag_of(node).as_str(), "mi" | "mo" | "mn" | "ms" | "mtext")
+}
+
+fn is_html_integration(node: &NodeRef) -> bool {
+    let tag = tag_of(node);
+    match namespace_of(node) {
+        Namespace::Svg => matches!(tag.as_str(), "foreignObject" | "desc" | "title"),
+        Namespace::MathMl => {
+            tag == "annotation-xml"
+                && attribute_of(node, "encoding").is_some_and(|encoding| {
+                    let encoding = encoding.to_ascii_lowercase();
+                    encoding == "text/html" || encoding == "application/xhtml+xml"
+                })
+        }
+        Namespace::Html => false,
+    }
+}
+
+/// SVG's camel-cased names, which the tokenizer has lowercased.
+fn adjust_svg_tag(tag: &str) -> &str {
+    match tag {
+        "altglyph" => "altGlyph",
+        "altglyphdef" => "altGlyphDef",
+        "altglyphitem" => "altGlyphItem",
+        "animatecolor" => "animateColor",
+        "animatemotion" => "animateMotion",
+        "animatetransform" => "animateTransform",
+        "clippath" => "clipPath",
+        "feblend" => "feBlend",
+        "fecolormatrix" => "feColorMatrix",
+        "fecomponenttransfer" => "feComponentTransfer",
+        "fecomposite" => "feComposite",
+        "feconvolvematrix" => "feConvolveMatrix",
+        "fediffuselighting" => "feDiffuseLighting",
+        "fedisplacementmap" => "feDisplacementMap",
+        "fedistantlight" => "feDistantLight",
+        "fedropshadow" => "feDropShadow",
+        "feflood" => "feFlood",
+        "fefunca" => "feFuncA",
+        "fefuncb" => "feFuncB",
+        "fefuncg" => "feFuncG",
+        "fefuncr" => "feFuncR",
+        "fegaussianblur" => "feGaussianBlur",
+        "feimage" => "feImage",
+        "femerge" => "feMerge",
+        "femergenode" => "feMergeNode",
+        "femorphology" => "feMorphology",
+        "feoffset" => "feOffset",
+        "fepointlight" => "fePointLight",
+        "fespecularlighting" => "feSpecularLighting",
+        "fespotlight" => "feSpotLight",
+        "fetile" => "feTile",
+        "feturbulence" => "feTurbulence",
+        "foreignobject" => "foreignObject",
+        "glyphref" => "glyphRef",
+        "lineargradient" => "linearGradient",
+        "radialgradient" => "radialGradient",
+        "textpath" => "textPath",
+        other => other,
+    }
+}
+
+fn adjust_svg_attribute(name: &str) -> &str {
+    match name {
+        "attributename" => "attributeName",
+        "attributetype" => "attributeType",
+        "basefrequency" => "baseFrequency",
+        "baseprofile" => "baseProfile",
+        "calcmode" => "calcMode",
+        "clippathunits" => "clipPathUnits",
+        "diffuseconstant" => "diffuseConstant",
+        "edgemode" => "edgeMode",
+        "filterunits" => "filterUnits",
+        "glyphref" => "glyphRef",
+        "gradienttransform" => "gradientTransform",
+        "gradientunits" => "gradientUnits",
+        "kernelmatrix" => "kernelMatrix",
+        "kernelunitlength" => "kernelUnitLength",
+        "keypoints" => "keyPoints",
+        "keysplines" => "keySplines",
+        "keytimes" => "keyTimes",
+        "lengthadjust" => "lengthAdjust",
+        "limitingconeangle" => "limitingConeAngle",
+        "markerheight" => "markerHeight",
+        "markerunits" => "markerUnits",
+        "markerwidth" => "markerWidth",
+        "maskcontentunits" => "maskContentUnits",
+        "maskunits" => "maskUnits",
+        "numoctaves" => "numOctaves",
+        "pathlength" => "pathLength",
+        "patterncontentunits" => "patternContentUnits",
+        "patterntransform" => "patternTransform",
+        "patternunits" => "patternUnits",
+        "pointsatx" => "pointsAtX",
+        "pointsaty" => "pointsAtY",
+        "pointsatz" => "pointsAtZ",
+        "preservealpha" => "preserveAlpha",
+        "preserveaspectratio" => "preserveAspectRatio",
+        "primitiveunits" => "primitiveUnits",
+        "refx" => "refX",
+        "refy" => "refY",
+        "repeatcount" => "repeatCount",
+        "repeatdur" => "repeatDur",
+        "requiredextensions" => "requiredExtensions",
+        "requiredfeatures" => "requiredFeatures",
+        "specularconstant" => "specularConstant",
+        "specularexponent" => "specularExponent",
+        "spreadmethod" => "spreadMethod",
+        "startoffset" => "startOffset",
+        "stddeviation" => "stdDeviation",
+        "stitchtiles" => "stitchTiles",
+        "surfacescale" => "surfaceScale",
+        "systemlanguage" => "systemLanguage",
+        "tablevalues" => "tableValues",
+        "targetx" => "targetX",
+        "targety" => "targetY",
+        "textlength" => "textLength",
+        "viewbox" => "viewBox",
+        "viewtarget" => "viewTarget",
+        "xchannelselector" => "xChannelSelector",
+        "ychannelselector" => "yChannelSelector",
+        "zoomandpan" => "zoomAndPan",
+        other => other,
+    }
+}
+
+fn adjust_foreign_attributes(attributes: &mut [Attribute], svg: bool) {
+    for attribute in attributes {
+        let name = attribute.name();
+        let adjusted = if svg {
+            adjust_svg_attribute(&name).to_string()
+        } else if name == "definitionurl" {
+            "definitionURL".to_string()
+        } else {
+            name.clone()
+        };
+        if adjusted != name {
+            *attribute = Attribute::from_name_value(&adjusted, &attribute.value());
+        }
+    }
+}
+
+/// Start tags that break out of foreign content back into HTML.
+fn breaks_out_of_foreign(tag: &str, attributes: &[Attribute]) -> bool {
+    match tag {
+        "b" | "big" | "blockquote" | "body" | "br" | "center" | "code" | "dd" | "div" | "dl"
+        | "dt" | "em" | "embed" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head" | "hr" | "i"
+        | "img" | "li" | "listing" | "menu" | "meta" | "nobr" | "ol" | "p" | "pre" | "ruby" | "s"
+        | "small" | "span" | "strong" | "strike" | "sub" | "sup" | "table" | "tt" | "u" | "ul"
+        | "var" => true,
+        "font" => attributes
+            .iter()
+            .any(|a| matches!(a.name().as_str(), "color" | "face" | "size")),
+        _ => false,
+    }
 }
 
 impl HtmlParser {
@@ -42,995 +309,2236 @@ impl HtmlParser {
         Self {
             window: Rc::new(RefCell::new(Window::new())),
             mode: InsertionMode::Initial,
-            original_insertion_mode: InsertionMode::Initial,
-            stack_of_open_elements: Vec::new(),
-            t, // HtmlTokenizer
+            original_mode: InsertionMode::Initial,
+            template_modes: Vec::new(),
+            open_elements: Vec::new(),
+            active_formatting: Vec::new(),
+            head_element: None,
+            form_element: None,
+            frameset_ok: true,
+            foster_parenting: false,
+            quirks: false,
+            pending_table_text: Vec::new(),
+            ignore_next_newline: false,
+            fragment_context: None,
+            t,
         }
     }
 
-    // contain_in_stack checks if the specified element is in the stack of open elements.
-    fn contain_in_stack(&mut self, element_kind: ElementKind) -> bool {
-        for i in 0..self.stack_of_open_elements.len() {
-            if self.stack_of_open_elements[i].borrow().element_kind() == Some(element_kind) {
-                return true;
+    pub fn construct_tree(&mut self) -> Rc<RefCell<Window>> {
+        while let Some(token) = self.t.next() {
+            let done = token == HtmlToken::Eof;
+            self.process(token);
+            if done {
+                break;
             }
         }
-
-        false
+        // Whatever is still open is done with.
+        self.open_elements.clear();
+        self.window.clone()
     }
 
-    // pop_until pops the element from the stack of open elements until the element is found.
-    // Spec: HTML Living Standard — closing elements may reference tags that have
-    // already been implicitly closed or were never opened (e.g. `</center>` when
-    // `<center>` was already popped by a prior close tag).  Gracefully bail out
-    // instead of panicking when the element is absent.
-    fn pop_until(&mut self, element_kind: ElementKind) {
-        if !self.contain_in_stack(element_kind) {
+    /// Parse `html` as the contents of an element with this tag, for `innerHTML`.
+    /// Returns the top-level nodes.
+    /// https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments
+    pub fn parse_fragment(context_tag: &str, html: String) -> Vec<NodeRef> {
+        Self::parse_fragment_in(context_tag, Namespace::Html, html)
+    }
+
+    pub fn parse_fragment_in(
+        context_tag: &str,
+        namespace: Namespace,
+        html: String,
+    ) -> Vec<NodeRef> {
+        let mut parser = Self::new(HtmlTokenizer::new(html));
+        let context = Rc::new(RefCell::new(Node::new(NodeKind::Element(
+            Element::new_in(context_tag, Vec::new(), namespace),
+        ))));
+        let state = if namespace != Namespace::Html {
+            State::Data
+        } else {
+            match context_tag {
+                "title" | "textarea" => State::Rcdata,
+                "style" | "xmp" | "iframe" | "noembed" | "noframes" => State::Rawtext,
+                "script" => State::ScriptData,
+                "noscript" => State::Rawtext,
+                "plaintext" => State::Plaintext,
+                _ => State::Data,
+            }
+        };
+        parser.t.set_state(state);
+        let root = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+            "html",
+            Vec::new(),
+        )))));
+        parser.append_to_document(root.clone());
+        parser.open_elements.push(root.clone());
+        if context_tag == "template" && namespace == Namespace::Html {
+            parser.template_modes.push(InsertionMode::InTemplate);
+        }
+        parser.fragment_context = Some(context);
+        parser.reset_insertion_mode();
+        while let Some(token) = parser.t.next() {
+            let done = token == HtmlToken::Eof;
+            parser.process(token);
+            if done {
+                break;
+            }
+        }
+        let mut nodes = Vec::new();
+        let mut child = root.borrow().first_child();
+        while let Some(c) = child {
+            child = c.borrow().next_sibling();
+            nodes.push(c);
+        }
+        nodes
+    }
+
+    // ---- The tree ----------------------------------------------------------
+
+    fn document(&self) -> NodeRef {
+        self.window.borrow().document()
+    }
+
+    fn append_to_document(&self, node: NodeRef) {
+        append_child(&self.document(), node);
+    }
+
+    fn current(&self) -> Option<NodeRef> {
+        self.open_elements.last().cloned()
+    }
+
+    fn current_is(&self, tag: &str) -> bool {
+        self.current().is_some_and(|n| is_html(&n, tag))
+    }
+
+    /// The current node, or the fragment's context when only the root is open.
+    fn adjusted_current(&self) -> Option<NodeRef> {
+        if self.fragment_context.is_some() && self.open_elements.len() == 1 {
+            return self.fragment_context.clone();
+        }
+        self.current()
+    }
+
+    fn fragment_is_select(&self) -> bool {
+        self.fragment_context
+            .as_ref()
+            .is_some_and(|context| is_html(context, "select"))
+    }
+
+    fn has_template_on_stack(&self) -> bool {
+        self.open_elements.iter().any(|n| is_html(n, "template"))
+    }
+
+    /// https://html.spec.whatwg.org/multipage/parsing.html#appropriate-place-for-inserting-a-node
+    fn insertion_place(&self, target: Option<NodeRef>) -> InsertionPlace {
+        let target = target
+            .or_else(|| self.current())
+            .unwrap_or_else(|| self.document());
+        if self.foster_parenting && is_html_any(&target, &["table", "tbody", "tfoot", "thead", "tr"]) {
+            let last_template = self.open_elements.iter().rposition(|n| is_html(n, "template"));
+            let last_table = self.open_elements.iter().rposition(|n| is_html(n, "table"));
+            if let Some(template) = last_template {
+                if last_table.is_none_or(|table| template > table) {
+                    return InsertionPlace {
+                        parent: self.open_elements[template].clone(),
+                        before: None,
+                    };
+                }
+            }
+            let Some(table) = last_table else {
+                return InsertionPlace {
+                    parent: self.open_elements[0].clone(),
+                    before: None,
+                };
+            };
+            let table_node = self.open_elements[table].clone();
+            if let Some(parent) = table_node.borrow().parent().upgrade() {
+                return InsertionPlace {
+                    parent,
+                    before: Some(table_node.clone()),
+                };
+            }
+            return InsertionPlace {
+                parent: self.open_elements[table - 1].clone(),
+                before: None,
+            };
+        }
+        InsertionPlace {
+            parent: target,
+            before: None,
+        }
+    }
+
+    fn insert_at(&self, place: InsertionPlace, node: NodeRef) {
+        match place.before {
+            Some(before) => insert_before(&place.parent, node, &before),
+            None => append_child(&place.parent, node),
+        }
+    }
+
+    fn insert_comment(&mut self, text: String) {
+        let node = new_node(NodeKind::Comment(text));
+        let place = self.insertion_place(None);
+        self.insert_at(place, node);
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let place = self.insertion_place(None);
+        if matches!(place.parent.borrow().kind, NodeKind::Document) {
             return;
         }
+        // Text joins the text node right before where it goes, if there is one.
+        let previous = match &place.before {
+            Some(before) => before.borrow().previous_sibling().upgrade(),
+            None => place.parent.borrow().last_child().upgrade(),
+        };
+        if let Some(previous) = previous {
+            if let NodeKind::Text(ref mut text) = previous.borrow_mut().kind {
+                text.push(c);
+                return;
+            }
+        }
+        self.insert_at(place, new_node(NodeKind::Text(c.to_string())));
+    }
 
-        loop {
-            let current = match self.stack_of_open_elements.pop() {
-                Some(n) => n,
-                None => return,
-            };
+    fn create_html_element(&self, tag: &str, attributes: Vec<Attribute>) -> NodeRef {
+        new_node(NodeKind::Element(Element::new(tag, attributes)))
+    }
 
-            if current.borrow().element_kind() == Some(element_kind) {
+    /// Insert an HTML element and push it on the stack.
+    fn insert_element(&mut self, tag: &str, attributes: Vec<Attribute>) -> NodeRef {
+        let node = self.create_html_element(tag, attributes);
+        let place = self.insertion_place(None);
+        self.insert_at(place, node.clone());
+        self.open_elements.push(node.clone());
+        node
+    }
+
+    fn insert_foreign_element(
+        &mut self,
+        tag: &str,
+        attributes: Vec<Attribute>,
+        namespace: Namespace,
+    ) -> NodeRef {
+        let node = new_node(NodeKind::Element(Element::new_in(tag, attributes, namespace)));
+        let place = self.insertion_place(None);
+        self.insert_at(place, node.clone());
+        self.open_elements.push(node.clone());
+        node
+    }
+
+    fn generic_text_element(&mut self, tag: &str, attributes: Vec<Attribute>, state: State) {
+        self.insert_element(tag, attributes);
+        self.t.set_state(state);
+        self.original_mode = self.mode;
+        self.mode = InsertionMode::Text;
+    }
+
+    fn pop_until(&mut self, tags: &[&str]) {
+        while let Some(node) = self.open_elements.pop() {
+            if is_html_any(&node, tags) {
                 return;
             }
         }
     }
 
-    // Tag-name variants of the stack helpers: work for every element,
-    // including tags without a dedicated ElementKind variant.
-    fn contain_in_stack_tag(&self, tag: &str) -> bool {
-        self.stack_of_open_elements
-            .iter()
-            .any(|n| n.borrow().element_tag_name().as_deref() == Some(tag))
-    }
-
-    fn pop_until_tag(&mut self, tag: &str) {
-        if !self.contain_in_stack_tag(tag) {
-            return;
-        }
-        loop {
-            let current = match self.stack_of_open_elements.pop() {
-                Some(n) => n,
-                None => return,
-            };
-            if current.borrow().element_tag_name().as_deref() == Some(tag) {
+    fn pop_until_node(&mut self, target: &NodeRef) {
+        while let Some(node) = self.open_elements.pop() {
+            if Rc::ptr_eq(&node, target) {
                 return;
             }
         }
     }
 
-    fn pop_current_node_tag(&mut self, tag: &str) -> bool {
-        let matches = self
-            .stack_of_open_elements
-            .last()
-            .map(|n| n.borrow().element_tag_name().as_deref() == Some(tag))
-            .unwrap_or(false);
-        if matches {
-            self.stack_of_open_elements.pop();
+    fn remove_from_stack(&mut self, target: &NodeRef) {
+        if let Some(index) = self.open_elements.iter().position(|n| Rc::ptr_eq(n, target)) {
+            self.open_elements.remove(index);
         }
-        matches
     }
 
-    /// HTML void elements: no content, never pushed onto the open-element
-    /// stack past their own start tag.
-    /// https://html.spec.whatwg.org/multipage/syntax.html#void-elements
-    fn is_void_element(tag: &str) -> bool {
-        matches!(
-            tag,
-            "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link"
-                | "meta" | "param" | "source" | "track" | "wbr"
-        )
-    }
+    // ---- Scopes ------------------------------------------------------------
 
-    /// Check if an element kind is in the stack, but only within the innermost
-    /// scope boundary (e.g., don't look past <table> for table-internal tags).
-    fn contain_in_scope(&self, target: ElementKind, boundary: ElementKind) -> bool {
-        for item in self.stack_of_open_elements.iter().rev() {
-            let kind = item.borrow().element_kind();
-            if kind == Some(target) {
+    /// https://html.spec.whatwg.org/multipage/parsing.html#has-an-element-in-the-specific-scope
+    fn in_specific_scope(&self, tags: &[&str], boundary: &dyn Fn(&NodeRef) -> bool) -> bool {
+        for node in self.open_elements.iter().rev() {
+            if is_html_any(node, tags) {
                 return true;
             }
-            if kind == Some(boundary) {
+            if boundary(node) {
                 return false;
             }
         }
         false
     }
 
-    /// Implicitly close elements that should be closed when a new element
-    /// of the same kind (or an element that implies closing) is opened.
-    /// Ref: HTML spec — optional end tags for td, th, tr, li, p, dt, dd.
-    fn close_implicit(&mut self, new_tag: &str) {
-        match new_tag {
-            "td" | "th" => {
-                // Close any open td/th within the current table scope.
-                if self.contain_in_scope(ElementKind::Td, ElementKind::Table) {
-                    self.pop_until(ElementKind::Td);
-                } else if self.contain_in_scope(ElementKind::Th, ElementKind::Table) {
-                    self.pop_until(ElementKind::Th);
+    fn scope_boundary(node: &NodeRef) -> bool {
+        match namespace_of(node) {
+            Namespace::Html => is_html_any(
+                node,
+                &["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"],
+            ),
+            Namespace::MathMl => matches!(
+                tag_of(node).as_str(),
+                "mi" | "mo" | "mn" | "ms" | "mtext" | "annotation-xml"
+            ),
+            Namespace::Svg => {
+                matches!(tag_of(node).as_str(), "foreignObject" | "desc" | "title")
+            }
+        }
+    }
+
+    fn in_scope(&self, tags: &[&str]) -> bool {
+        self.in_specific_scope(tags, &Self::scope_boundary)
+    }
+
+    fn in_list_item_scope(&self, tags: &[&str]) -> bool {
+        self.in_specific_scope(tags, &|n| {
+            Self::scope_boundary(n) || is_html_any(n, &["ol", "ul"])
+        })
+    }
+
+    fn in_button_scope(&self, tags: &[&str]) -> bool {
+        self.in_specific_scope(tags, &|n| Self::scope_boundary(n) || is_html(n, "button"))
+    }
+
+    fn in_table_scope(&self, tags: &[&str]) -> bool {
+        self.in_specific_scope(tags, &|n| is_html_any(n, &["html", "table", "template"]))
+    }
+
+    fn node_in_scope(&self, target: &NodeRef) -> bool {
+        for node in self.open_elements.iter().rev() {
+            if Rc::ptr_eq(node, target) {
+                return true;
+            }
+            if Self::scope_boundary(node) {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// https://html.spec.whatwg.org/multipage/parsing.html#generate-implied-end-tags
+    fn generate_implied_end_tags(&mut self, except: Option<&str>) {
+        while let Some(node) = self.current() {
+            let implied = is_html_any(
+                &node,
+                &["dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc"],
+            );
+            if !implied || except.is_some_and(|tag| is_html(&node, tag)) {
+                return;
+            }
+            self.open_elements.pop();
+        }
+    }
+
+    fn generate_all_implied_end_tags(&mut self) {
+        while let Some(node) = self.current() {
+            let implied = is_html_any(
+                &node,
+                &[
+                    "caption", "colgroup", "dd", "dt", "li", "optgroup", "option", "p", "rb",
+                    "rp", "rt", "rtc", "tbody", "td", "tfoot", "th", "thead", "tr",
+                ],
+            );
+            if !implied {
+                return;
+            }
+            self.open_elements.pop();
+        }
+    }
+
+    fn close_p(&mut self) {
+        self.generate_implied_end_tags(Some("p"));
+        self.pop_until(&["p"]);
+    }
+
+    fn close_p_if_in_button_scope(&mut self) {
+        if self.in_button_scope(&["p"]) {
+            self.close_p();
+        }
+    }
+
+    // ---- Active formatting elements ----------------------------------------
+
+    /// https://html.spec.whatwg.org/multipage/parsing.html#push-onto-the-list-of-active-formatting-elements
+    fn push_active_formatting(&mut self, node: NodeRef, tag: &str, attributes: Vec<Attribute>) {
+        // Noah's Ark: no more than three identical elements since the last marker.
+        let same = |a: &[Attribute], b: &[Attribute]| {
+            a.len() == b.len() && a.iter().all(|x| b.contains(x))
+        };
+        let mut matching = Vec::new();
+        for (index, entry) in self.active_formatting.iter().enumerate().rev() {
+            match entry {
+                Formatting::Marker => break,
+                Formatting::Element {
+                    tag: t,
+                    attributes: a,
+                    ..
+                } if t == tag && same(a, &attributes) => matching.push(index),
+                _ => {}
+            }
+        }
+        if matching.len() >= 3 {
+            self.active_formatting.remove(matching[matching.len() - 1]);
+        }
+        self.active_formatting.push(Formatting::Element {
+            node,
+            tag: tag.to_string(),
+            attributes,
+        });
+    }
+
+    fn formatting_index_of(&self, target: &NodeRef) -> Option<usize> {
+        self.active_formatting.iter().position(|entry| {
+            matches!(entry, Formatting::Element { node, .. } if Rc::ptr_eq(node, target))
+        })
+    }
+
+    /// https://html.spec.whatwg.org/multipage/parsing.html#reconstruct-the-active-formatting-elements
+    fn reconstruct_active_formatting(&mut self) {
+        let Some(last) = self.active_formatting.last() else {
+            return;
+        };
+        let is_open = |parser: &Self, entry: &Formatting| match entry {
+            Formatting::Marker => true,
+            Formatting::Element { node, .. } => {
+                parser.open_elements.iter().any(|n| Rc::ptr_eq(n, node))
+            }
+        };
+        if is_open(self, last) {
+            return;
+        }
+        let mut index = self.active_formatting.len() - 1;
+        while index > 0 && !is_open(self, &self.active_formatting[index - 1]) {
+            index -= 1;
+        }
+        for i in index..self.active_formatting.len() {
+            let Formatting::Element { tag, attributes, .. } = self.active_formatting[i].clone()
+            else {
+                continue;
+            };
+            let node = self.insert_element(&tag, attributes.clone());
+            self.active_formatting[i] = Formatting::Element {
+                node,
+                tag,
+                attributes,
+            };
+        }
+    }
+
+    fn clear_active_formatting_to_marker(&mut self) {
+        while let Some(entry) = self.active_formatting.pop() {
+            if matches!(entry, Formatting::Marker) {
+                return;
+            }
+        }
+    }
+
+    /// The adoption agency algorithm, for misnested formatting.
+    /// https://html.spec.whatwg.org/multipage/parsing.html#adoption-agency-algorithm
+    fn adoption_agency(&mut self, subject: &str) -> bool {
+        if let Some(current) = self.current() {
+            if is_html(&current, subject) && self.formatting_index_of(&current).is_none() {
+                self.open_elements.pop();
+                return true;
+            }
+        }
+        for _ in 0..8 {
+            // The last formatting element with this tag since the last marker.
+            let mut found = None;
+            for (index, entry) in self.active_formatting.iter().enumerate().rev() {
+                match entry {
+                    Formatting::Marker => break,
+                    Formatting::Element { tag, .. } if tag == subject => {
+                        found = Some(index);
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            "tr" => {
-                // Close any open td/th first, then any open tr, within current table.
-                if self.contain_in_scope(ElementKind::Td, ElementKind::Table) {
-                    self.pop_until(ElementKind::Td);
-                } else if self.contain_in_scope(ElementKind::Th, ElementKind::Table) {
-                    self.pop_until(ElementKind::Th);
+            let Some(formatting_index) = found else {
+                return false;
+            };
+            let Formatting::Element { node: formatting, .. } =
+                self.active_formatting[formatting_index].clone()
+            else {
+                return false;
+            };
+            let Some(stack_index) = self
+                .open_elements
+                .iter()
+                .position(|n| Rc::ptr_eq(n, &formatting))
+            else {
+                self.active_formatting.remove(formatting_index);
+                return true;
+            };
+            if !self.node_in_scope(&formatting) {
+                return true;
+            }
+            // The topmost special element below the formatting element.
+            let furthest_block = self.open_elements[stack_index + 1..]
+                .iter()
+                .find(|n| is_special(n))
+                .cloned();
+            let Some(furthest_block) = furthest_block else {
+                self.pop_until_node(&formatting);
+                self.active_formatting.remove(formatting_index);
+                return true;
+            };
+            let common_ancestor = self.open_elements[stack_index - 1].clone();
+            let mut bookmark = formatting_index;
+            let mut node = furthest_block.clone();
+            let mut last_node = furthest_block.clone();
+            let mut inner = 0;
+            let mut node_index = self
+                .open_elements
+                .iter()
+                .position(|n| Rc::ptr_eq(n, &node))
+                .unwrap_or(0);
+            loop {
+                inner += 1;
+                node_index -= 1;
+                node = self.open_elements[node_index].clone();
+                if Rc::ptr_eq(&node, &formatting) {
+                    break;
                 }
-                if self.contain_in_scope(ElementKind::Tr, ElementKind::Table) {
-                    self.pop_until(ElementKind::Tr);
+                let in_list = self.formatting_index_of(&node);
+                if inner > 3 {
+                    if let Some(index) = in_list {
+                        self.active_formatting.remove(index);
+                        if index < bookmark {
+                            bookmark -= 1;
+                        }
+                    }
+                }
+                let Some(index) = self.formatting_index_of(&node) else {
+                    self.open_elements.remove(node_index);
+                    continue;
+                };
+                // Replace it with a fresh copy, in both lists.
+                let Formatting::Element { tag, attributes, .. } =
+                    self.active_formatting[index].clone()
+                else {
+                    continue;
+                };
+                let copy = self.create_html_element(&tag, attributes.clone());
+                self.active_formatting[index] = Formatting::Element {
+                    node: copy.clone(),
+                    tag,
+                    attributes,
+                };
+                self.open_elements[node_index] = copy.clone();
+                node = copy;
+                if Rc::ptr_eq(&last_node, &furthest_block) {
+                    bookmark = index + 1;
+                }
+                detach(&last_node);
+                append_child(&node, last_node.clone());
+                last_node = node.clone();
+            }
+            detach(&last_node);
+            let place = self.insertion_place(Some(common_ancestor));
+            self.insert_at(place, last_node.clone());
+
+            let Some(formatting_now) = self.formatting_index_of(&formatting) else {
+                return true;
+            };
+            let Formatting::Element { tag, attributes, .. } =
+                self.active_formatting[formatting_now].clone()
+            else {
+                return true;
+            };
+            let copy = self.create_html_element(&tag, attributes.clone());
+            let mut child = furthest_block.borrow().first_child();
+            while let Some(c) = child {
+                child = c.borrow().next_sibling();
+                detach(&c);
+                append_child(&copy, c);
+            }
+            append_child(&furthest_block, copy.clone());
+
+            self.active_formatting.remove(formatting_now);
+            if formatting_now < bookmark {
+                bookmark -= 1;
+            }
+            let bookmark = bookmark.min(self.active_formatting.len());
+            self.active_formatting.insert(
+                bookmark,
+                Formatting::Element {
+                    node: copy.clone(),
+                    tag,
+                    attributes,
+                },
+            );
+            self.remove_from_stack(&formatting);
+            let at = self
+                .open_elements
+                .iter()
+                .position(|n| Rc::ptr_eq(n, &furthest_block))
+                .map(|i| i + 1)
+                .unwrap_or(self.open_elements.len());
+            self.open_elements.insert(at, copy);
+        }
+        true
+    }
+
+    // ---- Insertion modes ---------------------------------------------------
+
+    /// https://html.spec.whatwg.org/multipage/parsing.html#reset-the-insertion-mode-appropriately
+    fn reset_insertion_mode(&mut self) {
+        for index in (0..self.open_elements.len()).rev() {
+            let last = index == 0;
+            let node = if last {
+                self.fragment_context
+                    .clone()
+                    .unwrap_or_else(|| self.open_elements[index].clone())
+            } else {
+                self.open_elements[index].clone()
+            };
+            let tag = tag_of(&node);
+            if namespace_of(&node) == Namespace::Html {
+                match tag.as_str() {
+                    "td" | "th" if !last => {
+                        self.mode = InsertionMode::InCell;
+                        return;
+                    }
+                    "tr" => {
+                        self.mode = InsertionMode::InRow;
+                        return;
+                    }
+                    "tbody" | "thead" | "tfoot" => {
+                        self.mode = InsertionMode::InTableBody;
+                        return;
+                    }
+                    "caption" => {
+                        self.mode = InsertionMode::InCaption;
+                        return;
+                    }
+                    "colgroup" => {
+                        self.mode = InsertionMode::InColumnGroup;
+                        return;
+                    }
+                    "table" => {
+                        self.mode = InsertionMode::InTable;
+                        return;
+                    }
+                    "template" => {
+                        self.mode = self
+                            .template_modes
+                            .last()
+                            .copied()
+                            .unwrap_or(InsertionMode::InTemplate);
+                        return;
+                    }
+                    "head" if !last => {
+                        self.mode = InsertionMode::InHead;
+                        return;
+                    }
+                    "body" => {
+                        self.mode = InsertionMode::InBody;
+                        return;
+                    }
+                    "frameset" => {
+                        self.mode = InsertionMode::InFrameset;
+                        return;
+                    }
+                    "html" => {
+                        self.mode = if self.head_element.is_none() {
+                            InsertionMode::BeforeHead
+                        } else {
+                            InsertionMode::AfterHead
+                        };
+                        return;
+                    }
+                    _ => {}
                 }
             }
-            "li" => {
-                if self.contain_in_scope(ElementKind::Li, ElementKind::Ul) {
-                    self.pop_until(ElementKind::Li);
+            if last {
+                self.mode = InsertionMode::InBody;
+                return;
+            }
+        }
+        self.mode = InsertionMode::InBody;
+    }
+
+    /// Route a token: foreign content has its own rules.
+    /// https://html.spec.whatwg.org/multipage/parsing.html#tree-construction-dispatcher
+    fn process(&mut self, token: HtmlToken) {
+        if self.ignore_next_newline {
+            self.ignore_next_newline = false;
+            if token == HtmlToken::Char('\n') {
+                return;
+            }
+        }
+        if self.uses_html_rules(&token) {
+            self.t.set_cdata_allowed(
+                self.adjusted_current()
+                    .is_some_and(|n| namespace_of(&n) != Namespace::Html),
+            );
+            self.process_in_mode(self.mode, token);
+        } else {
+            self.process_foreign(token);
+        }
+        self.t.set_cdata_allowed(
+            self.adjusted_current()
+                .is_some_and(|n| namespace_of(&n) != Namespace::Html),
+        );
+    }
+
+    fn uses_html_rules(&self, token: &HtmlToken) -> bool {
+        let Some(node) = self.adjusted_current() else {
+            return true;
+        };
+        if namespace_of(&node) == Namespace::Html {
+            return true;
+        }
+        if is_mathml_text_integration(&node) {
+            match token {
+                HtmlToken::StartTag { tag, .. } if tag != "mglyph" && tag != "malignmark" => {
+                    return true;
+                }
+                HtmlToken::Char(_) => return true,
+                _ => {}
+            }
+        }
+        if namespace_of(&node) == Namespace::MathMl && tag_of(&node) == "annotation-xml" {
+            if let HtmlToken::StartTag { tag, .. } = token {
+                if tag == "svg" {
+                    return true;
+                }
+            }
+        }
+        if is_html_integration(&node) {
+            match token {
+                HtmlToken::StartTag { .. } | HtmlToken::Char(_) => return true,
+                _ => {}
+            }
+        }
+        matches!(token, HtmlToken::Eof)
+    }
+
+    fn process_in_mode(&mut self, mode: InsertionMode, token: HtmlToken) {
+        match mode {
+            InsertionMode::Initial => self.in_initial(token),
+            InsertionMode::BeforeHtml => self.in_before_html(token),
+            InsertionMode::BeforeHead => self.in_before_head(token),
+            InsertionMode::InHead => self.in_head(token),
+            InsertionMode::InHeadNoscript => self.in_head_noscript(token),
+            InsertionMode::AfterHead => self.in_after_head(token),
+            InsertionMode::InBody => self.in_body(token),
+            InsertionMode::Text => self.in_text(token),
+            InsertionMode::InTable => self.in_table(token),
+            InsertionMode::InTableText => self.in_table_text(token),
+            InsertionMode::InCaption => self.in_caption(token),
+            InsertionMode::InColumnGroup => self.in_column_group(token),
+            InsertionMode::InTableBody => self.in_table_body(token),
+            InsertionMode::InRow => self.in_row(token),
+            InsertionMode::InCell => self.in_cell(token),
+            InsertionMode::InTemplate => self.in_template(token),
+            InsertionMode::AfterBody => self.in_after_body(token),
+            InsertionMode::InFrameset => self.in_frameset(token),
+            InsertionMode::AfterFrameset => self.in_after_frameset(token),
+            InsertionMode::AfterAfterBody => self.in_after_after_body(token),
+            InsertionMode::AfterAfterFrameset => self.in_after_after_frameset(token),
+        }
+    }
+
+    fn in_initial(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => {}
+            HtmlToken::Comment(text) => {
+                append_child(&self.document(), new_node(NodeKind::Comment(text)));
+            }
+            HtmlToken::Doctype {
+                name,
+                public_id,
+                system_id,
+                force_quirks,
+            } => {
+                self.quirks = force_quirks
+                    || name.as_deref() != Some("html")
+                    || doctype_means_quirks(public_id.as_deref(), system_id.as_deref());
+                append_child(
+                    &self.document(),
+                    new_node(NodeKind::Doctype {
+                        name: name.unwrap_or_default(),
+                        public_id: public_id.unwrap_or_default(),
+                        system_id: system_id.unwrap_or_default(),
+                    }),
+                );
+                self.mode = InsertionMode::BeforeHtml;
+            }
+            other => {
+                self.quirks = true;
+                self.mode = InsertionMode::BeforeHtml;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_before_html(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::Comment(text) => {
+                append_child(&self.document(), new_node(NodeKind::Comment(text)));
+            }
+            HtmlToken::Char(c) if is_space(c) => {}
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "html" => {
+                let node = self.create_html_element("html", attributes.clone());
+                append_child(&self.document(), node.clone());
+                self.open_elements.push(node);
+                self.mode = InsertionMode::BeforeHead;
+            }
+            HtmlToken::EndTag { ref tag }
+                if !matches!(tag.as_str(), "head" | "body" | "html" | "br") => {}
+            other => {
+                let node = self.create_html_element("html", Vec::new());
+                append_child(&self.document(), node.clone());
+                self.open_elements.push(node);
+                self.mode = InsertionMode::BeforeHead;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_before_head(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => {}
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "head" => {
+                let head = self.insert_element("head", attributes.clone());
+                self.head_element = Some(head);
+                self.mode = InsertionMode::InHead;
+            }
+            HtmlToken::EndTag { ref tag }
+                if !matches!(tag.as_str(), "head" | "body" | "html" | "br") => {}
+            other => {
+                let head = self.insert_element("head", Vec::new());
+                self.head_element = Some(head);
+                self.mode = InsertionMode::InHead;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_head(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => self.insert_char(c),
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::StartTag { ref tag, ref attributes, .. }
+                if matches!(tag.as_str(), "base" | "basefont" | "bgsound" | "link" | "meta") =>
+            {
+                self.insert_element(tag, attributes.clone());
+                self.open_elements.pop();
+            }
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "title" => {
+                self.generic_text_element(tag, attributes.clone(), State::Rcdata);
+            }
+            HtmlToken::StartTag { ref tag, ref attributes, .. }
+                if matches!(tag.as_str(), "noframes" | "style") =>
+            {
+                self.generic_text_element(tag, attributes.clone(), State::Rawtext);
+            }
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "noscript" => {
+                // Scripting is on: its contents are only for browsers without it.
+                self.generic_text_element(tag, attributes.clone(), State::Rawtext);
+            }
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "script" => {
+                self.generic_text_element(tag, attributes.clone(), State::ScriptData);
+            }
+            HtmlToken::EndTag { ref tag } if tag == "head" => {
+                self.open_elements.pop();
+                self.mode = InsertionMode::AfterHead;
+            }
+            HtmlToken::EndTag { ref tag }
+                if matches!(tag.as_str(), "body" | "html" | "br") =>
+            {
+                self.open_elements.pop();
+                self.mode = InsertionMode::AfterHead;
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "template" => {
+                self.insert_element(tag, attributes.clone());
+                self.active_formatting.push(Formatting::Marker);
+                self.frameset_ok = false;
+                self.mode = InsertionMode::InTemplate;
+                self.template_modes.push(InsertionMode::InTemplate);
+            }
+            HtmlToken::EndTag { ref tag } if tag == "template" => {
+                if !self.has_template_on_stack() {
+                    return;
+                }
+                self.generate_all_implied_end_tags();
+                self.pop_until(&["template"]);
+                self.clear_active_formatting_to_marker();
+                self.template_modes.pop();
+                self.reset_insertion_mode();
+            }
+            HtmlToken::StartTag { ref tag, .. } if tag == "head" => {}
+            HtmlToken::EndTag { .. } => {}
+            other => {
+                self.open_elements.pop();
+                self.mode = InsertionMode::AfterHead;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_head_noscript(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::EndTag { ref tag } if tag == "noscript" => {
+                self.open_elements.pop();
+                self.mode = InsertionMode::InHead;
+            }
+            HtmlToken::Char(c) if is_space(c) => self.in_head(token),
+            HtmlToken::Comment(_) => self.in_head(token),
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "basefont" | "bgsound" | "link" | "meta" | "noframes" | "style"
+                ) =>
+            {
+                self.in_head(token)
+            }
+            HtmlToken::EndTag { ref tag } if tag == "br" => {
+                self.open_elements.pop();
+                self.mode = InsertionMode::InHead;
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::StartTag { ref tag, .. } if matches!(tag.as_str(), "head" | "noscript") => {}
+            HtmlToken::EndTag { .. } => {}
+            other => {
+                self.open_elements.pop();
+                self.mode = InsertionMode::InHead;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_after_head(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => self.insert_char(c),
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "body" => {
+                self.insert_element(tag, attributes.clone());
+                self.frameset_ok = false;
+                self.mode = InsertionMode::InBody;
+            }
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "frameset" => {
+                self.insert_element(tag, attributes.clone());
+                self.mode = InsertionMode::InFrameset;
+            }
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script"
+                        | "style" | "template" | "title"
+                ) =>
+            {
+                // These still belong in the head, however late they turn up.
+                if let Some(head) = self.head_element.clone() {
+                    self.open_elements.push(head.clone());
+                    self.in_head(token);
+                    self.remove_from_stack(&head);
+                }
+            }
+            HtmlToken::EndTag { ref tag } if tag == "template" => self.in_head(token),
+            HtmlToken::StartTag { ref tag, .. } if tag == "head" => {}
+            HtmlToken::EndTag { ref tag }
+                if !matches!(tag.as_str(), "body" | "html" | "br") => {}
+            other => {
+                self.insert_element("body", Vec::new());
+                self.mode = InsertionMode::InBody;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char('\0') => {}
+            HtmlToken::Char(c) if is_space(c) => {
+                self.reconstruct_active_formatting();
+                self.insert_char(c);
+            }
+            HtmlToken::Char(c) => {
+                self.reconstruct_active_formatting();
+                self.insert_char(c);
+                self.frameset_ok = false;
+            }
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { tag, self_closing, attributes } => {
+                self.in_body_start_tag(tag, self_closing, attributes);
+            }
+            HtmlToken::EndTag { tag } => self.in_body_end_tag(tag),
+            HtmlToken::Eof => {
+                if !self.template_modes.is_empty() {
+                    self.in_template(HtmlToken::Eof);
+                }
+            }
+        }
+    }
+
+    fn in_body_start_tag(&mut self, tag: String, self_closing: bool, attributes: Vec<Attribute>) {
+        match tag.as_str() {
+            "html" => {
+                if self.has_template_on_stack() {
+                    return;
+                }
+                if let Some(root) = self.open_elements.first().cloned() {
+                    add_missing_attributes(&root, attributes);
+                }
+            }
+            "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style"
+            | "template" | "title" => self.in_head(HtmlToken::StartTag {
+                tag,
+                self_closing,
+                attributes,
+            }),
+            "body" => {
+                let body = self.open_elements.get(1).cloned();
+                let Some(body) = body.filter(|b| is_html(b, "body")) else {
+                    return;
+                };
+                if self.has_template_on_stack() {
+                    return;
+                }
+                self.frameset_ok = false;
+                add_missing_attributes(&body, attributes);
+            }
+            "frameset" => {
+                let body = self.open_elements.get(1).cloned();
+                let Some(body) = body.filter(|b| is_html(b, "body")) else {
+                    return;
+                };
+                if !self.frameset_ok {
+                    return;
+                }
+                detach(&body);
+                self.open_elements.truncate(1);
+                self.insert_element(&tag, attributes);
+                self.mode = InsertionMode::InFrameset;
+            }
+            "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog"
+            | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
+            | "hgroup" | "main" | "menu" | "nav" | "ol" | "p" | "search" | "section" | "summary"
+            | "ul" => {
+                self.close_p_if_in_button_scope();
+                self.insert_element(&tag, attributes);
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.close_p_if_in_button_scope();
+                if self
+                    .current()
+                    .is_some_and(|n| is_html_any(&n, &["h1", "h2", "h3", "h4", "h5", "h6"]))
+                {
+                    self.open_elements.pop();
+                }
+                self.insert_element(&tag, attributes);
+            }
+            "pre" | "listing" => {
+                self.close_p_if_in_button_scope();
+                self.insert_element(&tag, attributes);
+                self.ignore_next_newline = true;
+                self.frameset_ok = false;
+            }
+            "form" => {
+                let in_template = self.has_template_on_stack();
+                if self.form_element.is_some() && !in_template {
+                    return;
+                }
+                self.close_p_if_in_button_scope();
+                let form = self.insert_element(&tag, attributes);
+                if !in_template {
+                    self.form_element = Some(form);
+                }
+            }
+            "li" | "dd" | "dt" => {
+                self.frameset_ok = false;
+                let closers: &[&str] = if tag == "li" { &["li"] } else { &["dd", "dt"] };
+                for index in (0..self.open_elements.len()).rev() {
+                    let node = self.open_elements[index].clone();
+                    if is_html_any(&node, closers) {
+                        let name = tag_of(&node);
+                        self.generate_implied_end_tags(Some(&name));
+                        self.pop_until(&[name.as_str()]);
+                        break;
+                    }
+                    if is_special(&node) && !is_html_any(&node, &["address", "div", "p"]) {
+                        break;
+                    }
+                }
+                self.close_p_if_in_button_scope();
+                self.insert_element(&tag, attributes);
+            }
+            "plaintext" => {
+                self.close_p_if_in_button_scope();
+                self.insert_element(&tag, attributes);
+                self.t.set_state(State::Plaintext);
+            }
+            "button" => {
+                if self.in_scope(&["button"]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&["button"]);
+                }
+                self.reconstruct_active_formatting();
+                self.insert_element(&tag, attributes);
+                self.frameset_ok = false;
+            }
+            "a" => {
+                // An `<a>` already open since the last marker closes first.
+                let mut open_a = None;
+                for entry in self.active_formatting.iter().rev() {
+                    match entry {
+                        Formatting::Marker => break,
+                        Formatting::Element { tag, node, .. } if tag == "a" => {
+                            open_a = Some(node.clone());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(node) = open_a {
+                    if !self.adoption_agency("a") {
+                        self.any_other_end_tag("a");
+                    }
+                    if let Some(index) = self.formatting_index_of(&node) {
+                        self.active_formatting.remove(index);
+                    }
+                    self.remove_from_stack(&node);
+                }
+                self.reconstruct_active_formatting();
+                let node = self.insert_element(&tag, attributes.clone());
+                self.push_active_formatting(node, &tag, attributes);
+            }
+            "b" | "big" | "code" | "em" | "font" | "i" | "s" | "small" | "strike" | "strong"
+            | "tt" | "u" => {
+                self.reconstruct_active_formatting();
+                let node = self.insert_element(&tag, attributes.clone());
+                self.push_active_formatting(node, &tag, attributes);
+            }
+            "nobr" => {
+                self.reconstruct_active_formatting();
+                if self.in_scope(&["nobr"]) {
+                    if !self.adoption_agency("nobr") {
+                        self.any_other_end_tag("nobr");
+                    }
+                    self.reconstruct_active_formatting();
+                }
+                let node = self.insert_element(&tag, attributes.clone());
+                self.push_active_formatting(node, &tag, attributes);
+            }
+            "applet" | "marquee" | "object" => {
+                self.reconstruct_active_formatting();
+                self.insert_element(&tag, attributes);
+                self.active_formatting.push(Formatting::Marker);
+                self.frameset_ok = false;
+            }
+            "table" => {
+                if !self.quirks {
+                    self.close_p_if_in_button_scope();
+                }
+                self.insert_element(&tag, attributes);
+                self.frameset_ok = false;
+                self.mode = InsertionMode::InTable;
+            }
+            "area" | "br" | "embed" | "img" | "keygen" | "wbr" => {
+                self.reconstruct_active_formatting();
+                self.insert_element(&tag, attributes);
+                self.open_elements.pop();
+                self.frameset_ok = false;
+            }
+            "input" => {
+                if self.fragment_is_select() {
+                    return;
+                }
+                if self.in_scope(&["select"]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&["select"]);
+                }
+                self.reconstruct_active_formatting();
+                let hidden = attributes.iter().any(|a| {
+                    a.name() == "type" && a.value().eq_ignore_ascii_case("hidden")
+                });
+                self.insert_element(&tag, attributes);
+                self.open_elements.pop();
+                if !hidden {
+                    self.frameset_ok = false;
+                }
+            }
+            "param" | "source" | "track" => {
+                self.insert_element(&tag, attributes);
+                self.open_elements.pop();
+            }
+            "hr" => {
+                self.close_p_if_in_button_scope();
+                if self.in_scope(&["select"]) {
+                    self.generate_implied_end_tags(None);
+                }
+                self.insert_element(&tag, attributes);
+                self.open_elements.pop();
+                self.frameset_ok = false;
+            }
+            "image" => {
+                self.in_body_start_tag("img".to_string(), self_closing, attributes);
+            }
+            "textarea" => {
+                self.insert_element(&tag, attributes);
+                self.ignore_next_newline = true;
+                self.t.set_state(State::Rcdata);
+                self.original_mode = self.mode;
+                self.frameset_ok = false;
+                self.mode = InsertionMode::Text;
+            }
+            "xmp" => {
+                self.close_p_if_in_button_scope();
+                self.reconstruct_active_formatting();
+                self.frameset_ok = false;
+                self.generic_text_element(&tag, attributes, State::Rawtext);
+            }
+            "iframe" => {
+                self.frameset_ok = false;
+                self.generic_text_element(&tag, attributes, State::Rawtext);
+            }
+            "noembed" | "noscript" => {
+                self.generic_text_element(&tag, attributes, State::Rawtext);
+            }
+            // A select can hold most markup, so it has no insertion mode of its own.
+            // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inbody
+            "select" => {
+                if self.fragment_is_select() {
+                    return;
+                }
+                if self.in_scope(&["select"]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&["select"]);
+                } else {
+                    self.reconstruct_active_formatting();
+                    self.insert_element(&tag, attributes);
+                    self.frameset_ok = false;
+                }
+            }
+            "option" => {
+                if self.in_scope(&["select"]) {
+                    self.generate_implied_end_tags(Some("optgroup"));
+                } else if self.current_is("option") {
+                    self.open_elements.pop();
+                }
+                self.reconstruct_active_formatting();
+                self.insert_element(&tag, attributes);
+            }
+            "optgroup" => {
+                if self.in_scope(&["select"]) {
+                    self.generate_implied_end_tags(None);
+                } else if self.current_is("option") {
+                    self.open_elements.pop();
+                }
+                self.reconstruct_active_formatting();
+                self.insert_element(&tag, attributes);
+            }
+            "rb" | "rtc" => {
+                if self.in_scope(&["ruby"]) {
+                    self.generate_implied_end_tags(None);
+                }
+                self.insert_element(&tag, attributes);
+            }
+            "rp" | "rt" => {
+                if self.in_scope(&["ruby"]) {
+                    self.generate_implied_end_tags(Some("rtc"));
+                }
+                self.insert_element(&tag, attributes);
+            }
+            "math" | "svg" => {
+                self.reconstruct_active_formatting();
+                let svg = tag == "svg";
+                let mut attributes = attributes;
+                adjust_foreign_attributes(&mut attributes, svg);
+                let namespace = if svg { Namespace::Svg } else { Namespace::MathMl };
+                self.insert_foreign_element(&tag, attributes, namespace);
+                if self_closing {
+                    self.open_elements.pop();
+                }
+            }
+            "caption" | "col" | "colgroup" | "frame" | "head" | "tbody" | "td" | "tfoot" | "th"
+            | "thead" | "tr" => {}
+            _ => {
+                self.reconstruct_active_formatting();
+                self.insert_element(&tag, attributes);
+            }
+        }
+    }
+
+    fn in_body_end_tag(&mut self, tag: String) {
+        match tag.as_str() {
+            "template" => self.in_head(HtmlToken::EndTag { tag }),
+            "body" => {
+                if self.in_scope(&["body"]) {
+                    self.mode = InsertionMode::AfterBody;
+                }
+            }
+            "html" => {
+                if self.in_scope(&["body"]) {
+                    self.mode = InsertionMode::AfterBody;
+                    self.process_in_mode(self.mode, HtmlToken::EndTag { tag });
+                }
+            }
+            "address" | "article" | "aside" | "blockquote" | "button" | "center" | "details"
+            | "dialog" | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer"
+            | "header" | "hgroup" | "listing" | "main" | "menu" | "nav" | "ol" | "pre" | "search"
+            | "section" | "select" | "summary" | "ul" => {
+                if self.in_scope(&[tag.as_str()]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&[tag.as_str()]);
+                }
+            }
+            "form" => {
+                if !self.has_template_on_stack() {
+                    let node = self.form_element.take();
+                    let Some(node) = node.filter(|n| self.node_in_scope(n)) else {
+                        return;
+                    };
+                    self.generate_implied_end_tags(None);
+                    self.remove_from_stack(&node);
+                } else if self.in_scope(&["form"]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&["form"]);
                 }
             }
             "p" => {
-                if self.contain_in_stack(ElementKind::P) {
-                    self.pop_until(ElementKind::P);
+                if !self.in_button_scope(&["p"]) {
+                    self.insert_element("p", Vec::new());
+                }
+                self.close_p();
+            }
+            "li" => {
+                if self.in_list_item_scope(&["li"]) {
+                    self.generate_implied_end_tags(Some("li"));
+                    self.pop_until(&["li"]);
                 }
             }
-            "dt" | "dd" => {
-                if self.contain_in_scope(ElementKind::Dt, ElementKind::Dl) {
-                    self.pop_until(ElementKind::Dt);
-                } else if self.contain_in_scope(ElementKind::Dd, ElementKind::Dl) {
-                    self.pop_until(ElementKind::Dd);
+            "dd" | "dt" => {
+                if self.in_scope(&[tag.as_str()]) {
+                    self.generate_implied_end_tags(Some(&tag));
+                    self.pop_until(&[tag.as_str()]);
+                }
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                let headings = ["h1", "h2", "h3", "h4", "h5", "h6"];
+                if self.in_scope(&headings) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&headings);
+                }
+            }
+            "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small" | "strike"
+            | "strong" | "tt" | "u" => {
+                if !self.adoption_agency(&tag) {
+                    self.any_other_end_tag(&tag);
+                }
+            }
+            "applet" | "marquee" | "object" => {
+                if self.in_scope(&[tag.as_str()]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&[tag.as_str()]);
+                    self.clear_active_formatting_to_marker();
+                }
+            }
+            "br" => self.in_body_start_tag("br".to_string(), false, Vec::new()),
+            _ => self.any_other_end_tag(&tag),
+        }
+    }
+
+    fn any_other_end_tag(&mut self, tag: &str) {
+        for index in (0..self.open_elements.len()).rev() {
+            let node = self.open_elements[index].clone();
+            if is_html(&node, tag) {
+                self.generate_implied_end_tags(Some(tag));
+                self.open_elements.truncate(index);
+                return;
+            }
+            if is_special(&node) {
+                return;
+            }
+        }
+    }
+
+    fn in_text(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) => self.insert_char(c),
+            HtmlToken::Eof => {
+                self.open_elements.pop();
+                self.mode = self.original_mode;
+                self.process_in_mode(self.mode, HtmlToken::Eof);
+            }
+            HtmlToken::EndTag { .. } => {
+                self.open_elements.pop();
+                self.mode = self.original_mode;
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_to_table_context(&mut self) {
+        while let Some(node) = self.current() {
+            if is_html_any(&node, &["table", "template", "html"]) {
+                return;
+            }
+            self.open_elements.pop();
+        }
+    }
+
+    fn clear_to_table_body_context(&mut self) {
+        while let Some(node) = self.current() {
+            if is_html_any(&node, &["tbody", "tfoot", "thead", "template", "html"]) {
+                return;
+            }
+            self.open_elements.pop();
+        }
+    }
+
+    fn clear_to_row_context(&mut self) {
+        while let Some(node) = self.current() {
+            if is_html_any(&node, &["tr", "template", "html"]) {
+                return;
+            }
+            self.open_elements.pop();
+        }
+    }
+
+    fn in_table(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(_)
+                if self.current().is_some_and(|n| {
+                    is_html_any(&n, &["table", "tbody", "template", "tfoot", "thead", "tr"])
+                }) =>
+            {
+                self.pending_table_text.clear();
+                self.original_mode = self.mode;
+                self.mode = InsertionMode::InTableText;
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, ref attributes, .. } => match tag.as_str() {
+                "caption" => {
+                    self.clear_to_table_context();
+                    self.active_formatting.push(Formatting::Marker);
+                    self.insert_element(tag, attributes.clone());
+                    self.mode = InsertionMode::InCaption;
+                }
+                "colgroup" => {
+                    self.clear_to_table_context();
+                    self.insert_element(tag, attributes.clone());
+                    self.mode = InsertionMode::InColumnGroup;
+                }
+                "col" => {
+                    self.clear_to_table_context();
+                    self.insert_element("colgroup", Vec::new());
+                    self.mode = InsertionMode::InColumnGroup;
+                    self.process_in_mode(self.mode, token);
+                }
+                "tbody" | "tfoot" | "thead" => {
+                    self.clear_to_table_context();
+                    self.insert_element(tag, attributes.clone());
+                    self.mode = InsertionMode::InTableBody;
+                }
+                "td" | "th" | "tr" => {
+                    self.clear_to_table_context();
+                    self.insert_element("tbody", Vec::new());
+                    self.mode = InsertionMode::InTableBody;
+                    self.process_in_mode(self.mode, token);
+                }
+                "table" => {
+                    if !self.in_table_scope(&["table"]) {
+                        return;
+                    }
+                    self.pop_until(&["table"]);
+                    self.reset_insertion_mode();
+                    self.process_in_mode(self.mode, token);
+                }
+                "style" | "script" | "template" => self.in_head(token),
+                "input" => {
+                    let hidden = attributes.iter().any(|a| {
+                        a.name() == "type" && a.value().eq_ignore_ascii_case("hidden")
+                    });
+                    if !hidden {
+                        return self.in_table_anything_else(token);
+                    }
+                    self.insert_element(tag, attributes.clone());
+                    self.open_elements.pop();
+                }
+                "form" => {
+                    if self.has_template_on_stack() || self.form_element.is_some() {
+                        return;
+                    }
+                    let form = self.insert_element(tag, attributes.clone());
+                    self.form_element = Some(form);
+                    self.open_elements.pop();
+                }
+                _ => self.in_table_anything_else(token),
+            },
+            HtmlToken::EndTag { ref tag } => match tag.as_str() {
+                "table" => {
+                    if !self.in_table_scope(&["table"]) {
+                        return;
+                    }
+                    self.pop_until(&["table"]);
+                    self.reset_insertion_mode();
+                }
+                "body" | "caption" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot"
+                | "th" | "thead" | "tr" => {}
+                "template" => self.in_head(token),
+                _ => self.in_table_anything_else(token),
+            },
+            HtmlToken::Eof => self.in_body(HtmlToken::Eof),
+            other => self.in_table_anything_else(other),
+        }
+    }
+
+    fn in_table_anything_else(&mut self, token: HtmlToken) {
+        self.foster_parenting = true;
+        self.in_body(token);
+        self.foster_parenting = false;
+    }
+
+    fn in_table_text(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char('\0') => {}
+            HtmlToken::Char(c) => self.pending_table_text.push(c),
+            other => {
+                let pending = std::mem::take(&mut self.pending_table_text);
+                if pending.iter().any(|c| !is_space(*c)) {
+                    for c in pending {
+                        self.in_table_anything_else(HtmlToken::Char(c));
+                    }
+                } else {
+                    for c in pending {
+                        self.insert_char(c);
+                    }
+                }
+                self.mode = self.original_mode;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn close_caption(&mut self) -> bool {
+        if !self.in_table_scope(&["caption"]) {
+            return false;
+        }
+        self.generate_implied_end_tags(None);
+        self.pop_until(&["caption"]);
+        self.clear_active_formatting_to_marker();
+        self.mode = InsertionMode::InTable;
+        true
+    }
+
+    fn in_caption(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::EndTag { ref tag } if tag == "caption" => {
+                self.close_caption();
+            }
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead"
+                        | "tr"
+                ) =>
+            {
+                if self.close_caption() {
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            HtmlToken::EndTag { ref tag } if tag == "table" => {
+                if self.close_caption() {
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            HtmlToken::EndTag { ref tag }
+                if matches!(
+                    tag.as_str(),
+                    "body" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th"
+                        | "thead" | "tr"
+                ) => {}
+            other => self.in_body(other),
+        }
+    }
+
+    fn in_column_group(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => self.insert_char(c),
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "col" => {
+                self.insert_element(tag, attributes.clone());
+                self.open_elements.pop();
+            }
+            HtmlToken::EndTag { ref tag } if tag == "colgroup" => {
+                if self.current_is("colgroup") {
+                    self.open_elements.pop();
+                    self.mode = InsertionMode::InTable;
+                }
+            }
+            HtmlToken::EndTag { ref tag } if tag == "col" => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "template" => self.in_head(token),
+            HtmlToken::EndTag { ref tag } if tag == "template" => self.in_head(token),
+            HtmlToken::Eof => self.in_body(HtmlToken::Eof),
+            other => {
+                if self.current_is("colgroup") {
+                    self.open_elements.pop();
+                    self.mode = InsertionMode::InTable;
+                    self.process_in_mode(self.mode, other);
+                }
+            }
+        }
+    }
+
+    fn in_table_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::StartTag { ref tag, ref attributes, .. } if tag == "tr" => {
+                self.clear_to_table_body_context();
+                self.insert_element(tag, attributes.clone());
+                self.mode = InsertionMode::InRow;
+            }
+            HtmlToken::StartTag { ref tag, .. } if matches!(tag.as_str(), "th" | "td") => {
+                self.clear_to_table_body_context();
+                self.insert_element("tr", Vec::new());
+                self.mode = InsertionMode::InRow;
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::EndTag { ref tag } if matches!(tag.as_str(), "tbody" | "tfoot" | "thead") => {
+                if self.in_table_scope(&[tag.as_str()]) {
+                    self.clear_to_table_body_context();
+                    self.open_elements.pop();
+                    self.mode = InsertionMode::InTable;
+                }
+            }
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead"
+                ) =>
+            {
+                self.close_table_body_and_reprocess(token);
+            }
+            HtmlToken::EndTag { ref tag } if tag == "table" => {
+                self.close_table_body_and_reprocess(token);
+            }
+            HtmlToken::EndTag { ref tag }
+                if matches!(
+                    tag.as_str(),
+                    "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" | "tr"
+                ) => {}
+            other => self.in_table(other),
+        }
+    }
+
+    fn close_table_body_and_reprocess(&mut self, token: HtmlToken) {
+        if self.in_table_scope(&["tbody", "thead", "tfoot"]) {
+            self.clear_to_table_body_context();
+            self.open_elements.pop();
+            self.mode = InsertionMode::InTable;
+            self.process_in_mode(self.mode, token);
+        }
+    }
+
+    fn close_row(&mut self) -> bool {
+        if !self.in_table_scope(&["tr"]) {
+            return false;
+        }
+        self.clear_to_row_context();
+        self.open_elements.pop();
+        self.mode = InsertionMode::InTableBody;
+        true
+    }
+
+    fn in_row(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::StartTag { ref tag, ref attributes, .. }
+                if matches!(tag.as_str(), "th" | "td") =>
+            {
+                self.clear_to_row_context();
+                self.insert_element(tag, attributes.clone());
+                self.mode = InsertionMode::InCell;
+                self.active_formatting.push(Formatting::Marker);
+            }
+            HtmlToken::EndTag { ref tag } if tag == "tr" => {
+                self.close_row();
+            }
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" | "tr"
+                ) =>
+            {
+                if self.close_row() {
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            HtmlToken::EndTag { ref tag } if tag == "table" => {
+                if self.close_row() {
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            HtmlToken::EndTag { ref tag } if matches!(tag.as_str(), "tbody" | "tfoot" | "thead") => {
+                if self.in_table_scope(&[tag.as_str()]) && self.close_row() {
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            HtmlToken::EndTag { ref tag }
+                if matches!(
+                    tag.as_str(),
+                    "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th"
+                ) => {}
+            other => self.in_table(other),
+        }
+    }
+
+    fn close_cell(&mut self) {
+        self.generate_implied_end_tags(None);
+        self.pop_until(&["td", "th"]);
+        self.clear_active_formatting_to_marker();
+        self.mode = InsertionMode::InRow;
+    }
+
+    fn in_cell(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::EndTag { ref tag } if matches!(tag.as_str(), "td" | "th") => {
+                if self.in_table_scope(&[tag.as_str()]) {
+                    self.generate_implied_end_tags(None);
+                    self.pop_until(&[tag.as_str()]);
+                    self.clear_active_formatting_to_marker();
+                    self.mode = InsertionMode::InRow;
+                }
+            }
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead"
+                        | "tr"
+                ) =>
+            {
+                if self.in_table_scope(&["td", "th"]) {
+                    self.close_cell();
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            HtmlToken::EndTag { ref tag }
+                if matches!(tag.as_str(), "body" | "caption" | "col" | "colgroup" | "html") => {}
+            HtmlToken::EndTag { ref tag }
+                if matches!(tag.as_str(), "table" | "tbody" | "tfoot" | "thead" | "tr") =>
+            {
+                if self.in_table_scope(&[tag.as_str()]) {
+                    self.close_cell();
+                    self.process_in_mode(self.mode, token);
+                }
+            }
+            other => self.in_body(other),
+        }
+    }
+
+    fn in_template(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(_) | HtmlToken::Comment(_) | HtmlToken::Doctype { .. } => {
+                self.in_body(token)
+            }
+            HtmlToken::StartTag { ref tag, .. }
+                if matches!(
+                    tag.as_str(),
+                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script"
+                        | "style" | "template" | "title"
+                ) =>
+            {
+                self.in_head(token)
+            }
+            HtmlToken::EndTag { ref tag } if tag == "template" => self.in_head(token),
+            HtmlToken::StartTag { ref tag, .. } => {
+                let next = match tag.as_str() {
+                    "caption" | "colgroup" | "tbody" | "tfoot" | "thead" => InsertionMode::InTable,
+                    "col" => InsertionMode::InColumnGroup,
+                    "tr" => InsertionMode::InTableBody,
+                    "td" | "th" => InsertionMode::InRow,
+                    _ => InsertionMode::InBody,
+                };
+                self.template_modes.pop();
+                self.template_modes.push(next);
+                self.mode = next;
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::EndTag { .. } => {}
+            HtmlToken::Eof => {
+                if !self.has_template_on_stack() {
+                    return;
+                }
+                self.pop_until(&["template"]);
+                self.clear_active_formatting_to_marker();
+                self.template_modes.pop();
+                self.reset_insertion_mode();
+                self.process_in_mode(self.mode, HtmlToken::Eof);
+            }
+        }
+    }
+
+    fn in_after_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => self.in_body(token),
+            HtmlToken::Comment(text) => {
+                // Goes on the root, after the body.
+                if let Some(root) = self.open_elements.first().cloned() {
+                    append_child(&root, new_node(NodeKind::Comment(text)));
+                }
+            }
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::EndTag { ref tag } if tag == "html" => {
+                if self.fragment_context.is_none() {
+                    self.mode = InsertionMode::AfterAfterBody;
+                }
+            }
+            HtmlToken::Eof => {}
+            other => {
+                self.mode = InsertionMode::InBody;
+                self.process_in_mode(self.mode, other);
+            }
+        }
+    }
+
+    fn in_frameset(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => self.insert_char(c),
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, ref attributes, .. } => match tag.as_str() {
+                "html" => self.in_body(token),
+                "frameset" => {
+                    self.insert_element(tag, attributes.clone());
+                }
+                "frame" => {
+                    self.insert_element(tag, attributes.clone());
+                    self.open_elements.pop();
+                }
+                "noframes" => self.in_head(token),
+                _ => {}
+            },
+            HtmlToken::EndTag { ref tag } if tag == "frameset" => {
+                if self.open_elements.len() > 1 {
+                    self.open_elements.pop();
+                }
+                if self.fragment_context.is_none() && !self.current_is("frameset") {
+                    self.mode = InsertionMode::AfterFrameset;
                 }
             }
             _ => {}
         }
     }
 
-    fn pop_current_node(&mut self, element_kind: ElementKind) -> bool {
-        let current = match self.stack_of_open_elements.last() {
-            Some(n) => n,
-            None => return false,
-        };
-
-        if current.borrow().element_kind() == Some(element_kind) {
-            self.stack_of_open_elements.pop();
-            return true;
+    fn in_after_frameset(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char(c) if is_space(c) => self.insert_char(c),
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::StartTag { ref tag, .. } if tag == "noframes" => self.in_head(token),
+            HtmlToken::EndTag { ref tag } if tag == "html" => {
+                self.mode = InsertionMode::AfterAfterFrameset;
+            }
+            _ => {}
         }
-
-        false
     }
 
-    fn create_char(&self, c: char) -> Node {
-        let mut s = String::new();
-        s.push(c);
-        Node::new(NodeKind::Text(s))
+    fn in_after_after_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Comment(text) => {
+                append_child(&self.document(), new_node(NodeKind::Comment(text)));
+            }
+            HtmlToken::Doctype { .. } => self.in_body(token),
+            HtmlToken::Char(c) if is_space(c) => self.in_body(token),
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::Eof => {}
+            other => {
+                self.mode = InsertionMode::InBody;
+                self.process_in_mode(self.mode, other);
+            }
+        }
     }
 
-    // insert_char adds a new text node to the DOM tree.
-    // 1. Get the last element from the stack of open elements. This node called "current".
-    // 2. If the stack is empty, it trys to add the text node to the root element. This is not appropriate, so it returns.
-    // 3. If the current node is NodeKind::Text, then add the text to the current node and return.
-    // 4. If the current node is not NodeKind::Text, then create a new text node.
-    // 5/6. If the current node has already a child node, then add the new node to the last child node.
-    // 7/8. If the brother node is not found, then set the new node as the first child node of the current node.
-    // 9. Set the new node as the last child node of the current node.
-    // 10. Set the parent node of the new node as the current node.(Rc::downgrade)
-    // 11. Lastly, push the new node to the stack of open elements.
-    // NOTE: The specification doesn't add the text node to the stack of open elements.
-    // https://html.spec.whatwg.org/multipage/parsing.html#insert-a-character
-    // Although our implementation of insert_char is different from the specification, basic behavior is the same.
-    fn insert_char(&mut self, c: char) {
-        let current = match self.stack_of_open_elements.last() {
-            // 1
-            Some(n) => n.clone(),
-            None => return, // 2
-        };
+    fn in_after_after_frameset(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Comment(text) => {
+                append_child(&self.document(), new_node(NodeKind::Comment(text)));
+            }
+            HtmlToken::Doctype { .. } => self.in_body(token),
+            HtmlToken::Char(c) if is_space(c) => self.in_body(token),
+            HtmlToken::StartTag { ref tag, .. } if tag == "html" => self.in_body(token),
+            HtmlToken::StartTag { ref tag, .. } if tag == "noframes" => self.in_head(token),
+            _ => {}
+        }
+    }
 
-        // If the current node is NodeKind::Text, then add the text to it.
-        if let NodeKind::Text(ref mut s) = current.borrow_mut().kind {
-            // 3
-            s.push(c);
+    /// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inforeign
+    fn process_foreign(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Char('\0') => self.insert_char('\u{fffd}'),
+            HtmlToken::Char(c) if is_space(c) => self.insert_char(c),
+            HtmlToken::Char(c) => {
+                self.insert_char(c);
+                self.frameset_ok = false;
+            }
+            HtmlToken::Comment(text) => self.insert_comment(text),
+            HtmlToken::Doctype { .. } => {}
+            HtmlToken::StartTag { ref tag, ref attributes, .. }
+                if breaks_out_of_foreign(tag, attributes) =>
+            {
+                while let Some(node) = self.current() {
+                    if is_mathml_text_integration(&node)
+                        || is_html_integration(&node)
+                        || namespace_of(&node) == Namespace::Html
+                    {
+                        break;
+                    }
+                    self.open_elements.pop();
+                }
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::StartTag { .. } => self.foreign_start_tag(token),
+            HtmlToken::EndTag { ref tag } if tag == "br" || tag == "p" => {
+                while let Some(node) = self.current() {
+                    if is_mathml_text_integration(&node)
+                        || is_html_integration(&node)
+                        || namespace_of(&node) == Namespace::Html
+                    {
+                        break;
+                    }
+                    self.open_elements.pop();
+                }
+                self.process_in_mode(self.mode, token);
+            }
+            HtmlToken::EndTag { ref tag } => {
+                let mut index = self.open_elements.len();
+                while index > 0 {
+                    index -= 1;
+                    let node = self.open_elements[index].clone();
+                    if index == 0 {
+                        return;
+                    }
+                    if tag_of(&node).eq_ignore_ascii_case(tag) {
+                        self.open_elements.truncate(index);
+                        return;
+                    }
+                    if namespace_of(&self.open_elements[index - 1]) == Namespace::Html {
+                        self.process_in_mode(self.mode, token);
+                        return;
+                    }
+                }
+            }
+            HtmlToken::Eof => self.process_in_mode(self.mode, HtmlToken::Eof),
+        }
+    }
+
+    fn foreign_start_tag(&mut self, token: HtmlToken) {
+        let HtmlToken::StartTag { tag, self_closing, mut attributes } = token else {
             return;
-        }
-
-        // Collapse whitespace: skip space/newline that would create a new text node.
-        // Preserve a single space between inline siblings as a word separator.
-        if c == '\n' || c == ' ' {
-            // Never create whitespace text nodes inside table structural elements.
-            let parent_kind = current.borrow().element_kind();
-            if matches!(
-                parent_kind,
-                Some(ElementKind::Table)
-                    | Some(ElementKind::Tr)
-                    | Some(ElementKind::Head)
-                    | Some(ElementKind::Html)
-                    | Some(ElementKind::Ul)
-                    | Some(ElementKind::Dl)
-            ) {
-                return;
-            }
-            if current.borrow().first_child().is_none() {
-                return;
-            }
-            // Find the last child and check if it is a text node.
-            let last_child = current.borrow().last_child().upgrade();
-            let last_child_is_text = last_child
-                .as_ref()
-                .map(|n| matches!(n.borrow().kind(), NodeKind::Text(_)))
-                .unwrap_or(false);
-            // If the last child is already a text node, the space was already
-            // handled (appended to that text node) in the branch above.
-            // If the last child is an element, create a space text node as separator.
-            if last_child_is_text {
-                return;
-            }
-        }
-
-        let node = Rc::new(RefCell::new(self.create_char(c))); // 4
-
-        if current.borrow().first_child().is_some() {
-            // Traverse to the last sibling, then append the new text node.
-            let mut last_sibling = current.borrow().first_child();
-            loop {
-                last_sibling = match last_sibling {
-                    Some(ref n) => {
-                        if n.borrow().next_sibling().is_some() {
-                            n.borrow().next_sibling()
-                        } else {
-                            break;
-                        }
-                    }
-                    None => break,
-                };
-            }
-            if let Some(ref last) = last_sibling {
-                last.borrow_mut().set_next_sibling(Some(node.clone()));
-                node.borrow_mut()
-                    .set_previous_sibling(Rc::downgrade(last));
-            }
-        } else {
-            current.borrow_mut().set_first_child(Some(node.clone()));
-        }
-
-        current.borrow_mut().set_last_child(Rc::downgrade(&node));
-        node.borrow_mut().set_parent(Rc::downgrade(&current));
-
-        self.stack_of_open_elements.push(node);
-    }
-
-    fn create_element(&self, tag: &str, attributes: Vec<Attribute>) -> Node {
-        Node::new(NodeKind::Element(Element::new(tag, attributes)))
-    }
-
-    // insert_element adds a new element to the DOM tree.
-    // 1. Get the last element from the stack of open elements. This node called "current".
-    // 2. If the stack is empty, root element is current.
-    // 3. Create a new node and store it to the node variable formatted as RC<RefCell<Node>> to wrap the node.
-    // 4/5/6. If the current node has already a child node, then add the new node to the last child node after finding the brother node.
-    // 7/8. If the brother node is not found, then set the new node as the first child node of the current node.
-    // 9. Set the new node as the last child node of the current node.
-    // 10. Set the parent node of the new node as the current node.
-    //     These steps are necessary to prevent the circular reference.(Rc::downgrade)
-    // 11. Lastly, push the new node to the stack of open elements.
-    // ref. https://html.spec.whatwg.org/multipage/parsing.html#insert-a-foreign-element
-    fn insert_element(&mut self, tag: &str, attributes: Vec<Attribute>) {
-        // If the current node is a Text node, pop it first so that the new element
-        // becomes a sibling of the text rather than a child of it.
-        if let Some(top) = self.stack_of_open_elements.last() {
-            if matches!(top.borrow().kind(), NodeKind::Text(_)) {
-                self.stack_of_open_elements.pop();
-            }
-        }
-
-        let window = self.window.borrow();
-        let current = match self.stack_of_open_elements.last() {
-            // 1
-            Some(n) => n.clone(),
-            None => window.document(), // 2
         };
-        let node = Rc::new(RefCell::new(self.create_element(tag, attributes))); // 3
-
-        if current.borrow().first_child().is_some() {
-            // 4
-            let mut last_sibling = current.borrow().first_child();
-            loop {
-                // 5
-                last_sibling = match last_sibling {
-                    Some(ref node) => {
-                        if node.borrow().next_sibling().is_some() {
-                            node.borrow().next_sibling()
-                        } else {
-                            break;
-                        }
-                    }
-                    None => unimplemented!("last_sibling should be Some."),
-                }
-            }
-
-            last_sibling
-                .as_ref()
-                .unwrap()
-                .borrow_mut()
-                .set_next_sibling(Some(node.clone())); // 6
-            node.borrow_mut().set_previous_sibling(Rc::downgrade(
-                &last_sibling.expect("last_sibling should be Some"),
-            ))
-        } else {
-            // 7
-            current.borrow_mut().set_first_child(Some(node.clone())); // 8
+        let namespace = self
+            .adjusted_current()
+            .map(|n| namespace_of(&n))
+            .unwrap_or(Namespace::Html);
+        let svg = namespace == Namespace::Svg;
+        let tag = if svg { adjust_svg_tag(&tag).to_string() } else { tag };
+        adjust_foreign_attributes(&mut attributes, svg);
+        self.insert_foreign_element(&tag, attributes, namespace);
+        if self_closing {
+            self.open_elements.pop();
         }
-
-        current.borrow_mut().set_last_child(Rc::downgrade(&node)); // 9
-        node.borrow_mut().set_parent(Rc::downgrade(&current)); // 10
-
-        self.stack_of_open_elements.push(node); // 11
     }
+}
 
-    pub fn construct_tree(&mut self) -> Rc<RefCell<Window>> {
-        let mut token = self.t.next();
+fn is_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ')
+}
 
-        while token.is_some() {
-            match self.mode {
-                InsertionMode::Initial => {
-                    // DOCTYPE is not supported in this version.
-                    // So, a token like `<!DOCTYPE html>` displays as a string token.
-                    // The string token is ignored.
-                    if let Some(HtmlToken::Char(_)) = token {
-                        token = self.t.next();
-                        continue;
-                    }
+/// Which DOCTYPEs put a document in quirks mode.
+/// https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode
+fn doctype_means_quirks(public_id: Option<&str>, system_id: Option<&str>) -> bool {
+    let public = public_id.unwrap_or("").to_ascii_lowercase();
+    let system = system_id.unwrap_or("").to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        "-//w3o//dtd w3 html strict 3.0//en//",
+        "-/w3c/dtd html 4.0 transitional/en",
+        "html",
+    ];
+    const PREFIXES: &[&str] = &[
+        "+//silmaril//dtd html pro v0r11 19970101//",
+        "-//as//dtd html 3.0 aswedit + extensions//",
+        "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+        "-//ietf//dtd html 2.0",
+        "-//ietf//dtd html 3",
+        "-//ietf//dtd html level 0",
+        "-//ietf//dtd html level 1",
+        "-//ietf//dtd html level 2",
+        "-//ietf//dtd html level 3",
+        "-//ietf//dtd html strict",
+        "-//ietf//dtd html//",
+        "-//metrius//dtd metrius presentational//",
+        "-//microsoft//dtd internet explorer 2.0",
+        "-//microsoft//dtd internet explorer 3.0",
+        "-//netscape comm. corp.//dtd html//",
+        "-//netscape comm. corp.//dtd strict html//",
+        "-//o'reilly and associates//dtd html",
+        "-//softquad",
+        "-//spyglass//dtd html 2.0 extended//",
+        "-//sq//dtd html 2.0 hotmetal + extensions//",
+        "-//sun microsystems corp.//dtd hotjava",
+        "-//w3c//dtd html 3",
+        "-//w3c//dtd html 4.0 frameset//",
+        "-//w3c//dtd html 4.0 transitional//",
+        "-//w3c//dtd w3 html//",
+        "-//w3o//dtd w3 html 3.0//",
+        "-//webtechs//dtd mozilla html",
+    ];
+    if EXACT.contains(&public.as_str())
+        || PREFIXES.iter().any(|p| public.starts_with(p))
+        || system == "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd"
+    {
+        return true;
+    }
+    system_id.is_none()
+        && (public.starts_with("-//w3c//dtd html 4.01 frameset//")
+            || public.starts_with("-//w3c//dtd html 4.01 transitional//"))
+}
 
-                    self.mode = InsertionMode::BeforeHtml;
-                    continue;
-                }
+fn new_node(kind: NodeKind) -> NodeRef {
+    Rc::new(RefCell::new(Node::new(kind)))
+}
 
-                // BeforeHtml handles mainly <html> tag.
-                // 1. If the token is a space character or return character, ignore the token and move to the next token.
-                // 2. If the token is a start tag token whose tag name is "html", then add a new node to the DOM tree.
-                //    And change the insertion mode to "BeforeHead".
-                // 3. When the token is EOF, return the DOM tree.
-                // 4. Otherwise, add the HTML element to the DOM tree.
-                InsertionMode::BeforeHtml => {
-                    match token {
-                        Some(HtmlToken::Char(c)) => {
-                            if c == ' ' || c == '\n' {
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::StartTag {
-                            ref tag,
-                            self_closing: _,
-                            ref attributes,
-                        }) => {
-                            if tag == "html" {
-                                self.insert_element(tag, attributes.to_vec());
-                                self.mode = InsertionMode::BeforeHead;
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::EndTag { ref tag }) => {
-                            if tag != "head" || tag != "body" || tag != "html" || tag != "br" {
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                    }
-                    self.insert_element("html", Vec::new());
-                    self.mode = InsertionMode::BeforeHead;
-                    continue;
-                }
-
-                // BeforeHead handles mainly <head> tag.
-                // 1. If the token is a space character or return character, ignore the token and move to the next token.
-                // 2. If the token is a start tag token whose tag name is "head", then add a new node to the DOM tree.
-                //    And change the insertion mode to "InHead".
-                // 3. Otherwise, add the HTML element to the DOM tree.
-                InsertionMode::BeforeHead => {
-                    match token {
-                        Some(HtmlToken::Char(c)) => {
-                            if c == ' ' || c == '\n' {
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::StartTag {
-                            ref tag,
-                            self_closing: _,
-                            ref attributes,
-                        }) => {
-                            if tag == "head" {
-                                self.insert_element(tag, attributes.to_vec());
-                                self.mode = InsertionMode::InHead;
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                        _ => {}
-                    }
-                    self.insert_element("head", Vec::new());
-                    self.mode = InsertionMode::InHead;
-                    continue;
-                }
-
-                // InHead handles mainly end tag of <head> and start tag of <style> and <script>.
-                // 1. If the token is a space character or return character, ignore the token and move to the next token.
-                // 2. If the token is a start tag token whose tag name is "style" or "script", then add a new node to the DOM tree.
-                //    And change the insertion mode to "Text".
-                // NOTE: According to the specification, <style> and <script> tags are not same, but they are treated as same in this version.
-                // 5. If the token is an end tag token whose tag name is "head", then change the insertion mode to "AfterHead".
-                // 6. Otherwise, ignore the token and move to the next token.
-                InsertionMode::InHead => {
-                    match token {
-                        Some(HtmlToken::Char(c)) => {
-                            if c == ' ' || c == '\n' {
-                                self.insert_char(c);
-                                token = self.t.next();
-                                continue;
-                            }
-                            // Anything else: close the head and reprocess in
-                            // AfterHead — stray text before <body> belongs to
-                            // the body, not on the floor (it used to be
-                            // silently dropped here).
-                            self.pop_until(ElementKind::Head);
-                            self.mode = InsertionMode::AfterHead;
-                            continue;
-                        }
-                        Some(HtmlToken::StartTag {
-                            ref tag,
-                            self_closing: _,
-                            ref attributes,
-                        }) => {
-                            if tag == "style" || tag == "script" || tag == "title" {
-                                self.insert_element(tag, attributes.to_vec());
-                                self.original_insertion_mode = self.mode;
-                                self.mode = InsertionMode::Text;
-                                token = self.t.next();
-                                continue;
-                            }
-                            if tag == "link" {
-                                self.insert_element(tag, attributes.to_vec());
-                                self.pop_current_node(ElementKind::Link);
-                                token = self.t.next();
-                                continue;
-                            }
-                            if tag == "body" {
-                                self.pop_until(ElementKind::Head);
-                                self.mode = InsertionMode::AfterHead;
-                                continue;
-                            }
-                            if let Ok(element_kind) = ElementKind::from_str(tag) {
-                                if element_kind == ElementKind::Link
-                                    || element_kind == ElementKind::Style
-                                    || element_kind == ElementKind::Script
-                                    || element_kind == ElementKind::Title
-                                {
-                                    token = self.t.next();
-                                    continue;
-                                }
-                                self.pop_until(ElementKind::Head);
-                                self.mode = InsertionMode::AfterHead;
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::EndTag { ref tag }) => {
-                            if tag == "head" {
-                                self.mode = InsertionMode::AfterHead;
-                                token = self.t.next();
-                                self.pop_until(ElementKind::Head);
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                    }
-                    token = self.t.next();
-                    continue;
-                } // AfterHead handles mainly start tag of <body> tag.
-
-                // AfterHead handles mainly start tag of <body> tag.
-                // 1. If the token is a space character or return character, ignore the token and move to the next token.
-                // 2. If the token is a start tag token whose tag name is "body", then add a new node to the DOM tree.
-                //    And change the insertion mode to "InBody".
-                // 3. Otherwise, add the HTML element to the DOM tree.
-                InsertionMode::AfterHead => {
-                    match token {
-                        Some(HtmlToken::Char(c)) => {
-                            if c == ' ' || c == '\n' {
-                                self.insert_char(c);
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::StartTag {
-                            ref tag,
-                            self_closing: _,
-                            ref attributes,
-                        }) => {
-                            if tag == "body" {
-                                self.insert_element(tag, attributes.to_vec());
-                                token = self.t.next();
-                                self.mode = InsertionMode::InBody;
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                        _ => {}
-                    }
-                    self.insert_element("body", Vec::new());
-                    self.mode = InsertionMode::InBody;
-                    continue;
-                }
-
-                // InBody handles mainly <body> tag tag(like <p>, <div>, etc.).
-                InsertionMode::InBody => match token {
-                    Some(HtmlToken::StartTag {
-                        ref tag,
-                        self_closing: _,
-                        ref attributes,
-                    }) => match tag.as_str() {
-                        // Raw-content elements appearing in <body>: capture
-                        // their text via the Text insertion mode (mirrors the
-                        // InHead handling) instead of leaking it as page text.
-                        "style" | "script" | "title" => {
-                            self.insert_element(tag, attributes.to_vec());
-                            self.original_insertion_mode = self.mode;
-                            self.mode = InsertionMode::Text;
-                            token = self.t.next();
-                            continue;
-                        }
-                        t if Self::is_void_element(t) => {
-                            self.insert_element(tag, attributes.to_vec());
-                            self.pop_current_node_tag(tag);
-                            token = self.t.next();
-                            continue;
-                        }
-                        // Every other element — known or unknown — enters the
-                        // DOM with its real tag name. Unknown elements used to
-                        // be dropped here, which broke selector matching and
-                        // default styling for all HTML5 semantic tags.
-                        _ => {
-                            self.close_implicit(tag);
-                            self.insert_element(tag, attributes.to_vec());
-                            token = self.t.next();
-                            continue;
-                        }
-                    },
-                    Some(HtmlToken::EndTag { ref tag }) => match tag.as_str() {
-                        "body" => {
-                            self.mode = InsertionMode::AfterBody;
-                            token = self.t.next();
-                            if !self.contain_in_stack(ElementKind::Body) {
-                                continue;
-                            }
-                            self.pop_until(ElementKind::Body);
-                            continue;
-                        }
-                        "html" => {
-                            if self.pop_current_node(ElementKind::Body) {
-                                self.mode = InsertionMode::AfterBody;
-                                assert!(self.pop_current_node(ElementKind::Html));
-                            } else {
-                                token = self.t.next();
-                            }
-                            continue;
-                        }
-                        _ => {
-                            let tag = tag.clone();
-                            token = self.t.next();
-                            self.pop_until_tag(&tag);
-                            continue;
-                        }
-                    },
-                    Some(HtmlToken::Eof) | None => {
-                        return self.window.clone();
-                    }
-                    Some(HtmlToken::Char(c)) => {
-                        self.insert_char(c);
-                        token = self.t.next();
-                        continue;
-                    }
-                },
-
-                // Text handles mainly text content.
-                // 2. Add the text content to the DOM tree until the token is end of <style> or <script> tag.
-                InsertionMode::Text => {
-                    match token {
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                        Some(HtmlToken::EndTag { ref tag }) => {
-                            if tag == "style" {
-                                self.pop_until(ElementKind::Style);
-                                self.mode = self.original_insertion_mode;
-                                token = self.t.next();
-                                continue;
-                            }
-                            if tag == "script" {
-                                self.pop_until(ElementKind::Script);
-                                self.mode = self.original_insertion_mode;
-                                token = self.t.next();
-                                continue;
-                            }
-                            if tag == "title" {
-                                self.pop_until(ElementKind::Title);
-                                self.mode = self.original_insertion_mode;
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::Char(c)) => {
-                            self.insert_char(c);
-                            token = self.t.next();
-                            continue;
-                        }
-                        _ => {}
-                    }
-
-                    self.mode = self.original_insertion_mode;
-                }
-
-                // AfterBody handles mainly end of <html> tag.
-                // 1. If the token is a character token, then ignore the token and move to the next token.
-                // 2. If the token is an end of <html> tag, then change the insertion mode to "AfterAfterBody".
-                // 3. Otherwise, change the insertion mode to "InBody".
-                InsertionMode::AfterBody => {
-                    match token {
-                        Some(HtmlToken::Char(_c)) => {
-                            token = self.t.next();
-                            continue;
-                        }
-                        Some(HtmlToken::EndTag { ref tag }) => {
-                            if tag == "html" {
-                                self.mode = InsertionMode::AfterAfterBody;
-                                token = self.t.next();
-                                continue;
-                            }
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                        _ => {}
-                    }
-
-                    self.mode = InsertionMode::InBody;
-                }
-
-                // AfterAfterBody handles mainly end of the document.
-                // 1. If the token is a character token, then ignore the token and move to the next token.
-                // 2. If the token is EOF or None, then return the DOM tree.
-                // 3. Otherwise, change the insertion mode to "InBody" because the browser try to parse the HTML again if the content is not valid.
-                InsertionMode::AfterAfterBody => {
-                    match token {
-                        Some(HtmlToken::Char(_c)) => {
-                            token = self.t.next();
-                            continue;
-                        }
-                        Some(HtmlToken::Eof) | None => {
-                            return self.window.clone();
-                        }
-                        _ => {}
-                    }
-
-                    // Failed to parse the HTML. So, try to parse the HTML again.
-                    self.mode = InsertionMode::InBody;
-                }
+fn add_missing_attributes(node: &NodeRef, attributes: Vec<Attribute>) {
+    if let NodeKind::Element(ref mut element) = node.borrow_mut().kind {
+        for attribute in attributes {
+            if element.get_attribute(&attribute.name()).is_none() {
+                element.set_attribute(&attribute.name(), &attribute.value());
             }
         }
+    }
+}
 
-        self.window.clone()
+fn append_child(parent: &NodeRef, child: NodeRef) {
+    let last = parent.borrow().last_child().upgrade();
+    child.borrow_mut().set_parent(Rc::downgrade(parent));
+    match last {
+        Some(last) => {
+            child.borrow_mut().set_previous_sibling(Rc::downgrade(&last));
+            last.borrow_mut().set_next_sibling(Some(child.clone()));
+        }
+        None => parent.borrow_mut().set_first_child(Some(child.clone())),
+    }
+    parent.borrow_mut().set_last_child(Rc::downgrade(&child));
+}
+
+fn insert_before(parent: &NodeRef, child: NodeRef, before: &NodeRef) {
+    let previous = before.borrow().previous_sibling().upgrade();
+    child.borrow_mut().set_parent(Rc::downgrade(parent));
+    child.borrow_mut().set_next_sibling(Some(before.clone()));
+    before.borrow_mut().set_previous_sibling(Rc::downgrade(&child));
+    match previous {
+        Some(previous) => {
+            child.borrow_mut().set_previous_sibling(Rc::downgrade(&previous));
+            previous.borrow_mut().set_next_sibling(Some(child));
+        }
+        None => parent.borrow_mut().set_first_child(Some(child)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::string::ToString;
     use std::vec;
+
+    fn parse(html: &str) -> NodeRef {
+        let window = HtmlParser::new(HtmlTokenizer::new(html.to_string())).construct_tree();
+        let document = window.borrow().document();
+        document
+    }
+
+    /// Children of `node`, as tag names and quoted text.
+    fn outline(node: &NodeRef) -> String {
+        let mut parts = Vec::new();
+        let mut child = node.borrow().first_child();
+        while let Some(c) = child {
+            child = c.borrow().next_sibling();
+            match c.borrow().kind {
+                NodeKind::Element(ref e) => {
+                    let inner = outline(&c);
+                    if inner.is_empty() {
+                        parts.push(e.tag_name().to_string());
+                    } else {
+                        parts.push(format!("{}({})", e.tag_name(), inner));
+                    }
+                }
+                NodeKind::Text(ref t) => parts.push(format!("{t:?}")),
+                _ => {}
+            }
+        }
+        parts.join(" ")
+    }
 
     #[test]
     fn test_empty() {
-        let html = "".to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let expected = Rc::new(RefCell::new(Node::new(NodeKind::Document)));
-
-        assert_eq!(expected, window.borrow().document());
+        assert_eq!(outline(&parse("")), "html(head body)");
     }
 
     #[test]
     fn test_body() {
-        let html = "<html><head></head><body></body></html>".to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let document = window.borrow().document();
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Document))),
-            document
-        );
-
-        let html = document
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of document");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "html",
-                Vec::new()
-            ))))),
-            html
-        );
-
-        let head = html
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of html");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "head",
-                Vec::new()
-            ))))),
-            head
-        );
-
-        let body = head
-            .borrow()
-            .next_sibling()
-            .expect("failed to get a next sibling of head");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "body",
-                Vec::new()
-            ))))),
-            body
-        );
+        assert_eq!(outline(&parse("<html><head></head><body></body></html>")), "html(head body)");
     }
 
     #[test]
     fn test_text() {
-        let html = "<html><head></head><body>text</body></html>".to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let document = window.borrow().document();
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Document))),
-            document
-        );
+        assert_eq!(outline(&parse("<body>text</body>")), "html(head body(\"text\"))");
+    }
 
-        let html = document
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of document");
+    #[test]
+    fn implied_tags_appear() {
         assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "html",
-                Vec::new()
-            ))))),
-            html
-        );
-
-        let body = html
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of document")
-            .borrow()
-            .next_sibling()
-            .expect("failed to get a next sibling of head");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "body",
-                Vec::new()
-            ))))),
-            body
-        );
-
-        let text = body
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of document");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Text("text".to_string())))),
-            text
+            outline(&parse("<p>a<p>b<ul><li>c<li>d</ul>")),
+            "html(head body(p(\"a\") p(\"b\") ul(li(\"c\") li(\"d\"))))"
         );
     }
 
     #[test]
-    fn test_multiple_nodes() {
-        let html = "<html><head></head><body><p><a foo=bar>text</a></p></body></html>".to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let document = window.borrow().document();
+    fn table_parts_are_implied() {
+        assert_eq!(
+            outline(&parse("<table><tr><td>a<td>b<tr><td>c</table>")),
+            "html(head body(table(tbody(tr(td(\"a\") td(\"b\")) tr(td(\"c\"))))))"
+        );
+    }
 
+    #[test]
+    fn stray_table_text_is_foster_parented() {
+        assert_eq!(
+            outline(&parse("<table>x<tr><td>y</table>")),
+            "html(head body(\"x\" table(tbody(tr(td(\"y\"))))))"
+        );
+    }
+
+    #[test]
+    fn misnested_formatting_goes_through_the_adoption_agency() {
+        assert_eq!(
+            outline(&parse("<p>1<b>2<i>3</b>4</i>5</p>")),
+            "html(head body(p(\"1\" b(\"2\" i(\"3\")) i(\"4\") \"5\")))"
+        );
+        assert_eq!(
+            outline(&parse("<a>1<div>2</a>3</div>")),
+            "html(head body(a(\"1\") div(a(\"2\") \"3\")))"
+        );
+    }
+
+    #[test]
+    fn formatting_carries_across_blocks() {
+        assert_eq!(
+            outline(&parse("<b>a<p>b</p>c</b>d")),
+            "html(head body(b(\"a\" p(\"b\") \"c\") \"d\"))"
+        );
+    }
+
+    #[test]
+    fn head_content_stays_in_the_head() {
+        assert_eq!(
+            outline(&parse("<title>t</title><p>x")),
+            "html(head(title(\"t\")) body(p(\"x\")))"
+        );
+    }
+
+    #[test]
+    fn script_and_style_content_is_text() {
+        assert_eq!(
+            outline(&parse("<script>a<b>c</script><style>p>q{}</style>")),
+            "html(head(script(\"a<b>c\") style(\"p>q{}\")) body)"
+        );
+    }
+
+    #[test]
+    fn svg_gets_its_namespace_and_case() {
+        let document = parse("<svg viewbox='0 0 1 1'><lineargradient/><foreignobject><p>x</p></foreignobject></svg>");
+        assert_eq!(
+            outline(&document),
+            "html(head body(svg(linearGradient foreignObject(p(\"x\")))))"
+        );
         let body = document
             .borrow()
             .first_child()
-            .expect("failed to get a first child of document")
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of document")
-            .borrow()
-            .next_sibling()
-            .expect("failed to get a next sibling of head");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "body",
-                Vec::new()
-            ))))),
-            body
-        );
+            .and_then(|html| html.borrow().last_child().upgrade())
+            .expect("body");
+        let svg = body.borrow().first_child().expect("svg");
+        assert_eq!(namespace_of(&svg), Namespace::Svg);
+        assert_eq!(attribute_of(&svg, "viewBox").as_deref(), Some("0 0 1 1"));
+    }
 
-        let p = body
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of body");
+    #[test]
+    fn a_block_tag_breaks_out_of_svg() {
         assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "p",
-                Vec::new()
-            ))))),
-            p
-        );
-
-        let mut attr = Attribute::new();
-        attr.add_char('f', true);
-        attr.add_char('o', true);
-        attr.add_char('o', true);
-        attr.add_char('b', false);
-        attr.add_char('a', false);
-        attr.add_char('r', false);
-        let a = p
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of p");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-                "a",
-                vec![attr]
-            ))))),
-            a
-        );
-
-        let text = a
-            .borrow()
-            .first_child()
-            .expect("failed to get a first child of a");
-        assert_eq!(
-            Rc::new(RefCell::new(Node::new(NodeKind::Text("text".to_string())))),
-            text
+            outline(&parse("<svg><circle/><div>x</div>")),
+            "html(head body(svg(circle) div(\"x\")))"
         );
     }
+
+    #[test]
+    fn frameset_replaces_the_body() {
+        assert_eq!(
+            outline(&parse("<frameset><frame src=a><frame src=b></frameset>")),
+            "html(head frameset(frame frame))"
+        );
+    }
+
+    #[test]
+    fn fragment_parses_into_its_context() {
+        let nodes = HtmlParser::parse_fragment("div", "<p>a<p>b".to_string());
+        assert_eq!(nodes.len(), 2);
+        let nodes = HtmlParser::parse_fragment("tr", "<td>a<td>b".to_string());
+        assert_eq!(nodes.len(), 2);
+        assert!(is_html(&nodes[0], "td"));
+        let nodes = HtmlParser::parse_fragment("textarea", "<b>x".to_string());
+        assert!(matches!(nodes[0].borrow().kind, NodeKind::Text(ref t) if t == "<b>x"));
+    }
+
+    #[test]
+    fn newline_after_pre_is_dropped() {
+        assert_eq!(
+            outline(&parse("<pre>\na</pre><textarea>\nb</textarea>")),
+            "html(head body(pre(\"a\") textarea(\"b\")))"
+        );
+    }
+
     #[test]
     fn test_form_controls() {
-        let html = "<html><head></head><body><form><input value=foo /><button>Go</button><img src=hero.png /></form></body></html>".to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let document = window.borrow().document();
-
-        let body = document
-            .borrow()
-            .first_child()
-            .expect("html should exist")
-            .borrow()
-            .first_child()
-            .expect("head should exist")
-            .borrow()
-            .next_sibling()
-            .expect("body should exist");
-        let form = body.borrow().first_child().expect("form should exist");
-        assert_eq!(form.borrow().element_kind(), Some(ElementKind::Form));
-
-        let input = form.borrow().first_child().expect("input should exist");
-        assert_eq!(input.borrow().element_kind(), Some(ElementKind::Input));
-
-        let button = input
-            .borrow()
-            .next_sibling()
-            .expect("button should exist");
-        assert_eq!(button.borrow().element_kind(), Some(ElementKind::Button));
-
-        let image = button
-            .borrow()
-            .next_sibling()
-            .expect("image should exist");
-        assert_eq!(image.borrow().element_kind(), Some(ElementKind::Img));
+        let _ = vec![0];
+        assert_eq!(
+            outline(&parse("<form><input><button>b</button></form>")),
+            "html(head body(form(input button(\"b\"))))"
+        );
     }
 
     #[test]
-    fn test_unknown_and_html5_elements_enter_dom_with_real_tags() {
-        let html = "<html><head></head><body><nav>menu</nav><article><wix-image>x</wix-image></article></body></html>"
-            .to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let document = window.borrow().document();
-
-        let body = document
-            .borrow()
-            .first_child()
-            .expect("html should exist")
-            .borrow()
-            .first_child()
-            .expect("head should exist")
-            .borrow()
-            .next_sibling()
-            .expect("body should exist");
-
-        let nav = body.borrow().first_child().expect("nav should exist");
+    fn test_unknown_and_html5_elements_keep_their_real_tags() {
         assert_eq!(
-            nav.borrow().element_tag_name(),
-            Some("nav".to_string())
+            outline(&parse("<nav><x-widget>a</x-widget></nav>")),
+            "html(head body(nav(x-widget(\"a\"))))"
         );
-        assert_eq!(nav.borrow().element_kind(), Some(ElementKind::Unknown));
-
-        let article = nav.borrow().next_sibling().expect("article should exist");
-        assert_eq!(
-            article.borrow().element_tag_name(),
-            Some("article".to_string())
-        );
-
-        // The custom element nests inside <article>: its end tag pops it, so
-        // following content would go back to article, and the element keeps
-        // its author-given name.
-        let custom = article
-            .borrow()
-            .first_child()
-            .expect("custom element should exist");
-        assert_eq!(
-            custom.borrow().element_tag_name(),
-            Some("wix-image".to_string())
-        );
-        let text = custom.borrow().first_child().expect("text should exist");
-        assert!(matches!(text.borrow().kind(), NodeKind::Text(ref s) if s == "x"));
     }
 
     #[test]
-    fn test_unknown_end_tag_pops_matching_element_only() {
-        // </b> must not close the unknown element; </my-tag> must.
-        let html =
-            "<html><head></head><body><my-tag><b>bold</b>tail</my-tag>after</body></html>"
-                .to_string();
-        let t = HtmlTokenizer::new(html);
-        let window = HtmlParser::new(t).construct_tree();
-        let document = window.borrow().document();
-
-        let body = document
-            .borrow()
-            .first_child()
-            .expect("html should exist")
-            .borrow()
-            .first_child()
-            .expect("head should exist")
-            .borrow()
-            .next_sibling()
-            .expect("body should exist");
-
-        let my_tag = body.borrow().first_child().expect("my-tag should exist");
+    fn an_unknown_end_tag_closes_only_its_own_element() {
         assert_eq!(
-            my_tag.borrow().element_tag_name(),
-            Some("my-tag".to_string())
+            outline(&parse("<div><x-a><p>t</x-b></p></x-a></div>")),
+            "html(head body(div(x-a(p(\"t\")))))"
         );
-
-        let b = my_tag.borrow().first_child().expect("b should exist");
-        assert_eq!(b.borrow().element_kind(), Some(ElementKind::B));
-        // "tail" is still inside my-tag, "after" is a sibling of my-tag.
-        let tail = b.borrow().next_sibling().expect("tail text should exist");
-        assert!(matches!(tail.borrow().kind(), NodeKind::Text(ref s) if s == "tail"));
-        let after = my_tag.borrow().next_sibling().expect("after text");
-        assert!(matches!(after.borrow().kind(), NodeKind::Text(ref s) if s == "after"));
     }
 }
-
-
-
-
-

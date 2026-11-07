@@ -2,31 +2,29 @@
 //! tree-construction corpus (saba/testdata/html5lib-tests/, last upstream
 //! revision before the corpus moved to WPT).
 //!
-//! The engine's parser implements a subset of the spec (no comments, no
-//! doctype nodes, no namespaces, no fragment parsing, no adoption agency),
-//! so most cases fail today. This runner asserts the pass count never
-//! DECREASES: raise `BASELINE_PASSES` whenever parser work lands, never
-//! lower it. Per-file counts print with `cargo test -p cosmo_engine
-//! --test html5lib -- --nocapture`.
+//! This runner asserts the pass count never DECREASES: raise `BASELINE_PASSES`
+//! whenever parser work lands, never lower it. Per-file counts print with
+//! `cargo test -p cosmo_engine --test html5lib -- --nocapture`.
 
-use cosmo_engine::renderer::dom::node::{Node, NodeKind};
+use cosmo_engine::renderer::dom::node::{Namespace, Node, NodeKind};
 use cosmo_engine::renderer::html::parser::HtmlParser;
 use cosmo_engine::renderer::html::token::HtmlTokenizer;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-/// Minimum number of corpus cases that must pass. Measured on 2026-07-13;
+/// Minimum number of corpus cases that must pass. Measured on 2026-11-07;
 /// raise together with parser improvements (plan 2.6 targets >= 85% of
 /// non-script, non-fragment cases).
-const BASELINE_PASSES: usize = 79;
+const BASELINE_PASSES: usize = 1752;
 
 struct Case {
     file: String,
     data: String,
     expected: String,
     script_dependent: bool,
-    fragment: bool,
+    /// The context element for a fragment case: its namespace prefix, if any, and tag.
+    fragment: Option<String>,
 }
 
 fn parse_dat(file: &str, content: &str) -> Vec<Case> {
@@ -34,13 +32,13 @@ fn parse_dat(file: &str, content: &str) -> Vec<Case> {
     let mut section = "";
     let mut data = String::new();
     let mut document = String::new();
-    let mut fragment = false;
+    let mut fragment: Option<String> = None;
     let mut script_dependent = false;
     let mut in_case = false;
 
     let mut flush = |data: &mut String,
                      document: &mut String,
-                     fragment: &mut bool,
+                     fragment: &mut Option<String>,
                      script: &mut bool,
                      in_case: &mut bool| {
         if *in_case {
@@ -55,12 +53,12 @@ fn parse_dat(file: &str, content: &str) -> Vec<Case> {
                 data: d,
                 expected: doc,
                 script_dependent: *script,
-                fragment: *fragment,
+                fragment: fragment.take(),
             });
         }
         data.clear();
         document.clear();
-        *fragment = false;
+        *fragment = None;
         *script = false;
         *in_case = false;
     };
@@ -78,11 +76,11 @@ fn parse_dat(file: &str, content: &str) -> Vec<Case> {
                 script_dependent = true;
                 section = "script";
             }
-            "#script-off" => section = "script",
-            "#document-fragment" => {
-                fragment = true;
-                section = "fragment";
+            "#script-off" => {
+                script_dependent = true;
+                section = "script";
             }
+            "#document-fragment" => section = "fragment",
             _ => match section {
                 "data" => {
                     data.push_str(line);
@@ -92,6 +90,7 @@ fn parse_dat(file: &str, content: &str) -> Vec<Case> {
                     document.push_str(line);
                     document.push('\n');
                 }
+                "fragment" => fragment = Some(line.trim().to_string()),
                 _ => {}
             },
         }
@@ -100,26 +99,79 @@ fn parse_dat(file: &str, content: &str) -> Vec<Case> {
     cases
 }
 
+/// `xlink:href` on a foreign element serializes as `xlink href`, the format's way
+/// of showing an attribute's namespace.
+fn foreign_attribute_name(name: &str) -> String {
+    match name {
+        "xlink:actuate" | "xlink:arcrole" | "xlink:href" | "xlink:role" | "xlink:show"
+        | "xlink:title" | "xlink:type" | "xml:lang" | "xml:space" | "xmlns:xlink" => {
+            name.replacen(':', " ", 1)
+        }
+        other => other.to_string(),
+    }
+}
+
 fn serialize(node: &Option<Rc<RefCell<Node>>>, depth: usize, out: &mut String) {
     let mut current = node.clone();
     while let Some(n) = current {
+        let mut template_depth = None;
         match n.borrow().kind() {
             NodeKind::Document => {}
+            NodeKind::Comment(ref text) => {
+                out.push_str("| ");
+                out.push_str(&"  ".repeat(depth));
+                out.push_str("<!-- ");
+                out.push_str(text);
+                out.push_str(" -->\n");
+            }
+            NodeKind::Doctype { ref name, ref public_id, ref system_id } => {
+                out.push_str("| ");
+                out.push_str(&"  ".repeat(depth));
+                out.push_str("<!DOCTYPE ");
+                out.push_str(name);
+                if !public_id.is_empty() || !system_id.is_empty() {
+                    out.push_str(&format!(" \"{public_id}\" \"{system_id}\""));
+                }
+                out.push_str(">\n");
+            }
             NodeKind::Element(ref e) => {
                 out.push_str("| ");
                 out.push_str(&"  ".repeat(depth));
                 out.push('<');
+                match e.namespace() {
+                    Namespace::Html => {}
+                    Namespace::Svg => out.push_str("svg "),
+                    Namespace::MathMl => out.push_str("math "),
+                }
                 out.push_str(e.tag_name());
                 out.push_str(">\n");
-                let mut attrs = e.attributes();
-                attrs.sort_by(|a, b| a.name().cmp(&b.name()));
-                for a in attrs {
+                let mut attrs: Vec<(String, String)> = e
+                    .attributes()
+                    .iter()
+                    .map(|a| {
+                        let name = if e.namespace() == Namespace::Html {
+                            a.name()
+                        } else {
+                            foreign_attribute_name(&a.name())
+                        };
+                        (name, a.value())
+                    })
+                    .collect();
+                attrs.sort();
+                for (name, value) in attrs {
                     out.push_str("| ");
                     out.push_str(&"  ".repeat(depth + 1));
-                    out.push_str(&a.name());
+                    out.push_str(&name);
                     out.push_str("=\"");
-                    out.push_str(&a.value());
+                    out.push_str(&value);
                     out.push_str("\"\n");
+                }
+                // A template's children live in its content document.
+                if e.tag_name() == "template" && e.namespace() == Namespace::Html {
+                    out.push_str("| ");
+                    out.push_str(&"  ".repeat(depth + 1));
+                    out.push_str("content\n");
+                    template_depth = Some(depth + 2);
                 }
             }
             NodeKind::Text(ref t) => {
@@ -130,14 +182,22 @@ fn serialize(node: &Option<Rc<RefCell<Node>>>, depth: usize, out: &mut String) {
                 out.push_str("\"\n");
             }
         }
-        let child_depth = match n.borrow().kind() {
+        let child_depth = template_depth.unwrap_or_else(|| match n.borrow().kind() {
             NodeKind::Document => depth,
             _ => depth + 1,
-        };
+        });
         serialize(&n.borrow().first_child(), child_depth, out);
         let next = n.borrow().next_sibling();
         current = next;
     }
+}
+
+/// Serialize a node and its subtree, leaving its siblings out.
+fn serialize_one(node: &Rc<RefCell<Node>>, depth: usize, out: &mut String) {
+    let next = node.borrow().next_sibling();
+    node.borrow_mut().set_next_sibling(None);
+    serialize(&Some(node.clone()), depth, out);
+    node.borrow_mut().set_next_sibling(next);
 }
 
 #[test]
@@ -165,20 +225,41 @@ fn tree_construction_corpus() {
         let mut file_pass = 0usize;
         let mut file_total = 0usize;
         for case in parse_dat(&file, &content) {
-            if case.fragment || case.script_dependent {
+            if case.script_dependent {
                 skipped += 1;
                 continue;
             }
             total += 1;
             file_total += 1;
-            let window = HtmlParser::new(HtmlTokenizer::new(case.data.clone())).construct_tree();
-            let document = window.borrow().document();
             let mut actual = String::new();
-            serialize(&document.borrow().first_child(), 0, &mut actual);
+            match &case.fragment {
+                Some(context) => {
+                    let (namespace, tag) = match context.split_once(' ') {
+                        Some(("svg", tag)) => (Namespace::Svg, tag),
+                        Some(("math", tag)) => (Namespace::MathMl, tag),
+                        _ => (Namespace::Html, context.as_str()),
+                    };
+                    let nodes =
+                        HtmlParser::parse_fragment_in(tag, namespace, case.data.clone());
+                    for node in nodes {
+                        let mut single = String::new();
+                        serialize_one(&node, 0, &mut single);
+                        actual.push_str(&single);
+                    }
+                }
+                None => {
+                    let window =
+                        HtmlParser::new(HtmlTokenizer::new(case.data.clone())).construct_tree();
+                    let document = window.borrow().document();
+                    serialize(&document.borrow().first_child(), 0, &mut actual);
+                }
+            }
             let actual = actual.trim_end_matches('\n');
             if actual == case.expected {
                 passed += 1;
                 file_pass += 1;
+            } else if std::env::var("HTML5LIB_SHOW").as_deref() == Ok(file.as_str()) {
+                println!("--- {}\n--- expected\n{}\n--- actual\n{}", case.data, case.expected, actual);
             }
         }
         println!("{file}: {file_pass}/{file_total}");

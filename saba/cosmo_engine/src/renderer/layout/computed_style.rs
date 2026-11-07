@@ -11,6 +11,7 @@ use std::vec::Vec;
 use std::cell::RefCell;
 
 use crate::renderer::css::token::CssToken;
+use crate::renderer::text::face::{FontClass, TextFace};
 
 /// Per-element CSS custom-property scope, shared copy-on-write between
 /// elements (children clone the Rc; an element that defines its own
@@ -88,6 +89,24 @@ pub struct ComputedStyle {
     font_size: Option<FontSize>,
     text_decoration: Option<TextDecoration>,
     bold: Option<bool>,
+    italic: Option<bool>,
+    letter_spacing: Option<f64>,
+    word_spacing: Option<f64>,
+    /// How `vertical-align` moves this box; not inherited.
+    vertical_align: Option<VerticalAlign>,
+    text_indent: Option<f64>,
+    outline: Option<Outline>,
+    text_shadow: Option<TextShadow>,
+    aspect_ratio: Option<f64>,
+    /// `width` as an expression involving the containing block (`calc(100% - 2em)`).
+    width_expr: Option<Rc<MathExpr>>,
+    height_expr: Option<Rc<MathExpr>>,
+    /// `width: fit-content` or `max-content`: shrink to the contents.
+    width_fit: bool,
+    /// `padding` and `margin` percentages, per side (top, right, bottom, left).
+    /// They resolve against the containing block's width during layout.
+    padding_ratio: [Option<f64>; 4],
+    margin_ratio: [Option<f64>; 4],
     visibility_hidden: Option<bool>,
     box_sizing_border_box: Option<bool>,
     /// `grid-template-areas` rows (each row a list of area names; "." = empty).
@@ -278,6 +297,102 @@ pub enum LineHeight {
     Px(f64),
     /// Multiplier of the element's own font size (from a number or %).
     Factor(f64),
+    /// `normal`: whatever the font says.
+    Normal,
+}
+
+/// `vertical-align`, in the forms this engine distinguishes.
+/// https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VerticalAlign {
+    Baseline,
+    /// Raised this many pixels; negative lowers it.
+    Raise(f64),
+    /// Raised by this fraction of the line-height.
+    RaiseRatio(f64),
+    Super,
+    Sub,
+    Middle,
+    TextTop,
+    TextBottom,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outline {
+    pub width: f64,
+    pub offset: f64,
+    pub color: Color,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextShadow {
+    pub x: f64,
+    pub y: f64,
+    pub color: Color,
+}
+
+/// A CSS math expression that may refer to the containing block, so it can only
+/// be worked out during layout.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MathExpr {
+    Px(f64),
+    /// A share of the containing block, as a ratio.
+    Ratio(f64),
+    Number(f64),
+    Add(Box<MathExpr>, Box<MathExpr>),
+    Sub(Box<MathExpr>, Box<MathExpr>),
+    Mul(Box<MathExpr>, Box<MathExpr>),
+    Div(Box<MathExpr>, Box<MathExpr>),
+    Min(Vec<MathExpr>),
+    Max(Vec<MathExpr>),
+    Clamp(Box<MathExpr>, Box<MathExpr>, Box<MathExpr>),
+}
+
+impl MathExpr {
+    pub fn eval(&self, containing: f64) -> f64 {
+        match self {
+            MathExpr::Px(v) | MathExpr::Number(v) => *v,
+            MathExpr::Ratio(r) => containing * r,
+            MathExpr::Add(a, b) => a.eval(containing) + b.eval(containing),
+            MathExpr::Sub(a, b) => a.eval(containing) - b.eval(containing),
+            MathExpr::Mul(a, b) => a.eval(containing) * b.eval(containing),
+            MathExpr::Div(a, b) => {
+                let divisor = b.eval(containing);
+                if divisor == 0.0 {
+                    0.0
+                } else {
+                    a.eval(containing) / divisor
+                }
+            }
+            MathExpr::Min(items) => items
+                .iter()
+                .map(|e| e.eval(containing))
+                .fold(f64::INFINITY, f64::min),
+            MathExpr::Max(items) => items
+                .iter()
+                .map(|e| e.eval(containing))
+                .fold(f64::NEG_INFINITY, f64::max),
+            MathExpr::Clamp(min, value, max) => {
+                let min = min.eval(containing);
+                value.eval(containing).min(max.eval(containing)).max(min)
+            }
+        }
+    }
+
+    pub fn has_ratio(&self) -> bool {
+        match self {
+            MathExpr::Ratio(_) => true,
+            MathExpr::Px(_) | MathExpr::Number(_) => false,
+            MathExpr::Add(a, b)
+            | MathExpr::Sub(a, b)
+            | MathExpr::Mul(a, b)
+            | MathExpr::Div(a, b) => a.has_ratio() || b.has_ratio(),
+            MathExpr::Min(items) | MathExpr::Max(items) => items.iter().any(Self::has_ratio),
+            MathExpr::Clamp(a, b, c) => a.has_ratio() || b.has_ratio() || c.has_ratio(),
+        }
+    }
 }
 
 /// One track of a grid template.
@@ -379,6 +494,19 @@ impl ComputedStyle {
             font_size: None,
             text_decoration: None,
             bold: None,
+            italic: None,
+            letter_spacing: None,
+            word_spacing: None,
+            vertical_align: None,
+            text_indent: None,
+            outline: None,
+            text_shadow: None,
+            aspect_ratio: None,
+            width_expr: None,
+            height_expr: None,
+            width_fit: false,
+            padding_ratio: [None; 4],
+            margin_ratio: [None; 4],
             visibility_hidden: None,
             box_sizing_border_box: None,
             list_style_type: None,
@@ -542,6 +670,21 @@ impl ComputedStyle {
             if self.bold.is_none() && parent_style.bold == Some(true) {
                 self.bold = Some(true);
             }
+            if self.italic.is_none() {
+                self.italic = parent_style.italic;
+            }
+            if self.letter_spacing.is_none() {
+                self.letter_spacing = parent_style.letter_spacing;
+            }
+            if self.word_spacing.is_none() {
+                self.word_spacing = parent_style.word_spacing;
+            }
+            if self.text_indent.is_none() {
+                self.text_indent = parent_style.text_indent;
+            }
+            if self.text_shadow.is_none() {
+                self.text_shadow = parent_style.text_shadow.clone();
+            }
             // visibility is inherited (a child may set visible to reappear
             // inside a hidden parent).
             if self.visibility_hidden.is_none() {
@@ -622,17 +765,12 @@ impl ComputedStyle {
                 Some(ElementKind::Button) | Some(ElementKind::Img) | Some(ElementKind::Input) => {
                     Color::lightgray()
                 }
-                Some(ElementKind::Body) => Color::white(),
                 // Use transparent default so parent backgrounds (e.g. body bgcolor) show through.
                 _ => Color::transparent(),
             });
         }
         if self.color.is_none() {
-            if node.borrow().element_kind() == Some(ElementKind::A) {
-                self.color = Some(Color::link_blue());
-            } else {
-                self.color = Some(Color::black());
-            }
+            self.color = Some(Color::black());
         }
         let is_textarea = node.borrow().element_tag_name().as_deref() == Some("textarea");
         if self.display.is_none() {
@@ -1334,6 +1472,142 @@ impl ComputedStyle {
         self.bold.unwrap_or(false)
     }
 
+    /// What this element's text is drawn in.
+    pub fn text_face(&self) -> TextFace {
+        TextFace {
+            class: self
+                .font_family
+                .as_deref()
+                .map(FontClass::from_name)
+                .unwrap_or_default(),
+            bold: self.is_bold(),
+            italic: self.italic.unwrap_or(false),
+            ..TextFace::default()
+        }
+        .with_spacing(self.letter_spacing.unwrap_or(0.0), self.word_spacing.unwrap_or(0.0))
+    }
+
+    pub fn set_italic(&mut self, italic: bool) {
+        self.italic = Some(italic);
+    }
+    /// The element's color so far, for properties defaulting to `currentColor`.
+    pub fn color_or_black(&self) -> Color {
+        self.color.clone().unwrap_or_else(Color::black)
+    }
+    pub fn is_italic(&self) -> bool {
+        self.italic.unwrap_or(false)
+    }
+    pub fn set_letter_spacing(&mut self, px: f64) {
+        self.letter_spacing = Some(px);
+    }
+    pub fn letter_spacing(&self) -> f64 {
+        self.letter_spacing.unwrap_or(0.0)
+    }
+    pub fn set_word_spacing(&mut self, px: f64) {
+        self.word_spacing = Some(px);
+    }
+    pub fn word_spacing(&self) -> f64 {
+        self.word_spacing.unwrap_or(0.0)
+    }
+    pub fn vertical_align(&self) -> VerticalAlign {
+        self.vertical_align.unwrap_or(VerticalAlign::Baseline)
+    }
+    pub fn set_vertical_align(&mut self, value: VerticalAlign) {
+        self.vertical_align = Some(value);
+    }
+    pub fn text_indent(&self) -> f64 {
+        self.text_indent.unwrap_or(0.0)
+    }
+    pub fn set_text_indent(&mut self, px: f64) {
+        self.text_indent = Some(px);
+    }
+    pub fn outline(&self) -> Option<&Outline> {
+        self.outline.as_ref()
+    }
+    pub fn set_outline(&mut self, outline: Option<Outline>) {
+        self.outline = outline;
+    }
+    pub fn text_shadow(&self) -> Option<&TextShadow> {
+        self.text_shadow.as_ref()
+    }
+    pub fn set_text_shadow(&mut self, shadow: Option<TextShadow>) {
+        self.text_shadow = shadow;
+    }
+    pub fn aspect_ratio(&self) -> Option<f64> {
+        self.aspect_ratio
+    }
+    pub fn set_aspect_ratio(&mut self, ratio: Option<f64>) {
+        self.aspect_ratio = ratio;
+    }
+    pub fn width_expr(&self) -> Option<&MathExpr> {
+        self.width_expr.as_deref()
+    }
+    pub fn set_width_expr(&mut self, expr: MathExpr) {
+        self.clear_width();
+        self.width_expr = Some(Rc::new(expr));
+        self.width_author = true;
+    }
+    pub fn height_expr(&self) -> Option<&MathExpr> {
+        self.height_expr.as_deref()
+    }
+    pub fn set_height_expr(&mut self, expr: MathExpr) {
+        self.clear_height();
+        self.height_expr = Some(Rc::new(expr));
+        self.height_author = true;
+    }
+    /// `width: auto`: back to whatever the box's context gives it.
+    pub fn clear_width(&mut self) {
+        self.width = None;
+        self.width_ratio = None;
+        self.width_expr = None;
+        self.width_fit = false;
+        self.width_author = false;
+    }
+    pub fn clear_height(&mut self) {
+        self.height = None;
+        self.height_ratio = None;
+        self.height_expr = None;
+        self.height_author = false;
+    }
+    pub fn width_is_fit(&self) -> bool {
+        self.width_fit
+    }
+    pub fn set_width_fit(&mut self) {
+        self.clear_width();
+        self.width_fit = true;
+    }
+    pub fn set_padding_ratio(&mut self, side: usize, ratio: Option<f64>) {
+        self.padding_ratio[side] = ratio;
+    }
+    pub fn set_margin_ratio(&mut self, side: usize, ratio: Option<f64>) {
+        self.margin_ratio[side] = ratio;
+    }
+    /// Turn `padding` and `margin` percentages into pixels, now that the
+    /// containing block's width is known.
+    pub fn resolve_percent_edges(&mut self, containing_width: i64) {
+        let resolve = |value: f64, ratio: Option<f64>| {
+            ratio.map(|r| containing_width as f64 * r).unwrap_or(value)
+        };
+        if self.padding_ratio.iter().any(Option::is_some) {
+            let p = self.padding_or_zero();
+            self.padding = Some(EdgeSize::from_values(
+                resolve(p.top(), self.padding_ratio[0]),
+                resolve(p.right(), self.padding_ratio[1]),
+                resolve(p.bottom(), self.padding_ratio[2]),
+                resolve(p.left(), self.padding_ratio[3]),
+            ));
+        }
+        if self.margin_ratio.iter().any(Option::is_some) {
+            let m = self.margin_or_default();
+            self.margin = Some(EdgeSize::from_values(
+                resolve(m.top(), self.margin_ratio[0]),
+                resolve(m.right(), self.margin_ratio[1]),
+                resolve(m.bottom(), self.margin_ratio[2]),
+                resolve(m.left(), self.margin_ratio[3]),
+            ));
+        }
+    }
+
     pub fn set_bold(&mut self, bold: bool) {
         self.bold = Some(bold);
     }
@@ -1606,12 +1880,14 @@ impl ComputedStyle {
         self.height = Some(height);
         self.height_author = true;
         self.height_ratio = None;
+        self.height_expr = None;
             self.height_target = None;
     }
 
     pub fn set_height_ratio(&mut self, ratio: f64) {
         self.height_ratio = Some(ratio);
         self.height = Some(0.0);
+        self.height_expr = None;
     }
 
     /// True when the author wrote a literal `height: 0` (not a percentage
@@ -1620,6 +1896,7 @@ impl ComputedStyle {
     pub fn explicit_zero_height(&self) -> bool {
         self.height_author
             && self.height_ratio.is_none()
+            && self.height_expr.is_none()
             && matches!(self.height, Some(h) if h == 0.0)
     }
 
@@ -1632,6 +1909,7 @@ impl ComputedStyle {
     pub fn explicit_zero_width(&self) -> bool {
         self.width_author
             && self.width_ratio.is_none()
+            && self.width_expr.is_none()
             && matches!(self.width, Some(w) if w == 0.0)
     }
 
@@ -1647,6 +1925,8 @@ impl ComputedStyle {
         self.width = Some(width);
         self.width_author = true;
         self.width_ratio = None;
+        self.width_expr = None;
+        self.width_fit = false;
         // A declared width replaces whatever an animation was heading towards.
         self.width_target = None;
     }
@@ -1654,6 +1934,8 @@ impl ComputedStyle {
     pub fn set_width_ratio(&mut self, ratio: f64) {
         self.width_ratio = Some(ratio);
         self.width = Some(0.0);
+        self.width_expr = None;
+        self.width_fit = false;
     }
 
     pub fn width(&self) -> f64 {
@@ -1897,10 +2179,11 @@ impl ComputedStyle {
 
 /// A min-/max-width/height constraint: absolute px or a fraction of the
 /// containing block.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SizeLimit {
     Px(f64),
     Ratio(f64),
+    Expr(Rc<MathExpr>),
 }
 
 impl SizeLimit {
@@ -1909,6 +2192,10 @@ impl SizeLimit {
             SizeLimit::Px(v) => Some(*v as i64),
             SizeLimit::Ratio(r) if containing > 0 => Some((containing as f64 * r) as i64),
             SizeLimit::Ratio(_) => None,
+            SizeLimit::Expr(expr) if containing > 0 || !expr.has_ratio() => {
+                Some(expr.eval(containing as f64) as i64)
+            }
+            SizeLimit::Expr(_) => None,
         }
     }
 }
@@ -2172,9 +2459,6 @@ impl FontSize {
     fn default(node: &Rc<RefCell<Node>>) -> Self {
         match &node.borrow().kind() {
             NodeKind::Element(element) => match element.kind() {
-                ElementKind::H1 => FontSize::XXLarge,
-                ElementKind::H2 => FontSize::XLarge,
-                ElementKind::H3 => FontSize::XLarge,
                 _ => FontSize::Medium,
             },
             _ => FontSize::Medium,
@@ -2184,8 +2468,13 @@ impl FontSize {
     pub fn from_str(value: &str) -> Result<Self, Error> {
         match value {
             "medium" => Ok(Self::Medium),
-            "large" | "x-large" => Ok(Self::XLarge),
+            "xx-small" => Ok(Self::Px(9)),
+            "x-small" => Ok(Self::Px(10)),
+            "small" => Ok(Self::Px(13)),
+            "large" => Ok(Self::Px(18)),
+            "x-large" => Ok(Self::XLarge),
             "xx-large" => Ok(Self::XXLarge),
+            "xxx-large" => Ok(Self::Px(48)),
             _ => Err(Error::UnexpectedInput(format!(
                 "font-size {:?} is not supported yet",
                 value
@@ -2549,6 +2838,7 @@ impl DisplayType {
     fn default(node: &Rc<RefCell<Node>>) -> Self {
         match &node.borrow().kind() {
             NodeKind::Document => DisplayType::Block,
+            NodeKind::Comment(_) | NodeKind::Doctype { .. } => DisplayType::DisplayNone,
             NodeKind::Element(e) => {
                 if e.is_non_rendered_element() {
                     DisplayType::DisplayNone
@@ -2586,13 +2876,14 @@ impl DisplayType {
 pub enum TextDecoration {
     None,
     Underline,
+    LineThrough,
+    Overline,
 }
 
 impl TextDecoration {
     fn default(node: &Rc<RefCell<Node>>) -> Self {
         match &node.borrow().kind() {
             NodeKind::Element(element) => match element.kind() {
-                ElementKind::A => TextDecoration::Underline,
                 _ => TextDecoration::None,
             },
             _ => TextDecoration::None,
@@ -2603,6 +2894,8 @@ impl TextDecoration {
         match value {
             "none" => Ok(Self::None),
             "underline" => Ok(Self::Underline),
+            "line-through" => Ok(Self::LineThrough),
+            "overline" => Ok(Self::Overline),
             _ => Err(Error::UnexpectedInput(format!(
                 "text-decoration {:?} is not supported yet",
                 value

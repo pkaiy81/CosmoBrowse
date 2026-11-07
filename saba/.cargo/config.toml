@@ -1,0 +1,6 @@
+
+[env]
+# Layout recurses with the depth of the page. The browser runs it on a 64 MiB
+# thread (renderer_native's main), so tests get the same room rather than the
+# 2 MiB a test thread has by default.
+RUST_MIN_STACK = "67108864"
