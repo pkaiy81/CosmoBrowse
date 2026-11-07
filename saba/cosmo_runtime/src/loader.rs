@@ -598,6 +598,14 @@ pub fn make_fetch_engine_with_waker(
 }
 
 impl cosmo_script::FetchEngine for RuntimeFetchEngine {
+    fn document_cookie(&self) -> String {
+        crate::security::script_visible_cookies(&self.base_url)
+    }
+
+    fn set_document_cookie(&self, cookie: &str) {
+        crate::security::set_cookie_from_script(&self.base_url, cookie);
+    }
+
     fn start(
         &self,
         req: cosmo_script::FetchRequest,
@@ -735,6 +743,8 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
             return reject(url, msg);
         }
     }
+    // Cookies go with same-origin requests, the default for `fetch`.
+    let same_origin = crate::security::is_same_origin(base, &url);
     let mut builder = match req.method.to_ascii_uppercase().as_str() {
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
@@ -745,11 +755,20 @@ fn do_fetch(base: &str, req: cosmo_script::FetchRequest) -> cosmo_script::FetchR
     for (name, value) in &req.headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
+    if same_origin {
+        let mut cookie = HeaderMap::new();
+        if attach_cookie_header(&mut cookie, &url, &url) {
+            builder = builder.headers(cookie);
+        }
+    }
     if let Some(body) = req.body {
         builder = builder.body(body);
     }
     match builder.send() {
         Ok(resp) => {
+            if same_origin {
+                let _ = apply_set_cookie_headers(resp.headers(), &url);
+            }
             // CORS check on the response headers before exposing the body.
             if enforce_cors && !crate::security::passes_cors(base, &url, resp.headers()) {
                 return reject(
@@ -887,7 +906,7 @@ pub fn extract_title(html: &str) -> Option<String> {
 pub fn prepare_html_for_display(html: &str, base_url: &str, frame_id: &str) -> String {
     let base_tag = format!("<base href=\"{}\">", escape_html_attr(base_url));
     let navigation_script = format!(
-        "<script>(function(){{document.addEventListener('click',function(event){{var anchor=event.target&&event.target.closest?event.target.closest('a'):null;if(!anchor)return;if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;var href=anchor.href||anchor.getAttribute('href');if(!href)return;event.preventDefault();window.parent.postMessage({{type:'cosmobrowse:navigate',frameId:'{}',href:href,target:anchor.getAttribute('target')||''}},'*');}});}})();</script>",
+        "<script>(function(){{document.addEventListener('click',function(event){{var anchor=event.target&&event.target.closest?event.target.closest('a'):null;if(!anchor)return;if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;var href=anchor.getAttribute('href');if(!href)return;event.preventDefault();window.parent.postMessage({{type:'cosmobrowse:navigate',frameId:'{}',href:href,target:anchor.getAttribute('target')||''}},'*');}});}})();</script>",
         escape_js_string(frame_id)
     );
     let payload = format!("{base_tag}{navigation_script}");

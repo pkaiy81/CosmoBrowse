@@ -12,8 +12,7 @@ use boa_engine::gc::{Finalize, Trace};
 use boa_engine::object::builtins::{JsArray, JsPromise, JsProxy};
 use boa_engine::builtins::promise::ResolvingFunctions;
 use cosmo_engine::renderer::dom::api::{
-    collect_text, element_closest, element_matches, get_element_by_id, query_selector,
-    query_selector_all,
+    collect_text, element_closest, element_matches, get_element_by_id, query_selector_all,
 };
 use cosmo_engine::renderer::dom::node::{Element, Node, NodeKind};
 use cosmo_engine::renderer::html::parser::HtmlParser;
@@ -971,7 +970,7 @@ fn dispatch_event_object(
                     })
             };
             if let Err(error) = result {
-                CONSOLE_LOG.with(|log| log.borrow_mut().push(format!("[error] listener: {error}")));
+                record_console(format!("[error] listener: {error}"));
             }
             if stopped(event) {
                 return false;
@@ -2155,9 +2154,12 @@ impl ScriptHost {
             } else {
                 Vec::new()
             };
-            let _ = timer
+            if let Err(error) = timer
                 .callback
-                .call(&JsValue::undefined(), &args, &mut self.context);
+                .call(&JsValue::undefined(), &args, &mut self.context)
+            {
+                record_console(format!("[error] timer: {error}"));
+            }
             if let Some(iv) = timer.interval {
                 let due = clock + iv.max(1);
                 TIMERS.with(|t| {
@@ -2467,8 +2469,16 @@ fn console_log(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
                 .unwrap_or_else(|_| "<unrenderable>".to_string())
         })
         .collect();
-    CONSOLE_LOG.with(|l| l.borrow_mut().push(parts.join(" ")));
+    record_console(parts.join(" "));
     Ok(JsValue::undefined())
+}
+
+/// Adds a line to the page's console, and to stderr under `COSMO_DEBUG_CONSOLE`.
+pub(crate) fn record_console(line: String) {
+    if std::env::var_os("COSMO_DEBUG_CONSOLE").is_some() {
+        eprintln!("[console] {line}");
+    }
+    CONSOLE_LOG.with(|log| log.borrow_mut().push(line));
 }
 
 fn schedule_timer(args: &[JsValue], ctx: &mut Context, repeat: bool) -> JsResult<JsValue> {
@@ -2800,55 +2810,6 @@ fn xhr_abort(this: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsVal
     Ok(JsValue::undefined())
 }
 
-fn script_dom_root() -> Option<Rc<RefCell<Node>>> {
-    SCRIPT_DOM.with(|d| d.borrow().clone())
-}
-
-/// Register a document-level event listener (on the DOM root node, so bubbling
-/// events from any element reach it — used by the injected navigation script's
-/// `document.addEventListener('click', ...)`).
-fn doc_add_event_listener(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
-    let Some(root) = script_dom_root() else {
-        return Ok(JsValue::undefined());
-    };
-    let event_type = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
-    let Some(cb) = a.get(1).and_then(|v| v.as_object()).cloned() else {
-        return Ok(JsValue::undefined());
-    };
-    let capture = parse_capture(a.get(2), c);
-    let once = parse_once(a.get(2), c);
-    LISTENERS.with(|m| {
-        m.borrow_mut()
-            .entry(node_key(&root))
-            .or_default()
-            .push(Listener { event_type, callback: cb, capture, once });
-    });
-    Ok(JsValue::undefined())
-}
-
-fn doc_remove_event_listener(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
-    let Some(root) = script_dom_root() else {
-        return Ok(JsValue::undefined());
-    };
-    let event_type = a.first().cloned().unwrap_or_default().to_string(c)?.to_std_string_escaped();
-    let cb = a.get(1).and_then(|v| v.as_object()).cloned();
-    LISTENERS.with(|m| {
-        if let Some(v) = m.borrow_mut().get_mut(&node_key(&root)) {
-            v.retain(|l| {
-                l.event_type != event_type || cb.as_ref().map(|c| c != &l.callback).unwrap_or(true)
-            });
-        }
-    });
-    Ok(JsValue::undefined())
-}
-
-fn doc_dispatch_event(_this: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
-    let Some(root) = script_dom_root() else {
-        return Ok(JsValue::from(true));
-    };
-    dispatch_from_script(root, a, c)
-}
-
 /// `window.parent.postMessage(message, targetOrigin)` — capture the message
 /// (JSON-serialized) for the runtime to drain.
 fn post_message(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -2909,20 +2870,6 @@ fn dom_get_elements_by_class_name(
     dom_select_all_to_array(&selector, ctx)
 }
 
-fn dom_create_element(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let tag = args
-        .first()
-        .cloned()
-        .unwrap_or_default()
-        .to_string(ctx)?
-        .to_std_string_escaped();
-    let node = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
-        &tag,
-        Vec::new(),
-    )))));
-    Ok(JsValue::from(make_element(node, ctx)))
-}
-
 fn dom_create_text_node(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let text = args
         .first()
@@ -2950,43 +2897,6 @@ fn dom_get_element_by_id(
         Some(n) => JsValue::from(make_element(n, ctx)),
         None => JsValue::null(),
     })
-}
-
-fn dom_query_selector(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let sel = args
-        .first()
-        .and_then(|v| v.as_string())
-        .map(|s| s.to_std_string_escaped())
-        .unwrap_or_default();
-    let node =
-        SCRIPT_DOM.with(|d| d.borrow().as_ref().and_then(|dom| query_selector(dom.clone(), &sel)));
-    Ok(match node {
-        Some(n) => JsValue::from(make_element(n, ctx)),
-        None => JsValue::null(),
-    })
-}
-
-fn dom_query_selector_all(
-    _this: &JsValue,
-    args: &[JsValue],
-    ctx: &mut Context,
-) -> JsResult<JsValue> {
-    let sel = args
-        .first()
-        .and_then(|v| v.as_string())
-        .map(|s| s.to_std_string_escaped())
-        .unwrap_or_default();
-    let nodes = SCRIPT_DOM.with(|d| {
-        d.borrow()
-            .as_ref()
-            .map(|dom| query_selector_all(dom.clone(), &sel))
-            .unwrap_or_default()
-    });
-    let array = JsArray::new(ctx);
-    for n in nodes {
-        array.push(make_element(n, ctx), ctx)?;
-    }
-    Ok(array.into())
 }
 
 #[cfg(test)]

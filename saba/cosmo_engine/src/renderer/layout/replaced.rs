@@ -408,9 +408,163 @@ impl LayoutObject {
             .collect()
     }
 
-    pub(crate) fn is_block_level_replaced(&self) -> bool {
-        self.is_replaced_box() && self.style.display() == DisplayType::Block
+    /// This box's style as `getComputedStyle` reports it.
+    pub fn computed_style_properties(&self) -> Vec<(String, String)> {
+        use crate::renderer::layout::computed_style::{
+            Color, FlexDirection, Float, PositionType, TextAlign, TextDecoration,
+        };
+        let style = &self.style;
+        let px = |value: f64| format!("{}px", value);
+        let color = |c: Color| css_color(c.code());
+        let (margin, padding, border) = (style.margin(), style.padding(), style.border());
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut add = |name: &str, value: String| out.push((name.to_string(), value));
+        let display = if style.is_inline_outer() {
+            if style.display() == DisplayType::Flex { "inline-flex" } else { "inline-grid" }
+        } else {
+            match style.display() {
+                DisplayType::Block => "block",
+                DisplayType::Inline => "inline",
+                DisplayType::Flex => "flex",
+                DisplayType::Grid => "grid",
+                DisplayType::InlineBlock => "inline-block",
+                DisplayType::Contents => "contents",
+                DisplayType::DisplayNone => "none",
+            }
+        };
+        add("display", display.to_string());
+        add(
+            "position",
+            match style.position() {
+                PositionType::Static => "static",
+                PositionType::Relative => "relative",
+                PositionType::Absolute => "absolute",
+                PositionType::Fixed => "fixed",
+                PositionType::Sticky => "sticky",
+            }
+            .to_string(),
+        );
+        add("visibility", if style.is_visibility_hidden() { "hidden" } else { "visible" }.to_string());
+        add("opacity", format!("{}", style.opacity_or_default()));
+        add("color", color(style.color()));
+        add("background-color", color(style.background_color()));
+        add("font-size", format!("{}px", style.font_size().px()));
+        add("font-family", style.font_family());
+        add("font-weight", if style.is_bold() { "700" } else { "400" }.to_string());
+        add("font-style", if style.is_italic() { "italic" } else { "normal" }.to_string());
+        add("line-height", format!("{}px", styled_line_height(style)));
+        add("width", format!("{}px", self.size().width()));
+        add("height", format!("{}px", self.size().height()));
+        add("margin-top", px(margin.top()));
+        add("margin-right", px(margin.right()));
+        add("margin-bottom", px(margin.bottom()));
+        add("margin-left", px(margin.left()));
+        add("padding-top", px(padding.top()));
+        add("padding-right", px(padding.right()));
+        add("padding-bottom", px(padding.bottom()));
+        add("padding-left", px(padding.left()));
+        add("border-top-width", px(border.top()));
+        add("border-right-width", px(border.right()));
+        add("border-bottom-width", px(border.bottom()));
+        add("border-left-width", px(border.left()));
+        add("box-sizing", if style.is_border_box() { "border-box" } else { "content-box" }.to_string());
+        add(
+            "float",
+            match style.float_or_default() {
+                Float::None => "none",
+                Float::Left => "left",
+                Float::Right => "right",
+            }
+            .to_string(),
+        );
+        add(
+            "overflow",
+            if style.overflow_scrollable() {
+                "auto"
+            } else if style.overflow_clip() {
+                "hidden"
+            } else {
+                "visible"
+            }
+            .to_string(),
+        );
+        add(
+            "text-align",
+            match style.text_align() {
+                TextAlign::Left => "left",
+                TextAlign::Center => "center",
+                TextAlign::Right => "right",
+            }
+            .to_string(),
+        );
+        add(
+            "text-decoration-line",
+            match style.text_decoration() {
+                TextDecoration::None => "none",
+                TextDecoration::Underline => "underline",
+                TextDecoration::LineThrough => "line-through",
+                TextDecoration::Overline => "overline",
+            }
+            .to_string(),
+        );
+        add(
+            "flex-direction",
+            match style.flex_direction() {
+                FlexDirection::Row => "row",
+                FlexDirection::Column => "column",
+            }
+            .to_string(),
+        );
+        add("z-index", "auto".to_string());
+        add("transform", "none".to_string());
+        add("transition-duration", "0s".to_string());
+        add("animation-name", "none".to_string());
+        add("animation-duration", "0s".to_string());
+        if let Some(custom) = style.custom_properties() {
+            for (name, tokens) in custom.iter() {
+                add(name, css_tokens_to_string(tokens));
+            }
+        }
+        out
     }
+}
+
+/// A color as `getComputedStyle` writes it.
+fn css_color(code: &str) -> String {
+    let hex = code.trim_start_matches('#');
+    let channel = |at: usize| hex.get(at..at + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+    match (channel(0), channel(2), channel(4), channel(6)) {
+        (Some(r), Some(g), Some(b), Some(255)) | (Some(r), Some(g), Some(b), None) => {
+            format!("rgb({r}, {g}, {b})")
+        }
+        (Some(r), Some(g), Some(b), Some(a)) => {
+            format!("rgba({r}, {g}, {b}, {})", (a as f64 / 255.0 * 100.0).round() / 100.0)
+        }
+        _ => "rgba(0, 0, 0, 0)".to_string(),
+    }
+}
+
+/// A custom property's tokens back as text.
+fn css_tokens_to_string(tokens: &[crate::renderer::css::token::CssToken]) -> String {
+    use crate::renderer::css::token::CssToken;
+    let mut out = String::new();
+    for token in tokens {
+        let piece = match token {
+            CssToken::HashToken(v) | CssToken::Ident(v) => v.clone(),
+            CssToken::StringToken(v) => format!("\"{v}\""),
+            CssToken::Number(v) => v.to_string(),
+            CssToken::Dimension(v, unit) => format!("{v}{unit}"),
+            CssToken::Delim(c) => c.to_string(),
+            CssToken::Colon => ":".to_string(),
+            CssToken::SemiColon => ";".to_string(),
+            CssToken::OpenParenthesis => "(".to_string(),
+            CssToken::CloseParenthesis => ")".to_string(),
+            CssToken::Whitespace => " ".to_string(),
+            _ => String::new(),
+        };
+        out.push_str(&piece);
+    }
+    out.trim().to_string()
 }
 
 /// The candidate from a `srcset` best suited to a box this wide: the narrowest

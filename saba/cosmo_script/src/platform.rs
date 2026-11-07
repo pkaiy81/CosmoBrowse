@@ -4,7 +4,7 @@
 use super::*;
 use boa_engine::module::{ModuleLoader, Referrer};
 use boa_engine::object::builtins::JsArray;
-use boa_engine::{JsError, JsNativeError, JsString, Module};
+use boa_engine::{JsNativeError, JsString, Module};
 use cosmo_engine::renderer::css::media::{parse_media_query_list, MediaContext};
 use cosmo_engine::renderer::css::token::CssTokenizer;
 use cosmo_engine::renderer::dom::node::Namespace;
@@ -14,9 +14,10 @@ use std::path::Path;
 /// layout, which it keeps as fresh as it can afford to.
 pub trait LayoutProvider: 'static {
     /// The element's border box, in page coordinates: x, y, width, height.
-    fn rect(&self, node: &Rc<RefCell<Node>>) -> Option<[f64; 4]>;
+    /// `generation` says which state of the DOM the page is asking about.
+    fn rect(&self, node: &Rc<RefCell<Node>>, generation: u64) -> Option<[f64; 4]>;
     /// The element's computed style, as CSS property names and values.
-    fn computed_style(&self, node: &Rc<RefCell<Node>>) -> Vec<(String, String)>;
+    fn computed_style(&self, node: &Rc<RefCell<Node>>, generation: u64) -> Vec<(String, String)>;
     /// The viewport's width and height.
     fn viewport(&self) -> (f64, f64);
 }
@@ -250,7 +251,8 @@ fn rect_of(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let Some(node) = a.first().and_then(handle_node) else {
         return Ok(JsValue::null());
     };
-    let rect = LAYOUT_PROVIDER.with(|p| p.borrow().as_ref().and_then(|p| p.rect(&node)));
+    let generation = DOM_GENERATION.with(|g| g.get());
+    let rect = LAYOUT_PROVIDER.with(|p| p.borrow().as_ref().and_then(|p| p.rect(&node, generation)));
     let Some(rect) = rect else {
         return Ok(JsValue::null());
     };
@@ -265,8 +267,9 @@ fn computed_style(_t: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsVa
     let Some(node) = a.first().and_then(handle_node) else {
         return Ok(JsValue::null());
     };
+    let generation = DOM_GENERATION.with(|g| g.get());
     let values = LAYOUT_PROVIDER
-        .with(|p| p.borrow().as_ref().map(|p| p.computed_style(&node)))
+        .with(|p| p.borrow().as_ref().map(|p| p.computed_style(&node, generation)))
         .unwrap_or_default();
     let object = ObjectInitializer::new(c).build();
     for (name, value) in values {
@@ -475,12 +478,6 @@ pub(crate) fn node_clone(this: &JsValue, a: &[JsValue], c: &mut Context) -> JsRe
     Ok(JsValue::from(make_element(clone_tree(&node, deep), c)))
 }
 
-fn require_function(name: &str) -> JsError {
-    JsNativeError::typ()
-        .with_message(format!("{name} is not available"))
-        .into()
-}
-
 /// The object `bootstrap.js` builds the platform from.
 pub(crate) fn make_native_object(node_base: JsObject, ctx: &mut Context) -> JsObject {
     let document_methods = ObjectInitializer::new(ctx)
@@ -489,7 +486,6 @@ pub(crate) fn make_native_object(node_base: JsObject, ctx: &mut Context) -> JsOb
         .function(NativeFunction::from_fn_ptr(dom_get_elements_by_tag_name), js_string!("getElementsByTagName"), 1)
         .function(NativeFunction::from_fn_ptr(dom_get_elements_by_class_name), js_string!("getElementsByClassName"), 1)
         .build();
-    let _ = require_function;
     ObjectInitializer::new(ctx)
         .property(js_string!("nodeBase"), node_base, Attribute::all())
         .property(js_string!("documentMethods"), document_methods, Attribute::all())
@@ -530,6 +526,9 @@ pub(crate) fn make_native_object(node_base: JsObject, ctx: &mut Context) -> JsOb
 const MAX_DOCUMENT_SCRIPT_BYTES: usize = 32 * 1024 * 1024;
 /// How long to wait for one script before going on without it.
 const SCRIPT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a page's scripts may hold up its first paint. Boa can't be interrupted,
+/// so this is checked between scripts: past it, the rest don't run.
+const SCRIPT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn attribute_of(node: &Rc<RefCell<Node>>, name: &str) -> Option<String> {
     match node.borrow().kind {
@@ -582,6 +581,15 @@ fn script_text(node: &Rc<RefCell<Node>>) -> String {
     text
 }
 
+/// A URL from the page, made absolute against the document's.
+fn absolute_url(url: &str) -> String {
+    url::Url::parse(&location_href())
+        .ok()
+        .and_then(|base| base.join(url.trim()).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| url.to_string())
+}
+
 fn start_script_fetch(url: &str) -> Option<std::sync::mpsc::Receiver<FetchResponse>> {
     FETCH_ENGINE.with(|engine| {
         engine.borrow().as_ref().map(|engine| {
@@ -603,7 +611,7 @@ fn receive_script(rx: &std::sync::mpsc::Receiver<FetchResponse>) -> Option<Strin
 }
 
 fn log_script_error(what: &str, error: impl std::fmt::Display) {
-    CONSOLE_LOG.with(|log| log.borrow_mut().push(format!("[error] {what}: {error}")));
+    crate::record_console(format!("[error] {what}: {error}"));
 }
 
 fn fire_simple_event(target: &Rc<RefCell<Node>>, event_type: &str, ctx: &mut Context) {
@@ -642,7 +650,9 @@ impl ScriptHost {
             let Some(kind) = script_kind(&node) else {
                 continue;
             };
-            let src = attribute_of(&node, "src").filter(|s| !s.trim().is_empty());
+            let src = attribute_of(&node, "src")
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| absolute_url(&s));
             let pending = src.as_deref().and_then(start_script_fetch);
             if src.is_none() && script_text(&node).trim().is_empty() {
                 continue;
@@ -671,7 +681,15 @@ impl ScriptHost {
         prepared.sort_by_key(order);
 
         let mut budget = MAX_DOCUMENT_SCRIPT_BYTES;
+        let started = std::time::Instant::now();
         for script in prepared {
+            if started.elapsed() > SCRIPT_TIME_BUDGET {
+                log_script_error(
+                    "script time budget exceeded, skipping",
+                    script.url.as_deref().unwrap_or("inline"),
+                );
+                continue;
+            }
             let (text, base) = match &script.pending {
                 Some(rx) => match receive_script(rx) {
                     Some(text) => (text, script.url.clone()),
@@ -847,7 +865,10 @@ pub(crate) fn run_inserted_scripts(node: &Rc<RefCell<Node>>, ctx: &mut Context) 
         let Some(kind) = script_kind(&script) else {
             continue;
         };
-        match attribute_of(&script, "src").filter(|s| !s.trim().is_empty()) {
+        match attribute_of(&script, "src")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| absolute_url(&s))
+        {
             Some(src) => {
                 if let Some(rx) = start_script_fetch(&src) {
                     PENDING_SCRIPTS.with(|p| {
