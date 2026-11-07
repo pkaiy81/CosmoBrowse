@@ -18,6 +18,8 @@
 
 **完了/ほぼ完了**: 4.4 transition/animation(完了)、2.5 inline(IFC+UAX#14 が全インライン文脈をカバー)、2.3 float(#92 で一部完了。行短縮の到達範囲など残は当該指示書冒頭を参照)。上の表の規模/リスクは着手前の見積りのまま。
 
+**2026-11-07**: JS プラットフォーム完了(外部スクリプト/module/import map、DOM クラス階層、レイアウト問い合わせ、Boa 0.22)。実サイトでの次の課題は canvas 2D、iframe、アニメーションの毎フレーム全レイアウト。詳細は `saba/HANDOFF.md`。
+
 1. **iframe**（frameset 基盤の要素単位一般化）
 2. **2.3 の残り**（行短縮の到達範囲）
 3. **4.1 incremental layout**（perf。安全網 `COSMO_LAYOUT_ASSERT` あり）

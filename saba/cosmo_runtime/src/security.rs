@@ -584,6 +584,58 @@ pub fn cookie_header_value(request_url: &str, site_for_cookies_url: &str) -> Opt
     HeaderValue::from_str(&value).ok()
 }
 
+/// What `document.cookie` reads: the cookies for `url`, without the `HttpOnly`
+/// ones, which exist to be out of script's reach.
+pub fn script_visible_cookies(url: &str) -> String {
+    let Some(origin) = origin_key(url) else {
+        return String::new();
+    };
+    let Ok(state) = persistent_security_state().lock() else {
+        return String::new();
+    };
+    state
+        .cookie_jar
+        .get(&origin)
+        .map(|cookies| {
+            cookies
+                .iter()
+                .filter(|cookie| !cookie.http_only && can_send_cookie(cookie, url, url))
+                .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default()
+}
+
+/// A write to `document.cookie`. Script can't set an `HttpOnly` cookie, nor
+/// overwrite one that already exists.
+pub fn set_cookie_from_script(url: &str, cookie: &str) {
+    let is_http_only = cookie
+        .split(';')
+        .skip(1)
+        .any(|attribute| attribute.trim().eq_ignore_ascii_case("httponly"));
+    if is_http_only {
+        return;
+    }
+    let name = cookie.split(['=', ';']).next().unwrap_or("").trim().to_string();
+    if let Some(origin) = origin_key(url) {
+        if let Ok(state) = persistent_security_state().lock() {
+            let protected = state
+                .cookie_jar
+                .get(&origin)
+                .is_some_and(|cookies| cookies.iter().any(|c| c.name == name && c.http_only));
+            if protected {
+                return;
+            }
+        }
+    }
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(cookie) {
+        headers.insert(reqwest::header::SET_COOKIE, value);
+        let _ = apply_set_cookie_headers(&headers, url);
+    }
+}
+
 pub fn attach_cookie_header(
     headers: &mut HeaderMap,
     request_url: &str,

@@ -16,7 +16,7 @@ thread_local! {
 /// `:has(...)`: test `node`'s descendants, plus its later siblings and theirs,
 /// which is everything a relative selector can reach.
 fn matches_has(node: &Rc<RefCell<Node>>, selector: &Selector) -> bool {
-    if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+    if !matches!(node.borrow().kind, NodeKind::Element(_)) {
         return false;
     }
     fn any_within(start: Option<Rc<RefCell<Node>>>, selector: &Selector) -> bool {
@@ -46,7 +46,7 @@ fn form_or_link_state(
 ) -> Option<bool> {
     use crate::renderer::css::cssom::PseudoClassKind as K;
     let borrowed = node.borrow();
-    let NodeKind::Element(ref element) = borrowed.kind() else {
+    let NodeKind::Element(ref element) = borrowed.kind else {
         return Some(false);
     };
     let tag = element.tag_name();
@@ -82,7 +82,7 @@ fn form_or_link_state(
             let mut child = borrowed.first_child();
             let mut empty = true;
             while let Some(c) = child {
-                match c.borrow().kind() {
+                match c.borrow().kind {
                     NodeKind::Text(ref t) if t.is_empty() => {}
                     _ => empty = false,
                 }
@@ -155,7 +155,7 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
                 if Rc::ptr_eq(&c, node) {
                     return if adjacent_only { last_was_match } else { matched_any };
                 }
-                if matches!(c.borrow().kind(), NodeKind::Element(_)) {
+                if matches!(c.borrow().kind, NodeKind::Element(_)) {
                     let m = dom_node_selected(&c, prev);
                     last_was_match = m;
                     matched_any |= m;
@@ -171,11 +171,11 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
         // it to a synthesized generated box via pseudo_element_target.
         Selector::PseudoElement(..) => return false,
         Selector::Not(inner) => {
-            return matches!(node.borrow().kind(), NodeKind::Element(_))
+            return matches!(node.borrow().kind, NodeKind::Element(_))
                 && !dom_node_selected(node, inner);
         }
         Selector::Is(inner) | Selector::Where(inner) => {
-            return matches!(node.borrow().kind(), NodeKind::Element(_))
+            return matches!(node.borrow().kind, NodeKind::Element(_))
                 && dom_node_selected(node, inner);
         }
         Selector::HasSubject => {
@@ -188,7 +188,7 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
         }
         Selector::Has(inner) => return matches_has(node, inner),
         Selector::PseudoClass(kind) => {
-            if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+            if !matches!(node.borrow().kind, NodeKind::Element(_)) {
                 return false;
             }
             use crate::renderer::css::cssom::PseudoClassKind;
@@ -214,14 +214,14 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
                     .borrow()
                     .parent()
                     .upgrade()
-                    .map(|p| matches!(p.borrow().kind(), NodeKind::Element(_)))
+                    .map(|p| matches!(p.borrow().kind, NodeKind::Element(_)))
                     .unwrap_or(false);
                 return !parent_is_element;
             }
             // 1-based index of this element among its parent's ELEMENT
             // children (and, for the *-of-type family, among element children
             // with the SAME tag), plus the respective totals.
-            let own_tag = match node.borrow().kind() {
+            let own_tag = match node.borrow().kind {
                 NodeKind::Element(ref e) => e.tag_name().to_string(),
                 _ => return false,
             };
@@ -235,7 +235,7 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
             let mut total_of_type = 0usize;
             let mut child = parent.borrow().first_child();
             while let Some(c) = child {
-                if let NodeKind::Element(ref e) = c.borrow().kind() {
+                if let NodeKind::Element(ref e) = c.borrow().kind {
                     total += 1;
                     let same_type = e.tag_name() == own_tag;
                     if same_type {
@@ -294,26 +294,26 @@ pub(crate) fn dom_node_selected(node: &Rc<RefCell<Node>>, selector: &Selector) -
         }
         _ => {}
     }
-    match node.borrow().kind() {
+    match node.borrow().kind {
         NodeKind::Element(ref e) => match selector {
             Selector::TypeSelector(type_name) => e.tag_name() == *type_name,
             // An element may carry several space-separated class names;
             // the selector matches any one of them.
             // https://html.spec.whatwg.org/multipage/dom.html#classes
-            Selector::ClassSelector(class_name) => e.attributes().iter().any(|attr| {
-                attr.name() == "class"
-                    && attr.value().split_ascii_whitespace().any(|c| c == class_name)
+            Selector::ClassSelector(class_name) => e.attribute_list().iter().any(|attr| {
+                attr.name_str() == "class"
+                    && attr.value_str().split_ascii_whitespace().any(|c| c == class_name)
             }),
             Selector::IdSelector(id_name) => e
-                .attributes()
+                .attribute_list()
                 .iter()
-                .any(|attr| attr.name() == "id" && attr.value() == *id_name),
+                .any(|attr| attr.name_str() == "id" && attr.value_str() == id_name),
             Selector::Attribute { name, op, value } => e
-                .attributes()
+                .attribute_list()
                 .iter()
-                .filter(|attr| attr.name().eq_ignore_ascii_case(name))
+                .filter(|attr| attr.name_str().eq_ignore_ascii_case(name))
                 .any(|attr| {
-                    let v = attr.value();
+                    let v = attr.value_str();
                     use crate::renderer::css::cssom::AttrOp;
                     match op {
                         AttrOp::Exists => true,

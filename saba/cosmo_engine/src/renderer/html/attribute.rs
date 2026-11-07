@@ -42,4 +42,12 @@ impl Attribute {
     pub fn value(&self) -> String {
         self.value.clone()
     }
+
+    pub fn name_str(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value_str(&self) -> &str {
+        &self.value
+    }
 }

@@ -759,6 +759,18 @@ $BIN --screenshot    <URL> /tmp/out.png                    # 既定サイズ
 
 ---
 
+### JS プラットフォーム(2026-11-07)
+
+ページのスクリプトは `ScriptHost::run_document_scripts`(`cosmo_script/src/platform.rs`)が実行する。外部 `<script src>`、defer、async、module、import map、動的に挿入された script に対応。DOM クラス階層や Web API は `cosmo_script/src/bootstrap.js` に JS で書いてある。レイアウト問い合わせ(`getBoundingClientRect`、`getComputedStyle`)は `LayoutProvider` トレイト経由で、実装は `cosmo_runtime` の `PageLayoutProvider`。
+
+- **Boa は 0.22**(`annex-b` 有効)。0.20 は `WeakMap` の値から循環に到達できると GC のマークが終わらずメモリを使い切るため、実ページがほぼ全滅していた。`substr` などは `annex-b` がないと存在しない。
+- **実サイトで確認するときはリリースビルド**(`cargo build --release -p renderer_native`)。デバッグビルドの Boa は桁違いに遅い。`COSMO_DEBUG_CONSOLE=1` でコンソールとスクリプトエラーが stderr に出る。
+- **`ulimit -v` を付け、並列で走らせないこと。** 実ページは数 GB を使うことがあり、並列実行で OOM killer が動いた。
+- スクリーンショットは `settle_async` が最大 5 秒フレームを回すので、無限アニメーションのあるページは実際の読み込み時間より長くかかる。
+- `Intl` は bootstrap.js のスタブ(Boa の `intl` 機能は未有効)。`IntersectionObserver` と `ResizeObserver` は 1 回発火するだけ、`MutationObserver` はポーリング、`WebSocket`/`EventSource`/`Worker` は実体なし。canvas 2D は未実装。
+- 確認済み(目視): example.com、rust-lang.org、react.dev、vuejs.org、github.com のリポジトリページ、en.wikipedia.org の記事、bbc.com/news、apple.com。GitHub は code-view のチャンクが protobuf の記述子で失敗する(残課題)。
+- `@keyframes` と transition は毎フレーム全レイアウトする(react.dev で約 200ms/フレーム)。合成だけで済むプロパティの最適化は未着手。
+
 ## 5. 動作確認できているサイト
 
 | サイト | 状態 |

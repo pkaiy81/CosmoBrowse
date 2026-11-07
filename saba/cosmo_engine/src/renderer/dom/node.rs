@@ -262,13 +262,15 @@ impl Element {
         self.attributes.clone()
     }
 
+    pub fn attribute_list(&self) -> &[Attribute] {
+        &self.attributes
+    }
+
     pub fn get_attribute(&self, name: &str) -> Option<String> {
-        for attr in &self.attributes {
-            if attr.name() == name {
-                return Some(attr.value());
-            }
-        }
-        None
+        self.attributes
+            .iter()
+            .find(|attr| attr.name_str() == name)
+            .map(|attr| attr.value())
     }
 
     /// Set (or add) an attribute value — the DOM `setAttribute` operation.

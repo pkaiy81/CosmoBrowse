@@ -157,6 +157,7 @@ fn image_http_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
+            .user_agent(cosmo_runtime::USER_AGENT)
             .connect_timeout(IMAGE_CONNECT_TIMEOUT)
             .timeout(IMAGE_REQUEST_TIMEOUT)
             .build()

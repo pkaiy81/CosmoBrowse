@@ -123,7 +123,7 @@ fn build_layout_tree(
             // CSS generated content: a ::before box becomes the first child and a
             // ::after box the last child of the element.
             // https://www.w3.org/TR/css-content-3/
-            if matches!(n.borrow().kind(), NodeKind::Element(_)) {
+            if matches!(n.borrow().kind, NodeKind::Element(_)) {
                 use crate::renderer::css::cssom::PseudoElement;
                 if let Some(before) = crate::renderer::layout::layout_object::build_pseudo_element(
                     &n,

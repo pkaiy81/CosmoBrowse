@@ -417,7 +417,11 @@ impl AppBridge {
         // screenshot captures a progressed/settled animation state (bounded —
         // an endless animation stops at the frame cap).
         let mut frames = 0;
-        while self.has_pending_animation() && frames < max {
+        let started = std::time::Instant::now();
+        while self.has_pending_animation()
+            && frames < max
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
             if self.animation_frame() {
                 updated = true;
             }

@@ -84,7 +84,7 @@ pub(crate) fn prepare_root_style(body: &Rc<RefCell<Node>>, cssom: &StyleSheet) {
     let Some(html) = body.borrow().parent().upgrade() else {
         return;
     };
-    if !matches!(html.borrow().kind(), NodeKind::Element(_)) {
+    if !matches!(html.borrow().kind, NodeKind::Element(_)) {
         return;
     }
     let Some(object) = create_layout_object(&Some(html), &None, cssom) else {
@@ -135,9 +135,25 @@ pub fn create_layout_object(
         // document; the stable sort keeps document order for equal
         // specificity (later rule wins). Spec: CSS Cascade §6.
         // https://www.w3.org/TR/css-cascade-4/#cascade-specificity
-        let mut matched: Vec<&QualifiedRule> = cssom
-            .rules
-            .iter()
+        let candidates = match &n.borrow().kind {
+            NodeKind::Element(element) => {
+                let attribute = |name: &str| {
+                    element
+                        .attribute_list()
+                        .iter()
+                        .find(|attr| attr.name_str() == name)
+                        .map(|attr| attr.value_str())
+                };
+                cssom.candidate_rules(
+                    attribute("id"),
+                    attribute("class").unwrap_or_default().split_ascii_whitespace(),
+                    element.tag_name(),
+                )
+            }
+            _ => Vec::new(),
+        };
+        let mut matched: Vec<&QualifiedRule> = candidates
+            .into_iter()
             .filter(|rule| layout_object.borrow().is_node_selected(&rule.selector))
             .collect();
         matched.sort_by_key(|rule| (!rule.user_agent, !rule.layered, rule.selector.specificity()));
@@ -178,7 +194,7 @@ pub fn create_layout_object(
                     let mut chain: Vec<Rc<RefCell<Node>>> = Vec::new();
                     let mut current = n.borrow().parent().upgrade();
                     while let Some(p) = current {
-                        if matches!(p.borrow().kind(), NodeKind::Element(_)) {
+                        if matches!(p.borrow().kind, NodeKind::Element(_)) {
                             chain.push(p.clone());
                         }
                         let next = p.borrow().parent().upgrade();
@@ -277,8 +293,7 @@ pub fn build_pseudo_element(
     // Collect matching pseudo-element rules (host part matches host_node),
     // sorted by specificity.
     let mut matched: Vec<&QualifiedRule> = cssom
-        .rules
-        .iter()
+        .pseudo_element_rules()
         .filter(|rule| match &rule.selector {
             Selector::PseudoElement(host_sel, kind) => {
                 *kind == pe && dom_node_selected(host_node, host_sel)
