@@ -157,6 +157,7 @@ fn image_http_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
+            .user_agent(cosmo_runtime::USER_AGENT)
             .connect_timeout(IMAGE_CONNECT_TIMEOUT)
             .timeout(IMAGE_REQUEST_TIMEOUT)
             .build()
@@ -723,8 +724,8 @@ fn draw_rect(
             }
             // Rotated border stroke.
             if rect.border_width > 0 && !rect.border_color.is_empty() {
-                let (br, bg_c, bb, _) = parse_css_color(&rect.border_color);
-                let mut bp = paint_solid(br, bg_c, bb, opacity);
+                let (br, bg_c, bb, border_alpha) = parse_css_color(&rect.border_color);
+                let mut bp = paint_solid(br, bg_c, bb, opacity * border_alpha as f32 / 255.0);
                 bp.anti_alias = true;
                 let inset = rect.border_width as f32 / 2.0;
                 let bw = rect.border_width as f32;
@@ -837,8 +838,8 @@ fn draw_rect(
             .unwrap_or(false);
     if any_border && !rect.border_color.is_empty() {
         let bw = rect.border_width;
-        let (br, bg_c, bb, _) = parse_css_color(&rect.border_color);
-        let border_opacity = (rect.opacity).clamp(0.0, 1.0) as f32;
+        let (br, bg_c, bb, border_alpha) = parse_css_color(&rect.border_color);
+        let border_opacity = (rect.opacity).clamp(0.0, 1.0) as f32 * border_alpha as f32 / 255.0;
         let mut bp = Paint::default();
         bp.set_color(
             Color::from_rgba(
@@ -888,8 +889,9 @@ fn draw_rect(
             };
             bar(x, y, w, bt); // top
             bar(x, y + h - bb, w, bb); // bottom
-            bar(x, y, bl, h); // left
-            bar(x + w - brr, y, brr, h); // right
+            // Between those: where bars overlap, a translucent color would show twice.
+            bar(x, y + bt, bl, h - bt - bb); // left
+            bar(x + w - brr, y + bt, brr, h - bt - bb); // right
         }
     }
 
@@ -968,6 +970,7 @@ fn draw_rect(
                     None => (0, 0),
                 };
                 let no_repeat = rect.background_no_repeat;
+                let mask_color = rect.background_mask_color.as_deref().map(parse_css_color);
                 let data = pixmap.data_mut();
                 for dy in 0..h {
                     let py = y + dy;
@@ -993,10 +996,17 @@ fn draw_rect(
                         let sx = (rel_x * src_w / target_w).min(src_w - 1);
                         let sy = (rel_y * src_h / target_h).min(src_h - 1);
                         let si = (sy * src_w + sx) as usize * 4;
-                        let sr = decoded.rgba[si];
-                        let sg = decoded.rgba[si + 1];
-                        let sb = decoded.rgba[si + 2];
-                        let sa = decoded.rgba[si + 3];
+                        let (sr, sg, sb, sa) = match mask_color {
+                            Some((r, g, b, a)) => {
+                                (r, g, b, (decoded.rgba[si + 3] as u32 * a as u32 / 255) as u8)
+                            }
+                            None => (
+                                decoded.rgba[si],
+                                decoded.rgba[si + 1],
+                                decoded.rgba[si + 2],
+                                decoded.rgba[si + 3],
+                            ),
+                        };
                         let di = (py * pw + px_x) as usize * 4;
                         if di + 3 >= data.len() {
                             continue;

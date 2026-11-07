@@ -1,0 +1,23 @@
+<!doctype html><style>
+body{margin:0;font:14px sans-serif}
+.cb{position:relative;margin:10px;width:400px;height:120px;padding:10px;border:4px solid #888;background:#eee}
+.overlay{position:absolute;inset:0;background:rgba(0,120,255,.25);display:flex;align-items:center;justify-content:center}
+.shrink{position:absolute;top:4px;right:4px;background:#fd8}
+.pad{position:absolute;left:0;bottom:0;background:#8df}
+.margin{position:absolute;left:50%;top:50%;width:100px;height:20px;margin-left:-50px;margin-top:-10px;background:#c8f}
+.center{position:absolute;left:0;right:0;width:60px;bottom:30px;margin:0 auto;background:#8d8}
+.pct{position:absolute;left:10%;right:60%;top:25%;height:20px;background:#fbb}
+.auto{position:relative;margin:10px;width:400px;background:#eee}
+.stretch{position:absolute;top:0;bottom:0;left:300px;width:40px;background:#f8c}
+.small{position:relative;margin:10px;width:60px;height:30px;background:#ddd}
+.wide{position:absolute;left:0;top:30px;white-space:nowrap;background:#dfc}
+.wide100{position:absolute;left:0;top:50px;width:200%;background:#cfd}
+.corner{position:fixed;right:10px;bottom:10px;background:#faa}
+.fixpct{position:fixed;left:50%;top:0;margin-left:-40px;width:80px;background:#afa}
+</style>
+<div class=cb><div class=overlay>centered</div><div class=shrink>shrinks</div><div class=pad>at the padding edge</div><div class=margin>margin</div><div class=center>auto</div><div class=pct>pct</div></div>
+<div class=auto>auto height holds this line<br>and this one<div class=stretch>tall</div></div>
+<div class=auto><span class=shrink>inline, but positioned</span>a positioned child doesn't join the lines<br>second line</div>
+<div class=small>small<div class=wide>wider than its positioned parent</div><div class=wide100>twice as wide</div></div>
+<div style="height:60px"></div>
+<div class=corner>corner</div><div class=fixpct>centered</div>

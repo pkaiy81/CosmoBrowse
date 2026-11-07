@@ -59,6 +59,9 @@ pub struct DrawRect {
     pub height: i64,
     pub background_color: String,
     pub background_image: Option<String>,
+    /// Paint `background_image` as a mask: this color, wherever the image is opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_mask_color: Option<String>,
     /// `linear-gradient(...)`: (angle_deg, [(hex_color, pos)]). None = no gradient.
     #[serde(default)]
     pub background_gradient: Option<(f64, Vec<(String, f64)>)>,

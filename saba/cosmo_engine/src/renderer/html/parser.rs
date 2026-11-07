@@ -335,6 +335,8 @@ impl HtmlParser {
         }
         // Whatever is still open is done with.
         self.open_elements.clear();
+        let document = self.window.borrow().document();
+        crate::renderer::dom::api::attach_declarative_shadow_roots(&document);
         self.window.clone()
     }
 

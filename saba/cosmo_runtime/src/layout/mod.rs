@@ -9,7 +9,7 @@ use cosmo_engine::renderer::css::token::CssTokenizer;
 use crate::forms;
 use crate::loader::fetch_external_stylesheets;
 use cosmo_engine::renderer::dom::api::{
-    get_js_content, get_style_content, get_stylesheet_links,
+    get_style_content, get_stylesheet_links,
 };
 use cosmo_engine::renderer::dom::node::NodeKind;
 use cosmo_engine::renderer::html::parser::HtmlParser;
@@ -116,15 +116,6 @@ pub fn diff_scene_items(previous: &[SceneItem], next: &[SceneItem]) -> SceneDiff
         changed,
     }
 }
-
-/// Upper bound on the concatenated `<script>` bytes we hand to Boa. The
-/// execution watchdog (loop/recursion caps in cosmo_script) prevents runaway
-/// *execution*, but Boa still has to *parse* the whole payload up front, so a
-/// cap keeps navigation responsive on pages shipping multi-MB minified bundles
-/// the engine can't meaningfully run anyway. Raised well above typical page JS
-/// now that execution is bounded (plan 3.5 wanted this removed; a parse-time
-/// guard remains prudent).
-const MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
 
 pub fn build_layout_scene_with_script_runtime(
     document_url: &str,
@@ -273,6 +264,149 @@ pub struct ClickOutcome {
     /// shim injected by `loader::prepare_html_for_display` posts its
     /// `cosmobrowse:navigate` request here.
     pub messages: Vec<String>,
+}
+
+/// A hash of everything `resolve_cssom` reads.
+fn stylesheets_fingerprint(dom: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    get_style_content(dom.clone()).hash(&mut hasher);
+    get_stylesheet_links(dom.clone()).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Parses the stylesheets again if script has changed them: CSS-in-JS, or a sheet
+/// loaded late.
+fn refresh_stylesheets(
+    dom: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    document_url: &str,
+    cssom: &RefCell<cosmo_engine::renderer::css::cssom::StyleSheet>,
+    fingerprint: &std::cell::Cell<u64>,
+) {
+    let current = stylesheets_fingerprint(dom);
+    if current != fingerprint.get() {
+        fingerprint.set(current);
+        *cssom.borrow_mut() = resolve_cssom(dom.clone(), document_url);
+    }
+}
+
+/// How long script's layout queries get fresh answers however much they cost.
+/// Past this, a page that keeps changing the DOM and measuring it gets answers that
+/// may be a moment old, so that it can't spend all its time in layout.
+const FREE_LAYOUT_QUERY_TIME: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Layout, for script's questions about it.
+struct PageLayoutProvider {
+    dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+    document_url: String,
+    cssom: Rc<RefCell<cosmo_engine::renderer::css::cssom::StyleSheet>>,
+    css_fingerprint: Rc<std::cell::Cell<u64>>,
+    rect: Rc<RefCell<FrameRect>>,
+    current: RefCell<Option<CurrentLayout>>,
+    time_in_layout: std::cell::Cell<std::time::Duration>,
+}
+
+/// The layout script's queries read, with its boxes found by node.
+struct CurrentLayout {
+    generation: u64,
+    laid_out_at: std::time::Instant,
+    took: std::time::Duration,
+    _view: LayoutView,
+    boxes: std::collections::HashMap<
+        usize,
+        Rc<RefCell<cosmo_engine::renderer::layout::layout_object::LayoutObject>>,
+    >,
+}
+
+impl PageLayoutProvider {
+    fn ensure_layout(&self, generation: u64) {
+        if let Some(current) = self.current.borrow().as_ref() {
+            if current.generation == generation {
+                return;
+            }
+            // Keep layout to about a quarter of the time, however often it's asked.
+            if self.time_in_layout.get() > FREE_LAYOUT_QUERY_TIME
+                && current.laid_out_at.elapsed() < current.took * 3
+            {
+                return;
+            }
+        }
+        let started = std::time::Instant::now();
+        refresh_stylesheets(&self.dom, &self.document_url, &self.cssom, &self.css_fingerprint);
+        let rect = self.rect.borrow().clone();
+        let view = build_layout_view(self.dom.clone(), &self.cssom.borrow(), &rect);
+        let mut boxes = std::collections::HashMap::new();
+        fn index(
+            object: Option<Rc<RefCell<cosmo_engine::renderer::layout::layout_object::LayoutObject>>>,
+            boxes: &mut std::collections::HashMap<
+                usize,
+                Rc<RefCell<cosmo_engine::renderer::layout::layout_object::LayoutObject>>,
+            >,
+        ) {
+            let mut current = object;
+            while let Some(o) = current {
+                let key = Rc::as_ptr(&o.borrow().node_ref()) as *const () as usize;
+                boxes.entry(key).or_insert_with(|| o.clone());
+                index(o.borrow().first_child(), boxes);
+                current = o.borrow().next_sibling();
+            }
+        }
+        index(view.root(), &mut boxes);
+        self.time_in_layout.set(self.time_in_layout.get() + started.elapsed());
+        *self.current.borrow_mut() = Some(CurrentLayout {
+            generation,
+            laid_out_at: std::time::Instant::now(),
+            took: started.elapsed(),
+            _view: view,
+            boxes,
+        });
+    }
+
+    fn with_box<T>(
+        &self,
+        node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+        generation: u64,
+        read: impl FnOnce(&cosmo_engine::renderer::layout::layout_object::LayoutObject) -> T,
+    ) -> Option<T> {
+        self.ensure_layout(generation);
+        let current = self.current.borrow();
+        let key = Rc::as_ptr(node) as *const () as usize;
+        let object = current.as_ref()?.boxes.get(&key)?.clone();
+        let object = object.borrow();
+        Some(read(&object))
+    }
+}
+
+impl cosmo_script::LayoutProvider for PageLayoutProvider {
+    fn rect(
+        &self,
+        node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+        generation: u64,
+    ) -> Option<[f64; 4]> {
+        self.with_box(node, generation, |object| {
+            [
+                object.point().x() as f64,
+                object.point().y() as f64,
+                object.size().width() as f64,
+                object.size().height() as f64,
+            ]
+        })
+    }
+
+    fn computed_style(
+        &self,
+        node: &Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
+        generation: u64,
+    ) -> Vec<(String, String)> {
+        // No box means `display: none`, or something inside it.
+        self.with_box(node, generation, |object| object.computed_style_properties())
+            .unwrap_or_else(|| vec![("display".to_string(), "none".to_string())])
+    }
+
+    fn viewport(&self) -> (f64, f64) {
+        let rect = self.rect.borrow();
+        (rect.width as f64, rect.height as f64)
+    }
 }
 
 /// Marks a `<select>` as showing its list, for the painter.
@@ -537,10 +671,15 @@ pub struct LivePage {
     document_url: String,
     /// The `<select>` whose list is showing.
     open_select: Option<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
+    /// A hash of the stylesheets `cssom` was parsed from: `<style>` and `<link>`
+    /// elements script has changed mean parsing them again.
+    css_fingerprint: Rc<std::cell::Cell<u64>>,
+    /// The frame's rect at the last layout, which script's queries lay out at.
+    layout_rect: Rc<RefCell<FrameRect>>,
     /// The parsed stylesheets, resolved once at load and reused across
     /// pumps/reflows (script DOM mutations rarely change the stylesheets, so
     /// the expensive CSS re-parse is skipped — the first incremental win).
-    cssom: cosmo_engine::renderer::css::cssom::StyleSheet,
+    cssom: Rc<RefCell<cosmo_engine::renderer::css::cssom::StyleSheet>>,
     /// DOM mutation generation at the last layout; a pump that leaves it
     /// unchanged skips re-layout (no script tick touched the DOM).
     last_generation: u64,
@@ -589,28 +728,43 @@ impl LivePage {
         host.set_fetch_engine(engine);
         host.set_document(dom.clone());
 
-        let script = get_js_content(dom.clone());
-        if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
-            let _ = host.eval_to_string(&script);
-            // The document is parsed by the time we get here, so the handlers
-            // the scripts just registered for it fire now.
-            host.fire_dom_content_loaded();
-            // Only what is due at t=0. A retained page has a frame clock
-            // (`animation_frame`) to deliver delayed timers on schedule, so
-            // unlike the one-shot pipeline it must not flush them up front —
-            // that would make timed UI (and the transitions it triggers) snap
-            // to its end state before the first paint.
-            host.run_due(1000);
-        }
+        // Scripts can ask about layout while they run, so the stylesheets have to
+        // be there first.
+        let cssom = Rc::new(RefCell::new(resolve_cssom(dom.clone(), document_url)));
+        let css_fingerprint = Rc::new(std::cell::Cell::new(stylesheets_fingerprint(&dom)));
+        let layout_rect = Rc::new(RefCell::new(rect.clone()));
+        host.set_layout_provider(Box::new(PageLayoutProvider {
+            dom: dom.clone(),
+            document_url: document_url.to_string(),
+            cssom: cssom.clone(),
+            css_fingerprint: css_fingerprint.clone(),
+            rect: layout_rect.clone(),
+            current: RefCell::new(None),
+            time_in_layout: std::cell::Cell::new(std::time::Duration::ZERO),
+        }));
+
+        host.run_document_scripts();
+        // The document is parsed by the time we get here, so the handlers the
+        // scripts just registered for it fire now.
+        host.fire_dom_content_loaded();
+        // Only what is due at t=0. A retained page has a frame clock
+        // (`animation_frame`) to deliver delayed timers on schedule, so unlike
+        // the one-shot pipeline it must not flush them up front — that would make
+        // timed UI (and the transitions it triggers) snap to its end state before
+        // the first paint.
+        host.run_due(1000);
+        host.fire_load();
+        host.run_due(1000);
         replace_local_storage(document_url, &host.local_storage_entries());
 
-        let cssom = resolve_cssom(dom.clone(), document_url);
         let last_generation = host.dom_generation();
         let mut page = Self {
             host,
             dom,
             document_url: document_url.to_string(),
             cssom,
+            css_fingerprint,
+            layout_rect,
             last_generation,
             transitions: TransitionDriver::default(),
             keyframes: KeyframeDriver::default(),
@@ -629,6 +783,11 @@ impl LivePage {
     /// `pump_and_relayout` may yield an updated scene.
     pub fn has_pending_work(&self) -> bool {
         self.host.has_pending_fetches()
+    }
+
+    #[cfg(test)]
+    fn eval_for_test(&mut self, script: &str) -> String {
+        self.host.eval_to_string(script).unwrap_or_else(|e| e)
     }
 
     /// Whether the page has an ongoing animation the GUI should keep driving
@@ -678,7 +837,7 @@ impl LivePage {
         }
         let mut outcome = ClickOutcome::default();
         let target = {
-            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            let view = build_layout_view(self.dom.clone(), &self.cssom.borrow(), rect);
             view.find_node_by_position(point)
                 .map(|object| object.borrow().node_ref())
                 .and_then(nearest_element)
@@ -795,7 +954,7 @@ impl LivePage {
         rect: &FrameRect,
     ) -> ClickOutcome {
         let picked = {
-            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            let view = build_layout_view(self.dom.clone(), &self.cssom.borrow(), rect);
             view.find_object_of_node(&select).and_then(|object| {
                 let object = object.borrow();
                 let row = object.select_popup_rows().iter().position(|(x, y, w, h)| {
@@ -828,7 +987,7 @@ impl LivePage {
     /// without one changes nothing, so the renderer can skip hover tracking
     /// (which costs a hit-test plus a re-style) entirely.
     pub fn uses_hover(&self) -> bool {
-        self.cssom.uses_hover()
+        self.cssom.borrow().uses_hover()
     }
 
     /// Point the `:hover` state at `point` (frame-local document coordinates),
@@ -848,7 +1007,7 @@ impl LivePage {
             None => Vec::new(),
             Some(point) => {
                 let hovered = {
-                    let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+                    let view = build_layout_view(self.dom.clone(), &self.cssom.borrow(), rect);
                     view.find_node_by_position(point)
                         .map(|object| object.borrow().node_ref())
                         .and_then(nearest_element)
@@ -868,7 +1027,7 @@ impl LivePage {
     /// rather than to the URL bar.
     pub fn focus_field_at(&mut self, point: (i64, i64), rect: &FrameRect) -> bool {
         let hit = {
-            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            let view = build_layout_view(self.dom.clone(), &self.cssom.borrow(), rect);
             view.find_node_by_position(point)
                 .map(|object| object.borrow().node_ref())
                 .and_then(nearest_element)
@@ -910,7 +1069,7 @@ impl LivePage {
     /// Whether this document styles anything on `:focus` / `:focus-within`.
     /// Pages that don't need no re-layout when the focus moves.
     pub fn uses_focus(&self) -> bool {
-        self.cssom.uses_focus()
+        self.cssom.borrow().uses_focus()
     }
 
     /// Whether the focused field holds more than one line, so Enter types a
@@ -987,7 +1146,7 @@ impl LivePage {
     fn current_caret_stops(&mut self, rect: &FrameRect) -> Option<&Vec<CaretStop>> {
         if self.caret_stops.is_none() {
             let field = self.focused_field.clone()?;
-            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            let view = build_layout_view(self.dom.clone(), &self.cssom.borrow(), rect);
             self.caret_stops = view.field_caret_stops(&field, &current_value(&field));
         }
         self.caret_stops.as_ref().map(|(stops, _)| stops)
@@ -1032,13 +1191,22 @@ impl LivePage {
     /// frames where a transition starts or is cancelled, never on static pages.
     fn layout_and_drive(&mut self, rect: &FrameRect) -> LayoutScene {
         self.caret_stops = None;
+        let resized = {
+            let last = self.layout_rect.borrow();
+            (last.width, last.height) != (rect.width, rect.height)
+        };
+        *self.layout_rect.borrow_mut() = rect.clone();
+        if resized {
+            self.host.fire_resize();
+        }
+        refresh_stylesheets(&self.dom, &self.document_url, &self.cssom, &self.css_fingerprint);
         let (scene, transitions, animations) =
-            layout_scene_and_targets(self.dom.clone(), &self.cssom, rect);
+            layout_scene_and_targets(self.dom.clone(), &self.cssom.borrow(), rect);
         // `@keyframes` playback first: it may write overrides that the
         // transition driver should then see as the current displayed value.
         let animated = self.keyframes.sync(&animations);
         if self.transitions.sync_targets(&transitions) | animated {
-            layout_scene_only(self.dom.clone(), &self.cssom, rect)
+            layout_scene_only(self.dom.clone(), &self.cssom.borrow(), rect)
         } else {
             scene
         }
@@ -1095,7 +1263,6 @@ fn execute_scripts_boa(
     document_url: &str,
     dom: Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>,
 ) -> (bool, Vec<String>) {
-    let script = get_js_content(dom.clone());
     let mut diagnostics = Vec::new();
     let mut host = cosmo_script::ScriptHost::new();
     host.set_location(document_url);
@@ -1103,18 +1270,15 @@ fn execute_scripts_boa(
     host.set_fetch_engine(crate::loader::make_fetch_engine(document_url));
     host.set_document(dom);
 
-    // Interim watchdog (see fn doc). Larger than the toy cap since Boa handles
-    // far more real-world JS, but still bounded.
-    let ran = if !script.trim().is_empty() && script.len() <= MAX_SCRIPT_BYTES {
-        if let Err(e) = host.eval_to_string(&script) {
-            diagnostics.push(format!("Script error: {e}"));
-        }
+    let ran = {
+        host.run_document_scripts();
         // The document is parsed by now, so its DOMContentLoaded handlers run.
         host.fire_dom_content_loaded();
         // Drain microtasks + due one-shot timers as at initial load; each
         // interval fires at most once (no spinning at first paint). Bounded to
         // cap runaway setTimeout(0) chains.
         host.run_initial_load(1000);
+        host.fire_load();
         // Interim lifecycle: this layout pass is one-shot, so wait (bounded)
         // for in-flight fetch() requests to settle and their .then chains to
         // mutate the DOM before we lay out. Progressive rendering across
@@ -1127,8 +1291,6 @@ fn execute_scripts_boa(
             host.run_initial_load(1000);
         }
         true
-    } else {
-        false
     };
     replace_local_storage(document_url, &host.local_storage_entries());
     for line in host.take_console_log() {
@@ -1225,13 +1387,30 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 } else {
                     String::new()
                 };
+                // A solid background seen through `mask-image` is how icons take
+                // the text's color.
+                let masked_color = style
+                    .mask_image()
+                    .filter(|_| style.background_image().is_none() && style.background_gradient().is_none())
+                    .map(|_| style.used_background_color())
+                    .filter(|color| color.rgba_channels().3 > 0)
+                    .map(|color| color.code().to_string());
+                let masked = masked_color.is_some();
                 scene_items.push(SceneItem::Rect {
                     x,
                     y,
                     width: lw,
                     height: lh,
-                    background_color: style.used_background_color().code().to_string(),
-                    background_image: style.background_image().map(|s| s.to_string()),
+                    background_color: if masked_color.is_some() {
+                        "transparent".to_string()
+                    } else {
+                        style.used_background_color().code().to_string()
+                    },
+                    background_image: masked_color
+                        .is_some()
+                        .then(|| style.mask_image().map(str::to_string))
+                        .unwrap_or_else(|| style.background_image().map(|s| s.to_string())),
+                    background_mask_color: masked_color,
                     background_gradient: style.background_gradient().map(|g| {
                         (
                             g.angle_deg,
@@ -1250,9 +1429,17 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     border_width,
                     border_widths,
                     border_color,
-                    background_position: style.background_position(),
-                    background_no_repeat: style.background_no_repeat(),
-                    background_size: style.background_size(),
+                    background_position: if masked {
+                        style.mask_position()
+                    } else {
+                        style.background_position()
+                    },
+                    background_no_repeat: if masked {
+                        style.mask_no_repeat()
+                    } else {
+                        style.background_no_repeat()
+                    },
+                    background_size: if masked { style.mask_size() } else { style.background_size() },
                     border_radius: scaled_len(
                         ctx,
                         style.border_radius_for(layout_size.width(), layout_size.height()),
@@ -1560,6 +1747,541 @@ mod tests {
     /// connections and may open more than one, and a request that arrives after
     /// the listener is gone waits out the 10s connect + 20s request timeouts —
     /// which is what the 30s failures in this module were.
+    /// A server for a whole small site: path, content type, extra headers, body.
+    /// Also records each request's `Cookie` header, in the `x-seen-cookie` of the
+    /// response to `/echo-cookie`.
+    fn spawn_site_server(
+        routes: Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)>,
+        delay: std::time::Duration,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        let mut buf = [0u8; 4096];
+                        let read = stream.read(&mut buf).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                        let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        std::thread::sleep(delay);
+                        let cookie = request
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .starts_with("cookie:")
+                                    .then(|| l[7..].trim().to_string())
+                            })
+                            .unwrap_or_default();
+                        let response = if path == "/echo-cookie" {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{cookie}",
+                                cookie.len(),
+                            )
+                        } else if let Some((_, ty, headers, body)) =
+                            routes.iter().find(|(p, ..)| *p == path)
+                        {
+                            let extra: String =
+                                headers.iter().map(|h| format!("{h}\r\n")).collect();
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\n{extra}\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len(),
+                            )
+                        } else {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                                .to_string()
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    /// Loads `html` as `path` on a site and returns the text it put in `#out`,
+    /// once its fetches and timers are through.
+    fn run_page_on_site(
+        routes: Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)>,
+        html: &str,
+    ) -> String {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = spawn_site_server(
+            routes,
+            std::time::Duration::from_millis(0),
+            stop.clone(),
+        );
+        let base = format!("http://127.0.0.1:{port}/page.html");
+        let rect = FrameRect { x: 0, y: 0, width: 800, height: 600 };
+        let (mut page, _) = LivePage::load(&base, html, &rect, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let _ = page.pump_and_relayout(&rect);
+            let _ = page.animation_frame(&rect);
+            if !page.has_pending_work() && !page.has_pending_animation() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = page.pump_and_relayout(&rect);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server.join();
+        page.eval_for_test("document.getElementById('out').textContent")
+    }
+
+    const JS: &str = "text/javascript";
+
+    #[test]
+    fn external_scripts_run_in_document_order_around_inline_ones() {
+        let out = run_page_on_site(
+            vec![
+                ("/a.js", JS, vec![], "window.log=['a'];"),
+                ("/b.js", JS, vec![], "log.push('b:'+!!document.getElementById('out'));"),
+                ("/d.js", JS, vec![], "log.push('defer:'+!!document.getElementById('tail'));"),
+            ],
+            "<html><body><p id=out></p>\
+             <script defer src=d.js></script>\
+             <script src=a.js></script>\
+             <script>log.push('inline');</script>\
+             <script src=b.js></script>\
+             <p id=tail></p>\
+             <script>log.push('last');\
+               document.addEventListener('DOMContentLoaded',function(){\
+                 log.push('dcl');document.getElementById('out').textContent=log.join(' ');});\
+             </script></body></html>",
+        );
+        assert_eq!(out, "a inline b:true last defer:true dcl");
+    }
+
+    #[test]
+    fn a_failing_script_does_not_stop_the_next_one() {
+        let out = run_page_on_site(
+            vec![("/ok.js", JS, vec![], "window.r.push('ok');")],
+            "<html><body><p id=out></p>\
+             <script>window.r=[];</script>\
+             <script>throw new Error('boom');</script>\
+             <script>syntax error here(</script>\
+             <script src=missing.js onerror=\"r.push('onerror')\"></script>\
+             <script src=ok.js onload=\"r.push('onload')\"></script>\
+             <script>document.getElementById('out').textContent=r.join(' ');</script>\
+             </body></html>",
+        );
+        assert_eq!(out, "onerror ok onload");
+    }
+
+    #[test]
+    fn module_scripts_import_their_dependencies() {
+        let out = run_page_on_site(
+            vec![
+                ("/m.js", JS, vec![], "import {n} from './dep.js';\
+                    import d from '/sub/def.js';\
+                    document.getElementById('out').textContent=n+d+(typeof document.currentScript)\
+                      +new URL(import.meta.url).pathname;"),
+                ("/dep.js", JS, vec![], "export const n = 'dep';"),
+                ("/sub/def.js", JS, vec![], "export default 'def';"),
+            ],
+            "<html><body><p id=out></p><script type=module src=m.js></script></body></html>",
+        );
+        assert_eq!(out, "depdefobject/m.js");
+    }
+
+    #[test]
+    fn import_maps_resolve_bare_names_and_prefixes() {
+        let out = run_page_on_site(
+            vec![
+                ("/m.js", JS, vec![], "import a from 'lib';import b from 'pkg/deep/b.js';\
+                    import c from './rel.js';\
+                    document.getElementById('out').textContent=a+b+c;"),
+                ("/vendor/lib.v2.js", JS, vec![], "export default 'lib';"),
+                ("/vendor/pkg/deep/b.js", JS, vec![], "export default 'b';"),
+                ("/mapped-rel.js", JS, vec![], "export default 'mapped';"),
+            ],
+            "<html><head><script type=importmap>{\"imports\":{\
+               \"lib\":\"/vendor/lib.v2.js\",\
+               \"pkg/\":\"/vendor/pkg/\",\
+               \"./rel.js\":\"/mapped-rel.js\"}}</script></head>\
+             <body><p id=out></p><script type=module src=m.js></script></body></html>",
+        );
+        assert_eq!(out, "libbmapped");
+    }
+
+    #[test]
+    fn clearing_an_interval_from_its_own_callback_stops_it() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var n=0,id=setInterval(function(){n++;if(n===3)clearInterval(id);\
+               document.getElementById('out').textContent=String(n);},1);\
+             </script></body></html>",
+        );
+        assert_eq!(out, "3");
+    }
+
+    #[test]
+    fn character_data_reads_and_writes_in_place() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><!--note-->x</div><script>\
+             var d=document.getElementById('d'),c=d.firstChild,t=d.lastChild;\
+             var seen=[c.nodeType,c.data,t.nodeValue];\
+             c.data='changed';t.nodeValue='y';d.lastChild.data+='z';\
+             seen.push(d.innerHTML,d.textContent);\
+             d.textContent='';seen.push(d.childNodes.length,d.firstChild);\
+             d.textContent='a';d.append('b');seen.push(d.childNodes.length,d.lastChild.parentNode===d);\
+             document.getElementById('out').textContent=seen.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "8|note|x|<!--changed-->yz|yz|0||2|true");
+    }
+
+    #[test]
+    fn interface_objects_answer_instanceof() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><i></i>t<!--c--></div><svg id=s class=k></svg><script>\
+             var d=document.getElementById('d'),s=document.getElementById('s');\
+             var w=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT),seen=[];\
+             while(w.nextNode())seen.push(w.currentNode.nodeType);\
+             var c=document.createTreeWalker(d,NodeFilter.SHOW_TEXT,function(){return NodeFilter.FILTER_REJECT;});\
+             var r=[d.childNodes instanceof NodeList,d.classList instanceof DOMTokenList,\
+               s instanceof SVGElement,s.className instanceof SVGAnimatedString,s.className.baseVal,\
+               seen.join(''),c.nextNode(),document.location===location,typeof ReadableStream,\
+               new DOMMatrix().translate(2,3).e,navigator.userAgent.indexOf('CosmoBrowse')>0];\
+             document.getElementById('out').textContent=r.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "true|true|true|true|k|13||true|function|2|true");
+    }
+
+    #[test]
+    fn a_tree_walker_follows_the_spec() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><a><i>1</i>2</a><!--c--><b>3</b></div><template id=t><u>x</u>y</template><script>\
+             var d=document.getElementById('d'),r=[];\
+             var names=function(w,step){var o=[],n;while((n=w[step]()))o.push(n.nodeName);return o.join(',');};\
+             r.push(names(document.createTreeWalker(d,NodeFilter.SHOW_ALL),'nextNode'));\
+             var skip=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT,function(n){return n.nodeName==='A'?NodeFilter.FILTER_SKIP:NodeFilter.FILTER_ACCEPT;});\
+             r.push(names(skip,'nextNode'));\
+             var reject=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT,function(n){return n.nodeName==='A'?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT;});\
+             r.push(names(reject,'nextNode'));\
+             var back=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT);back.currentNode=d.lastChild;\
+             r.push(names(back,'previousNode'));\
+             var outside=document.createTreeWalker(document,129);\
+             outside.currentNode=document.getElementById('t').content;\
+             r.push(names(outside,'nextNode'));\
+             var family=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT);\
+             r.push(family.firstChild().nodeName,family.nextSibling().nodeName,family.parentNode().nodeName);\
+             var it=document.createNodeIterator(d,NodeFilter.SHOW_TEXT);r.push(it.nextNode().data,it.nextNode().data,it.previousNode().data);\
+             document.getElementById('out').textContent=r.join(' ');\
+             </script></body></html>",
+        );
+        assert_eq!(
+            out,
+            "A,I,#text,#text,#comment,B,#text I,B B I,A,DIV U A B DIV 1 2 1"
+        );
+    }
+
+    #[test]
+    fn streams_deliver_what_is_enqueued() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var rs=new ReadableStream({start:function(c){c.enqueue('a');c.enqueue('b');c.close();}});\
+             var r=rs.getReader(),got=[];\
+             (function next(){return r.read().then(function(x){if(x.done){\
+               document.getElementById('out').textContent=got.join('');return;}\
+               got.push(x.value);return next();});})();\
+             </script></body></html>",
+        );
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn the_legacy_parts_of_javascript_that_the_web_relies_on_work() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var o={};o.__defineGetter__('g',function(){return 'g';});\
+             document.getElementById('out').textContent=['abcdef'.substr(2,2),escape('a b'),o.g].join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "cd|a%20b|g");
+    }
+
+    #[test]
+    fn a_shadow_tree_is_kept_apart_from_the_document() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=h><span id=light>light</span></div><script>\
+             var h=document.getElementById('h'),r=h.attachShadow({mode:'open'});\
+             r.innerHTML='<b id=inner class=x>shadow</b><slot></slot>';\
+             var inner=r.getElementById('inner'),o=[\
+               document.getElementById('inner')===null,document.querySelector('.x')===null,\
+               h.children.length,h.textContent,h.shadowRoot===r,r.nodeType,r.parentNode,r.host===h,\
+               inner.getRootNode()===r,inner.isConnected,inner.getRootNode({composed:true})===document,\
+               inner.closest('body'),r.querySelector('slot').assignedNodes().length,\
+               h.querySelector('#light').assignedSlot===r.querySelector('slot')];\
+             var c=document.createElement('div').attachShadow({mode:'closed'});\
+             o.push(c.host.shadowRoot);\
+             document.getElementById('out').textContent=o.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(
+            out,
+            "true|true|1|light|true|11||true|true|true|true||1|true|"
+        );
+    }
+
+    #[test]
+    fn markup_can_declare_a_shadow_tree() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p>\
+             <div id=open><template shadowrootmode=open><b id=in>shadow</b><slot></slot></template>light</div>\
+             <div id=closed><template shadowrootmode=closed><b>hidden</b></template></div>\
+             <div id=plain><template><b>inert</b></template></div><script>\
+             var o=document.getElementById('open'),c=document.getElementById('closed'),p=document.getElementById('plain');\
+             var r=o.shadowRoot,seen=[r.mode,r.host===o,r.getElementById('in').textContent,\
+               o.querySelector('template'),o.textContent,c.shadowRoot,c.children.length,\
+               p.shadowRoot,p.querySelector('template').content.firstChild.textContent];\
+             var again=o.attachShadow({mode:'open'});seen.push(again===r,r.childNodes.length);\
+             var threw='no';try{o.attachShadow({mode:'open'});}catch(e){threw=e.name;}seen.push(threw);\
+             document.getElementById('out').textContent=seen.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "open|true|shadow||light||0||inert|true|0|NotSupportedError");
+    }
+
+    #[test]
+    fn events_are_retargeted_at_the_edge_of_a_shadow_tree() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=h></div><script>\
+             var h=document.getElementById('h'),r=h.attachShadow({mode:'open'});\
+             r.innerHTML='<i id=t></i>';var t=r.querySelector('#t'),log=[];\
+             var note=function(where){return function(e){log.push(where+':'+(e.target.id||e.target.nodeName));};};\
+             t.addEventListener('x',note('in'));r.addEventListener('x',note('root'));\
+             h.addEventListener('x',note('host'));document.addEventListener('x',note('doc'));\
+             t.dispatchEvent(new Event('x',{bubbles:true}));log.push('/');\
+             t.dispatchEvent(new Event('x',{bubbles:true,composed:true}));\
+             document.getElementById('out').textContent=log.join(' ');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "in:t root:t / in:t root:t host:h doc:h");
+    }
+
+    #[test]
+    fn custom_elements_hear_about_their_lifecycle() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><x-a id=early></x-a><script>\
+             var log=[];\
+             class A extends HTMLElement{\
+               static get observedAttributes(){return ['k'];}\
+               connectedCallback(){log.push('in:'+this.id);}\
+               disconnectedCallback(){log.push('out:'+this.id);}\
+               attributeChangedCallback(n,o,v){log.push(n+':'+o+'>'+v);}\
+             }\
+             customElements.define('x-a',A);\
+             var late=document.createElement('x-a');late.id='late';\
+             log.push(late instanceof A);\
+             late.setAttribute('k','1');late.setAttribute('other','1');\
+             document.body.appendChild(late);document.body.appendChild(late);\
+             late.remove();\
+             var holder=document.createElement('div');document.body.appendChild(holder);\
+             holder.innerHTML='<x-a id=parsed></x-a>';\
+             var r=document.createElement('div');document.body.appendChild(r);\
+             r.attachShadow({mode:'open'}).innerHTML='<x-a id=shadowed></x-a>';\
+             holder.innerHTML='';\
+             document.getElementById('out').textContent=log.join(' ');\
+             </script></body></html>",
+        );
+        assert_eq!(
+            out,
+            "in:early true k:null>1 in:late out:late in:parsed in:shadowed out:parsed"
+        );
+    }
+
+    #[test]
+    fn a_stylesheet_object_reaches_layout() {
+        let html = "<html><head><style id=s></style></head><body style=margin:0>\
+            <div id=a>a</div><div id=b>b</div><div id=h></div><script>\
+            document.getElementById('s').sheet.insertRule('#a{height:31px}',0);\
+            var sheet=new CSSStyleSheet();sheet.replaceSync('#b{height:32px}');\
+            document.adoptedStyleSheets=[sheet];\
+            var r=document.getElementById('h').attachShadow({mode:'open'});\
+            r.innerHTML='<div id=in>x</div>';\
+            var inner=new CSSStyleSheet();inner.replaceSync(':host{display:block;height:33px}#in{height:34px}');\
+            r.adoptedStyleSheets=[inner];\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        let height = |page: &mut LivePage, script: &str| {
+            page.eval_for_test(&format!("{script}.getBoundingClientRect().height"))
+        };
+        assert_eq!(height(&mut page, "document.getElementById('a')"), "31");
+        assert_eq!(height(&mut page, "document.getElementById('b')"), "32");
+        assert_eq!(height(&mut page, "document.getElementById('h')"), "33");
+        assert_eq!(height(&mut page, "document.getElementById('h').shadowRoot.getElementById('in')"), "34");
+        page.eval_for_test("document.getElementById('s').sheet.deleteRule(0)");
+        assert_eq!(page.eval_for_test("document.getElementById('s').sheet.cssRules.length"), "0");
+    }
+
+    #[test]
+    fn scripts_inserted_by_script_load() {
+        let out = run_page_on_site(
+            vec![("/late.js", JS, vec![], "window.loaded='late';")],
+            "<html><body><p id=out></p><script>\
+             var s=document.createElement('script');s.src='late.js';\
+             s.onload=function(){document.getElementById('out').textContent=window.loaded;};\
+             document.head.appendChild(s);\
+             </script></body></html>",
+        );
+        assert_eq!(out, "late");
+    }
+
+    #[test]
+    fn the_dom_has_its_class_hierarchy() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d class='a b'><span>x</span>t<input id=i value=v></div><script>\
+             var d=document.getElementById('d'),r=[];\
+             r.push(d instanceof HTMLElement && d instanceof Element && d instanceof Node && d instanceof EventTarget);\
+             r.push(document.getElementById('i') instanceof HTMLInputElement);\
+             r.push(document.getElementById('i').value);\
+             r.push(d.classList.contains('b'));\
+             r.push(d.firstElementChild.tagName);\
+             r.push(d.children.length);\
+             r.push(document.querySelector('#d span').textContent);\
+             r.push(d.childNodes[1].nodeType);\
+             d.append('z');r.push(d.lastChild.data);\
+             var f=document.createDocumentFragment();f.appendChild(document.createElement('b'));f.appendChild(document.createElement('i'));\
+             d.appendChild(f);r.push(d.querySelectorAll('b,i').length);\
+             r.push(d.cloneNode(true).children.length);\
+             r.push(d.querySelector('p'),d.querySelector('div'));\
+             d.remove();r.push(document.getElementById('d')===null);\
+             document.getElementById('out').textContent=r.join(',');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "true,true,v,true,SPAN,2,x,3,z,2,4,,,true");
+    }
+
+    #[test]
+    fn moving_a_node_to_where_it_already_is_leaves_the_tree_whole() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><div id=d><i id=a>a</i><i id=b>b</i></div><script>\
+             var d=document.getElementById('d'),a=document.getElementById('a'),b=document.getElementById('b');\
+             d.prepend(a);d.insertBefore(b,b);d.insertBefore(a,a);\
+             var inner='';try{a.appendChild(d);}catch(e){inner=e.message.split(':')[0];}\
+             var wrong='';try{d.insertBefore(document.createElement('u'),document.body);}catch(e){wrong=e.message.split(':')[0];}\
+             document.getElementById('out').textContent=d.textContent+'|'+inner+'|'+wrong;\
+             </script></body></html>",
+        );
+        assert_eq!(out, "ab|HierarchyRequestError|NotFoundError");
+    }
+
+    #[test]
+    fn a_collection_with_live_weak_map_values_finishes() {
+        // Boa before 0.22 never finished marking a cycle reachable from a WeakMap
+        // value, and ran out of memory trying.
+        let out = run_page_on_site(
+            vec![],
+            "<html><body><p id=out></p><script>\
+             var key={},map=new WeakMap(),cycle={};cycle.self=cycle;map.set(key,cycle);\
+             var keep=[];for(var i=0;i<200000;i++){keep.push({i:i});}\
+             document.getElementById('out').textContent=map.get(key)===cycle?'alive':'lost';\
+             </script></body></html>",
+        );
+        assert_eq!(out, "alive");
+    }
+
+    #[test]
+    fn script_can_measure_layout_and_read_computed_style() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><head><style>body{margin:0}\
+             #b{width:120px;height:30px;margin-left:10px;color:#ff0000;--brand: blue}\
+             #n{display:none}</style></head><body><div id=b></div><div id=n></div><p id=out></p><script>\
+             var b=document.getElementById('b'),r=b.getBoundingClientRect(),c=getComputedStyle(b);\
+             var o=[r.left,r.top,r.width,r.height,b.offsetWidth,c.color,c.display,c.width,\
+               c.getPropertyValue('--brand'),getComputedStyle(document.getElementById('n')).display,innerWidth];\
+             document.getElementById('out').textContent=o.join('|');\
+             </script></body></html>",
+        );
+        assert_eq!(out, "10|0|120|30|120|rgb(255, 0, 0)|block|120px|blue|none|800");
+    }
+
+    #[test]
+    fn layout_queries_see_changes_made_by_script() {
+        let out = run_page_on_site(
+            vec![],
+            "<html><head><style>body{margin:0}</style></head><body><div id=b style='width:50px'></div>\
+             <p id=out></p><script>\
+             var b=document.getElementById('b');var w1=b.getBoundingClientRect().width;\
+             b.style.width='70px';var w2=b.getBoundingClientRect().width;\
+             document.getElementById('out').textContent=w1+' '+w2;\
+             </script></body></html>",
+        );
+        assert_eq!(out, "50 70");
+    }
+
+    #[test]
+    fn a_style_element_added_by_script_restyles_the_page() {
+        let html = "<html><head><style>body{margin:0}#b{height:10px}</style></head><body>\
+            <div id=b>styled</div><script>\
+            setTimeout(function(){var s=document.createElement('style');\
+              s.textContent='#b{height:77px;background-color:#00ff00}';\
+              document.head.appendChild(s);},0);\
+            </script></body></html>";
+        let rect = FrameRect { x: 0, y: 0, width: 300, height: 300 };
+        let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
+        let _ = page.animation_frame(&rect);
+        let height = page
+            .eval_for_test("document.getElementById('b').getBoundingClientRect().height");
+        assert_eq!(height, "77");
+    }
+
+    #[test]
+    fn cookies_follow_http_only_and_reach_same_origin_requests() {
+        let out = run_page_on_site(
+            vec![(
+                "/set",
+                "text/plain",
+                vec!["Set-Cookie: secret=s3; HttpOnly", "Set-Cookie: plain=p1"],
+                "ok",
+            )],
+            "<html><body><p id=out></p><script>\
+             fetch('/set').then(function(){\
+               var seen=document.cookie;\
+               document.cookie='mine=m1';\
+               document.cookie='secret=stolen';\
+               return fetch('/echo-cookie').then(function(r){return r.text();}).then(function(sent){\
+                 document.getElementById('out').textContent=[seen,document.cookie,sent].join('#');\
+               });\
+             });\
+             </script></body></html>",
+        );
+        let parts: Vec<&str> = out.split('#').collect();
+        assert_eq!(parts.len(), 3, "{out}");
+        assert_eq!(parts[0], "plain=p1");
+        assert!(parts[1].contains("mine=m1") && !parts[1].contains("secret"), "{out}");
+        assert!(parts[2].contains("secret=s3"), "{out}");
+    }
+
     fn spawn_fixture_server(
         body: &'static str,
         content_type: &'static str,
@@ -1577,6 +2299,9 @@ mod tests {
                         stream.set_nonblocking(false).ok();
                         let mut buf = [0u8; 1024];
                         let _ = stream.read(&mut buf);
+                        // Slow enough that the response can't beat the page's load,
+                        // since these tests are about what happens after it.
+                        std::thread::sleep(std::time::Duration::from_millis(300));
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1610,9 +2335,15 @@ mod tests {
     fn live_page_progressive_render_after_fetch() {
         let _env = lock_layout_assert_env();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (port, server) = spawn_fixture_server(
-            r#"{"items":["late-x","late-y"]}"#,
-            "application/json",
+        // Slow enough that the response can't beat the first paint.
+        let (port, server) = spawn_site_server(
+            vec![(
+                "/data.json",
+                "application/json",
+                vec![],
+                r#"{"items":["late-x","late-y"]}"#,
+            )],
+            std::time::Duration::from_millis(500),
             stop.clone(),
         );
 
@@ -2540,7 +3271,7 @@ mod tests {
     }
 
     fn styled_row_height(page: &LivePage, rect: &FrameRect, id: &str) -> i64 {
-        let view = build_layout_view(page.dom.clone(), &page.cssom, rect);
+        let view = build_layout_view(page.dom.clone(), &page.cssom.borrow(), rect);
         let object = view.find_object_of_node(&element(page, id)).expect("box");
         let rows = object.borrow().select_popup_rows();
         rows[0].3
@@ -2720,6 +3451,7 @@ mod diff_tests {
             height: 10,
             background_color: "#fff".to_string(),
             background_image: None,
+            background_mask_color: None,
             background_gradient: None,
             opacity: 1.0,
             z_index: 0,
@@ -2746,6 +3478,7 @@ mod diff_tests {
             height: 10,
             background_color: "#fff".to_string(),
             background_image: None,
+            background_mask_color: None,
             background_gradient: None,
             opacity: 1.0,
             z_index: 1,

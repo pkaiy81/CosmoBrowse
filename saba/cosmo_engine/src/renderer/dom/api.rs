@@ -7,6 +7,7 @@ use std::string::String;
 use std::string::ToString;
 use std::vec::Vec;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomEventType {
@@ -132,33 +133,29 @@ pub fn get_target_element_node(
 /// Append the concatenated text of `node` and its descendants to `output`
 /// (the DOM `textContent` read algorithm, simplified).
 pub fn collect_text(node: Option<Rc<RefCell<Node>>>, output: &mut String) {
-    let Some(node) = node else {
-        return;
-    };
-
-    if let NodeKind::Text(text) = node.borrow().kind() {
-        output.push_str(&text);
+    let mut current = node;
+    while let Some(node) = current {
+        if let NodeKind::Text(text) = &node.borrow().kind {
+            output.push_str(text);
+        }
+        collect_text(node.borrow().first_child(), output);
+        current = node.borrow().next_sibling();
     }
-
-    collect_text(node.borrow().first_child(), output);
-    collect_text(node.borrow().next_sibling(), output);
 }
 
 fn collect_tag_texts(node: Option<Rc<RefCell<Node>>>, kind: ElementKind, output: &mut Vec<String>) {
-    let Some(node) = node else {
-        return;
-    };
-
-    if node.borrow().element_kind() == Some(kind) {
-        let mut text = String::new();
-        collect_text(node.borrow().first_child(), &mut text);
-        if !text.is_empty() {
-            output.push(text);
+    let mut current = node;
+    while let Some(node) = current {
+        if node.borrow().element_kind() == Some(kind) {
+            let mut text = String::new();
+            collect_text(node.borrow().first_child(), &mut text);
+            if !text.is_empty() {
+                output.push(text);
+            }
         }
+        collect_tag_texts(node.borrow().first_child(), kind, output);
+        current = node.borrow().next_sibling();
     }
-
-    collect_tag_texts(node.borrow().first_child(), kind, output);
-    collect_tag_texts(node.borrow().next_sibling(), kind, output);
 }
 
 fn collect_stylesheet_links_internal(node: Option<Rc<RefCell<Node>>>, output: &mut Vec<String>) {
@@ -169,7 +166,11 @@ fn collect_stylesheet_links_internal(node: Option<Rc<RefCell<Node>>>, output: &m
     if let NodeKind::Element(element) = node.borrow().kind() {
         if element.kind() == ElementKind::Link {
             let rel = element.get_attribute("rel").unwrap_or_default();
-            if rel.eq_ignore_ascii_case("stylesheet") {
+            // `rel` is a list: `preload stylesheet` is a stylesheet too.
+            let is_stylesheet = rel
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"));
+            if is_stylesheet {
                 if let Some(href) = element.get_attribute("href") {
                     output.push(href);
                 }
@@ -184,6 +185,18 @@ fn collect_stylesheet_links_internal(node: Option<Rc<RefCell<Node>>>, output: &m
 pub fn get_style_content(root: Rc<RefCell<Node>>) -> String {
     let mut styles = Vec::new();
     collect_tag_texts(Some(root), ElementKind::Style, &mut styles);
+    styles.join("\n")
+}
+
+/// The text of the `<style>` elements at and under `node`, not its siblings.
+pub fn get_style_content_within(node: &Rc<RefCell<Node>>) -> String {
+    let mut styles = Vec::new();
+    if node.borrow().element_kind() == Some(ElementKind::Style) {
+        let mut text = String::new();
+        collect_text(node.borrow().first_child(), &mut text);
+        styles.push(text);
+    }
+    collect_tag_texts(node.borrow().first_child(), ElementKind::Style, &mut styles);
     styles.join("\n")
 }
 
@@ -255,12 +268,7 @@ pub fn query_selector_all(
     root: Rc<RefCell<Node>>,
     selector: &str,
 ) -> Vec<Rc<RefCell<Node>>> {
-    use crate::renderer::css::cssom::CssParser;
-    use crate::renderer::css::token::CssTokenizer;
-    use crate::renderer::style::selector::dom_node_selected;
-
-    let css = format!("{selector}{{}}");
-    let sheet = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
+    let sheet = parsed_selector(selector);
     let mut out: Vec<Rc<RefCell<Node>>> = Vec::new();
     fn walk(
         node: Option<Rc<RefCell<Node>>>,
@@ -268,21 +276,19 @@ pub fn query_selector_all(
         out: &mut Vec<Rc<RefCell<Node>>>,
     ) {
         use crate::renderer::style::selector::dom_node_selected;
-        let Some(n) = node else { return };
-        if matches!(n.borrow().kind(), NodeKind::Element(_))
-            && rules.iter().any(|r| dom_node_selected(&n, &r.selector))
-        {
-            out.push(n.clone());
+        let mut current = node;
+        while let Some(n) = current {
+            if matches!(n.borrow().kind, NodeKind::Element(_))
+                && rules.iter().any(|r| dom_node_selected(&n, &r.selector))
+            {
+                out.push(n.clone());
+            }
+            walk(n.borrow().first_child(), rules, out);
+            current = n.borrow().next_sibling();
         }
-        let (first, next) = {
-            let b = n.borrow();
-            (b.first_child(), b.next_sibling())
-        };
-        walk(first, rules, out);
-        walk(next, rules, out);
     }
-    let _ = dom_node_selected; // (used inside walk)
-    walk(Some(root), &sheet.rules, &mut out);
+    // What's under `root`: not `root`, and not what comes after it.
+    walk(root.borrow().first_child(), &sheet.rules, &mut out);
     out
 }
 
@@ -291,20 +297,39 @@ pub fn query_selector(root: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<RefC
     query_selector_all(root, selector).into_iter().next()
 }
 
+/// A selector from script, parsed. Pages ask the same few over and over.
+fn parsed_selector(selector: &str) -> Rc<crate::renderer::css::cssom::StyleSheet> {
+    use crate::renderer::css::cssom::CssParser;
+    use crate::renderer::css::token::CssTokenizer;
+    thread_local! {
+        static PARSED: RefCell<HashMap<String, Rc<crate::renderer::css::cssom::StyleSheet>>> =
+            RefCell::new(HashMap::new());
+    }
+    PARSED.with(|parsed| {
+        let mut parsed = parsed.borrow_mut();
+        if let Some(sheet) = parsed.get(selector) {
+            return sheet.clone();
+        }
+        if parsed.len() >= 512 {
+            parsed.clear();
+        }
+        let css = format!("{selector}{{}}");
+        let sheet = Rc::new(CssParser::new(CssTokenizer::new(css)).parse_stylesheet());
+        parsed.insert(selector.to_string(), sheet.clone());
+        sheet
+    })
+}
+
 /// `element.matches(selector)`: does `node` match the CSS selector? Reuses the
 /// engine's selector matcher (same parse-into-empty-rule trick as
 /// `query_selector_all`). Non-element nodes never match.
 pub fn element_matches(node: &Rc<RefCell<Node>>, selector: &str) -> bool {
-    use crate::renderer::css::cssom::CssParser;
-    use crate::renderer::css::token::CssTokenizer;
     use crate::renderer::style::selector::dom_node_selected;
 
-    if !matches!(node.borrow().kind(), NodeKind::Element(_)) {
+    if !matches!(node.borrow().kind, NodeKind::Element(_)) {
         return false;
     }
-    let css = format!("{selector}{{}}");
-    let sheet = CssParser::new(CssTokenizer::new(css)).parse_stylesheet();
-    sheet
+    parsed_selector(selector)
         .rules
         .iter()
         .any(|r| dom_node_selected(node, &r.selector))
@@ -318,9 +343,66 @@ pub fn element_closest(node: Rc<RefCell<Node>>, selector: &str) -> Option<Rc<Ref
         if element_matches(&n, selector) {
             return Some(n);
         }
-        current = n.borrow().parent().upgrade();
+        // The search doesn't leave the shadow tree it started in.
+        current = n.borrow().parent().upgrade().filter(|p| !p.borrow().is_shadow_root());
     }
     None
+}
+
+/// Turns `<template shadowrootmode>` into the shadow tree it declares.
+/// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inhead
+pub fn attach_declarative_shadow_roots(root: &Rc<RefCell<Node>>) {
+    use crate::renderer::dom::node::SHADOW_ROOT_TAG;
+    use crate::renderer::html::attribute::Attribute;
+    let mut child = root.borrow().first_child();
+    while let Some(c) = child {
+        let next = c.borrow().next_sibling();
+        let mode = match &c.borrow().kind {
+            NodeKind::Element(element) if element.tag_name() == "template" => element
+                .get_attribute("shadowrootmode")
+                .map(|mode| mode.to_ascii_lowercase())
+                .filter(|mode| mode == "open" || mode == "closed"),
+            _ => None,
+        };
+        let can_host =
+            matches!(root.borrow().kind, NodeKind::Element(_)) && root.borrow().shadow_root().is_none();
+        if let (Some(mode), true) = (mode, can_host) {
+            let mut attribute = Attribute::new();
+            for character in "mode".chars() {
+                attribute.add_char(character, true);
+            }
+            for character in mode.chars() {
+                attribute.add_char(character, false);
+            }
+            let shadow = Rc::new(RefCell::new(Node::new(NodeKind::Element(Element::new(
+                SHADOW_ROOT_TAG,
+                vec![attribute],
+            )))));
+            shadow.borrow_mut().set_parent(Rc::downgrade(root));
+            detach_node(&c);
+            while let Some(grandchild) = {
+                let first = c.borrow().first_child();
+                first
+            } {
+                detach_node(&grandchild);
+                let last = shadow.borrow().last_child().upgrade();
+                grandchild.borrow_mut().set_parent(Rc::downgrade(&shadow));
+                match last {
+                    Some(last) => {
+                        grandchild.borrow_mut().set_previous_sibling(Rc::downgrade(&last));
+                        last.borrow_mut().set_next_sibling(Some(grandchild.clone()));
+                    }
+                    None => shadow.borrow_mut().set_first_child(Some(grandchild.clone())),
+                }
+                shadow.borrow_mut().set_last_child(Rc::downgrade(&grandchild));
+            }
+            root.borrow_mut().set_shadow_root(shadow.clone());
+            attach_declarative_shadow_roots(&shadow);
+        } else {
+            attach_declarative_shadow_roots(&c);
+        }
+        child = next;
+    }
 }
 
 /// Take a node out of its parent, closing the gap between its siblings.

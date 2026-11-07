@@ -1,0 +1,26 @@
+<!doctype html><style>
+body{margin:8px;font:14px sans-serif;--ink:light-dark(#223,#eef)}
+div{height:22px;margin:2px 0;padding:0 6px;line-height:22px}
+.ld{background:light-dark(#cdf,#013);color:var(--ink)}
+.mix1{background:color-mix(in srgb,red,blue)}
+.mix2{background:color-mix(in srgb,white 25%,black);color:white}
+.mix3{background:color-mix(in srgb,#0a0,transparent 75%)}
+.ok1{background:oklch(70% 0.15 150)}
+.ok2{background:oklab(70% 0.1 -0.1)}
+.lab{background:lab(70 40 -40)}
+.lch{background:lch(70 50 60)}
+.hwb{background:hwb(200 20% 30%)}
+.col{background:color(srgb 0.9 0.6 0.2)}
+.hsl{background:hsl(280deg 60% 75% / 80%)}
+.cur{color:#a06;border:2px solid currentcolor;background:color-mix(in srgb,currentcolor 20%,white)}
+.sys{background:Canvas;color:LinkText;border:1px solid ButtonBorder}
+.grad{background:linear-gradient(90deg,oklch(70% 0.2 30),color-mix(in srgb,blue,white))}
+@supports (color:light-dark(red,blue)){.s1{background:#8d8}}
+@supports (color:color-mix(in srgb,red,blue)){.s2{background:#8d8}}
+@supports (color:oklch(50% 0.1 10)){.s3{background:#8d8}}
+@supports not (color:oklch(50% 0.1 10)){.s3{background:#f88}}
+</style>
+<div class=ld>light-dark</div><div class=mix1>mix red blue</div><div class=mix2>mix 25% white</div><div class=mix3>mix transparent</div>
+<div class=ok1>oklch</div><div class=ok2>oklab</div><div class=lab>lab</div><div class=lch>lch</div><div class=hwb>hwb</div><div class=col>color()</div><div class=hsl>hsl</div>
+<div class=cur>currentcolor</div><div class=sys>system colors</div><div class=grad>gradient stops</div>
+<div class=s1>supports light-dark</div><div class=s2>supports color-mix</div><div class=s3>supports oklch</div>

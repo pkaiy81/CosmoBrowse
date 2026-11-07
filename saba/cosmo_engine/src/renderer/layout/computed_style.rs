@@ -79,6 +79,12 @@ pub struct ComputedStyle {
     background_color: Option<Color>,
     background_image: Option<String>,
     background_gradient: Option<LinearGradient>,
+    /// `mask-image: url(...)`. Only a box's own background is masked, which is
+    /// what the icons that use it want.
+    mask_image: Option<String>,
+    mask_size: Option<(u8, f64, bool, f64, bool)>,
+    mask_position: Option<(f64, bool, f64, bool)>,
+    mask_no_repeat: bool,
     color: Option<Color>,
     display: Option<DisplayType>,
     float: Option<Float>,
@@ -200,6 +206,8 @@ pub struct ComputedStyle {
     /// resolved at positioning time.
     offset_top_ratio: Option<f64>,
     offset_left_ratio: Option<f64>,
+    offset_right_ratio: Option<f64>,
+    offset_bottom_ratio: Option<f64>,
     text_align: Option<TextAlign>,
     /// True when `text_align` originates from a legacy presentational center
     /// hint (a `<center>` element or `align="center"` attribute) rather than a
@@ -488,6 +496,10 @@ impl ComputedStyle {
         Self {
             background_color: None,
             background_image: None,
+            mask_image: None,
+            mask_size: None,
+            mask_position: None,
+            mask_no_repeat: false,
             background_gradient: None,
             color: None,
             display: None,
@@ -571,6 +583,8 @@ impl ComputedStyle {
             offset_bottom: None,
             offset_top_ratio: None,
             offset_left_ratio: None,
+            offset_right_ratio: None,
+            offset_bottom_ratio: None,
             text_align: None,
             text_align_legacy: false,
             z_index: None,
@@ -603,6 +617,108 @@ impl ComputedStyle {
             column_gap: None,
             row_gap: None,
             custom_properties: None,
+        }
+    }
+
+    /// Forgets what has been declared for a property, so that defaulting gives it
+    /// the parent's value if it inherits and its initial value if it doesn't. That
+    /// is `unset`; it's also `inherit` for the properties that inherit.
+    /// https://www.w3.org/TR/css-cascade-4/#inherit-initial
+    pub fn reset_property(&mut self, property: &str) {
+        match property {
+            "color" => self.color = None,
+            "text-decoration" | "text-decoration-line" => self.text_decoration = None,
+            "font" => {
+                self.font_family = None;
+                self.font_size = None;
+                self.bold = None;
+                self.italic = None;
+                self.line_height = None;
+            }
+            "font-family" => self.font_family = None,
+            "font-size" => self.font_size = None,
+            "font-weight" => self.bold = None,
+            "font-style" => self.italic = None,
+            "line-height" => self.line_height = None,
+            "letter-spacing" => self.letter_spacing = None,
+            "word-spacing" => self.word_spacing = None,
+            "text-align" => self.text_align = None,
+            "text-indent" => self.text_indent = None,
+            "text-shadow" => self.text_shadow = None,
+            "visibility" => self.visibility_hidden = None,
+            "list-style-type" => self.list_style_type = None,
+            "background" => {
+                self.background_color = None;
+                self.background_image = None;
+                self.background_gradient = None;
+            }
+            "background-color" => self.background_color = None,
+            "background-image" => {
+                self.background_image = None;
+                self.background_gradient = None;
+            }
+            "margin" => {
+                self.margin = None;
+                self.margin_left_auto = false;
+                self.margin_right_auto = false;
+                self.margin_top_auto = false;
+                self.margin_bottom_auto = false;
+            }
+            "padding" => self.padding = None,
+            "border" | "border-width" => self.border = None,
+            "border-color" => self.border_color = None,
+            "display" => self.display = None,
+            "position" => self.position = None,
+            "float" => self.float = None,
+            "clear" => self.clear = None,
+            "opacity" => self.opacity = None,
+            "outline" => self.outline = None,
+            "vertical-align" => self.vertical_align = None,
+            "box-sizing" => self.box_sizing_border_box = None,
+            _ => {}
+        }
+    }
+
+    /// `property: inherit`. The properties that inherit anyway go through
+    /// defaulting; the rest take the parent's value here.
+    pub fn inherit_property(&mut self, property: &str, parent: &ComputedStyle) {
+        self.reset_property(property);
+        match property {
+            "display" => {
+                self.display = parent.display;
+                self.inline_outer = parent.inline_outer;
+            }
+            "background" => {
+                self.background_color = parent.background_color.clone();
+                self.background_image = parent.background_image.clone();
+                self.background_gradient = parent.background_gradient.clone();
+            }
+            "background-color" => self.background_color = parent.background_color.clone(),
+            "background-image" => {
+                self.background_image = parent.background_image.clone();
+                self.background_gradient = parent.background_gradient.clone();
+            }
+            "margin" => {
+                self.margin = parent.margin.clone();
+                self.margin_left_auto = parent.margin_left_auto;
+                self.margin_right_auto = parent.margin_right_auto;
+                self.margin_top_auto = parent.margin_top_auto;
+                self.margin_bottom_auto = parent.margin_bottom_auto;
+            }
+            "padding" => self.padding = parent.padding.clone(),
+            "border" | "border-width" => {
+                self.border = parent.border.clone();
+                self.border_color = parent.border_color.clone();
+            }
+            "border-color" => self.border_color = parent.border_color.clone(),
+            "position" => self.position = parent.position,
+            "float" => self.float = parent.float,
+            "clear" => self.clear = parent.clear,
+            "opacity" => self.opacity = parent.opacity,
+            "vertical-align" => self.vertical_align = parent.vertical_align.clone(),
+            "box-sizing" => self.box_sizing_border_box = parent.box_sizing_border_box,
+            "outline" => self.outline = parent.outline.clone(),
+            _ => {}
         }
     }
 
@@ -1417,12 +1533,49 @@ impl ComputedStyle {
         self.background_no_repeat
     }
 
+    pub fn set_mask_image(&mut self, url: String) {
+        self.mask_image = Some(url);
+    }
+
+    pub fn mask_image(&self) -> Option<&str> {
+        self.mask_image.as_deref()
+    }
+
+    pub fn set_mask_size(&mut self, size: (u8, f64, bool, f64, bool)) {
+        self.mask_size = Some(size);
+    }
+
+    pub fn mask_size(&self) -> Option<(u8, f64, bool, f64, bool)> {
+        self.mask_size
+    }
+
+    pub fn set_mask_position(&mut self, x: f64, x_percent: bool, y: f64, y_percent: bool) {
+        self.mask_position = Some((x, x_percent, y, y_percent));
+    }
+
+    pub fn mask_position(&self) -> Option<(f64, bool, f64, bool)> {
+        self.mask_position
+    }
+
+    pub fn set_mask_no_repeat(&mut self, no_repeat: bool) {
+        self.mask_no_repeat = no_repeat;
+    }
+
+    pub fn mask_no_repeat(&self) -> bool {
+        self.mask_no_repeat
+    }
+
     pub fn text_align(&self) -> TextAlign {
         self.text_align.unwrap_or(TextAlign::Left)
     }
 
     pub fn set_text_align(&mut self, text_align: TextAlign) {
         self.text_align = Some(text_align);
+    }
+
+    /// The color declared so far, without what it would inherit.
+    pub fn declared_color(&self) -> Option<Color> {
+        self.color.clone()
     }
 
     pub fn set_color(&mut self, color: Color) {
@@ -2170,6 +2323,22 @@ impl ComputedStyle {
 
     pub fn offset_left_ratio(&self) -> Option<f64> {
         self.offset_left_ratio
+    }
+
+    pub fn set_offset_right_ratio(&mut self, r: f64) {
+        self.offset_right_ratio = Some(r);
+    }
+
+    pub fn offset_right_ratio(&self) -> Option<f64> {
+        self.offset_right_ratio
+    }
+
+    pub fn set_offset_bottom_ratio(&mut self, r: f64) {
+        self.offset_bottom_ratio = Some(r);
+    }
+
+    pub fn offset_bottom_ratio(&self) -> Option<f64> {
+        self.offset_bottom_ratio
     }
 
     pub fn set_offset_right(&mut self, right: f64) {

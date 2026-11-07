@@ -863,6 +863,7 @@ fn should_bypass_proxy(url: &str) -> bool {
 
 fn download_http_client(url: &str) -> AppResult<Client> {
     let mut builder = Client::builder()
+        .user_agent(cosmo_script::USER_AGENT)
         .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .timeout(DOWNLOAD_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(10));

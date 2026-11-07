@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-boa_engine = "0.20"
-boa_gc = "0.20"
+boa_engine = { version = "0.22", features = ["annex-b"] }
+boa_gc = "0.22"
 cosmo_engine = { path = "../cosmo_engine" }
+url = "2"
+serde_json = "1"

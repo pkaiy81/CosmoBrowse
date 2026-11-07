@@ -1,0 +1,16 @@
+<!doctype html><style>
+body{margin:0;font:14px sans-serif}.c{width:400px;margin:0 auto;background:#eee}
+.full{width:100vw;position:relative;left:50%;right:50%;margin-left:-50vw;margin-right:-50vw;background:#cdf;height:30px}
+.logical{inline-size:100vw;position:relative;inset-inline:50%;margin-inline:-50vw;background:#bde;height:30px}
+.pct{position:relative;left:10%;width:100px;background:#fcd;height:24px}
+.right{position:relative;right:50px;width:100px;margin-left:200px;background:#dfc;height:24px}
+.both{position:relative;left:20px;right:500px;width:100px;background:#def;height:24px}
+.tall{height:120px;background:#ddd;position:relative}
+.top{position:relative;top:50%;height:24px;width:100px;background:#fd8}
+.bottom{position:relative;bottom:10%;left:120px;height:24px;width:100px;background:#8df}
+.abs{position:absolute;right:10%;bottom:25%;width:60px;height:20px;background:#c8f}
+.auto{position:relative;top:50%;background:#fbb}
+</style>
+<div class=c>before<div class=full>full width</div><div class=logical>logical</div><div class=pct>left 10%</div><div class=right>right 50px</div><div class=both>left wins</div>
+<div class=tall><div class=top>top 50%</div><div class=bottom>bottom 10%</div><div class=abs>abs</div></div>
+<div><div class=auto>top % of an auto height stays put</div></div></div>
