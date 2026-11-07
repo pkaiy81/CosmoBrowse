@@ -3,6 +3,7 @@ use crate::model::{
     ResolvedStyle, SceneItem,
 };
 use crate::security::{local_storage_snapshot, replace_local_storage};
+use cosmo_engine::renderer::layout::layout_object::CaretStop;
 use cosmo_engine::renderer::css::cssom::CssParser;
 use cosmo_engine::renderer::css::token::CssTokenizer;
 use crate::loader::fetch_external_stylesheets;
@@ -273,6 +274,99 @@ pub struct ClickOutcome {
     pub messages: Vec<String>,
 }
 
+/// A caret movement requested from the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaretMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
+/// Where to draw the caret: frame-local document coordinates, and the field's
+/// text color.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaretRect {
+    pub x: i64,
+    pub y: i64,
+    pub height: i64,
+    pub color: String,
+}
+
+/// The stop on the line nearest `point`, and on that line the one nearest
+/// `point` horizontally.
+fn nearest_caret_stop(stops: &[CaretStop], point: (i64, i64)) -> usize {
+    let mut best = 0;
+    let mut best_distance = (i64::MAX, i64::MAX);
+    for (index, stop) in stops.iter().enumerate() {
+        let vertical = if point.1 < stop.y {
+            stop.y - point.1
+        } else {
+            (point.1 - (stop.y + stop.height)).max(0)
+        };
+        let distance = (vertical, (stop.x - point.0).abs());
+        if distance < best_distance {
+            best_distance = distance;
+            best = index;
+        }
+    }
+    best
+}
+
+/// The caret position `movement` leads to from `caret`. Vertical moves work on
+/// the painted lines, so they cross soft wraps as well as newlines; with no
+/// line to move to they go to the start or end of the value.
+fn moved_caret(stops: &[CaretStop], caret: usize, movement: CaretMove) -> usize {
+    let last = stops.len() - 1;
+    let here = stops[caret];
+    let on_line = |index: &usize| stops[*index].y == here.y;
+    match movement {
+        CaretMove::Left => caret.saturating_sub(1),
+        CaretMove::Right => (caret + 1).min(last),
+        CaretMove::LineStart => (0..=caret).rev().take_while(|i| on_line(i)).last().unwrap_or(caret),
+        CaretMove::LineEnd => (caret..=last).take_while(|i| on_line(i)).last().unwrap_or(caret),
+        CaretMove::Up => stops[..caret]
+            .iter()
+            .rev()
+            .find(|stop| stop.y < here.y)
+            .map(|line| {
+                let line_y = line.y;
+                let candidates: Vec<usize> =
+                    (0..caret).filter(|i| stops[*i].y == line_y).collect();
+                nearest_on_line(stops, &candidates, here.x)
+            })
+            .unwrap_or(0),
+        CaretMove::Down => stops[caret..]
+            .iter()
+            .find(|stop| stop.y > here.y)
+            .map(|line| {
+                let line_y = line.y;
+                let candidates: Vec<usize> =
+                    (caret..=last).filter(|i| stops[*i].y == line_y).collect();
+                nearest_on_line(stops, &candidates, here.x)
+            })
+            .unwrap_or(last),
+    }
+}
+
+fn nearest_on_line(stops: &[CaretStop], candidates: &[usize], x: i64) -> usize {
+    candidates
+        .iter()
+        .copied()
+        .min_by_key(|i| (stops[*i].x - x).abs())
+        .unwrap_or(0)
+}
+
+/// The byte offset of the `chars`-th character of `value`.
+fn byte_offset(value: &str, chars: usize) -> usize {
+    value
+        .char_indices()
+        .nth(chars)
+        .map_or(value.len(), |(offset, _)| offset)
+}
+
 /// Where a field keeps its text. `<input>` uses the `value` attribute, which is
 /// also what layout paints; `<textarea>` uses its child text, per HTML LS
 /// §4.10.11 (its value is its text content, not an attribute).
@@ -437,6 +531,12 @@ pub struct LivePage {
     /// The text field the user is typing into, if any. Keystrokes are routed
     /// here instead of to the browser chrome.
     focused_field: Option<Rc<RefCell<cosmo_engine::renderer::dom::node::Node>>>,
+    /// The caret, as a character position in the focused field's value. A script
+    /// can shorten the value between edits, so read it through `caret_index`.
+    caret: usize,
+    /// The focused field's caret stops and text color, kept until the next
+    /// layout because finding them takes a layout of its own.
+    caret_stops: Option<(Vec<CaretStop>, String)>,
 }
 
 impl LivePage {
@@ -494,6 +594,8 @@ impl LivePage {
             transitions: TransitionDriver::default(),
             keyframes: KeyframeDriver::default(),
             focused_field: None,
+            caret: 0,
+            caret_stops: None,
         };
         // The first layout only records the transition baselines: an element's
         // initial style never animates (CSS Transitions §2).
@@ -628,6 +730,12 @@ impl LivePage {
         };
         self.focused_field = hit.filter(is_text_input);
         self.publish_focus_chain();
+        self.caret_stops = None;
+        // The click also places the caret, whether or not the field already had
+        // the focus.
+        if let Some(stops) = self.current_caret_stops(rect) {
+            self.caret = nearest_caret_stop(stops, point);
+        }
         self.focused_field.is_some()
     }
 
@@ -650,6 +758,7 @@ impl LivePage {
 
     pub fn blur_field(&mut self) {
         self.focused_field = None;
+        self.caret_stops = None;
         self.publish_focus_chain();
     }
 
@@ -659,19 +768,89 @@ impl LivePage {
         self.cssom.uses_focus()
     }
 
-    /// Append `text` to the focused field's value.
-    pub fn insert_text(&mut self, text: &str, rect: &FrameRect) -> Option<LayoutScene> {
-        self.edit_focused_value(rect, |value| value.push_str(text))
+    /// Whether the focused field holds more than one line, so Enter types a
+    /// newline rather than activating anything.
+    pub fn focused_field_is_multiline(&self) -> bool {
+        self.focused_field
+            .as_ref()
+            .is_some_and(|field| field_storage(field) == Some(FieldStorage::ChildText))
     }
 
-    /// Delete the last character of the focused field's value.
-    pub fn backspace(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
-        self.edit_focused_value(rect, |value| {
-            value.pop();
+    /// Insert `text` at the caret in the focused field.
+    pub fn insert_text(&mut self, text: &str, rect: &FrameRect) -> Option<LayoutScene> {
+        self.edit_focused_value(rect, |value, caret| {
+            value.insert_str(byte_offset(value, caret), text);
+            caret + text.chars().count()
         })
     }
 
-    /// Apply `edit` to the focused field's value, fire `input`, and re-lay-out.
+    /// Delete the character before the caret in the focused field.
+    pub fn backspace(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
+        self.edit_focused_value(rect, |value, caret| {
+            if caret == 0 {
+                return 0;
+            }
+            value.remove(byte_offset(value, caret - 1));
+            caret - 1
+        })
+    }
+
+    /// Delete the character after the caret in the focused field.
+    pub fn delete_forward(&mut self, rect: &FrameRect) -> Option<LayoutScene> {
+        self.edit_focused_value(rect, |value, caret| {
+            if caret < value.chars().count() {
+                value.remove(byte_offset(value, caret));
+            }
+            caret
+        })
+    }
+
+    /// Move the caret in the focused field. Returns whether it moved. No layout
+    /// depends on it, so the scene stays as it is.
+    pub fn move_caret(&mut self, movement: CaretMove, rect: &FrameRect) -> bool {
+        let caret = self.caret_index();
+        let Some(stops) = self.current_caret_stops(rect) else {
+            return false;
+        };
+        let moved = moved_caret(stops, caret.min(stops.len() - 1), movement);
+        self.caret = moved;
+        moved != caret
+    }
+
+    /// Where to draw the caret, if a field has the focus and a box to draw it in.
+    pub fn caret_rect(&mut self, rect: &FrameRect) -> Option<CaretRect> {
+        let caret = self.caret_index();
+        self.current_caret_stops(rect)?;
+        let (stops, color) = self.caret_stops.as_ref()?;
+        let stop = stops[caret.min(stops.len() - 1)];
+        Some(CaretRect {
+            x: stop.x,
+            y: stop.y,
+            height: stop.height,
+            color: color.clone(),
+        })
+    }
+
+    fn caret_index(&self) -> usize {
+        let length = self
+            .focused_field
+            .as_ref()
+            .map_or(0, |field| current_value(field).chars().count());
+        self.caret.min(length)
+    }
+
+    fn current_caret_stops(&mut self, rect: &FrameRect) -> Option<&Vec<CaretStop>> {
+        if self.caret_stops.is_none() {
+            let field = self.focused_field.clone()?;
+            let view = build_layout_view(self.dom.clone(), &self.cssom, rect);
+            self.caret_stops = view.field_caret_stops(&field, &current_value(&field));
+        }
+        self.caret_stops.as_ref().map(|(stops, _)| stops)
+    }
+
+    /// Apply `edit` to the focused field's value at the caret, fire `input`, and
+    /// re-lay-out. `edit` returns the new caret position. An edit that changes
+    /// nothing (backspace at the start, say) is not an edit: no event, no layout.
     ///
     /// Where the value lives depends on the element: `<input>` keeps it in the
     /// `value` attribute, `<textarea>` in its child text (HTML LS §4.10.11).
@@ -682,11 +861,16 @@ impl LivePage {
     fn edit_focused_value(
         &mut self,
         rect: &FrameRect,
-        edit: impl FnOnce(&mut String),
+        edit: impl FnOnce(&mut String, usize) -> usize,
     ) -> Option<LayoutScene> {
         let field = self.focused_field.clone()?;
-        let mut value = current_value(&field);
-        edit(&mut value);
+        let before = current_value(&field);
+        let mut value = before.clone();
+        let caret = self.caret_index();
+        self.caret = edit(&mut value, caret);
+        if value == before {
+            return None;
+        }
         set_field_value(&field, &value);
         // Let the page see the edit. A handler may mutate the DOM further, so
         // the generation is re-read after dispatching.
@@ -702,6 +886,7 @@ impl LivePage {
     /// of flashing the end state. That override costs one extra layout on the
     /// frames where a transition starts or is cancelled, never on static pages.
     fn layout_and_drive(&mut self, rect: &FrameRect) -> LayoutScene {
+        self.caret_stops = None;
         let (scene, transitions, animations) =
             layout_scene_and_targets(self.dom.clone(), &self.cssom, rect);
         // `@keyframes` playback first: it may write overrides that the
@@ -1918,7 +2103,7 @@ mod tests {
         let (mut page, first) = LivePage::load("about:blank", html, &rect, None);
         assert!(scene_contains_text(&first, "seed"), "starts with its text content");
 
-        assert!(page.focus_field_at((20, 10), &rect), "a textarea takes focus");
+        assert!(page.focus_field_at((190, 10), &rect), "a textarea takes focus");
         let scene = page.insert_text("ed", &rect).expect("typing re-lays-out");
         assert!(
             scene_contains_text(&scene, "seeded"),
@@ -1940,7 +2125,7 @@ mod tests {
             <p>after</p></body></html>";
         let rect = FrameRect { x: 0, y: 0, width: 300, height: 200 };
         let (mut page, _) = LivePage::load("about:blank", html, &rect, None);
-        assert!(page.focus_field_at((20, 40), &rect), "textarea takes focus");
+        assert!(page.focus_field_at((190, 40), &rect), "textarea takes focus");
         let mut scene = None;
         // Two things this pins, both of which bit in the GUI but not in a
         // tidier fixture: a leading space (what the GUI sends for the space
@@ -1972,6 +2157,139 @@ mod tests {
         assert!(page.focus_field_at((20, 10), &rect));
         let scene = page.insert_text("new", &rect).expect("typing re-lays-out");
         assert!(scene_contains_text(&scene, "new"), "a text child is created");
+    }
+
+    fn caret_page(body: &str) -> (LivePage, FrameRect) {
+        let html = format!(
+            "<html><head><style>body{{margin:0}}input{{width:200px;height:24px}}\
+             textarea{{width:300px;height:100px}}</style></head><body>{body}</body></html>"
+        );
+        let rect = FrameRect { x: 0, y: 0, width: 400, height: 200 };
+        let (page, _) = LivePage::load("about:blank", &html, &rect, None);
+        (page, rect)
+    }
+
+    #[test]
+    fn typing_and_deleting_happen_at_the_caret() {
+        let (mut page, rect) = caret_page("<input value=\"abcd\">");
+        assert!(page.focus_field_at((190, 10), &rect));
+        assert!(page.move_caret(CaretMove::Left, &rect));
+        let scene = page.insert_text("X", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "abcXd"), "inserted before the last character");
+
+        let scene = page.backspace(&rect).expect("backspace re-lays-out");
+        assert!(scene_contains_text(&scene, "abcd"), "backspace takes the character before");
+
+        let scene = page.delete_forward(&rect).expect("delete re-lays-out");
+        assert!(scene_contains_text(&scene, "abc"), "delete takes the character after");
+        assert!(!scene_contains_text(&scene, "abcd"));
+
+        assert!(page.move_caret(CaretMove::LineStart, &rect));
+        let scene = page.insert_text("^", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "^abc"));
+    }
+
+    #[test]
+    fn the_caret_handles_multibyte_characters() {
+        let (mut page, rect) = caret_page("<input value=\"日本語\">");
+        assert!(page.focus_field_at((190, 10), &rect));
+        page.move_caret(CaretMove::Left, &rect);
+        let scene = page.insert_text("a", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "日本a語"));
+        let scene = page.backspace(&rect).expect("backspace re-lays-out");
+        assert!(scene_contains_text(&scene, "日本語"));
+        let scene = page.backspace(&rect).expect("backspace re-lays-out");
+        assert!(scene_contains_text(&scene, "日語"));
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_fires_no_input_event() {
+        let (mut page, rect) = caret_page(
+            "<input id=\"q\" value=\"\"><p id=\"seen\">none</p><script>\
+             document.getElementById('q').addEventListener('input',function(){\
+             document.getElementById('seen').textContent='fired';});</script>",
+        );
+        assert!(page.focus_field_at((10, 10), &rect));
+        assert!(page.backspace(&rect).is_none(), "nothing before the caret");
+        assert!(page.delete_forward(&rect).is_none(), "nothing after the caret");
+        assert!(!page.move_caret(CaretMove::Left, &rect), "already at the start");
+        assert!(!page.move_caret(CaretMove::Right, &rect), "already at the end");
+        let scene = page.relayout(&rect);
+        assert!(scene_contains_text(&scene, "none"), "the handler never ran");
+    }
+
+    #[test]
+    fn clicking_places_the_caret_nearest_the_point() {
+        let (mut page, rect) = caret_page("<input value=\"abcdefgh\">");
+        assert!(page.focus_field_at((10, 10), &rect), "left of the text");
+        let start = page.caret_rect(&rect).expect("a caret").x;
+        assert!(page.focus_field_at((190, 10), &rect), "right of the text");
+        let end = page.caret_rect(&rect).expect("a caret").x;
+        assert!(end > start);
+        assert!(page.focus_field_at(((start + end) / 2, 10), &rect), "the middle");
+        let middle = page.caret_rect(&rect).expect("a caret").x;
+        assert!(start < middle && middle < end, "{start} < {middle} < {end}");
+    }
+
+    #[test]
+    fn the_caret_follows_lines_in_a_textarea() {
+        let (mut page, rect) = caret_page("<textarea>one\n\nthree</textarea>");
+        assert!(page.focus_field_at((290, 90), &rect), "below the text: the end");
+        let last = page.caret_rect(&rect).expect("a caret");
+
+        page.move_caret(CaretMove::Up, &rect);
+        let blank = page.caret_rect(&rect).expect("a caret");
+        assert!(blank.y < last.y, "up leaves the last line");
+        page.move_caret(CaretMove::Up, &rect);
+        let first = page.caret_rect(&rect).expect("a caret");
+        assert!(first.y < blank.y, "the blank line is a line of its own");
+
+        page.move_caret(CaretMove::LineStart, &rect);
+        let scene = page.insert_text(">", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, ">one"));
+
+        page.move_caret(CaretMove::Down, &rect);
+        page.move_caret(CaretMove::Down, &rect);
+        page.move_caret(CaretMove::LineEnd, &rect);
+        let scene = page.insert_text("!", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "three!"));
+
+        page.move_caret(CaretMove::Down, &rect);
+        let scene = page.insert_text("?", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "three!?"), "down on the last line goes to the end");
+    }
+
+    #[test]
+    fn a_newline_starts_a_new_line_with_the_caret_on_it() {
+        let (mut page, rect) = caret_page("<textarea></textarea>");
+        assert!(page.focus_field_at((10, 10), &rect));
+        assert!(page.focused_field_is_multiline());
+        let scene = page.insert_text("a\n", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "a"));
+        let on_new_line = page.caret_rect(&rect).expect("a caret");
+        let scene = page.insert_text("b", &rect).expect("typing re-lays-out");
+        let painted_y = |needle: &str| {
+            scene.scene_items.iter().find_map(|item| match item {
+                SceneItem::Text { text, y, .. } if text == needle => Some(*y),
+                _ => None,
+            })
+        };
+        let (a, b) = (painted_y("a").expect("a painted"), painted_y("b").expect("b painted"));
+        assert!(b > a, "the newline moved the text down");
+        assert_eq!(on_new_line.y, b, "the caret was already on that line");
+    }
+
+    #[test]
+    fn a_single_line_input_is_not_multiline_and_a_script_can_shorten_its_value() {
+        let (mut page, rect) = caret_page("<input id=\"q\" value=\"abcdef\">");
+        assert!(page.focus_field_at((190, 10), &rect));
+        assert!(!page.focused_field_is_multiline());
+        page.host
+            .eval_to_string("document.getElementById('q').setAttribute('value','ab');")
+            .expect("script runs");
+        page.relayout(&rect);
+        let scene = page.insert_text("c", &rect).expect("typing re-lays-out");
+        assert!(scene_contains_text(&scene, "abc"), "the caret was clamped to the new end");
     }
 
     #[test]

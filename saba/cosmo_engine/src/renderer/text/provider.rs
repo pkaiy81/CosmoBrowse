@@ -20,6 +20,13 @@ pub trait FontMetricsProvider: Debug + Send + Sync {
     /// its own content.
     fn char_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64;
 
+    /// How far the renderer's pen actually moves for `c`, which can be less than
+    /// [`Self::char_advance`] reserves. A caret has to be placed with this one
+    /// to land between the glyphs.
+    fn painted_advance(&self, c: char, font_size: FontSize, bold: bool) -> i64 {
+        self.char_advance(c, font_size, bold)
+    }
+
     /// Default line box height (glyph height + leading) for the font size.
     fn line_height(&self, font_size: FontSize) -> i64 {
         line_height_px(font_size)
