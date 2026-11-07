@@ -985,34 +985,18 @@ pub(crate) fn parse_color_value(values: &[ComponentValue]) -> Option<Color> {
             ComponentValue::Ident(name) => {
                 let lower = name.to_ascii_lowercase();
                 let is_fn = matches!(values.get(i + 1), Some(ComponentValue::OpenParenthesis));
-                if is_fn && matches!(lower.as_str(), "rgb" | "rgba" | "hsl" | "hsla") {
-                    let mut nums: Vec<(f64, bool)> = Vec::new();
-                    let mut j = i + 2;
-                    while j < values.len() {
-                        match &values[j] {
-                            ComponentValue::CloseParenthesis => break,
-                            ComponentValue::Number(n) => nums.push((*n, false)),
-                            ComponentValue::Dimension(n, u) if u == "%" => nums.push((*n, true)),
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    if let Some(c) = color_from_function(&lower, &nums) {
+                if is_fn {
+                    let (arguments, close) = function_arguments(values, i + 1);
+                    if let Some(c) = color_from_arguments(&lower, &arguments) {
                         return Some(c);
                     }
-                    i = j;
-                } else if is_fn {
-                    // Skip over an unrelated function (url(...), var(...)).
-                    let mut j = i + 2;
-                    while j < values.len()
-                        && !matches!(values[j], ComponentValue::CloseParenthesis)
-                    {
-                        j += 1;
-                    }
-                    i = j;
+                    // An unrelated function (url(...), var(...)).
+                    i = close;
                 } else if lower == "transparent" {
                     return Color::from_name("transparent").ok();
-                } else if let Some(code) = named_color_code(&lower) {
+                } else if lower == "currentcolor" {
+                    return Some(CURRENT_COLOR.with(|c| c.borrow().clone()).unwrap_or(Color::black()));
+                } else if let Some(code) = named_color_code(&lower).or_else(|| system_color_code(&lower)) {
                     return Color::from_code(code).ok();
                 }
             }
@@ -1021,6 +1005,252 @@ pub(crate) fn parse_color_value(values: &[ComponentValue]) -> Option<Color> {
         i += 1;
     }
     None
+}
+
+thread_local! {
+    /// What `currentcolor` means in the declaration being parsed.
+    static CURRENT_COLOR: RefCell<Option<Color>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_current_color(color: Option<Color>) {
+    CURRENT_COLOR.with(|current| *current.borrow_mut() = color);
+}
+
+/// The system colors, in their light forms.
+/// https://www.w3.org/TR/css-color-4/#css-system-colors
+fn system_color_code(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "canvas" | "field" | "buttonhighlight" => "#ffffff",
+        "canvastext" | "fieldtext" | "buttontext" | "marktext" => "#000000",
+        "linktext" => "#0000ee",
+        "visitedtext" => "#551a8b",
+        "activetext" => "#ff0000",
+        "buttonface" => "#efefef",
+        "buttonborder" => "#767676",
+        "graytext" => "#808080",
+        "highlight" | "accentcolor" => "#0a64d8",
+        "highlighttext" | "accentcolortext" => "#ffffff",
+        "mark" => "#ffff00",
+        _ => return None,
+    })
+}
+
+/// A function's arguments split at its top-level commas, from the index of its
+/// opening parenthesis, and the index of the closing one.
+fn function_arguments(values: &[ComponentValue], open: usize) -> (Vec<&[ComponentValue]>, usize) {
+    let mut arguments = Vec::new();
+    let mut depth = 0;
+    let mut start = open + 1;
+    let mut i = open;
+    while i < values.len() {
+        match &values[i] {
+            ComponentValue::OpenParenthesis => depth += 1,
+            ComponentValue::CloseParenthesis => {
+                depth -= 1;
+                if depth == 0 {
+                    arguments.push(&values[start..i]);
+                    return (arguments, i);
+                }
+            }
+            ComponentValue::Delim(',') if depth == 1 => {
+                arguments.push(&values[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    arguments.push(&values[start.min(values.len())..]);
+    (arguments, values.len())
+}
+
+/// The channels of a color function, where `none` is 0 and an angle is in degrees.
+fn color_channels(arguments: &[&[ComponentValue]]) -> Vec<(f64, bool)> {
+    arguments
+        .iter()
+        .flat_map(|argument| argument.iter())
+        .filter_map(|value| match value {
+            ComponentValue::Number(n) => Some((*n, false)),
+            ComponentValue::Dimension(n, unit) => match unit.to_ascii_lowercase().as_str() {
+                "%" => Some((*n, true)),
+                "deg" => Some((*n, false)),
+                "rad" => Some((n.to_degrees(), false)),
+                "grad" => Some((n * 0.9, false)),
+                "turn" => Some((n * 360.0, false)),
+                _ => None,
+            },
+            ComponentValue::Ident(word) if word.eq_ignore_ascii_case("none") => Some((0.0, false)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn color_from_arguments(name: &str, arguments: &[&[ComponentValue]]) -> Option<Color> {
+    match name {
+        // https://www.w3.org/TR/css-color-5/#light-dark
+        "light-dark" => {
+            let dark = std::env::var("COSMO_PREFERS_DARK").ok().as_deref() == Some("1");
+            parse_color_value(arguments.get(usize::from(dark))?)
+        }
+        "color-mix" => color_mix(arguments),
+        "color" => {
+            let channels = color_channels(arguments);
+            let value = |i: usize| {
+                let (v, percent) = channels.get(i).copied().unwrap_or((0.0, false));
+                if percent { v / 100.0 } else { v }
+            };
+            let linear = arguments.first()?.iter().any(|t| {
+                matches!(t, ComponentValue::Ident(word) if word.eq_ignore_ascii_case("srgb-linear"))
+            });
+            let rgb = [value(0), value(1), value(2)];
+            let rgb = if linear { rgb.map(gamma_encode) } else { rgb };
+            Some(color_from_unit_rgb(rgb, alpha_channel(&channels, 3)))
+        }
+        "hwb" => {
+            let channels = color_channels(arguments);
+            let (hue, white, black) = (channels.first()?.0, channels.get(1)?.0 / 100.0, channels.get(2)?.0 / 100.0);
+            let total = white + black;
+            let (white, black) = if total > 1.0 { (white / total, black / total) } else { (white, black) };
+            let pure = hue_to_rgb(hue);
+            let rgb = pure.map(|channel| channel * (1.0 - white - black) + white);
+            Some(color_from_unit_rgb(rgb, alpha_channel(&channels, 3)))
+        }
+        "lab" | "lch" | "oklab" | "oklch" => {
+            let channels = color_channels(arguments);
+            let (lightness, lightness_percent) = *channels.first()?;
+            let oklab = name.starts_with("ok");
+            let lightness = match (lightness_percent, oklab) {
+                (true, true) => lightness / 100.0,
+                _ => lightness,
+            };
+            let axis = |i: usize, percent_of: f64| -> Option<f64> {
+                let (v, percent) = *channels.get(i)?;
+                Some(if percent { v / 100.0 * percent_of } else { v })
+            };
+            let (a, b) = if name.ends_with("ch") {
+                let chroma = axis(1, if oklab { 0.4 } else { 150.0 })?;
+                let hue = channels.get(2)?.0.to_radians();
+                (chroma * hue.cos(), chroma * hue.sin())
+            } else {
+                let scale = if oklab { 0.4 } else { 125.0 };
+                (axis(1, scale)?, axis(2, scale)?)
+            };
+            let linear = if oklab { oklab_to_linear(lightness, a, b) } else { lab_to_linear(lightness, a, b) };
+            Some(color_from_unit_rgb(linear.map(gamma_encode), alpha_channel(&channels, 3)))
+        }
+        "rgb" | "rgba" | "hsl" | "hsla" => color_from_function(name, &color_channels(arguments)),
+        _ => None,
+    }
+}
+
+fn alpha_channel(channels: &[(f64, bool)], index: usize) -> f64 {
+    channels
+        .get(index)
+        .map(|&(v, percent)| if percent { v / 100.0 } else { v })
+        .unwrap_or(1.0)
+}
+
+fn color_from_unit_rgb(rgb: [f64; 3], alpha: f64) -> Color {
+    let to8 = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::from_rgba(to8(rgb[0]), to8(rgb[1]), to8(rgb[2]), to8(alpha))
+}
+
+/// The fully saturated color at a hue.
+fn hue_to_rgb(hue: f64) -> [f64; 3] {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let x = 1.0 - (h.rem_euclid(2.0) - 1.0).abs();
+    match h as u32 {
+        0 => [1.0, x, 0.0],
+        1 => [x, 1.0, 0.0],
+        2 => [0.0, 1.0, x],
+        3 => [0.0, x, 1.0],
+        4 => [x, 0.0, 1.0],
+        _ => [1.0, 0.0, x],
+    }
+}
+
+fn gamma_encode(linear: f64) -> f64 {
+    let v = linear.clamp(0.0, 1.0);
+    if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// https://bottosson.github.io/posts/oklab/
+fn oklab_to_linear(l: f64, a: f64, b: f64) -> [f64; 3] {
+    let lms = [
+        l + 0.3963377774 * a + 0.2158037573 * b,
+        l - 0.1055613458 * a - 0.0638541728 * b,
+        l - 0.0894841775 * a - 1.2914855480 * b,
+    ]
+    .map(|v| v * v * v);
+    [
+        4.0767416621 * lms[0] - 3.3077115913 * lms[1] + 0.2309699292 * lms[2],
+        -1.2684380046 * lms[0] + 2.6097574011 * lms[1] - 0.3413193965 * lms[2],
+        -0.0041960863 * lms[0] - 0.7034186147 * lms[1] + 1.7076147010 * lms[2],
+    ]
+}
+
+/// CIE Lab (D50) to linear sRGB (D65).
+/// https://www.w3.org/TR/css-color-4/#color-conversion-code
+fn lab_to_linear(l: f64, a: f64, b: f64) -> [f64; 3] {
+    const KAPPA: f64 = 24389.0 / 27.0;
+    const EPSILON: f64 = 216.0 / 24389.0;
+    let fy = (l + 16.0) / 116.0;
+    let (fx, fz) = (a / 500.0 + fy, fy - b / 200.0);
+    let cube = |f: f64| {
+        if f * f * f > EPSILON { f * f * f } else { (116.0 * f - 16.0) / KAPPA }
+    };
+    let y = if l > KAPPA * EPSILON { fy * fy * fy } else { l / KAPPA };
+    let (x, y, z) = (cube(fx) * 0.3457 / 0.3585, y, cube(fz) * (1.0 - 0.3457 - 0.3585) / 0.3585);
+    [
+        3.1341359569958707 * x - 1.6173863321612538 * y - 0.4906619460083532 * z,
+        -0.978795502912089 * x + 1.916254567259524 * y + 0.03344273116131949 * z,
+        0.07195537988411677 * x - 0.2289768264158322 * y + 1.405386058324125 * z,
+    ]
+}
+
+/// `color-mix(in <space>, a p%, b q%)`, mixed in sRGB whatever the space named.
+/// https://www.w3.org/TR/css-color-5/#color-mix
+fn color_mix(arguments: &[&[ComponentValue]]) -> Option<Color> {
+    let component = |argument: &[ComponentValue]| -> Option<(Color, Option<f64>)> {
+        let percent = argument.iter().rev().find_map(|value| match value {
+            ComponentValue::Dimension(n, unit) if unit == "%" => Some(*n / 100.0),
+            _ => None,
+        });
+        // A percentage inside the color's own function isn't this one.
+        let last = argument.iter().rposition(|v| !matches!(v, ComponentValue::Whitespace))?;
+        let first = argument.iter().position(|v| !matches!(v, ComponentValue::Whitespace))?;
+        let outside = matches!(argument[last], ComponentValue::Dimension(..))
+            || matches!(argument[first], ComponentValue::Dimension(..));
+        Some((parse_color_value(argument)?, percent.filter(|_| outside)))
+    };
+    let (first, p1) = component(arguments.get(1)?)?;
+    let (second, p2) = component(arguments.get(2)?)?;
+    let (p1, p2) = match (p1, p2) {
+        (None, None) => (0.5, 0.5),
+        (Some(p), None) => (p, 1.0 - p),
+        (None, Some(q)) => (1.0 - q, q),
+        (Some(p), Some(q)) => (p, q),
+    };
+    let total = p1 + p2;
+    if total <= 0.0 {
+        return None;
+    }
+    let (w1, w2) = (p1 / total, p2 / total);
+    let unit = |c: u8| c as f64 / 255.0;
+    let (r1, g1, b1, a1) = first.rgba_channels();
+    let (r2, g2, b2, a2) = second.rgba_channels();
+    let alpha = unit(a1) * w1 + unit(a2) * w2;
+    // Premultiplied, so a transparent side contributes no color.
+    let mix = |c1: u8, c2: u8| {
+        if alpha == 0.0 {
+            0.0
+        } else {
+            (unit(c1) * unit(a1) * w1 + unit(c2) * unit(a2) * w2) / alpha
+        }
+    };
+    let rgb = [mix(r1, r2), mix(g1, g2), mix(b1, b2)];
+    // Percentages adding up to less than 100% make it that much transparent.
+    Some(color_from_unit_rgb(rgb, alpha * total.min(1.0)))
 }
 
 fn color_from_function(name: &str, nums: &[(f64, bool)]) -> Option<Color> {
@@ -1083,6 +1313,35 @@ mod tests {
             out.push(tok);
         }
         out
+    }
+
+    #[test]
+    fn parses_modern_color_functions() {
+        let code = |css: &str| parse_color_value(&vals(css)).map(|c| c.code().to_string());
+        assert_eq!(code("light-dark(#111111, #eeeeee)").as_deref(), Some("#111111"));
+        assert_eq!(code("light-dark(rgb(1,2,3), red)").as_deref(), Some("#010203"));
+        assert_eq!(code("color-mix(in srgb, red, blue)").as_deref(), Some("#800080"));
+        assert_eq!(code("color-mix(in srgb, white 25%, black)").as_deref(), Some("#404040"));
+        assert_eq!(code("color-mix(in srgb, red, transparent)").as_deref(), Some("#ff000080"));
+        assert_eq!(code("color-mix(in srgb, rgb(100% 0% 0%) 50%, rgb(0 0 255))").as_deref(), Some("#800080"));
+        assert_eq!(code("oklch(1 0 0)").as_deref(), Some("#ffffff"));
+        assert_eq!(code("oklch(0 0 0)").as_deref(), Some("#000000"));
+        assert_eq!(code("oklch(62.8% 0.2577 29.23)").as_deref(), Some("#ff0000"));
+        assert_eq!(code("oklab(45.2% -0.0325 -0.3115)").as_deref(), Some("#0000ff"));
+        assert_eq!(code("lab(100 0 0)").as_deref(), Some("#ffffff"));
+        assert_eq!(code("lch(54.29 106.84 40.85)").as_deref(), Some("#ff0000"));
+        assert_eq!(code("hwb(120 0% 0%)").as_deref(), Some("#00ff00"));
+        assert_eq!(code("hwb(0 100% 0%)").as_deref(), Some("#ffffff"));
+        assert_eq!(code("color(srgb 1 0 0)").as_deref(), Some("#ff0000"));
+        assert_eq!(code("color(srgb 0 0 1 / 50%)").as_deref(), Some("#0000ff80"));
+        assert_eq!(code("hsl(120deg 100% 50%)").as_deref(), Some("#00ff00"));
+        assert_eq!(code("rgb(255 0 0 / 50%)").as_deref(), Some("#ff000080"));
+        assert_eq!(code("Canvas").as_deref(), Some("#ffffff"));
+        assert_eq!(code("url(x.png)"), None);
+        set_current_color(Some(Color::from_code("#123456").unwrap()));
+        assert_eq!(code("currentColor").as_deref(), Some("#123456"));
+        assert_eq!(code("color-mix(in srgb, currentcolor, currentcolor)").as_deref(), Some("#123456"));
+        set_current_color(None);
     }
 
     #[test]

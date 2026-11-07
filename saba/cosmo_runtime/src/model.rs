@@ -260,6 +260,9 @@ pub enum SceneItem {
         height: i64,
         background_color: String,
         background_image: Option<String>,
+        /// Paint `background_image` as a mask: this color, wherever it's opaque.
+        #[serde(default)]
+        background_mask_color: Option<String>,
         /// `linear-gradient(...)` background: (angle_deg, [(hex_color, pos)]).
         #[serde(default)]
         background_gradient: Option<(f64, Vec<(String, f64)>)>,

@@ -45,6 +45,46 @@ fn font_weight_is_bold(value: &ComponentValue) -> Option<bool> {
     }
 }
 
+/// The width in a `border` shorthand: `<width> || <style> || <color>`, where only a
+/// color can be a function, so numbers inside one aren't widths. With no style the
+/// style is `none`, and so the used width is 0.
+/// https://www.w3.org/TR/css-backgrounds-3/#the-border-shorthands
+fn border_shorthand_width(values: &[ComponentValue], font_size: FontSize) -> f64 {
+    let mut depth = 0;
+    let mut width = 3.0;
+    let mut visible = false;
+    for value in values {
+        match value {
+            ComponentValue::OpenParenthesis => depth += 1,
+            ComponentValue::CloseParenthesis => depth -= 1,
+            _ if depth > 0 => {}
+            ComponentValue::Number(n) => width = *n,
+            ComponentValue::Dimension(n, unit) => {
+                if let Some(px) = length_to_px(*n, unit, font_size) {
+                    width = px;
+                }
+            }
+            ComponentValue::Ident(word) => match word.to_ascii_lowercase().as_str() {
+                "thin" => width = 1.0,
+                "medium" => width = 3.0,
+                "thick" => width = 5.0,
+                "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => {
+                    visible = true;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if visible { width } else { 0.0 }
+}
+
+fn value_mentions_currentcolor(values: &[ComponentValue]) -> bool {
+    values
+        .iter()
+        .any(|v| matches!(v, ComponentValue::Ident(word) if word.eq_ignore_ascii_case("currentcolor")))
+}
+
 /// The physical property a logical one means, for those that name a single one.
 fn physical_property(property: &str) -> Option<String> {
     let simple = match property {
@@ -154,7 +194,7 @@ impl LayoutObject {
         // wherever in the rule it was written. The sort is stable, so their
         // relative order, which decides what overrides what, is untouched.
         let mut declarations = declarations;
-        declarations.sort_by_key(|d| !matches!(d.property.as_str(), "font" | "font-size"));
+        declarations.sort_by_key(|d| !matches!(d.property.as_str(), "font" | "font-size" | "color"));
         for mut declaration in declarations {
             // Custom-property definitions are collected into the element's
             // scope before the cascade (create_layout_object); they are not
@@ -168,6 +208,16 @@ impl LayoutObject {
                 if let Some(scope) = &custom_scope {
                     declaration.value = substitute_vars(&declaration.value, scope);
                 }
+            }
+            if value_mentions_currentcolor(&declaration.value) {
+                // `color` itself means the parent's.
+                let own = self.style.declared_color().filter(|_| declaration.property != "color");
+                let inherited = || {
+                    self.parent
+                        .upgrade()
+                        .and_then(|parent| parent.try_borrow().ok().map(|p| p.style().color()))
+                };
+                set_current_color(own.or_else(inherited));
             }
             // Logical properties, in the only writing mode there is here:
             // horizontal, left to right.
@@ -288,6 +338,42 @@ impl LayoutObject {
                         .collect();
                     if let Some((x, xp, y, yp)) = assemble_bg_position(&comps) {
                         self.style.set_background_position(x, xp, y, yp);
+                    }
+                }
+                "mask" | "-webkit-mask" | "mask-image" | "-webkit-mask-image" => {
+                    if let Some(url) = extract_css_url(&declaration.value) {
+                        self.style.set_mask_image(url);
+                    }
+                    if declaration.property.ends_with("mask") {
+                        let (pos, no_repeat, size) = scan_background_shorthand(&declaration.value);
+                        if let Some((x, xp, y, yp)) = pos {
+                            self.style.set_mask_position(x, xp, y, yp);
+                        }
+                        self.style.set_mask_no_repeat(no_repeat);
+                        if let Some(size) = size {
+                            self.style.set_mask_size(size);
+                        }
+                    }
+                }
+                "mask-size" | "-webkit-mask-size" => {
+                    if let Some(size) = parse_background_size(&declaration.value) {
+                        self.style.set_mask_size(size);
+                    }
+                }
+                "mask-position" | "-webkit-mask-position" => {
+                    let comps: Vec<(f64, bool, Option<bool>)> = declaration
+                        .value
+                        .iter()
+                        .filter_map(bg_position_component)
+                        .take(2)
+                        .collect();
+                    if let Some((x, xp, y, yp)) = assemble_bg_position(&comps) {
+                        self.style.set_mask_position(x, xp, y, yp);
+                    }
+                }
+                "mask-repeat" | "-webkit-mask-repeat" => {
+                    if let Some(ComponentValue::Ident(value)) = first_value {
+                        self.style.set_mask_no_repeat(value.eq_ignore_ascii_case("no-repeat"));
                     }
                 }
                 "background-repeat" => {
@@ -952,7 +1038,21 @@ impl LayoutObject {
                         );
                     }
                 }
-                "border" | "border-width" => {
+                "border" => {
+                    let width = border_shorthand_width(
+                        &declaration.value,
+                        self.style.font_size_or_default(),
+                    );
+                    self.style.set_border(
+                        crate::renderer::layout::computed_style::EdgeSize::from_values(
+                            width, width, width, width,
+                        ),
+                    );
+                    if let Some(color) = parse_color_value(&declaration.value) {
+                        self.style.set_border_color(color);
+                    }
+                }
+                "border-width" => {
                     let base_font_size = self.style.font_size_or_default();
                     if let Some((top, right, bottom, left)) =
                         parse_spacing_shorthand(&declaration.value, base_font_size)
@@ -962,13 +1062,6 @@ impl LayoutObject {
                                 top, right, bottom, left,
                             ),
                         );
-                    }
-                    // The `border` shorthand also carries a color (and style):
-                    // pull a color token so the stroke is visible.
-                    if declaration.property == "border" {
-                        if let Some(color) = parse_color_value(&declaration.value) {
-                            self.style.set_border_color(color);
-                        }
                     }
                 }
                 // Per-side border shorthands and width longhands. The engine

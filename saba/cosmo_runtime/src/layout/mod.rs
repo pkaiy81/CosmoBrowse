@@ -1387,13 +1387,30 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                 } else {
                     String::new()
                 };
+                // A solid background seen through `mask-image` is how icons take
+                // the text's color.
+                let masked_color = style
+                    .mask_image()
+                    .filter(|_| style.background_image().is_none() && style.background_gradient().is_none())
+                    .map(|_| style.used_background_color())
+                    .filter(|color| color.rgba_channels().3 > 0)
+                    .map(|color| color.code().to_string());
+                let masked = masked_color.is_some();
                 scene_items.push(SceneItem::Rect {
                     x,
                     y,
                     width: lw,
                     height: lh,
-                    background_color: style.used_background_color().code().to_string(),
-                    background_image: style.background_image().map(|s| s.to_string()),
+                    background_color: if masked_color.is_some() {
+                        "transparent".to_string()
+                    } else {
+                        style.used_background_color().code().to_string()
+                    },
+                    background_image: masked_color
+                        .is_some()
+                        .then(|| style.mask_image().map(str::to_string))
+                        .unwrap_or_else(|| style.background_image().map(|s| s.to_string())),
+                    background_mask_color: masked_color,
                     background_gradient: style.background_gradient().map(|g| {
                         (
                             g.angle_deg,
@@ -1412,9 +1429,17 @@ fn display_items_to_scene(display_items: Vec<DisplayItem>, rect: &FrameRect) -> 
                     border_width,
                     border_widths,
                     border_color,
-                    background_position: style.background_position(),
-                    background_no_repeat: style.background_no_repeat(),
-                    background_size: style.background_size(),
+                    background_position: if masked {
+                        style.mask_position()
+                    } else {
+                        style.background_position()
+                    },
+                    background_no_repeat: if masked {
+                        style.mask_no_repeat()
+                    } else {
+                        style.background_no_repeat()
+                    },
+                    background_size: if masked { style.mask_size() } else { style.background_size() },
                     border_radius: scaled_len(
                         ctx,
                         style.border_radius_for(layout_size.width(), layout_size.height()),
@@ -3426,6 +3451,7 @@ mod diff_tests {
             height: 10,
             background_color: "#fff".to_string(),
             background_image: None,
+            background_mask_color: None,
             background_gradient: None,
             opacity: 1.0,
             z_index: 0,
@@ -3452,6 +3478,7 @@ mod diff_tests {
             height: 10,
             background_color: "#fff".to_string(),
             background_image: None,
+            background_mask_color: None,
             background_gradient: None,
             opacity: 1.0,
             z_index: 1,

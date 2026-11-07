@@ -1393,6 +1393,7 @@ fn replay_paint_commands(commands: &[PaintCommand]) -> Vec<SceneItem> {
                 height: rect.height,
                 background_color: rect.background_color.clone(),
                 background_image: rect.background_image.clone(),
+                background_mask_color: rect.background_mask_color.clone(),
                 background_gradient: rect.background_gradient.clone(),
                 opacity: rect.opacity,
                 z_index: rect.z_index,

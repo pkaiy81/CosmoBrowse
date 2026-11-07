@@ -79,6 +79,12 @@ pub struct ComputedStyle {
     background_color: Option<Color>,
     background_image: Option<String>,
     background_gradient: Option<LinearGradient>,
+    /// `mask-image: url(...)`. Only a box's own background is masked, which is
+    /// what the icons that use it want.
+    mask_image: Option<String>,
+    mask_size: Option<(u8, f64, bool, f64, bool)>,
+    mask_position: Option<(f64, bool, f64, bool)>,
+    mask_no_repeat: bool,
     color: Option<Color>,
     display: Option<DisplayType>,
     float: Option<Float>,
@@ -490,6 +496,10 @@ impl ComputedStyle {
         Self {
             background_color: None,
             background_image: None,
+            mask_image: None,
+            mask_size: None,
+            mask_position: None,
+            mask_no_repeat: false,
             background_gradient: None,
             color: None,
             display: None,
@@ -1523,12 +1533,49 @@ impl ComputedStyle {
         self.background_no_repeat
     }
 
+    pub fn set_mask_image(&mut self, url: String) {
+        self.mask_image = Some(url);
+    }
+
+    pub fn mask_image(&self) -> Option<&str> {
+        self.mask_image.as_deref()
+    }
+
+    pub fn set_mask_size(&mut self, size: (u8, f64, bool, f64, bool)) {
+        self.mask_size = Some(size);
+    }
+
+    pub fn mask_size(&self) -> Option<(u8, f64, bool, f64, bool)> {
+        self.mask_size
+    }
+
+    pub fn set_mask_position(&mut self, x: f64, x_percent: bool, y: f64, y_percent: bool) {
+        self.mask_position = Some((x, x_percent, y, y_percent));
+    }
+
+    pub fn mask_position(&self) -> Option<(f64, bool, f64, bool)> {
+        self.mask_position
+    }
+
+    pub fn set_mask_no_repeat(&mut self, no_repeat: bool) {
+        self.mask_no_repeat = no_repeat;
+    }
+
+    pub fn mask_no_repeat(&self) -> bool {
+        self.mask_no_repeat
+    }
+
     pub fn text_align(&self) -> TextAlign {
         self.text_align.unwrap_or(TextAlign::Left)
     }
 
     pub fn set_text_align(&mut self, text_align: TextAlign) {
         self.text_align = Some(text_align);
+    }
+
+    /// The color declared so far, without what it would inherit.
+    pub fn declared_color(&self) -> Option<Color> {
+        self.color.clone()
     }
 
     pub fn set_color(&mut self, color: Color) {
